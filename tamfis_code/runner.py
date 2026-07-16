@@ -16,7 +16,7 @@ from typing import Any, Optional, AsyncGenerator
 from rich.console import Console
 from rich.panel import Panel
 
-from .api_client import RemoteAPIClient, RemoteAPIError
+from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .render import StreamRenderer
 from . import state as local_state
 from .providers import ProviderManager, ProviderType
@@ -142,11 +142,16 @@ async def submit_ai_task_background(
         risk="read_only" if mode in {"chat", "audit", "plan"} else "workspace_write",
         detail=f"mode={mode}; background=true",
     )
+    # finish_action() unconditionally resets execution_status to "idle"/
+    # "running" as a side effect of closing out its own local bookkeeping --
+    # it must run before the save_session_state() call below sets the real
+    # status, not after, or "backgrounded" gets clobbered back to "idle"
+    # immediately even though a real task is now running server-side.
+    local_state.finish_action(session_id, action.id, status="completed", summary=f"submitted task {task_id}")
     local_state.save_session_state(
         session_id, last_task_id=task_id, active_task={"id": task_id, "objective": objective, "mode": mode},
         current_phase="queued", execution_status="backgrounded",
     )
-    local_state.finish_action(session_id, action.id, status="completed", summary=f"submitted task {task_id}")
     local_state.checkpoint(session_id, reason="background_task_submitted", summary=objective)
     return task
 

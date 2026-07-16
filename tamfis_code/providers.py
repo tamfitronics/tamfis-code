@@ -36,21 +36,22 @@ class ProviderManager:
     """Manages multiple AI providers with vision support"""
     
     PROVIDERS = {
+        # NOTE: provider catalogs drift as vendors ship/retire models --
+        # these lists are a reasonable, current-as-of-writing starting point
+        # for local/offline mode, not a live catalog feed. Review periodically.
         ProviderType.HF: ProviderConfig(
             name="Hugging Face",
             base_url="https://router.huggingface.co/v1",
             api_key_env="HF_TOKEN",
-            default_model="DavidAU/Llama3.3-8B-Instruct-Thinking-Heretic-Uncensored-Claude-4.5-Opus-High-Reasoning:featherless-ai",
+            default_model="meta-llama/Llama-3.2-3B-Instruct",
             models=[
                 # Text models
                 "meta-llama/Llama-3.2-3B-Instruct",
                 "mistralai/Mistral-7B-Instruct-v0.3",
                 "Qwen/Qwen2.5-7B-Instruct",
-                "DavidAU/Llama3.3-8B-Instruct-Thinking-Heretic-Uncensored-Claude-4.5-Opus-High-Reasoning:featherless-ai",
                 # Vision models
                 "microsoft/Phi-3.5-vision-instruct",
                 "meta-llama/Llama-3.2-11B-Vision-Instruct",
-                "google/gemma-2-27b-it-vision",
                 "Qwen/Qwen2-VL-7B-Instruct",
             ],
             weight=2,
@@ -60,44 +61,36 @@ class ProviderManager:
             name="NVIDIA NIM (API Catalog)",
             base_url="https://integrate.api.nvidia.com/v1",
             api_key_env="NVIDIA_API_KEY",
-            default_model="mistralai/mistral-small-4-119b-2603",
+            default_model="nvidia/nemotron-3-super-120b-a12b",
             models=[
                 # Text models
-                "mistralai/mistral-small-4-119b-2603",
-                "mistralai/mistral-large-2-123b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "moonshotai/kimi-k2.6",
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
-                "nvidia/nemotron-4-340b-instruct",
+                "mistralai/mistral-large-2-123b",
                 "google/gemma-2-27b-it",
-                "google/gemma-2-9b-it",
-                "microsoft/phi-3-mini-128k-instruct",
                 "microsoft/phi-3-medium-128k-instruct",
-                # Vision models
-                "nvidia/nemotron-3-nano-omni-30b-reasoning",
-                "nvidia/nemotron-3-ultra-550b",
-                "deepseek-v4-flash-nim",
-                "qwen3-next-80b-nim",
-                "google/gemma-2-27b-it-vision",
             ],
             weight=3,
             reasoning_supported=True,
-            vision_supported=True
+            vision_supported=False
         ),
         ProviderType.OPENROUTER: ProviderConfig(
             name="OpenRouter",
             base_url="https://openrouter.ai/api/v1",
             api_key_env="OPENROUTER_API_KEY",
-            default_model="anthropic/claude-3.5-sonnet",
+            default_model="openai/gpt-4o-mini",
             models=[
                 # Text models
-                "anthropic/claude-3.5-sonnet",
-                "anthropic/claude-3-opus",
-                "meta-llama/llama-3-70b-instruct",
-                "mistralai/mixtral-8x7b-instruct",
+                "openai/gpt-4o-mini",
+                "google/gemini-2.5-flash",
+                "meta-llama/llama-3.3-70b-instruct:free",
+                "mistralai/mistral-7b-instruct:free",
                 # Vision models
-                "google/gemini-pro-vision",
-                "openai/gpt-4-vision-preview",
-                "anthropic/claude-3-opus-vision",
+                "google/gemini-2.5-flash",
+                "openai/gpt-4o-mini",
             ],
             weight=1,
             vision_supported=True

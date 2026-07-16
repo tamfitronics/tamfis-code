@@ -1759,6 +1759,81 @@ def providers_command(ctx: click.Context):
     console.print(table)
     console.print(f"[dim]Default provider: {status.get('default', 'none')}[/dim]")
 
+
+@cli.command('local')
+@click.argument('objective', required=False)
+@click.option('--provider', default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option('--model', default=None, help="Provider-specific model id; defaults to that provider's default model.")
+@click.option('--no-tools', 'no_tools', is_flag=True, default=False, help="Disable read-only repo tools (read_file/list_directory/search_code/get_git_info) for this turn.")
+@click.option('--repl', 'run_repl', is_flag=True, default=False, help="Start an interactive local chat loop instead of a single turn.")
+@click.pass_context
+def local_command(ctx: click.Context, objective: Optional[str], provider: str, model: Optional[str], no_tools: bool, run_repl: bool):
+    """Offline chat with a directly-configured LLM provider -- no TamfisGPT
+    account, login, or network round-trip to the backend at all. Ollama
+    needs no API key and runs fully on-device; HF/NVIDIA/OpenRouter are
+    available if you've set your own key in the environment.
+
+    Read-only repo tools (read_file/list_directory/search_code/get_git_info)
+    are available so the model can answer questions about this directory --
+    nothing here can write files or run shell commands: local mode has no
+    server-side approval gate or audit trail, so mutation is never offered.
+    """
+    from .local_chat import resolve_provider_type, run_local_turn, stream_local_turn
+    from .providers import ProviderManager
+
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+
+    try:
+        provider_type = resolve_provider_type(provider)
+    except ValueError as exc:
+        raise click.UsageError(str(exc))
+
+    manager = ProviderManager()
+    use_tools = not no_tools
+
+    async def _one_turn(messages: list) -> str:
+        if use_tools:
+            answer = await run_local_turn(manager, provider_type, messages, model, console, use_tools=True)
+            console.print(answer)
+            return answer
+        parts: list[str] = []
+        async for chunk in stream_local_turn(manager, provider_type, messages, model):
+            console.print(chunk, end="")
+            parts.append(chunk)
+        console.print()
+        return "".join(parts)
+
+    if run_repl:
+        console.print("[dim]Local/offline mode -- Ctrl+D or /exit to quit.[/dim]")
+        history: list = []
+        while True:
+            try:
+                text = console.input("[bold cyan]you> [/bold cyan]").strip()
+            except (EOFError, KeyboardInterrupt):
+                console.print()
+                break
+            if not text or text in {"/exit", "/quit"}:
+                break
+            history.append({"role": "user", "content": text})
+            try:
+                answer = _run_async(_one_turn(history))
+            except Exception as exc:
+                print_error(console, str(exc))
+                history.pop()
+                continue
+            history.append({"role": "assistant", "content": answer})
+        return
+
+    if not objective:
+        raise click.UsageError("Provide an objective, or pass --repl for an interactive loop.")
+    try:
+        _run_async(_one_turn([{"role": "user", "content": objective}]))
+    except Exception as exc:
+        print_error(console, str(exc))
+        raise SystemExit(EXIT_TASK_FAILED)
+
+
 @cli.command('screenshot')
 @click.argument('url_or_path')
 @click.option('--width', '-w', default=1920, help='Screenshot width')
