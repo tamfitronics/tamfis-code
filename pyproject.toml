@@ -26,7 +26,15 @@ Homepage = "https://github.com/tamfitronics/tamfis-code"
 Repository = "https://github.com/tamfitronics/tamfis-code"
 
 [project.optional-dependencies]
-dev = ["build>=1.0", "twine>=5.0", "pytest>=8.0"]
+dev = [
+    "build>=1.0",
+    "twine>=5.0",
+    "pytest>=8.0",
+    # tests/test_agents.py and tests/test_mcp.py use @pytest.mark.asyncio --
+    # this was only working locally because a copy happened to already be
+    # installed system-wide (same class of gap as the openai dependency above).
+    "pytest-asyncio>=0.24",
+]
 
 [build-system]
 requires = ["setuptools>=68"]
