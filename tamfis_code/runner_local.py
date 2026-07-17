@@ -154,6 +154,21 @@ def _is_plain_conversation(messages: list[dict[str, Any]]) -> bool:
     return text.startswith(conversational_prefixes)
 
 
+# Verbs that signal the user is asking for an actual code change, not just an
+# investigation/question -- deliberately conservative (a false negative here
+# just means the honesty check below doesn't fire, same as today; a false
+# positive would wrongly flag a legitimate no-op completion as suspicious).
+_CHANGE_REQUEST_VERBS = (
+    "fix", "repair", "patch", "correct", "debug",
+    "add", "implement", "create", "write",
+    "update", "change", "modify", "edit", "refactor", "rewrite", "remove", "delete",
+)
+
+
+def _looks_like_change_request(text: str) -> bool:
+    return any(verb in text for verb in _CHANGE_REQUEST_VERBS)
+
+
 @dataclass
 class _StreamedToolCall:
     call_id: str = ""
@@ -276,6 +291,7 @@ async def run_local_agent_turn(
 
     previous_tool_calls_signature: Optional[tuple[tuple[str, str], ...]] = None
     consecutive_identical_rounds = 0
+    any_mutation = False
 
     for _round in range(max_rounds):
         renderer.handle_event({"event_type": "routing_started", "payload": {"requested_provider": provider.value}})
@@ -367,6 +383,22 @@ async def run_local_agent_turn(
                 error = "Provider completed without assistant text or tool calls."
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
+            # Confirmed live: a weak model can narrate "let's fix this" / "re-running
+            # the tests" in prose, complete with a fabricated "corrected" code block,
+            # without ever actually calling write_file/edit_file -- and the turn still
+            # completes normally since it simply stopped requesting tool calls. Never
+            # let that read as an unqualified success: if the objective clearly asked
+            # for a change and nothing was actually mutated, say so plainly instead of
+            # leaving the user to discover it themselves.
+            if not read_only and not any_mutation and _looks_like_change_request(_latest_user_text(messages)):
+                caveat = (
+                    "\n\n⚠ No files were changed during this task, despite the request "
+                    "asking for a fix/change. The response above may describe an edit "
+                    "without having actually made it -- verify the code yourself, or ask "
+                    "again more specifically (e.g. name the exact file)."
+                )
+                renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
+                content += caveat
             renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed"}})
             return TaskOutcome(status="completed", summary=content)
 
@@ -439,6 +471,7 @@ async def run_local_agent_turn(
             working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result, default=str)})
 
             if tc.name in {"write_file", "edit_file"} and result.get("success"):
+                any_mutation = True
                 state = local_state.get_session_state(session_id)
                 if state.modified_files:
                     mutation = state.modified_files[-1]

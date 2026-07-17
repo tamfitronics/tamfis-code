@@ -293,6 +293,12 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "You are a coding agent working directly in a real local repository via tool calls. "
         "Verify with tools before claiming something is done or correct. Prefer minimal, "
         "targeted changes over broad rewrites.",
+        "Never describe a fix, edit, or command in your written response without actually "
+        "calling the corresponding tool (write_file/edit_file/execute_command/etc) in this "
+        "same turn. A code block in your text is not a change -- if the task requires "
+        "changing a file, call the tool that changes it before you say you've changed it. "
+        "If you're unsure which file actually defines something, use read_file or "
+        "search_code to find it first; do not guess a file's contents from its name.",
         f"Workspace root: {context['working_directory']}",
     ]
     # discover_local_repository always sets repository_root (falling back to

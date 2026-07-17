@@ -160,6 +160,54 @@ class RunLocalAgentTurnTests(_StatePatchMixin, unittest.TestCase):
             mutation_events = [e for e in renderer.events if e["event_type"] == "file_mutation"]
             self.assertEqual(mutation_events[0]["payload"]["path"], str(Path(target).resolve()))
 
+    def test_change_request_completed_with_no_mutation_gets_a_caveat(self):
+        """Confirmed live: a weak model can narrate "I'll fix this" -- complete
+        with a fabricated "corrected" code block -- without ever calling
+        write_file/edit_file, and the turn still completes normally since it
+        simply stopped requesting tool calls. This must not read as an
+        unqualified success when the objective clearly asked for a change."""
+        with tempfile.TemporaryDirectory() as ws:
+            rounds = [
+                [
+                    _chunk(_delta(content="I've fixed the bug by changing n + 2 to n + 1.")),
+                ],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.OLLAMA, None,
+                [{"role": "user", "content": "fix the bug in calc.py"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertIn("No files were changed", outcome.summary)
+
+    def test_read_only_question_with_no_mutation_gets_no_caveat(self):
+        """The same zero-mutation completion is completely normal for a
+        read-only question -- the caveat must not fire just because nothing
+        changed, only when the objective asked for a change and nothing did."""
+        with tempfile.TemporaryDirectory() as ws:
+            rounds = [
+                [_chunk(_delta(content="This project is a standalone coding agent CLI."))],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.OLLAMA, None,
+                [{"role": "user", "content": "what does this project do?"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertNotIn("No files were changed", outcome.summary)
+
     def test_denied_tool_call_does_not_execute(self):
         with tempfile.TemporaryDirectory() as ws:
             target = str(Path(ws) / "app.py")
