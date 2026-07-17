@@ -61,6 +61,18 @@ class Config:
     output_mode: str = "text"
     timeout_seconds: float = 120.0
     debug: bool = False
+    # Real (LLM-backed) subagent delegation is opt-in: concurrent sessions
+    # against the Remote backend have open questions (rate limiting, approval
+    # prompts interleaving across sessions, concurrent state.json writers)
+    # that need validating against a live backend before being on by default.
+    enable_subagent_delegation: bool = False
+    # "standalone" (default): call a provider directly, no TamfisGPT backend.
+    # "remote": use the TamfisGPT Remote Workspace backend for every command
+    # without needing --remote on each invocation -- set this once (via
+    # `tamfis-code login` writing it, or manually in config.toml) for a paid
+    # TamfisGPT tenant who wants that be the default, the same way Claude
+    # Code/Codex/kimi-code default to their respective hosted accounts.
+    default_backend: str = "standalone"
     sources: dict[str, str] = field(default_factory=dict)  # field -> where it came from, for `doctor`/`config`
 
     def as_dict(self) -> dict[str, Any]:
@@ -71,6 +83,8 @@ class Config:
             "output_mode": self.output_mode,
             "timeout_seconds": self.timeout_seconds,
             "debug": self.debug,
+            "enable_subagent_delegation": self.enable_subagent_delegation,
+            "default_backend": self.default_backend,
         }
 
 
@@ -100,6 +114,12 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "timeout_seconds" in data:
             cfg.timeout_seconds = float(data["timeout_seconds"])
             cfg.sources["timeout_seconds"] = source_name
+        if "enable_subagent_delegation" in data:
+            cfg.enable_subagent_delegation = bool(data["enable_subagent_delegation"])
+            cfg.sources["enable_subagent_delegation"] = source_name
+        if data.get("default_backend") in ("standalone", "remote"):
+            cfg.default_backend = str(data["default_backend"])
+            cfg.sources["default_backend"] = source_name
 
     env_api_base = os.environ.get("TAMFIS_CODE_API_BASE")
     if env_api_base:
@@ -110,6 +130,16 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_approval in APPROVAL_MODES:
         cfg.approval_policy = env_approval
         cfg.sources["approval_policy"] = "env TAMFIS_CODE_APPROVAL_POLICY"
+
+    env_delegation = os.environ.get("TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION")
+    if env_delegation is not None:
+        cfg.enable_subagent_delegation = env_delegation.lower() in {"1", "true", "yes"}
+        cfg.sources["enable_subagent_delegation"] = "env TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION"
+
+    env_backend = os.environ.get("TAMFIS_CODE_DEFAULT_BACKEND")
+    if env_backend in ("standalone", "remote"):
+        cfg.default_backend = env_backend
+        cfg.sources["default_backend"] = "env TAMFIS_CODE_DEFAULT_BACKEND"
 
     return cfg
 
@@ -146,7 +176,12 @@ def load_credentials() -> Optional[Credentials]:
 
 def save_credentials(creds: Credentials) -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(CONFIG_DIR, stat.S_IRWXU)  # 0700 -- owner-only, matches spec's "restrictive permissions"
+    # Only chmod when needed -- see the identical fix in state.py's
+    # _save_raw for why doing this unconditionally is a landmine (raises
+    # PermissionError the moment CONFIG_DIR is ever owned by a different user
+    # than the caller).
+    if stat.S_IMODE(os.stat(CONFIG_DIR).st_mode) != stat.S_IRWXU:
+        os.chmod(CONFIG_DIR, stat.S_IRWXU)  # 0700 -- owner-only, matches spec's "restrictive permissions"
     payload = {
         "access_token": creds.access_token,
         "refresh_token": creds.refresh_token,

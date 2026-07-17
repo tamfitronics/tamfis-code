@@ -37,8 +37,40 @@ MAX_INDEX_FILES = 20_000
 @dataclass
 class WorkspaceContext:
     session_id: int
-    server_id: int
     workspace_root: str
+    # None for a purely local session (see resolve_local_workspace) -- only
+    # meaningful for the legacy Remote-backend path (resolve_workspace),
+    # which this field exists to support until that path is retired.
+    server_id: Optional[int] = None
+
+
+def _next_local_session_id() -> int:
+    known = local_state.all_known_session_ids()
+    return (max(known) + 1) if known else 1
+
+
+def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True) -> WorkspaceContext:
+    """Resolve a launch directory into a purely local session -- no network
+    calls, no RemoteAPIClient, no remote-assigned session/server id.
+
+    Reuses a prior session for the same workspace_root (matched by
+    `primary_workspace`, the same durable-root concept `resolve_workspace`
+    already used) rather than minting a new one on every invocation; a
+    fresh id is allocated via `_next_local_session_id()` (one past the
+    highest session id state.py already knows about) when no match exists.
+    """
+    workspace_root = str((cwd or Path.cwd()).resolve())
+
+    local_match = next((
+        sid for sid in reversed(local_state.all_known_session_ids())
+        if local_state.get_session_state(sid).primary_workspace == workspace_root
+    ), None)
+    session_id = local_match if local_match is not None else _next_local_session_id()
+
+    local_state.save_session_state(session_id, workspace_root=workspace_root)
+    if discover:
+        discover_local_repository(session_id, Path(workspace_root))
+    return WorkspaceContext(session_id=session_id, workspace_root=workspace_root)
 
 
 async def _get_or_create_local_server(client: RemoteAPIClient) -> dict:
@@ -241,3 +273,57 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
         discovery_fingerprint=fingerprint,
     )
     return context
+
+
+# Total instruction-file content budget for the system prompt -- generous
+# enough for a real AGENTS.md/CLAUDE.md, bounded so a huge README doesn't
+# blow the context window before the actual objective is even sent.
+MAX_INSTRUCTION_CHARS = 12_000
+
+
+def build_system_prompt(session_id: int, workspace_root: Path, *, force_discovery: bool = False) -> str:
+    """Build the standalone agent loop's system prompt from real local
+    workspace awareness (git branch/dirty status, instruction file
+    contents) -- replacing the context tamgpt6 used to assemble server-side.
+    Reuses discover_local_repository's existing fingerprint-cached scan
+    rather than re-walking the repo on every call.
+    """
+    context = discover_local_repository(session_id, workspace_root, force=force_discovery)
+    lines = [
+        "You are a coding agent working directly in a real local repository via tool calls. "
+        "Verify with tools before claiming something is done or correct. Prefer minimal, "
+        "targeted changes over broad rewrites.",
+        f"Workspace root: {context['working_directory']}",
+    ]
+    # discover_local_repository always sets repository_root (falling back to
+    # workspace_root itself when `git rev-parse --show-toplevel` fails) --
+    # `head` is the real "is this actually a Git repo" signal, since it's
+    # only None when that git call failed (see its `"no-head"` sentinel).
+    if context.get("head"):
+        lines.append(f"Git repository root: {context['repository_root']}  branch: {context.get('branch') or '(detached HEAD)'}")
+        if context.get("dirty"):
+            lines.append(
+                f"The working tree already has {len(context.get('dirty_files') or [])} uncommitted change(s) -- "
+                "be careful not to conflate your own edits with pre-existing ones when reporting what changed."
+            )
+    else:
+        lines.append("This directory is not a Git repository.")
+
+    instruction_files = context.get("instruction_files") or []
+    remaining_budget = MAX_INSTRUCTION_CHARS
+    instruction_blocks = []
+    for path_str in instruction_files:
+        if remaining_budget <= 0:
+            break
+        try:
+            content = Path(path_str).read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        snippet = content[:remaining_budget]
+        remaining_budget -= len(snippet)
+        truncated = " (truncated)" if len(snippet) < len(content) else ""
+        instruction_blocks.append(f"--- {path_str}{truncated} ---\n{snippet}")
+    if instruction_blocks:
+        lines.append("\nProject instructions found in this repository:\n" + "\n\n".join(instruction_blocks))
+
+    return "\n".join(lines)

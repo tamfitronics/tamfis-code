@@ -64,8 +64,15 @@ class ToolDefinition:
 
 class MCPServer:
     """MCP server for tool execution"""
-    
-    def __init__(self):
+
+    def __init__(self, *, workspace_root: Optional[str] = None, session_id: Optional[int] = None):
+        # workspace_root/session_id are optional so existing callers that
+        # construct MCPServer() with no arguments (tests, the `tools`/
+        # `screenshot` debug commands) keep today's behaviour: no boundary
+        # enforcement on write_file/edit_file, no mutation-ledger recording.
+        # The standalone agent loop (runner_local.py) always supplies both.
+        self.workspace_root = workspace_root
+        self.session_id = session_id
         self.tools: Dict[str, ToolDefinition] = {}
         self._register_default_tools()
     
@@ -99,6 +106,26 @@ class MCPServer:
             handler=self._write_file
         )
         
+        self.register_tool(
+            name="edit_file",
+            description=(
+                "Replace an exact, unique occurrence of old_string with new_string in a file. "
+                "Fails if old_string is not found, or is not unique -- include enough surrounding "
+                "context in old_string to make the match unambiguous. Use write_file instead for "
+                "creating a brand-new file or replacing one's entire contents."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "old_string": {"type": "string", "description": "Exact text to replace (must match exactly once)"},
+                    "new_string": {"type": "string", "description": "Replacement text"},
+                },
+                "required": ["path", "old_string", "new_string"],
+            },
+            handler=self._edit_file,
+        )
+
         self.register_tool(
             name="list_directory",
             description="List contents of a directory",
@@ -205,6 +232,25 @@ class MCPServer:
             for tool in self.tools.values()
         ]
 
+    def tool_schemas_openai(self, names: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+        """Wrap registered tools in the `{"type":"function","function":{...}}`
+        envelope a chat-completions `tools=[...]` payload needs. `names`
+        restricts to a subset (e.g. read-only tools for a lower-trust mode);
+        omit for the full registered set."""
+        selected = names if names is not None else list(self.tools.keys())
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.parameters,
+                },
+            }
+            for tool in self.tools.values()
+            if tool.name in selected
+        ]
+
     async def list_tools_async(self, include_shared: bool = True) -> List[Dict[str, Any]]:
         """List native CLI tools and tools discovered by the shared MCP hub."""
         tools = self.list_tools()
@@ -288,19 +334,59 @@ class MCPServer:
             return f"Error: '{path}' is not a file"
         return p.read_text(encoding='utf-8', errors='ignore')
     
-    async def _write_file(self, path: str, content: str) -> str:
-        # Resolve path relative to current working directory
+    def _resolve_in_workspace(self, path: str) -> Path:
+        """Resolve `path` against workspace_root (or cwd if none was given),
+        raising if it escapes the workspace boundary. Only enforced when
+        `self.workspace_root` is set -- see __init__'s docstring on why
+        legacy no-arg callers get today's unrestricted behaviour instead."""
+        base = Path(self.workspace_root) if self.workspace_root else Path.cwd()
         p = Path(path)
         if not p.is_absolute():
-            p = Path.cwd() / p
-        p = p.resolve()
+            p = base / p
+        resolved = p.resolve()
+        if self.workspace_root:
+            root = base.resolve()
+            if resolved != root and root not in resolved.parents:
+                raise PermissionError(f"'{path}' resolves outside the workspace root ({root})")
+        return resolved
+
+    async def _write_file(self, path: str, content: str) -> str:
+        p = self._resolve_in_workspace(path)
+        original_content = p.read_text(encoding="utf-8", errors="ignore") if p.is_file() else None
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding='utf-8')
-        # Verify the file was written
-        if p.exists():
-            return f"✅ Successfully wrote {len(content)} bytes to '{path}'"
-        else:
+        if not p.exists():
             return f"❌ Failed to write to '{path}'"
+        if self.session_id is not None:
+            from .safety import record_mutation
+            record_mutation(
+                self.session_id, path=str(p), operation="create" if original_content is None else "update",
+                original_content=original_content, new_content=content,
+            )
+        return f"✅ Successfully wrote {len(content)} bytes to '{path}'"
+
+    async def _edit_file(self, path: str, old_string: str, new_string: str) -> str:
+        p = self._resolve_in_workspace(path)
+        if not p.is_file():
+            return f"❌ Error: File '{path}' not found"
+        original_content = p.read_text(encoding="utf-8", errors="ignore")
+        occurrences = original_content.count(old_string)
+        if occurrences == 0:
+            return f"❌ Error: old_string not found in '{path}' -- no changes made"
+        if occurrences > 1:
+            return (
+                f"❌ Error: old_string matches {occurrences} times in '{path}' -- it must be unique. "
+                "Include more surrounding context to disambiguate."
+            )
+        new_content = original_content.replace(old_string, new_string, 1)
+        p.write_text(new_content, encoding="utf-8")
+        if self.session_id is not None:
+            from .safety import record_mutation
+            record_mutation(
+                self.session_id, path=str(p), operation="update",
+                original_content=original_content, new_content=new_content,
+            )
+        return f"✅ Edited '{path}'"
     
     async def _list_directory(self, path: str = ".") -> List[Dict[str, Any]]:
         p = Path(path)

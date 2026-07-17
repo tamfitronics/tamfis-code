@@ -1,19 +1,32 @@
 [project]
 name = "tamfis-code"
-version = "0.1.0"
-description = "TamfisGPT Code -- terminal coding agent client for the TamfisGPT Remote agent runtime"
+version = "0.2.0"
+description = "TamfisGPT Code -- standalone terminal coding agent (calls HF/NVIDIA NIM/OpenRouter/Ollama directly; --remote for the legacy TamfisGPT Remote backend)"
+readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.1",
     "httpx>=0.27",
     "rich>=13.0",
     "prompt_toolkit>=3.0",
+    # Provider calls (providers.py) go through the openai SDK's client against
+    # each vendor's OpenAI-compatible endpoint (HF, NVIDIA NIM, OpenRouter,
+    # Ollama) -- this was imported but never declared, only working because a
+    # copy happened to already be installed system-wide.
+    "openai>=1.30",
 ]
 
 [project.scripts]
 tamfis-code = "tamfis_code.cli:main"
 tamgpt-code = "tamfis_code.cli:main"
 tamfis = "tamfis_code.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/tamfitronics/tamfis-code"
+Repository = "https://github.com/tamfitronics/tamfis-code"
+
+[project.optional-dependencies]
+dev = ["build>=1.0", "twine>=5.0", "pytest>=8.0"]
 
 [build-system]
 requires = ["setuptools>=68"]

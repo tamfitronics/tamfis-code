@@ -87,6 +87,45 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("Proceed", contextualize_short_reply("ok", has_context=True))
         self.assertEqual(contextualize_short_reply("1", has_context=False), "1")
 
+    def test_live_panel_is_not_created_for_non_tty_console(self):
+        # Regression guard for the TTY fork: redirected/piped output must
+        # keep today's plain scrolling behaviour untouched, so the live
+        # panel path must not run at all when the console isn't a terminal.
+        console = _console()
+        renderer = StreamRenderer(console)
+        self.assertIsNone(renderer._live)
+
+        renderer.handle_event({
+            "event_type": "plan_created",
+            "payload": {"title": "Plan", "items": [{"step": "read the file", "status": "pending"}]},
+        })
+        # Non-TTY keeps the original one-shot print of the plan.
+        self.assertIn("read the file", console.file.getvalue())
+
+    def test_live_panel_is_created_when_console_is_a_terminal(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            self.assertIsNotNone(renderer._live)
+            renderer.handle_event({
+                "event_type": "plan_created",
+                "payload": {"title": "Plan", "items": [{"step": "read the file", "status": "pending"}]},
+            })
+            self.assertEqual(renderer._plan_steps, [{"step": "read the file", "status": "pending"}])
+        finally:
+            renderer.finish()
+        self.assertIsNone(renderer._live)
+
+    def test_assistant_delta_records_estimated_tokens(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            self.assertEqual(renderer._metrics.metrics.tokens_used, 0)
+            renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": "a" * 40}})
+            self.assertEqual(renderer._metrics.metrics.tokens_used, 10)
+        finally:
+            renderer.finish()
+
     def test_plan_created_tool_execution_stage_shows_tool_name(self):
         console = _console()
         renderer = StreamRenderer(console)

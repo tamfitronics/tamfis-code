@@ -1,5 +1,6 @@
 """Code indexing and semantic search for TAMFIS-CODE"""
 
+import hashlib
 import os
 import re
 import json
@@ -59,7 +60,12 @@ class CodeIndexer:
     
     def __init__(self, root_path: Path, index_path: Optional[Path] = None):
         self.root_path = Path(root_path)
-        self.index_path = index_path or Path.home() / '.tamfis' / 'index'
+        # Workspace-scoped by default (hash of the resolved root) -- a
+        # single shared ~/.tamfis/index/code_index.json used to silently
+        # clobber across every project this CLI ever indexed, since no
+        # caller passed an explicit index_path.
+        default_index_path = Path.home() / '.tamfis' / 'index' / hashlib.sha256(str(self.root_path.resolve()).encode()).hexdigest()[:16]
+        self.index_path = index_path or default_index_path
         self.files: Dict[str, CodeFile] = {}
         self.index_path.mkdir(parents=True, exist_ok=True)
         self.ignore_patterns = [

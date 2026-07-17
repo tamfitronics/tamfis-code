@@ -34,7 +34,7 @@ from .api_client import (
     credential_storage_backend, load_secure_credentials as load_credentials,
     save_secure_credentials as save_credentials,
 )
-from .config import APPROVAL_MODES, Config, Credentials, load_config
+from .config import APPROVAL_MODES, CONFIG_DIR, Config, Credentials, load_config
 from .doctor import run_doctor
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_unified_diff
 from .runner import (
@@ -43,7 +43,7 @@ from .runner import (
     run_ai_task_and_stream, run_shell_command, submit_ai_task_background,
 )
 from .tasks import find_recent_task
-from .workspace import blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, resolve_workspace
+from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, resolve_workspace
 
 EXIT_OK = 0
 EXIT_TASK_FAILED = 1
@@ -51,6 +51,7 @@ EXIT_INVALID_ARGS = 2
 EXIT_AUTH_FAILED = 3
 EXIT_RUNTIME_UNAVAILABLE = 6
 EXIT_INTERRUPTED = 7
+EXIT_LOCAL_STATE_ERROR = 8
 
 
 def _print_bg_hint(console: Console, session_id: int, task_id: str) -> None:
@@ -69,6 +70,14 @@ def _run_async(coro):
         raise SystemExit(EXIT_INTERRUPTED)
 
 
+def _use_remote(config: Config, remote_flag: bool) -> bool:
+    """A per-command --remote flag always wins; otherwise fall back to the
+    persistent config.toml/env `default_backend` setting (see config.py) --
+    this is what lets a paid TamfisGPT tenant set it once instead of typing
+    --remote on every command."""
+    return remote_flag or config.default_backend == "remote"
+
+
 def async_command(fn):
     @functools.wraps(fn)
     def wrapper(*args, **kwargs):
@@ -81,10 +90,16 @@ def async_command(fn):
 @click.option("--approval", "approval_policy", type=click.Choice(APPROVAL_MODES), default=None, help="Override the configured approval policy for this invocation.")
 @click.option("--api-base", "api_base", default=None, help="Override the configured Remote API base URL.")
 @click.option("--cwd", "cwd_override", type=click.Path(exists=True, file_okay=False), default=None, help="Treat this directory as the workspace instead of the current directory.")
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default) -- which provider the bare (no-subcommand) interactive REPL calls directly.")
+@click.option("--model", default=None, help="Provider-specific model id for the bare interactive REPL; defaults to that provider's default model.")
+@click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend for the bare interactive REPL instead of calling a provider directly.")
 @click.version_option(__version__, prog_name="tamfis-code")
 @click.pass_context
-def cli(ctx: click.Context, debug: bool, approval_policy: Optional[str], api_base: Optional[str], cwd_override: Optional[str]):
-    """TamfisGPT Code -- a terminal coding agent client for the TamfisGPT Remote runtime."""
+def cli(
+    ctx: click.Context, debug: bool, approval_policy: Optional[str], api_base: Optional[str],
+    cwd_override: Optional[str], provider: str, model: Optional[str], remote: bool,
+):
+    """TamfisGPT Code -- a standalone terminal coding agent."""
     workspace_root = Path(cwd_override).resolve() if cwd_override else Path.cwd()
     config = load_config(project_root=workspace_root)
     if os.environ.get("NO_COLOR") is not None:
@@ -112,16 +127,27 @@ def cli(ctx: click.Context, debug: bool, approval_policy: Optional[str], api_bas
     ctx.obj["workspace_root"] = workspace_root
 
     if ctx.invoked_subcommand is None:
-        _run_async(_interactive_entry(config, workspace_root))
+        _run_async(_interactive_entry(config, workspace_root, provider, model, remote))
 
 
-async def _interactive_entry(config: Config, workspace_root: Path) -> None:
+async def _interactive_entry(
+    config: Config, workspace_root: Path, provider: str = "auto",
+    model: Optional[str] = None, remote: bool = False,
+) -> None:
     from .interactive import run_interactive
 
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(workspace_root)
+        await run_interactive(None, config, workspace, provider=provider, model=model)
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote for the standalone REPL.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -145,7 +171,7 @@ async def _interactive_entry(config: Config, workspace_root: Path) -> None:
               help="Use an existing TamfisGPT access token (prefer the environment variable to shell history).")
 @click.pass_context
 def login(ctx: click.Context, email: Optional[str], existing_token: Optional[str]):
-    """Authenticate against the TamfisGPT account system."""
+    """Authenticate against the TamfisGPT account system (only needed for --remote commands -- standalone mode never requires login)."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
 
@@ -309,9 +335,10 @@ def workspace_remove(ctx: click.Context, path: Path):
 
 @cli.command(name="cwd")
 @click.argument("path", required=False, type=click.Path(exists=True, file_okay=False, path_type=Path))
+@click.option("--remote", is_flag=True, default=False, help="Update the working directory on the legacy TamfisGPT Remote Workspace backend instead of the local session.")
 @click.pass_context
 @async_command
-async def cwd_command(ctx: click.Context, path: Optional[Path]):
+async def cwd_command(ctx: click.Context, path: Optional[Path], remote: bool):
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
     session_id = _session_for_primary(ctx.obj["workspace_root"])
@@ -329,9 +356,16 @@ async def cwd_command(ctx: click.Context, path: Optional[Path]):
             f"Approve adding it with:\n  tamfis-code workspace add {target}"
         )
         raise SystemExit(EXIT_TASK_FAILED)
+
+    if not _use_remote(config, remote):
+        local_state.save_session_state(session_id, current_working_directory=target)
+        discover_local_repository(session_id, Path(target), force=True)
+        console.print(f"[green]Working directory:[/green] {target}")
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote to update the local session.")
         raise SystemExit(EXIT_AUTH_FAILED)
     async with RemoteAPIClient(config, creds) as client:
         updated = await client.set_session_cwd(session_id, target)
@@ -341,16 +375,26 @@ async def cwd_command(ctx: click.Context, path: Optional[Path]):
     console.print(f"[green]Working directory:[/green] {resolved}")
 
 @cli.command()
+@click.option("--remote", is_flag=True, default=False, help="Register/reuse a session on the legacy TamfisGPT Remote Workspace backend instead of a local one.")
 @click.pass_context
 @async_command
-async def init(ctx: click.Context):
-    """Register/reuse the local execution server and open a session for this directory."""
+async def init(ctx: click.Context, remote: bool):
+    """Open (or reuse) a session for this directory."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(workspace_root)
+        console.print(f"[green]Ready.[/green] session_id={workspace.session_id}  (standalone, local session)")
+        console.print(f"workspace_root={workspace.workspace_root}")
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote for a standalone local session.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -368,13 +412,42 @@ async def init(ctx: click.Context):
 
 
 @cli.command()
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option("--remote", is_flag=True, default=False, help="Check the legacy TamfisGPT Remote Workspace backend instead of local provider connectivity.")
 @click.pass_context
 @async_command
-async def doctor(ctx: click.Context):
-    """Validate runtime connectivity, authentication, and workspace scope."""
+async def doctor(ctx: click.Context, provider: str, remote: bool):
+    """Validate provider connectivity (or, with --remote, the legacy backend)."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        from .local_chat import resolve_provider_type
+        from .providers import get_provider_status
+        from .workspace import resolve_local_workspace
+
+        try:
+            provider_type = resolve_provider_type(provider)
+        except ValueError as exc:
+            raise click.UsageError(str(exc))
+        status = get_provider_status()
+        table = Table(show_header=True, header_style="bold")
+        for column in ("PROVIDER", "CONFIGURED", "KEY"):
+            table.add_column(column)
+        any_configured = False
+        for name, info in status["config"].items():
+            configured = bool(info["api_key_set"]) or name == "ollama"
+            any_configured = any_configured or configured
+            table.add_row(name, "[green]yes[/green]" if configured else "[dim]no[/dim]", info["key_preview"])
+        console.print(table)
+        console.print(f"[dim]Currently selected: {provider_type.value}  · auto would pick: {status['default']}[/dim]")
+        workspace = resolve_local_workspace(workspace_root, discover=False)
+        console.print(f"[green]Local session ready[/green]  session_id={workspace.session_id}  workspace_root={workspace.workspace_root}")
+        if not any_configured:
+            print_error(console, "No provider is configured (set HF_TOKEN / NVIDIA_API_KEY / OPENROUTER_API_KEY, or run Ollama locally).")
+            raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
+        return
 
     # Best-effort: if this directory already has (or can idempotently reuse)
     # a session, run_doctor's session/workspace-snapshot/event-replay checks
@@ -414,15 +487,27 @@ def config_command(ctx: click.Context):
 
 
 @cli.command()
+@click.option("--remote", is_flag=True, default=False, help="List sessions on the legacy TamfisGPT Remote Workspace backend instead of known local sessions.")
 @click.pass_context
 @async_command
-async def sessions(ctx: click.Context):
-    """List Remote sessions available to the current user."""
+async def sessions(ctx: click.Context, remote: bool):
+    """List known sessions (local by default, or --remote)."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        table = Table(show_header=True, header_style="bold")
+        for col in ("ID", "Workspace Root"):
+            table.add_column(col)
+        for sid in local_state.all_known_session_ids():
+            sess_state = local_state.get_session_state(sid)
+            table.add_row(str(sid), sess_state.workspace_root or sess_state.primary_workspace)
+        console.print(table)
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote to list local sessions.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -444,16 +529,33 @@ async def sessions(ctx: click.Context):
 
 
 @cli.command()
+@click.option("--remote", is_flag=True, default=False, help="Show status from the legacy TamfisGPT Remote Workspace backend instead of the local session.")
 @click.pass_context
 @async_command
-async def status(ctx: click.Context):
+async def status(ctx: click.Context, remote: bool):
     """Show session, task, CWD, and approval status for this workspace."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(workspace_root, discover=False)
+        state = local_state.get_session_state(workspace.session_id)
+        console.print(f"session_id={workspace.session_id}  (standalone, local session)  phase={state.current_phase}")
+        console.print(f"workspace_root={workspace.workspace_root}")
+        console.print(f"repository_root={state.repository_root or '(not a Git repository)'}  branch={state.active_branch or '-'}")
+        console.print(f"approval_policy={config.approval_policy}")
+        running = state.running_action or {}
+        console.print(f"running_action={running.get('purpose', 'none')}  queued={sum(1 for item in state.queued_user_instructions if item.get('status') == 'queued')}")
+        console.print(f"modified_files={len(state.modified_files)}  validations={len(state.validation_results)}  unresolved={len(state.unresolved_issues)}")
+        console.print(f"saved_plans={len(state.saved_plans)}  active_plan={state.active_plan_id or '-'}")
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote for local status.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     state = None
@@ -644,7 +746,12 @@ def queue_command(ctx: click.Context, instruction: tuple[str, ...], classificati
         if classification in {"append", "follow_up", "clarification"}:
             active_task = local_state.get_session_state(session_id).active_task
             task_id = active_task.get("id") if active_task else None
-            if task_id:
+            # A remote-mode active_task can be a concurrently-streaming task
+            # in another terminal, reachable via the Remote backend below --
+            # a standalone local turn is always synchronous within one
+            # process, so there's nothing "live" to push into; the queue
+            # just gets consumed on the next turn, silently and correctly.
+            if task_id and load_credentials() is not None:
                 try:
                     _run_async(_push_live_instruction(config, task_id, text, classification))
                     local_state.update_instruction(session_id, item.id, "running")
@@ -758,9 +865,25 @@ async def _run_ai_command(
             ]))
             local_state.save_session_state(workspace.session_id, allowed_workspaces=allowed)
             state = local_state.get_session_state(workspace.session_id)
+        if mode in {"coding", "agent", "execute"}:
+            repeated_failure = next(
+                (
+                    issue for issue in state.unresolved_issues
+                    if issue.get("type") == "repeated_action_failure" and issue.get("purpose") == objective
+                ),
+                None,
+            )
+            if repeated_failure:
+                console.print(
+                    f"[yellow]▲ This exact objective has already failed {repeated_failure.get('attempts')} "
+                    "times in a row.[/yellow]\n"
+                    "[dim]Continuing anyway -- consider `tamfis-code plan` to reconsider the approach "
+                    "instead of retrying it unchanged.[/dim]"
+                )
+
         dirty_files = state.repository_context.get("dirty_files") or []
         protected_dirty_files = blocking_dirty_files(dirty_files)
-        if mode == "execute" and protected_dirty_files:
+        if mode in {"coding", "agent", "execute"} and protected_dirty_files:
             console.print("[yellow]▲ Existing uncommitted changes detected[/yellow]")
             for path in protected_dirty_files[:20]:
                 console.print(f"  {path}")
@@ -824,6 +947,140 @@ async def _run_ai_command(
     return EXIT_TASK_FAILED
 
 
+async def _run_local_ai_command(
+    config: Config, workspace_root: Path, objective: str, mode: str,
+    model: str, provider: Optional[str], attachment_paths: tuple[str, ...],
+) -> int:
+    """Standalone equivalent of _run_ai_command -- calls a provider directly
+    and runs the tool-calling loop locally (runner_local.py), no
+    RemoteAPIClient/tamgpt6 backend involved. Reuses every piece of
+    _run_ai_command's logic that was already purely local (contextualize_short_reply,
+    explicit-path workspace approval, repeated-failure warning, dirty-tree
+    guard) -- only the remote-specific pieces (auth, attachment upload,
+    remote workspace-expansion RPC, background execution) are replaced or
+    dropped, since none of them have a meaningful standalone equivalent yet.
+    """
+    from .local_chat import resolve_provider_type
+    from .providers import ProviderManager
+    from .runner_local import run_local_agent_turn
+    from .safety import READ_ONLY_TOOLS
+    from .workspace import resolve_local_workspace
+
+    console = Console(no_color=not config.colour)
+
+    if attachment_paths:
+        print_error(console, "--attach is not yet supported in standalone (local provider) mode.")
+        return EXIT_INVALID_ARGS
+
+    try:
+        provider_type = resolve_provider_type(provider)
+    except ValueError as exc:
+        raise click.UsageError(str(exc))
+
+    workspace = resolve_local_workspace(workspace_root, discover=mode != "chat")
+    state = local_state.get_session_state(workspace.session_id)
+
+    from .interactive import contextualize_short_reply
+    objective = contextualize_short_reply(
+        objective, has_context=bool(state.last_task_id or state.conversation_summary or state.active_plan_id),
+    )
+
+    for requested_path in _explicit_absolute_paths(objective):
+        try:
+            requested_path.lstat()
+        except FileNotFoundError:
+            console.print(f"File not found: {requested_path}")
+            return EXIT_TASK_FAILED
+        except PermissionError:
+            console.print(f"Permission denied: {requested_path}")
+            return EXIT_TASK_FAILED
+        if requested_path.is_dir():
+            continue
+        approved = any(
+            str(requested_path.resolve()) == root_path
+            or str(requested_path.resolve()).startswith(root_path.rstrip("/") + "/")
+            for root_path in state.allowed_workspaces
+        )
+        if approved:
+            continue
+        expansion_root = _project_root_for_target(requested_path)
+        console.print(
+            f"Access to this path requires workspace approval:\n\n{expansion_root}\n\n"
+            "Approve adding it to this session's allowed workspaces?"
+        )
+        if not sys.stdin.isatty() or not click.confirm("Approve", default=False):
+            console.print(f"\n  tamfis-code workspace add {expansion_root}")
+            return EXIT_TASK_FAILED
+        # No remote session to notify -- allowed_workspaces is (and always
+        # was) purely a local state.py concept for this client.
+        allowed = list(dict.fromkeys([*state.allowed_workspaces, str(expansion_root)]))
+        local_state.save_session_state(workspace.session_id, allowed_workspaces=allowed)
+        state = local_state.get_session_state(workspace.session_id)
+
+    if mode in {"coding", "agent", "execute"}:
+        repeated_failure = next(
+            (
+                issue for issue in state.unresolved_issues
+                if issue.get("type") == "repeated_action_failure" and issue.get("purpose") == objective
+            ),
+            None,
+        )
+        if repeated_failure:
+            console.print(
+                f"[yellow]▲ This exact objective has already failed {repeated_failure.get('attempts')} "
+                "times in a row.[/yellow]\n"
+                "[dim]Continuing anyway -- consider `tamfis-code plan` to reconsider the approach "
+                "instead of retrying it unchanged.[/dim]"
+            )
+
+    dirty_files = state.repository_context.get("dirty_files") or []
+    protected_dirty_files = blocking_dirty_files(dirty_files)
+    if mode in {"coding", "agent", "execute"} and protected_dirty_files:
+        console.print("[yellow]▲ Existing uncommitted changes detected[/yellow]")
+        for path in protected_dirty_files[:20]:
+            console.print(f"  {path}")
+        console.print("[dim]Execution was not started because action-scoped rollback cannot safely distinguish overlapping user edits. Commit/stash them yourself, or use audit/plan mode.[/dim]")
+        state.unresolved_issues.append({
+            "type": "pre_existing_changes", "status": "blocked",
+            "detail": f"{len(protected_dirty_files)} protected dirty paths detected before execute",
+        })
+        local_state.save_session_state(workspace.session_id, unresolved_issues=state.unresolved_issues[-100:])
+        return EXIT_TASK_FAILED
+
+    read_only_mode = mode in {"chat", "audit", "plan"}
+    # Persisted (not cleared on completion, unlike the remote flow's
+    # active_task) so a later, separate `tamfis-code retry` invocation can
+    # recover both the objective AND the mode that was actually used --
+    # without this, retry had no way to know whether the last turn was
+    # e.g. "agent" vs "chat" and always guessed "coding".
+    local_state.save_session_state(workspace.session_id, active_task={"objective": objective, "mode": mode})
+    print_banner(console, host=f"local:{provider_type.value}", workspace_root=workspace.workspace_root, mode=mode, approval_policy=config.approval_policy)
+    renderer = StreamRenderer(console)
+    manager = ProviderManager()
+    outcome = await run_local_agent_turn(
+        manager, provider_type, model if model != "auto" else None, [{"role": "user", "content": objective}],
+        console, renderer,
+        workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+        approval_policy=config.approval_policy, interactive=False, read_only=read_only_mode,
+    )
+    renderer.finish()
+
+    if outcome.status == "completed":
+        if outcome.summary and not renderer.streamed_final_text:
+            console.print(outcome.summary)
+        if outcome.summary:
+            local_state.save_session_state(workspace.session_id, conversation_summary=outcome.summary[-4000:])
+        if mode == "plan" and outcome.summary:
+            saved = local_state.save_plan(workspace.session_id, objective=objective, content=outcome.summary)
+            console.print(
+                f"[green]Plan saved[/green] · {saved.id} · run `/execute-plan {saved.id}` "
+                f"in the REPL or `tamfis-code execute-plan {saved.id}` from the shell"
+            )
+        return EXIT_OK
+    print_error(console, outcome.error or f"task {outcome.status}")
+    return EXIT_TASK_FAILED
+
+
 def _ai_command(mode: str, help_text: str):
     @click.argument("objective", required=False)
     @click.option("--stdin", "read_stdin", is_flag=True, default=False, help="Read the objective from standard input (recommended for very large pasted text).")
@@ -833,8 +1090,9 @@ def _ai_command(mode: str, help_text: str):
     @click.option("--model", default="auto", show_default=True, help="Catalog model id, or auto.")
     @click.option("--mode", "mode_override", type=click.Choice(["auto", "coding", "chat", "audit", "plan", "agent", "execute"]), default=None, help="Override this command's task mode.")
     @click.option("--provider", type=click.Choice(["auto", "hf", "huggingface", "or", "openrouter", "ollama", "nvidia", "nvidia_nim", "gemini", "apiframe"]), default=None, help="Pin this task to a specific provider.")
+    @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend (tamgpt6) instead of calling a provider directly. Deprecated -- standalone (the default) is the supported path going forward.")
     @click.pass_context
-    def command(ctx: click.Context, objective: Optional[str], read_stdin: bool, prompt_file: Optional[Path], attachment_paths: tuple[str, ...], background: bool, model: str, mode_override: Optional[str], provider: Optional[str]):
+    def command(ctx: click.Context, objective: Optional[str], read_stdin: bool, prompt_file: Optional[Path], attachment_paths: tuple[str, ...], background: bool, model: str, mode_override: Optional[str], provider: Optional[str], remote: bool):
         config: Config = ctx.obj["config"]
         workspace_root: Path = ctx.obj["workspace_root"]
         sources = int(bool(objective and objective != "-")) + int(read_stdin or objective == "-") + int(prompt_file is not None)
@@ -847,6 +1105,11 @@ def _ai_command(mode: str, help_text: str):
             raise click.UsageError(
                 "Plan creation must stay attached so the completed plan can be saved locally; omit --bg."
             )
+        if background and not _use_remote(config, remote):
+            raise click.UsageError(
+                "--bg requires --remote (or default_backend = \"remote\" in config.toml): a standalone "
+                "local run has no server to keep the task alive once this process exits."
+            )
         if prompt_file is not None:
             objective_text = prompt_file.read_text(encoding="utf-8")
         elif read_stdin or objective == "-":
@@ -855,9 +1118,14 @@ def _ai_command(mode: str, help_text: str):
             objective_text = objective or ""
         if len(objective_text) > 1_000_000:
             raise click.UsageError("Objective exceeds the 1,000,000 character safety limit.")
-        exit_code = _run_async(_run_ai_command(
-            config, workspace_root, objective_text, effective_mode, background, model, provider, attachment_paths,
-        ))
+        if _use_remote(config, remote):
+            exit_code = _run_async(_run_ai_command(
+                config, workspace_root, objective_text, effective_mode, background, model, provider, attachment_paths,
+            ))
+        else:
+            exit_code = _run_async(_run_local_ai_command(
+                config, workspace_root, objective_text, effective_mode, model, provider, attachment_paths,
+            ))
         if exit_code != EXIT_OK:
             raise SystemExit(exit_code)
 
@@ -875,18 +1143,22 @@ cli.command(name="exec")(_ai_command("execute", "Run a tool-using engineering ta
 
 @cli.command(name="execute-plan")
 @click.argument("plan_id", required=False)
-@click.option("--bg", "background", is_flag=True, default=False, help="Execute the plan server-side and return immediately.")
+@click.option("--bg", "background", is_flag=True, default=False, help="Execute the plan server-side and return immediately (requires --remote).")
 @click.option("--model", default="auto", show_default=True)
 @click.option("--provider", type=click.Choice(["auto", "hf", "huggingface", "or", "openrouter", "ollama", "nvidia", "nvidia_nim", "gemini", "apiframe"]), default=None)
+@click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend instead of calling a provider directly.")
 @click.pass_context
 def execute_plan_command(
     ctx: click.Context, plan_id: Optional[str], background: bool,
-    model: str, provider: Optional[str],
+    model: str, provider: Optional[str], remote: bool,
 ):
     """Execute a saved plan (latest/active plan when no id is supplied)."""
     config: Config = ctx.obj["config"]
     root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+    if background and not _use_remote(config, remote):
+        print_error(console, "--bg requires --remote (or default_backend = \"remote\" in config.toml): a standalone local run has no server to keep the task alive once this process exits.")
+        raise SystemExit(EXIT_INVALID_ARGS)
     matching = [sid for sid in local_state.all_known_session_ids()
                 if local_state.get_session_state(sid).workspace_root == str(root)]
     if not matching:
@@ -899,10 +1171,11 @@ def execute_plan_command(
         raise SystemExit(EXIT_TASK_FAILED)
     selected_id = str(plan["id"])
     local_state.update_plan(session_id, selected_id, status="executing")
-    exit_code = _run_async(_run_ai_command(
-        config, root, local_state.plan_execution_objective(plan), "execute",
-        background, model, provider,
-    ))
+    objective = local_state.plan_execution_objective(plan)
+    if _use_remote(config, remote):
+        exit_code = _run_async(_run_ai_command(config, root, objective, "execute", background, model, provider))
+    else:
+        exit_code = _run_async(_run_local_ai_command(config, root, objective, "execute", model, provider, ()))
     refreshed = local_state.get_session_state(session_id)
     local_state.update_plan(
         session_id, selected_id,
@@ -918,16 +1191,34 @@ def execute_plan_command(
 @cli.command()
 @click.argument("command")
 @click.option("--bg", "background", is_flag=True, default=False, help="Submit and return immediately; the command keeps running server-side.")
+@click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend instead of running the command directly.")
 @click.pass_context
 @async_command
-async def run(ctx: click.Context, command: str, background: bool):
-    """Run an explicit shell command through the Remote command path."""
+async def run(ctx: click.Context, command: str, background: bool, remote: bool):
+    """Run an explicit shell command (locally by default, or --remote)."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        if background:
+            print_error(console, "--bg requires --remote: a standalone local run has no server to keep the command alive once this process exits.")
+            raise SystemExit(EXIT_INVALID_ARGS)
+        from .runner_local import run_local_shell_command
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(workspace_root, discover=False)
+        outcome = await run_local_shell_command(
+            console, workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+            command=command, approval_policy=config.approval_policy, interactive=False,
+        )
+        if outcome.status != "completed":
+            raise SystemExit(EXIT_TASK_FAILED)
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote to run locally.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -957,17 +1248,41 @@ async def run(ctx: click.Context, command: str, background: bool):
 
 @cli.command()
 @click.argument("session_id", type=int, required=False, default=None)
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option("--model", default=None, help="Provider-specific model id; defaults to that provider's default model.")
+@click.option("--remote", is_flag=True, default=False, help="Resume a session on the legacy TamfisGPT Remote Workspace backend instead of a local one.")
 @click.pass_context
 @async_command
-async def resume(ctx: click.Context, session_id: Optional[int]):
+async def resume(ctx: click.Context, session_id: Optional[int], provider: str, model: Optional[str], remote: bool):
     """Resume an interrupted or previous session (most recent if no id given), then continue interactively."""
     from .interactive import run_interactive
 
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        known = local_state.all_known_session_ids()
+        if session_id is not None:
+            if session_id not in known:
+                print_error(console, f"No known local session {session_id}. Use `tamfis-code sessions` to list known sessions.")
+                raise SystemExit(EXIT_TASK_FAILED)
+            target_id = session_id
+        else:
+            if not known:
+                print_error(console, "No sessions to resume.")
+                raise SystemExit(EXIT_TASK_FAILED)
+            target_id = known[-1]
+        target_state = local_state.get_session_state(target_id)
+        workspace = WorkspaceContext(session_id=target_id, workspace_root=target_state.workspace_root or target_state.primary_workspace)
+        console.print(f"[green]Resumed session {workspace.session_id}[/green]  workspace_root={workspace.workspace_root}")
+        if target_state.conversation_summary:
+            console.print(f"[dim]{target_state.conversation_summary[-1000:]}[/dim]")
+        await run_interactive(None, config, workspace, provider=provider, model=model)
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote to resume a local session.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -999,16 +1314,43 @@ async def resume(ctx: click.Context, session_id: Optional[int]):
 
 @cli.command()
 @click.argument("task_id", required=False, default=None)
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option("--model", default=None, help="Provider-specific model id; defaults to that provider's default model.")
+@click.option("--remote", is_flag=True, default=False, help="Retry a task on the legacy TamfisGPT Remote Workspace backend instead of resending locally.")
 @click.pass_context
 @async_command
-async def retry(ctx: click.Context, task_id: Optional[str]):
-    """Retry a failed task (most recent failure in this workspace's session if no id given)."""
+async def retry(ctx: click.Context, task_id: Optional[str], provider: str, model: Optional[str], remote: bool):
+    """Retry the last turn in this workspace (standalone), or a specific --remote task."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        if task_id is not None:
+            raise click.UsageError("A specific task_id only applies with --remote; standalone retry resends the session's last turn.")
+        from .local_chat import resolve_provider_type
+        from .providers import ProviderManager
+        from .workspace import resolve_local_workspace
+
+        try:
+            provider_type = resolve_provider_type(provider)
+        except ValueError as exc:
+            raise click.UsageError(str(exc))
+        workspace = resolve_local_workspace(workspace_root, discover=False)
+        state = local_state.get_session_state(workspace.session_id)
+        if not state.conversation_summary and not state.active_task:
+            print_error(console, "No previous turn in this session to retry.")
+            raise SystemExit(EXIT_TASK_FAILED)
+        objective = (state.active_task or {}).get("objective") or state.conversation_summary
+        mode = (state.active_task or {}).get("mode") or "coding"
+        exit_code = _run_async(_run_local_ai_command(config, workspace_root, objective, mode, model, provider, ()))
+        if exit_code != EXIT_OK:
+            raise SystemExit(exit_code)
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote to retry locally.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -1045,16 +1387,37 @@ async def retry(ctx: click.Context, task_id: Optional[str]):
 
 @cli.command()
 @click.argument("n", type=int, required=False, default=10)
+@click.option("--remote", is_flag=True, default=False, help="List mutations from the legacy TamfisGPT Remote Workspace backend instead of the local ledger.")
 @click.pass_context
 @async_command
-async def diffs(ctx: click.Context, n: int):
+async def diffs(ctx: click.Context, n: int, remote: bool):
     """List the last N file mutations (write_file/edit_file) in this workspace's session."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(workspace_root, discover=False)
+        mutations = list(reversed(local_state.get_session_state(workspace.session_id).modified_files[-n:]))
+        if not mutations:
+            console.print("[dim]No file mutations recorded yet in this session.[/dim]")
+            return
+        table = Table(show_header=True, header_style="bold")
+        for col in ("ID", "OP", "PATH", "+/-", "STATUS"):
+            table.add_column(col)
+        for m in mutations:
+            table.add_row(
+                str(m.get("mutation_id")), str(m.get("operation")), str(m.get("path")),
+                f"+{m.get('lines_added')}/-{m.get('lines_removed')}", str(m.get("revert_status")),
+            )
+        console.print(table)
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote for the local ledger.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -1085,16 +1448,30 @@ async def diffs(ctx: click.Context, n: int):
 
 @cli.command(name="diff")
 @click.argument("mutation_id", required=False)
+@click.option("--remote", is_flag=True, default=False, help="Show a diff from the legacy TamfisGPT Remote Workspace backend instead of the local ledger.")
 @click.pass_context
 @async_command
-async def diff_command(ctx: click.Context, mutation_id: Optional[str]):
+async def diff_command(ctx: click.Context, mutation_id: Optional[str], remote: bool):
     """Show an agent-recorded unified diff (latest mutation by default)."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(workspace_root, discover=False)
+        mutations = local_state.get_session_state(workspace.session_id).modified_files
+        selected = next((item for item in mutations if item.get("mutation_id") == mutation_id), None) if mutation_id else (mutations[-1] if mutations else None)
+        if selected is None:
+            print_error(console, "Mutation not found in this session." if mutation_id else "No file mutations recorded yet.")
+            raise SystemExit(EXIT_TASK_FAILED)
+        print_unified_diff(console, str(selected.get("unified_diff") or ""), title=f"{selected.get('path')} · {selected.get('mutation_id')}")
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote for the local ledger.")
         raise SystemExit(EXIT_AUTH_FAILED)
     async with RemoteAPIClient(config, creds) as client:
         try:
@@ -1122,16 +1499,31 @@ def changes_command(ctx: click.Context):
 
 @cli.command()
 @click.argument("mutation_id")
+@click.option("--remote", is_flag=True, default=False, help="Revert a mutation on the legacy TamfisGPT Remote Workspace backend instead of the local ledger.")
 @click.pass_context
 @async_command
-async def revert(ctx: click.Context, mutation_id: str):
+async def revert(ctx: click.Context, mutation_id: str, remote: bool):
     """Revert one file mutation by id (see `tamfis-code diffs`) -- restores the file to its content before that change, or deletes it if that mutation created the file."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        from .safety import revert_mutation
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(workspace_root, discover=False)
+        try:
+            result = revert_mutation(workspace.session_id, mutation_id)
+        except ValueError as exc:
+            print_error(console, str(exc))
+            raise SystemExit(EXIT_TASK_FAILED)
+        console.print(f"[green]Reverted[/green] {result.get('path')}")
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote for the local ledger.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -1151,15 +1543,22 @@ async def revert(ctx: click.Context, mutation_id: str):
 # -- background-session management ----------------------------------------
 
 @cli.command()
+@click.option("--remote", is_flag=True, default=False, help="Show running/backgrounded/approval-pending status from the legacy TamfisGPT Remote Workspace backend -- standalone sessions are always synchronous within one process, so this concept only applies remotely.")
 @click.pass_context
 @async_command
-async def agents(ctx: click.Context):
+async def agents(ctx: click.Context, remote: bool):
     """List sessions and each one's most recent task/status -- what's running, backgrounded, or waiting on approval."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
+
+    if not _use_remote(config, remote):
+        console.print("[dim]Standalone sessions have no background/approval-pending concept (each run is synchronous). Showing known local sessions -- see `tamfis-code sessions`.[/dim]")
+        ctx.invoke(sessions)
+        return
+
     creds = load_credentials()
     if creds is None:
-        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        print_error(console, "Not authenticated -- run `tamfis-code login` first, or omit --remote to list local sessions.")
         raise SystemExit(EXIT_AUTH_FAILED)
 
     async with RemoteAPIClient(config, creds) as client:
@@ -1204,7 +1603,7 @@ async def agents(ctx: click.Context):
 @click.pass_context
 @async_command
 async def attach(ctx: click.Context, session_id: int):
-    """Reattach to a session's live (or most recent) task stream. The task is not owned by this connection -- Ctrl+C detaches, it does not stop the task."""
+    """Reattach to a session's live (or most recent) task stream (legacy Remote Workspace backend only -- a standalone run is always synchronous within one process, so there's nothing to reattach to). The task is not owned by this connection -- Ctrl+C detaches, it does not stop the task."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
     creds = load_credentials()
@@ -1274,7 +1673,7 @@ def detach(ctx: click.Context):
 @click.pass_context
 @async_command
 async def logs(ctx: click.Context, session_id: int, follow: bool, tail: int):
-    """Show (or follow) a session's event history. Read-only -- never answers approvals; use `approve`/`reject` for that."""
+    """Show (or follow) a session's event history (legacy Remote Workspace backend only). Read-only -- never answers approvals; use `approve`/`reject` for that."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
     creds = load_credentials()
@@ -1305,7 +1704,7 @@ async def logs(ctx: click.Context, session_id: int, follow: bool, tail: int):
 @click.pass_context
 @async_command
 async def stop(ctx: click.Context, session_id: int):
-    """Cancel the active task in a session (server-side cancellation, not just local disconnect)."""
+    """Cancel the active task in a session (legacy Remote Workspace backend only; server-side cancellation, not just local disconnect). Standalone runs can just be interrupted with Ctrl+C."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
     creds = load_credentials()
@@ -1357,7 +1756,7 @@ async def _decide_approval(ctx: click.Context, approval_id: int, decision: str) 
 @click.pass_context
 @async_command
 async def approve(ctx: click.Context, approval_id: int, scope: str):
-    """Approve a pending command awaiting approval (the id shown in an `approval_required` event/logs line)."""
+    """Approve a pending command awaiting approval (legacy Remote Workspace backend only -- standalone mode prompts for approval inline, in the same process)."""
     await _decide_approval(ctx, approval_id, scope)
 
 
@@ -1367,7 +1766,7 @@ async def approve(ctx: click.Context, approval_id: int, scope: str):
 @click.pass_context
 @async_command
 async def reject(ctx: click.Context, approval_id: int, reason: Optional[str]):
-    """Reject/deny a pending command awaiting approval."""
+    """Reject/deny a pending command awaiting approval (legacy Remote Workspace backend only -- standalone mode prompts for approval inline, in the same process)."""
     await _decide_approval(ctx, approval_id, "deny")
     if reason:
         Console(no_color=not ctx.obj["config"].colour).print(f"Reason: {reason}")
@@ -1378,7 +1777,7 @@ async def reject(ctx: click.Context, approval_id: int, reason: Optional[str]):
 @click.pass_context
 @async_command
 async def inspect_command(ctx: click.Context, command_id: int):
-    """Show the exact command, CWD/risk metadata, and current status."""
+    """Show the exact command, CWD/risk metadata, and current status (legacy Remote Workspace backend only)."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
     creds = load_credentials()
@@ -1514,60 +1913,23 @@ def session_clean(days: int):
     click.echo(f"✅ Deleted {count} sessions older than {days} days")
 
 
-@cli.command('plan-cmd')
-@click.argument('description')
-@click.option('--file', '-f', multiple=True, help='Files to include in plan')
-@click.option('--apply', '-a', is_flag=True, help='Apply plan after review')
-def plan_cmd(description: str, file, apply: bool):
-    """Create and review a plan for changes"""
-    from .planreview import PlanReviewer, FileChange, ChangeType
-    from pathlib import Path
-    
-    reviewer = PlanReviewer()
-    changes = []
-    
-    for f in file:
-        path = Path(f)
-        if path.exists() and path.is_file():
-            content = path.read_text(encoding='utf-8', errors='ignore')
-            changes.append(FileChange(
-                path=str(path),
-                type=ChangeType.UPDATE,
-                content=content,
-                description=f"Update {path.name}"
-            ))
-    
-    plan = reviewer.create_plan(description, changes)
-    summary = reviewer.review_plan()
-    
-    click.echo(f"\n📋 Plan: {plan.id}")
-    click.echo(f"Description: {plan.description}")
-    click.echo(f"Changes: {summary['total_changes']}")
-    click.echo("\nFiles affected:")
-    for f in summary['files_affected']:
-        click.echo(f"  - {f}")
-    
-    if apply and click.confirm("\nApply this plan?"):
-        results = reviewer.apply()
-        for r in results:
-            if r.get('success'):
-                click.echo(f"  ✅ {r['path']}")
-            else:
-                click.echo(f"  ❌ {r['path']}: {r.get('error', 'Unknown error')}")
-
-
 @cli.command('agent-cmd')
-@click.argument('action', type=click.Choice(['list', 'run', 'info']))
-@click.option('--task', '-t', help='Task description')
+@click.argument('action', type=click.Choice(['list', 'run', 'info', 'delegate']))
+@click.option('--task', '-t', 'tasks', multiple=True, help='Task description (repeatable for delegate)')
 @click.option('--file', '-f', help='File to operate on')
-def agent_cmd(action: str, task: str, file: str):
+@click.option('--max-concurrency', default=1, show_default=True, help='Max concurrent delegated sub-tasks')
+@click.option('--provider', default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option('--model', default=None, help="Provider-specific model id; defaults to that provider's default model.")
+@click.pass_context
+def agent_cmd(ctx: click.Context, action: str, tasks: tuple[str, ...], file: str, max_concurrency: int, provider: str, model: Optional[str]):
     """Run subagents for various tasks"""
     import asyncio
     import json
     from .agents import AgentManager
-    
+
     manager = AgentManager()
-    
+    task = tasks[0] if tasks else None
+
     if action == 'list':
         agents = manager.list_agents()
         click.echo("🤖 Available Agents:")
@@ -1575,7 +1937,7 @@ def agent_cmd(action: str, task: str, file: str):
             click.echo(f"  - {a['name']}: {a['description']}")
             click.echo(f"    Capabilities: {', '.join(a['capabilities'])}")
         return
-    
+
     if action == 'info':
         agents = manager.list_agents()
         for a in agents:
@@ -1583,22 +1945,61 @@ def agent_cmd(action: str, task: str, file: str):
             click.echo(f"  Description: {a['description']}")
             click.echo(f"  Capabilities: {', '.join(a['capabilities'])}")
         return
-    
+
     if action == 'run':
         if not task:
             click.echo("❌ Please specify a task with --task")
             return
-        
+
         params = {}
         if file:
             params['file'] = file
-        
+
         result = asyncio.run(manager.execute_task(task, params))
         if 'error' in result:
             click.echo(f"❌ {result['error']}")
         else:
             click.echo(f"✅ Task completed by {result.get('agent', 'unknown')}")
             click.echo(json.dumps(result.get('result', {}), indent=2))
+        return
+
+    if action == 'delegate':
+        config: Config = ctx.obj["config"]
+        if not config.enable_subagent_delegation:
+            click.echo(
+                "❌ Subagent delegation is disabled. Enable it with "
+                "enable_subagent_delegation = true in config.toml, or "
+                "TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION=1."
+            )
+            raise SystemExit(EXIT_INVALID_ARGS)
+        if not tasks:
+            click.echo("❌ Please specify at least one --task")
+            raise SystemExit(EXIT_INVALID_ARGS)
+
+        from .local_chat import resolve_provider_type
+        from .providers import ProviderManager
+
+        try:
+            provider_type = resolve_provider_type(provider)
+        except ValueError as exc:
+            raise click.UsageError(str(exc))
+
+        workspace_root: Path = ctx.obj["workspace_root"]
+        console = Console(no_color=not config.colour)
+        provider_manager = ProviderManager()
+
+        results = _run_async(manager.execute_tasks(
+            list(tasks), manager=provider_manager, provider=provider_type, model=model,
+            console=console, workspace_root=str(workspace_root),
+            approval_policy=config.approval_policy, max_concurrency=max_concurrency,
+        ))
+        for r in results:
+            marker = "✅" if r["status"] == "completed" else "❌"
+            click.echo(f"{marker} {r['description']}")
+            summary = (r.get("result") or {}).get("summary") or (r.get("result") or {}).get("error")
+            if summary:
+                click.echo(f"   {summary}")
+        return
 
 
 @cli.command('tools')
@@ -1687,30 +2088,32 @@ def index_cmd(path: str, search: str, kind: str, stats: bool):
     click.echo(f"✅ Indexed {count} files")
 
 
-@cli.command('metrics')
-@click.option('--summary', '-s', is_flag=True, help='Show summary')
-def metrics_cmd(summary: bool):
-    """Show streaming metrics"""
-    import json
-    from .metrics import MetricsTracker
-    
-    tracker = MetricsTracker()
-    click.echo("📊 Metrics tracking started (Ctrl+C to stop)")
-    tracker.start(lambda msg: click.echo(f"\r{msg}", nl=False))
-    
+# The standalone `metrics` command used to start an empty MetricsTracker and
+# sleep 60s printing `\r`-overwritten zeros -- nothing ever called .record()
+# on it, since it was disconnected from the real streaming path. Superseded
+# by StreamRenderer's live token/rate display (render.py), which records real
+# per-task estimates as assistant_delta events arrive.
+
+
+def main() -> None:
     try:
-        import time
-        time.sleep(60)  # Run for 60 seconds
-    except KeyboardInterrupt:
-        pass
-    finally:
-        tracker.stop()
-        click.echo("\n")
-        if summary:
-            click.echo(json.dumps(tracker.get_summary(), indent=2))
+        cli()
+    except PermissionError as exc:
+        # Without this, a permission/ownership mismatch on CONFIG_DIR (e.g. it
+        # was created by a different user) surfaces as a raw traceback on the
+        # very first local state write of every single invocation -- the CLI
+        # "dies on the same step every time" with no actionable message, and
+        # since nothing ever got persisted, the next invocation looks like a
+        # fresh start and re-proposes the same plan instead of progressing.
+        click.echo(
+            f"✗ Permission denied writing local session state: {exc}\n"
+            f"  {CONFIG_DIR} (or a file inside it) is likely owned by a different "
+            "user than the one running tamfis-code. Check `ls -la "
+            f"{CONFIG_DIR}` and fix its ownership, then retry.",
+            err=True,
+        )
+        raise SystemExit(EXIT_LOCAL_STATE_ERROR)
 
-
-main = cli
 
 if __name__ == "__main__":
     cli()
@@ -1765,18 +2168,21 @@ def providers_command(ctx: click.Context):
 @click.option('--provider', default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
 @click.option('--model', default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.option('--no-tools', 'no_tools', is_flag=True, default=False, help="Disable read-only repo tools (read_file/list_directory/search_code/get_git_info) for this turn.")
+@click.option('--agent', 'full_agent', is_flag=True, default=False, help="Full read/write/execute tool access (write_file/edit_file/execute_command) via the local risk/approval/mutation-ledger layer, instead of read-only Q&A. Standalone -- no TamfisGPT backend involved.")
 @click.option('--repl', 'run_repl', is_flag=True, default=False, help="Start an interactive local chat loop instead of a single turn.")
 @click.pass_context
-def local_command(ctx: click.Context, objective: Optional[str], provider: str, model: Optional[str], no_tools: bool, run_repl: bool):
+def local_command(ctx: click.Context, objective: Optional[str], provider: str, model: Optional[str], no_tools: bool, full_agent: bool, run_repl: bool):
     """Offline chat with a directly-configured LLM provider -- no TamfisGPT
     account, login, or network round-trip to the backend at all. Ollama
     needs no API key and runs fully on-device; HF/NVIDIA/OpenRouter are
     available if you've set your own key in the environment.
 
     Read-only repo tools (read_file/list_directory/search_code/get_git_info)
-    are available so the model can answer questions about this directory --
-    nothing here can write files or run shell commands: local mode has no
-    server-side approval gate or audit trail, so mutation is never offered.
+    are available so the model can answer questions about this directory.
+    Pass --agent for full read/write/execute capability -- that path has its
+    own local risk classifier, approval prompts (per --approval-policy /
+    config.toml), and file-mutation ledger (see `tamfis-code diffs`/`revert`
+    once wired to it), since there's no server backing it anymore.
     """
     from .local_chat import resolve_provider_type, run_local_turn, stream_local_turn
     from .providers import ProviderManager
@@ -1791,6 +2197,55 @@ def local_command(ctx: click.Context, objective: Optional[str], provider: str, m
 
     manager = ProviderManager()
     use_tools = not no_tools
+
+    if full_agent:
+        from .render import StreamRenderer
+        from .runner_local import run_local_agent_turn
+        from .workspace import resolve_local_workspace
+
+        workspace = resolve_local_workspace(ctx.obj["workspace_root"])
+
+        async def _one_agent_turn(messages: list) -> str:
+            renderer = StreamRenderer(console)
+            outcome = await run_local_agent_turn(
+                manager, provider_type, model, messages, console, renderer,
+                workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
+            )
+            renderer.finish()
+            if outcome.status != "completed":
+                raise RuntimeError(outcome.error or "Task did not complete")
+            return outcome.summary or ""
+
+        if run_repl:
+            console.print(f"[dim]Local standalone agent mode (session {workspace.session_id}, {workspace.workspace_root}) -- Ctrl+D or /exit to quit.[/dim]")
+            history: list = []
+            while True:
+                try:
+                    text = console.input("[bold cyan]you> [/bold cyan]").strip()
+                except (EOFError, KeyboardInterrupt):
+                    console.print()
+                    break
+                if not text or text in {"/exit", "/quit"}:
+                    break
+                history.append({"role": "user", "content": text})
+                try:
+                    answer = _run_async(_one_agent_turn(history))
+                except Exception as exc:
+                    print_error(console, str(exc))
+                    history.pop()
+                    continue
+                history.append({"role": "assistant", "content": answer})
+            return
+
+        if not objective:
+            raise click.UsageError("Provide an objective, or pass --repl for an interactive loop.")
+        try:
+            _run_async(_one_agent_turn([{"role": "user", "content": objective}]))
+        except Exception as exc:
+            print_error(console, str(exc))
+            raise SystemExit(EXIT_TASK_FAILED)
+        return
 
     async def _one_turn(messages: list) -> str:
         if use_tools:
@@ -1888,32 +2343,9 @@ def screenshot_cmd(ctx: click.Context, url_or_path: str, width: int, height: int
 # Import enforcer
 from .enforcer import TestEnforcer, run_enforcer, add_enforcer_command
 
-# Add enforcer command
-@cli.command('enforce')
-@click.option('--python', '-p', is_flag=True, help='Only run Python tests')
-@click.option('--node', '-n', is_flag=True, help='Only run Node.js tests')
-@click.option('--shell', '-s', is_flag=True, help='Only run Shell checks')
-@click.option('--type', '-t', is_flag=True, help='Only run type checks')
-@click.pass_context
-def enforce_cmd(ctx: click.Context, python: bool, node: bool, shell: bool, type: bool):
-    """Enforce and run all tests (Python, Node.js, Shell, Type checking)"""
-    config: Config = ctx.obj["config"]
-    console = Console(no_color=not config.colour)
-    
-    console.print("[bold cyan]🔧 TAMFIS-CODE Test Enforcer[/bold cyan]")
-    console.print("=" * 50)
-    
-    enforcer = TestEnforcer()
-    
-    if python:
-        enforcer._run_python_tests()
-    elif node:
-        enforcer._run_node_tests()
-    elif shell:
-        enforcer._run_shell_checks()
-    elif type:
-        enforcer._run_type_checks()
-    else:
-        enforcer.run()
-    
-    console.print("[green]✅ Test enforcement completed![/green]")
+# `add_enforcer_command` registers a real `enforce` command backed by methods
+# that actually exist on TestEnforcer (--python/--node/--frontend). A previous
+# `enforce_cmd` defined directly here duplicated this with --shell/--type
+# flags wired to _run_shell_checks/_run_type_checks, neither of which exist on
+# TestEnforcer -- using those flags raised AttributeError at runtime.
+add_enforcer_command(cli)

@@ -20,6 +20,7 @@ import json
 import os
 import re
 import stat
+import sys
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -84,6 +85,8 @@ class AgentAction:
     started_at: Optional[str] = None
     completed_at: Optional[str] = None
     result_summary: str = ""
+    attempts: int = 0
+    last_error: str = ""
 
 
 @dataclass
@@ -96,6 +99,12 @@ class CodePlan:
     execution_task_id: Optional[str] = None
     created_at: str = field(default_factory=_now)
     updated_at: str = field(default_factory=_now)
+    # Structured mirror of the server's `plan_created` event payload (a list
+    # of {"step": str, "status": str} items), plus a client-assigned `index`
+    # since the server payload carries no stable step id of its own. `content`
+    # remains the human-readable markdown fallback -- this is additive, not a
+    # replacement, so nothing that reads `content` today needs to change.
+    steps: list[dict[str, Any]] = field(default_factory=list)
 
 
 @dataclass
@@ -140,14 +149,33 @@ def _load_raw() -> dict[str, Any]:
     try:
         payload = json.loads(STATE_PATH.read_text(encoding="utf-8"))
         return payload if isinstance(payload, dict) else {}
-    except (OSError, json.JSONDecodeError):
+    except OSError as exc:
+        # A permission/ownership mismatch here silently resets every session
+        # to blank (no active_plan_id, no saved_plans, no conversation_summary)
+        # -- the CLI then looks "amnesiac", re-proposing the same plan every
+        # invocation with no memory of prior progress. Surface it instead of
+        # swallowing it so that symptom is diagnosable.
+        print(
+            f"⚠ Could not read local session state at {STATE_PATH} ({exc}). "
+            "Continuing with a blank session -- prior plan/task memory is unavailable "
+            "until this is fixed (likely an ownership/permission mismatch on "
+            f"{CONFIG_DIR}).",
+            file=sys.stderr,
+        )
+        return {}
+    except json.JSONDecodeError:
         return {}
 
 
 def _save_raw(data: dict[str, Any]) -> None:
     """Atomically replace state so a killed CLI cannot leave invalid JSON."""
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    os.chmod(CONFIG_DIR, stat.S_IRWXU)
+    # Only chmod when it isn't already owner-only -- calling this unconditionally
+    # on every save raises PermissionError (uncaught, all the way up) the moment
+    # CONFIG_DIR is ever owned by a different user than the caller, which used to
+    # crash the whole CLI on its very first state write.
+    if stat.S_IMODE(os.stat(CONFIG_DIR).st_mode) != stat.S_IRWXU:
+        os.chmod(CONFIG_DIR, stat.S_IRWXU)
     fd, temp_name = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=CONFIG_DIR)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
@@ -238,13 +266,39 @@ def start_action(session_id: int, *, action_type: str, purpose: str,
     return action
 
 
-def finish_action(session_id: int, action_id: str, *, status: str, summary: str = "") -> None:
+# Number of consecutive failures for the same action `purpose` before it's
+# escalated into `unresolved_issues` -- below this, a single failure is just
+# noise (transient network blip, etc), not yet "the agent is stuck".
+FAILURE_ESCALATION_THRESHOLD = 2
+
+
+def finish_action(session_id: int, action_id: str, *, status: str, summary: str = "", error: str = "") -> None:
     state = get_session_state(session_id)
     finished = None
     remaining = []
     for action in state.pending_actions:
         if action.get("id") == action_id:
             action.update(status=status, completed_at=_now(), result_summary=summary)
+            if status == "failed":
+                action["last_error"] = error or summary
+                purpose = action.get("purpose", "")
+                prior_failures = sum(
+                    1 for completed in state.completed_actions
+                    if completed.get("purpose") == purpose and completed.get("status") == "failed"
+                )
+                action["attempts"] = prior_failures + 1
+                if action["attempts"] >= FAILURE_ESCALATION_THRESHOLD and not any(
+                    issue.get("type") == "repeated_action_failure" and issue.get("purpose") == purpose
+                    for issue in state.unresolved_issues
+                ):
+                    state.unresolved_issues.append({
+                        "type": "repeated_action_failure", "status": "needs_attention",
+                        "purpose": purpose, "attempts": action["attempts"],
+                        "detail": (
+                            f"'{purpose}' has failed {action['attempts']} times in a row -- "
+                            "consider a different approach instead of retrying as-is."
+                        ),
+                    })
             finished = action
         else:
             remaining.append(action)
@@ -293,6 +347,7 @@ def checkpoint(session_id: int, *, reason: str, summary: str = "") -> None:
 def save_plan(
     session_id: int, *, objective: str, content: str,
     source_task_id: Optional[str] = None,
+    steps: Optional[list[dict[str, Any]]] = None,
 ) -> CodePlan:
     """Persist a completed planning result as an executable plan."""
     state = get_session_state(session_id)
@@ -300,6 +355,11 @@ def save_plan(
         id=f"plan_{uuid.uuid4().hex[:10]}",
         objective=objective.strip(), content=content.strip(),
         source_task_id=source_task_id,
+        steps=[
+            {**step, "index": index}
+            for index, step in enumerate(steps or [])
+            if isinstance(step, dict)
+        ],
     )
     state.saved_plans = (state.saved_plans + [asdict(plan)])[-MAX_SAVED_PLANS:]
     state.active_plan_id = plan.id
@@ -339,6 +399,31 @@ def update_plan(
             break
     if updated is not None:
         state.active_plan_id = plan_id
+        put_session_state(state)
+    return updated
+
+
+def update_plan_steps(session_id: int, plan_id: str, items: list[dict[str, Any]]) -> Optional[dict[str, Any]]:
+    """Persist the server's `plan_created.items` onto the matching saved plan.
+
+    Today the server only ever emits this list once per plan and never
+    re-references individual steps afterward, so `steps` reflects whatever
+    the most recent `plan_created` event said -- there's no per-step
+    completion event to key off yet.
+    """
+    state = get_session_state(session_id)
+    updated = None
+    for item in state.saved_plans:
+        if item.get("id") == plan_id:
+            item["steps"] = [
+                {**step, "index": index}
+                for index, step in enumerate(items)
+                if isinstance(step, dict)
+            ]
+            item["updated_at"] = _now()
+            updated = item
+            break
+    if updated is not None:
         put_session_state(state)
     return updated
 

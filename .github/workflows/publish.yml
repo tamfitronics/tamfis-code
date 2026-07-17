@@ -1,0 +1,57 @@
+name: Publish to PyPI
+
+# Fires on any tag like v0.2.1 (see USAGE_INSTALL_RELEASE.md's release steps:
+# bump both version strings, commit, `git tag vX.Y.Z`, `git push --tags`).
+# Uses PyPI Trusted Publishing (OIDC) -- no API token stored as a secret
+# here. One-time setup required on pypi.org before the first tag push
+# actually succeeds: see the comment block at the bottom of this file.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -e ".[dev]"
+      - run: pytest -q
+
+  build-and-publish:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write  # required for PyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install build
+      - run: python -m build
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+# --- One-time setup on pypi.org (do this once before the first tag push) ---
+# 1. Create a PyPI account if you don't have one, at pypi.org.
+# 2. Go to https://pypi.org/manage/account/publishing/ and add a "pending
+#    publisher" for a project named `tamfis-code` that doesn't exist yet:
+#      Owner:      <your GitHub org/user, once the repo exists>
+#      Repository: tamfis-code
+#      Workflow:   publish.yml
+#      Environment: pypi
+# 3. In this repo's GitHub settings, create an environment named `pypi`
+#    (Settings -> Environments -> New environment) -- matches `environment:
+#    pypi` above. No secrets need to be added to it; trusted publishing
+#    authenticates via OIDC, not a stored token.
+# 4. First `git push origin vX.Y.Z` after that triggers this workflow and
+#    publishes for real. No PyPI API token ever needs to exist in this repo.

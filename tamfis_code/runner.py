@@ -10,7 +10,7 @@ import json
 import os
 import signal
 import traceback
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Optional, AsyncGenerator
 
 from rich.console import Console
@@ -62,6 +62,7 @@ class TaskOutcome:
     summary: Optional[str] = None
     error: Optional[str] = None
     plan_id: Optional[str] = None
+    plan_items: list[dict[str, Any]] = field(default_factory=list)
 
 
 def resolve_approval_decision(
@@ -238,6 +239,7 @@ async def run_ai_task_and_stream(
     if mode == "plan" and outcome.status == "completed" and outcome.summary:
         saved = local_state.save_plan(
             session_id, objective=objective, content=outcome.summary, source_task_id=task_id,
+            steps=outcome.plan_items,
         )
         outcome.plan_id = saved.id
         console.print(
@@ -309,6 +311,7 @@ async def _stream_task(
 ) -> TaskOutcome:
     outcome: Optional[TaskOutcome] = None
     last_assistant_content: Optional[str] = None
+    last_plan_items: list[dict[str, Any]] = []
     prompted_command_ids: set[int] = set()
     interrupted, uninstall_sigint = _install_sigint_watcher()
     queued_interrupt: Optional[dict[str, Any]] = None
@@ -328,7 +331,7 @@ async def _stream_task(
             await asyncio.sleep(0.25)
 
     async def consume() -> None:
-        nonlocal outcome, last_assistant_content, task_id
+        nonlocal outcome, last_assistant_content, last_plan_items, task_id
         async for event in client.stream_session(session_id, from_event_id):
             sequence = event.get("stream_sequence")
             if sequence is not None:
@@ -367,6 +370,18 @@ async def _stream_task(
             }
             if event_type in phase_by_event:
                 local_state.save_session_state(session_id, current_phase=phase_by_event[event_type])
+
+            if event_type == "plan_created":
+                items = payload.get("items") if isinstance(payload.get("items"), list) else []
+                last_plan_items = items
+                # If a saved plan is already active (e.g. re-planning mid
+                # `execute-plan`), keep its persisted step list current too --
+                # for a brand-new `plan` mode task there's no saved plan yet
+                # (that only happens once the task completes, below), so
+                # `last_plan_items` is what carries this forward in that case.
+                state = local_state.get_session_state(session_id)
+                if state.active_plan_id:
+                    local_state.update_plan_steps(session_id, state.active_plan_id, items)
 
             if event_type == "file_mutation":
                 state = local_state.get_session_state(session_id)
@@ -446,7 +461,7 @@ async def _stream_task(
                 renderer.handle_event(event)
 
             if event_type == "ai_task_completed":
-                outcome = TaskOutcome(status="completed", summary=last_assistant_content or "")
+                outcome = TaskOutcome(status="completed", summary=last_assistant_content or "", plan_items=last_plan_items)
                 if last_assistant_content:
                     local_state.save_session_state(
                         session_id, conversation_summary=last_assistant_content[-4000:],

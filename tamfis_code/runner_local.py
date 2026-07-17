@@ -1,0 +1,254 @@
+"""The standalone agent loop: calls an LLM provider directly (via
+providers.py's ProviderManager) and runs its own tool-calling loop locally,
+with no TamfisGPT Remote Workspace backend involved at all.
+
+Generalizes local_chat.py's run_local_turn (which already proved the basic
+send-tools -> parse tool_calls -> execute -> append role:"tool" -> resend
+pattern works against HF/NVIDIA NIM/OpenRouter/Ollama) into the primary,
+full-capability loop:
+  - streaming + tool-calling combined (local_chat.py's run_local_turn has
+    tools but no streaming; stream_local_turn streams but has no tools)
+  - the full tool set via mcp.py's MCPServer (read/write/edit/execute/etc),
+    not just the four read-only tools -- gated per call through safety.py's
+    risk classifier and runner.py's existing resolve_approval_decision
+  - an open-ended round loop (a high safety-valve cap, not local_chat.py's
+    hard MAX_TOOL_ROUNDS=5) with real termination conditions
+
+Emits the same event-dict shape StreamRenderer.handle_event already expects
+(assistant_delta/tool_call_requested/tool_output/file_mutation/
+approval_required/ai_task_completed/ai_task_failed) so render.py needs no
+changes to work with a local loop instead of remote SSE events.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Optional
+
+from rich.console import Console
+
+from . import state as local_state
+from .mcp import MCPServer
+from .providers import ProviderManager, ProviderType
+from .render import StreamRenderer
+from .runner import TaskOutcome, resolve_approval_decision
+from .safety import READ_ONLY_TOOLS, classify_tool_call_risk
+
+# A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
+# was appropriate for a read-only Q&A loop; a real coding-agent task
+# legitimately needs many more tool calls (read several files, make several
+# edits, run tests, iterate). This exists only to guarantee termination if
+# something is genuinely stuck in a loop, not to cap normal work.
+MAX_AGENT_ROUNDS = 200
+
+
+@dataclass
+class _StreamedToolCall:
+    call_id: str = ""
+    name: str = ""
+    arguments: str = ""
+
+
+async def _stream_one_completion(
+    client, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
+    renderer: StreamRenderer,
+) -> tuple[str, list[_StreamedToolCall]]:
+    """Stream one chat-completions call, forwarding text deltas to the
+    renderer as they arrive and accumulating any tool_calls deltas by index
+    (the standard OpenAI-compatible streaming tool-call pattern: id/name
+    only arrive in the first delta for a given index, arguments arrive as
+    incremental string fragments across many deltas)."""
+    content_parts: list[str] = []
+    tool_calls_by_index: dict[int, _StreamedToolCall] = {}
+
+    stream = await client.chat.completions.create(
+        model=model, messages=messages, stream=True,
+        temperature=0.2, max_tokens=4096, tools=tools, tool_choice="auto",
+    )
+    async for chunk in stream:
+        if not chunk.choices:
+            continue
+        delta = chunk.choices[0].delta
+        if getattr(delta, "content", None):
+            content_parts.append(delta.content)
+            renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": delta.content}})
+        for tc_delta in getattr(delta, "tool_calls", None) or []:
+            slot = tool_calls_by_index.setdefault(tc_delta.index, _StreamedToolCall())
+            if tc_delta.id:
+                slot.call_id = tc_delta.id
+            fn = getattr(tc_delta, "function", None)
+            if fn is not None:
+                if fn.name:
+                    slot.name = fn.name
+                if fn.arguments:
+                    slot.arguments += fn.arguments
+
+    ordered_calls = [tool_calls_by_index[i] for i in sorted(tool_calls_by_index)]
+    return "".join(content_parts), ordered_calls
+
+
+async def run_local_agent_turn(
+    manager: ProviderManager,
+    provider: ProviderType,
+    model: Optional[str],
+    messages: list[dict[str, Any]],
+    console: Console,
+    renderer: StreamRenderer,
+    *,
+    workspace_root: str,
+    session_id: int,
+    approval_policy: str = "ask",
+    interactive: bool = True,
+    max_rounds: int = MAX_AGENT_ROUNDS,
+    read_only: bool = False,
+) -> TaskOutcome:
+    """Run one user turn to completion against a directly-called provider,
+    executing tool calls locally (full tool set, approval-gated) instead of
+    delegating to a Remote Workspace backend. Mirrors run_ai_task_and_stream's
+    contract (same TaskOutcome shape) so cli.py/interactive.py can drive
+    either the local or (while it still exists) remote path interchangeably.
+
+    `read_only=True` restricts both the tool schema offered to the model AND
+    (defense in depth, in case a model requests a tool it wasn't offered)
+    execution itself to safety.READ_ONLY_TOOLS -- used for chat/audit/plan
+    modes, which must never mutate the workspace.
+    """
+    mcp_server = MCPServer(workspace_root=workspace_root, session_id=session_id)
+    tools = mcp_server.tool_schemas_openai(names=list(READ_ONLY_TOOLS)) if read_only else mcp_server.tool_schemas_openai()
+
+    # Real workspace awareness (git branch/dirty status, instruction file
+    # contents) -- replaces the context tamgpt6 used to assemble
+    # server-side. Prepended once per turn; harmless/idempotent if a caller
+    # ever already included its own system message (this one just goes
+    # first).
+    from .workspace import build_system_prompt
+    system_prompt = build_system_prompt(session_id, Path(workspace_root))
+    working_messages = [{"role": "system", "content": system_prompt}, *messages]
+    session_approved_risks: set[str] = set()
+
+    for _round in range(max_rounds):
+        client = manager.get_client(provider)
+        if not client:
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": f"Provider {provider.value} is not available (no client / no valid credentials)."}})
+            return TaskOutcome(status="failed", error=f"Provider {provider.value} is not available (no client / no valid credentials).")
+
+        resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
+        config = manager.PROVIDERS[resolved_provider]
+        resolved_model = model or config.default_model
+
+        try:
+            content, tool_calls = await _stream_one_completion(
+                client, model=resolved_model, messages=working_messages, tools=tools, renderer=renderer,
+            )
+        except Exception as exc:
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": str(exc)}})
+            return TaskOutcome(status="failed", error=str(exc))
+
+        if not tool_calls:
+            renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed"}})
+            return TaskOutcome(status="completed", summary=content)
+
+        working_messages.append({
+            "role": "assistant", "content": content or "",
+            "tool_calls": [
+                {"id": tc.call_id, "type": "function", "function": {"name": tc.name, "arguments": tc.arguments}}
+                for tc in tool_calls
+            ],
+        })
+
+        for tc in tool_calls:
+            try:
+                arguments = json.loads(tc.arguments or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+
+            risk = classify_tool_call_risk(tc.name, arguments, workspace_root=workspace_root)
+            renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+
+            if read_only and tc.name not in READ_ONLY_TOOLS:
+                result = {"error": f"'{tc.name}' is not available in read-only mode.", "success": False}
+                working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
+                renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                continue
+
+            if risk != "read_only" and risk not in session_approved_risks:
+                renderer.handle_event({
+                    "event_type": "approval_required",
+                    "payload": {
+                        "command": f"{tc.name}({json.dumps(arguments, default=str)})", "risk_level": risk,
+                        "working_directory": workspace_root, "reason": "The agent requested this command.",
+                    },
+                })
+                decision = resolve_approval_decision(console, f"{tc.name}({json.dumps(arguments, default=str)})", risk, approval_policy, interactive)
+                if decision == "approve_session":
+                    session_approved_risks.add(risk)
+                elif decision == "deny":
+                    result = {"error": "Denied by approval policy -- try a different, less risky approach.", "success": False}
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                    continue
+
+            result = await mcp_server.call_tool(tc.name, arguments)
+            renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+            working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result, default=str)})
+
+            if tc.name in {"write_file", "edit_file"} and result.get("success"):
+                state = local_state.get_session_state(session_id)
+                if state.modified_files:
+                    mutation = state.modified_files[-1]
+                    renderer.handle_event({"event_type": "file_mutation", "payload": {
+                        "path": mutation["path"], "lines_added": mutation["lines_added"],
+                        "lines_removed": mutation["lines_removed"], "mutation_id": mutation["mutation_id"],
+                    }})
+
+    message = f"(Stopped after {max_rounds} tool-call rounds without a final answer -- this usually means the task needs to be narrowed.)"
+    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+    return TaskOutcome(status="failed", error=message)
+
+
+async def run_local_shell_command(
+    console: Console, *, workspace_root: str, session_id: int, command: str,
+    approval_policy: str, interactive: bool,
+) -> TaskOutcome:
+    """Standalone equivalent of runner.py's run_shell_command -- executes an
+    explicit `$ <command>` / `/run` / `/shell` REPL command locally via
+    MCPServer's execute_command tool, gated through the same local risk
+    classifier and approval flow as any other tool call, instead of
+    submitting it to a Remote command queue."""
+    from .safety import classify_command_risk
+
+    action = local_state.start_action(
+        session_id, action_type="shell_command", purpose="Run an explicit local shell command",
+        risk="policy_classified", detail=command,
+    )
+    console.print(f"[bold]$[/bold] {command}")
+
+    risk = classify_command_risk(command)
+    if risk != "read_only":
+        decision = resolve_approval_decision(console, command, risk, approval_policy, interactive)
+        if decision == "deny":
+            local_state.finish_action(session_id, action.id, status="failed", summary="denied")
+            console.print("[dim]Denied.[/dim]")
+            return TaskOutcome(status="denied", error="Denied by approval policy")
+
+    mcp_server = MCPServer(workspace_root=workspace_root, session_id=session_id)
+    result = await mcp_server.call_tool("execute_command", {"command": command})
+    payload = result.get("result") if isinstance(result.get("result"), dict) else result
+    stdout = str(payload.get("stdout") or "")
+    stderr = str(payload.get("stderr") or "")
+    exit_code = payload.get("return_code")
+    ok = bool(result.get("success")) and exit_code == 0
+    body = stdout.strip()
+    if stderr.strip():
+        body = (body + "\n" + stderr.strip()).strip()
+    if not body:
+        body = "Command completed successfully with no output" if ok else f"Command failed with exit code {exit_code}"
+    from rich.panel import Panel
+    console.print(Panel(body, title=f"exit {exit_code}", border_style="green" if ok else "red"))
+
+    outcome = TaskOutcome(status="completed", summary=stdout) if ok else TaskOutcome(status="failed", error=stderr or f"exit code {exit_code}")
+    local_state.finish_action(session_id, action.id, status=outcome.status, summary=f"exit={exit_code}")
+    local_state.checkpoint(session_id, reason=f"command_{outcome.status}", summary=f"exit={exit_code}")
+    return outcome

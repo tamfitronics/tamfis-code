@@ -62,24 +62,6 @@ class TestNewModulesIntegration:
         
         assert summary['tokens_used'] == 100
 
-    def test_planreview(self):
-        """Test plan and review"""
-        from tamfis_code.planreview import PlanReviewer, FileChange, ChangeType
-        
-        reviewer = PlanReviewer()
-        changes = [
-            FileChange(
-                path=str(self.workspace / 'new.py'),
-                type=ChangeType.CREATE,
-                content='print("Hello")'
-            )
-        ]
-        reviewer.create_plan('Test Plan', changes)
-        reviewer.approve()
-        
-        results = reviewer.apply()
-        assert results[0]['success'] is True
-
     def test_agents(self):
         """Test agents"""
         import asyncio

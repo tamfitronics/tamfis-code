@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from typing import Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
@@ -22,8 +23,13 @@ from .config import APPROVAL_MODES, CONFIG_DIR, Config, MODE_ALIASES
 from .doctor import run_doctor
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_unified_diff
 from .runner import resolve_approval_decision, retry_task_and_stream, run_ai_task_and_stream, run_shell_command
+from .runner_local import run_local_agent_turn, run_local_shell_command
+from .safety import revert_mutation as local_revert_mutation
 from .tasks import find_recent_task
-from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session
+from .workspace import (
+    WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository,
+    find_resumable_session, resolve_local_workspace,
+)
 
 HELP_TEXT = """\
 Natural-language text submits a full coding-agent task (mode: coding).
@@ -50,6 +56,9 @@ $ <command>            explicit shell command
 /resume [session_id]  switch to another session (most recent if omitted)
 /retry [task_id]      retry a failed task (most recent failure if omitted)
 /agents              list sessions and their latest task status
+/delegate <a> | <b>  run objectives a, b, ... as concurrent delegated sub-tasks
+                      (requires enable_subagent_delegation = true in config.toml,
+                      or TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION=1)
 /diffs [n]           show the last n file mutations in this session (default 10)
 /diff [mutation_id]  show a semantic unified diff (latest if omitted)
 /revert <mutation_id> restore a file to its content before that mutation (or
@@ -134,9 +143,42 @@ def parse_intent(raw: str) -> Intent:
     return Intent("ai", objective=text, mode="coding")
 
 
-async def run_interactive(client: RemoteAPIClient, config: Config, workspace: WorkspaceContext) -> None:
-    console = Console(no_color=not config.colour)
-    print_banner(console, host=config.api_base, workspace_root=workspace.workspace_root, mode="interactive", approval_policy=config.approval_policy)
+async def run_interactive(
+    client: Optional[RemoteAPIClient], config: Config, workspace: WorkspaceContext,
+    *, provider: str = "auto", model: Optional[str] = None,
+) -> None:
+    """Drives the interactive REPL. `client=None` means standalone mode: no
+    TamfisGPT Remote Workspace backend, no login -- AI turns/shell commands
+    run through runner_local.py's local agent loop calling `provider`
+    directly instead. A handful of features that are inherently remote-server
+    concepts (background PTY terminals, a remote model catalog) have no
+    local equivalent yet and degrade to a clear message rather than crashing;
+    everything else (diffs/revert, resume, agents listing, retry, delegate,
+    doctor) has a real local implementation in this mode.
+    """
+    standalone = client is None
+    provider_manager = None
+    provider_type = None
+    last_turn: Optional[tuple[str, str]] = None  # (objective, mode) -- standalone /retry target
+
+    if standalone:
+        from .local_chat import resolve_provider_type
+        from .providers import ProviderManager
+
+        console = Console(no_color=not config.colour)
+        try:
+            provider_type = resolve_provider_type(provider)
+        except ValueError as exc:
+            print_error(console, str(exc))
+            return
+        provider_manager = ProviderManager()
+    else:
+        console = Console(no_color=not config.colour)
+
+    print_banner(
+        console, host=(f"local:{provider}" if standalone else config.api_base),
+        workspace_root=workspace.workspace_root, mode="interactive", approval_policy=config.approval_policy,
+    )
     console.print("[dim]Type /help for commands. Paste up to 1,000,000 characters; Alt+Enter adds a newline. Ctrl+D or Ctrl+C exits.[/dim]\n")
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -146,7 +188,8 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
     # id, so /pty read shows only new output. The server (RemotePtySession/
     # pty_broker's ring buffer) is the durable source of truth -- losing
     # this dict on restart just means the next /pty read re-shows output
-    # already seen, never data loss.
+    # already seen, never data loss. (Remote mode only -- standalone has no
+    # PTY backend at all yet, see the /pty handler below.)
     pty_offsets: dict[str, int] = {}
 
     @bindings.add("enter")
@@ -214,22 +257,36 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
         # showing the command list the way typing "/" alone is expected to.
         if text in ("/help", "/"):
             console.print(HELP_TEXT)
+            if standalone:
+                console.print(
+                    "[dim]Standalone mode: /pty and /model list have no local equivalent yet (they need a "
+                    "persistent server / remote model catalog) -- everything else above (diffs/revert, resume, "
+                    "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
+                )
             continue
         if text == "/cwd":
             console.print(workspace.workspace_root)
             continue
         if text == "/status":
             state = local_state.get_session_state(workspace.session_id)
+            identity_line = (
+                f"session_id={workspace.session_id}  (standalone, local session)"
+                if standalone else f"session_id={workspace.session_id}  server_id={workspace.server_id}"
+            )
+            backend_line = (
+                f"approval_policy={config.approval_policy}  provider={provider_type.value if provider_type else provider}"
+                if standalone else f"approval_policy={config.approval_policy}  api_base={config.api_base}"
+            )
             console.print(
-                f"session_id={workspace.session_id}  server_id={workspace.server_id}\n"
+                f"{identity_line}\n"
                 f"workspace_root={workspace.workspace_root}\n"
                 f"repository_root={state.repository_root or '-'}  branch={state.active_branch or '-'}\n"
                 f"phase={state.current_phase}  execution={state.execution_status}\n"
                 f"queue={sum(1 for item in state.queued_user_instructions if item.get('status') == 'queued')}  "
                 f"validations={len(state.validation_results)}  issues={len(state.unresolved_issues)}\n"
                 f"saved_plans={len(state.saved_plans)}  active_plan={state.active_plan_id or '-'}\n"
-                f"approval_policy={config.approval_policy}  api_base={config.api_base}\n"
-                f"model={state.selected_model}  provider={state.selected_provider or 'auto (hf -> openrouter)'}"
+                f"{backend_line}\n"
+                f"model={state.selected_model}  route={state.selected_provider or 'auto'}"
             )
             continue
         if text == "/context":
@@ -295,6 +352,51 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
                 )
                 continue
             parts = arg.split()
+
+            if standalone:
+                from .local_chat import resolve_provider_type as _resolve_provider_type
+                from .providers import ProviderManager as _ProviderManager, ProviderType
+
+                if parts[0].lower() == "list":
+                    route_arg = parts[1].lower() if len(parts) > 1 else None
+                    manager = _ProviderManager()
+                    routes = [route_arg] if route_arg else [p.value for p in manager.PROVIDERS]
+                    table = Table(show_header=True, header_style="bold")
+                    for column in ("PROVIDER", "MODELS"):
+                        table.add_column(column)
+                    shown = False
+                    for route_name in routes:
+                        try:
+                            route_type = _resolve_provider_type(route_name)
+                        except ValueError:
+                            continue
+                        pcfg = manager.PROVIDERS.get(route_type)
+                        if pcfg:
+                            table.add_row(pcfg.name, ", ".join(pcfg.models) or pcfg.default_model)
+                            shown = True
+                    console.print(table if shown else "[dim]Unknown provider. Use hf, nvidia, openrouter, or ollama.[/dim]")
+                    continue
+                if parts[0].lower() == "auto":
+                    provider_type = ProviderType.AUTO
+                    local_state.save_session_state(workspace.session_id, selected_model="auto", selected_provider=None)
+                    console.print("[green]Provider routing set to automatic.[/green]")
+                    continue
+                try:
+                    provider_type = _resolve_provider_type(parts[0])
+                except ValueError as exc:
+                    print_error(console, f"{exc} Usage: /model auto | /model <hf|nvidia|openrouter|ollama> [model-id]")
+                    continue
+                model_id = parts[1] if len(parts) > 1 else "auto"
+                if len(parts) > 2:
+                    print_error(console, "Model ids cannot contain spaces.")
+                    continue
+                model = None if model_id == "auto" else model_id
+                local_state.save_session_state(
+                    workspace.session_id, selected_model=model_id, selected_provider=parts[0].lower(),
+                )
+                console.print(f"[green]Pinned {parts[0].lower()} route[/green]  model={model_id}")
+                continue
+
             if parts[0].lower() == "list":
                 route = parts[1].lower() if len(parts) > 1 else None
                 if route not in (None, "hf", "openrouter"):
@@ -352,6 +454,21 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
             table.add_column("Tool")
             table.add_column("Purpose")
             table.add_column("Safeguard")
+            if standalone:
+                table.add_row("read_file", "Read a file's contents", "Read-only")
+                table.add_row("list_directory", "List a directory's contents", "Read-only")
+                table.add_row("search_code", "ripgrep-backed content search", "Read-only")
+                table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
+                table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Local risk classifier + approval + mutation ledger")
+                table.add_row("write_file", "Create or fully replace a file", "Workspace-boundary check + approval + mutation ledger")
+                table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
+                table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
+                console.print(table)
+                console.print(
+                    "[dim]This is the real local tool set (mcp.py) the standalone agent loop uses -- "
+                    "see safety.py for how risk is classified and see /diffs for the mutation ledger.[/dim]"
+                )
+                continue
             table.add_row("read_file", "Bounded, line-numbered file reads", "Read-only + CWD confinement")
             table.add_row("glob_files", "Find files by filename glob, not full paths", "Read-only + CWD confinement")
             table.add_row("grep_files", "Search repository contents", "Read-only + CWD confinement")
@@ -370,6 +487,13 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
             console.print("[dim]Native coding tools above do not require Codex Apps, Claude Apps, or MCP. Optional connector tools appear only when a real gateway is enabled and successfully discovered.[/dim]")
             continue
         if text == "/pty" or text.startswith("/pty "):
+            if standalone:
+                print_error(
+                    console,
+                    "Background terminals require --remote (a persistent server to host them) -- "
+                    "there's no standalone equivalent yet. Use $ <command> or /run for one-off local commands.",
+                )
+                continue
             arg = text[len("/pty"):].strip()
             parts = arg.split(maxsplit=1)
             sub = parts[0].lower() if parts else "list"
@@ -492,9 +616,31 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
             console.print("[green]Context checkpoint saved.[/green]")
             continue
         if text == "/doctor":
+            if standalone:
+                from .providers import get_provider_status as _get_provider_status
+
+                status = _get_provider_status()
+                table = Table(show_header=True, header_style="bold")
+                for column in ("PROVIDER", "CONFIGURED", "KEY"):
+                    table.add_column(column)
+                for name, info in status["config"].items():
+                    configured = "[green]yes[/green]" if info["api_key_set"] or name == "ollama" else "[dim]no[/dim]"
+                    table.add_row(name, configured, info["key_preview"])
+                console.print(table)
+                console.print(
+                    f"[dim]Currently selected: {provider_type.value if provider_type else provider}  "
+                    f"· auto would pick: {status['default']}[/dim]"
+                )
+                continue
             await run_doctor(config, console, Path(workspace.workspace_root), session_id=workspace.session_id)
             continue
         if text == "/agents":
+            if standalone:
+                for sid in local_state.all_known_session_ids():
+                    sess_state = local_state.get_session_state(sid)
+                    marker = " *" if sid == workspace.session_id else ""
+                    console.print(f"  {sid}  {sess_state.workspace_root or sess_state.primary_workspace}{marker}")
+                continue
             try:
                 sessions_list = await client.list_sessions()
             except (AuthRequiredError, RemoteAPIError) as e:
@@ -504,6 +650,45 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
                 marker = " *" if sess.get("id") == workspace.session_id else ""
                 console.print(f"  {sess.get('id')}  {sess.get('status')}  {sess.get('working_directory') or ''}{marker}")
             continue
+        if text == "/delegate" or text.startswith("/delegate "):
+            if not config.enable_subagent_delegation:
+                print_error(
+                    console,
+                    "Subagent delegation is disabled. Enable it with enable_subagent_delegation = true "
+                    "in config.toml, or TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION=1.",
+                )
+                continue
+            arg = text[len("/delegate"):].strip()
+            descriptions = [part.strip() for part in arg.split("|") if part.strip()]
+            if not descriptions:
+                print_error(console, "Usage: /delegate <objective 1> | <objective 2> | ...")
+                continue
+            # Delegation always runs through the standalone local loop
+            # (agents.py's DelegatedCodingAgent) regardless of whether this
+            # REPL session itself is standalone or --remote -- there's only
+            # one implementation now (it was fully converted, not dual-mode).
+            from .agents import AgentManager
+            manager = AgentManager()
+            delegate_manager = provider_manager
+            delegate_provider = provider_type
+            if delegate_manager is None:
+                from .local_chat import resolve_provider_type as _resolve_provider_type
+                from .providers import ProviderManager as _ProviderManager
+
+                delegate_manager = _ProviderManager()
+                delegate_provider = _resolve_provider_type("auto")
+            results = await manager.execute_tasks(
+                descriptions, manager=delegate_manager, provider=delegate_provider, model=model,
+                console=console, workspace_root=workspace.workspace_root,
+                approval_policy=config.approval_policy,
+            )
+            for r in results:
+                marker = "✅" if r["status"] == "completed" else "❌"
+                console.print(f"{marker} {r['description']}")
+                summary = (r.get("result") or {}).get("summary") or (r.get("result") or {}).get("error")
+                if summary:
+                    console.print(f"   {summary}")
+            continue
         if text == "/diffs" or text.startswith("/diffs "):
             arg = text[len("/diffs"):].strip()
             try:
@@ -511,24 +696,37 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
             except ValueError:
                 print_error(console, f"'{arg}' is not a valid number.")
                 continue
-            try:
-                result = await client.list_file_mutations(workspace.session_id, limit=limit)
-            except (AuthRequiredError, RemoteAPIError) as e:
-                print_error(console, str(e))
-                continue
-            mutations = result.get("mutations") or []
+            if standalone:
+                mutations = local_state.get_session_state(workspace.session_id).modified_files[-limit:]
+                mutations = list(reversed(mutations))
+            else:
+                try:
+                    result = await client.list_file_mutations(workspace.session_id, limit=limit)
+                except (AuthRequiredError, RemoteAPIError) as e:
+                    print_error(console, str(e))
+                    continue
+                mutations = result.get("mutations") or []
             if not mutations:
                 console.print("[dim]No file mutations recorded yet in this session.[/dim]")
             for m in mutations:
+                mutation_id = m.get("mutation_id") if standalone else m.get("id")
                 status = m.get("revert_status")
                 marker = " [reverted]" if status == "reverted" else (" [revert failed]" if status == "revert_failed" else "")
                 console.print(
-                    f"  {m.get('id')}  {m.get('operation')}  {m.get('path')}  "
+                    f"  {mutation_id}  {m.get('operation')}  {m.get('path')}  "
                     f"+{m.get('lines_added')}/-{m.get('lines_removed')}{marker}"
                 )
             continue
         if text == "/diff" or text.startswith("/diff "):
             mutation_id = text[len("/diff"):].strip()
+            if standalone:
+                mutations = local_state.get_session_state(workspace.session_id).modified_files
+                selected = next((item for item in mutations if item.get("mutation_id") == mutation_id), None) if mutation_id else (mutations[-1] if mutations else None)
+                if selected is None:
+                    print_error(console, "Mutation not found." if mutation_id else "No file mutations recorded yet.")
+                else:
+                    print_unified_diff(console, str(selected.get("unified_diff") or ""), title=str(selected.get("path") or "Changes"))
+                continue
             try:
                 result = await client.list_file_mutations(workspace.session_id, limit=200 if mutation_id else 1)
             except (AuthRequiredError, RemoteAPIError) as e:
@@ -546,6 +744,14 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
             if not arg:
                 print_error(console, "Usage: /revert <mutation_id> -- see /diffs for recent mutation ids.")
                 continue
+            if standalone:
+                try:
+                    result = local_revert_mutation(workspace.session_id, arg)
+                except ValueError as e:
+                    print_error(console, str(e))
+                    continue
+                console.print(f"[green]Reverted[/green] {result.get('path')}")
+                continue
             try:
                 result = await client.revert_file_mutation(workspace.session_id, arg)
             except (AuthRequiredError, RemoteAPIError) as e:
@@ -558,6 +764,32 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
             continue
         if text == "/resume" or text.startswith("/resume "):
             arg = text[len("/resume"):].strip()
+            if standalone:
+                known = local_state.all_known_session_ids()
+                if arg:
+                    try:
+                        target_id = int(arg)
+                    except ValueError:
+                        print_error(console, f"'{arg}' is not a valid session id.")
+                        continue
+                    if target_id not in known:
+                        print_error(console, f"No known local session {target_id}. Use /agents to list known sessions.")
+                        continue
+                else:
+                    candidates = [sid for sid in reversed(known) if sid != workspace.session_id]
+                    if not candidates:
+                        console.print("[dim]No other sessions to resume.[/dim]")
+                        continue
+                    target_id = candidates[0]
+                target_state = local_state.get_session_state(target_id)
+                workspace = WorkspaceContext(
+                    session_id=target_id,
+                    workspace_root=target_state.workspace_root or target_state.primary_workspace,
+                )
+                console.print(f"[green]Resumed session {workspace.session_id}[/green]  workspace_root={workspace.workspace_root}")
+                if target_state.conversation_summary:
+                    console.print(f"[dim]{target_state.conversation_summary[-1000:]}[/dim]")
+                continue
             try:
                 if arg:
                     try:
@@ -583,6 +815,30 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
                 pass
             continue
         if text == "/retry" or text.startswith("/retry "):
+            if standalone:
+                if last_turn is None:
+                    console.print("[dim]No previous turn in this session to retry.[/dim]")
+                    continue
+                objective, mode = last_turn
+                repo_state = local_state.get_session_state(workspace.session_id).repository_context
+                if mode in {"coding", "agent", "execute"} and blocking_dirty_files(repo_state.get("dirty_files") or []):
+                    print_error(console, "Existing uncommitted changes detected; retry is blocked to preserve user edits.")
+                    continue
+                renderer = StreamRenderer(console)
+                outcome = await run_local_agent_turn(
+                    provider_manager, provider_type, model, [{"role": "user", "content": objective}],
+                    console, renderer,
+                    workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                    approval_policy=config.approval_policy, interactive=True,
+                    read_only=mode in {"chat", "audit", "plan"},
+                )
+                renderer.finish()
+                if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
+                    console.print(Markdown(outcome.summary))
+                if outcome.status != "completed":
+                    print_error(console, outcome.error or f"task {outcome.status}")
+                console.print()
+                continue
             arg = text[len("/retry"):].strip()
             try:
                 if arg:
@@ -622,11 +878,17 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
             if intent.kind == "shell":
                 if not intent.command:
                     continue
-                outcome = await run_shell_command(
-                    client, console,
-                    session_id=workspace.session_id, command=intent.command,
-                    approval_policy=config.approval_policy, interactive=True,
-                )
+                if standalone:
+                    outcome = await run_local_shell_command(
+                        console, workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                        command=intent.command, approval_policy=config.approval_policy, interactive=True,
+                    )
+                else:
+                    outcome = await run_shell_command(
+                        client, console,
+                        session_id=workspace.session_id, command=intent.command,
+                        approval_policy=config.approval_policy, interactive=True,
+                    )
             elif intent.kind == "saved_plan":
                 plan = local_state.get_plan(workspace.session_id, intent.command or None)
                 if plan is None:
@@ -640,13 +902,25 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
                 local_state.update_plan(workspace.session_id, plan_id, status="executing")
                 renderer = StreamRenderer(console)
                 model_state = local_state.get_session_state(workspace.session_id)
-                outcome = await run_ai_task_and_stream(
-                    client, renderer, console,
-                    session_id=workspace.session_id,
-                    objective=local_state.plan_execution_objective(plan), mode="execute",
-                    approval_policy=config.approval_policy, interactive=True,
-                    model=model_state.selected_model, provider=model_state.selected_provider,
-                )
+                plan_objective = local_state.plan_execution_objective(plan)
+                if standalone:
+                    outcome = await run_local_agent_turn(
+                        provider_manager, provider_type, model, [{"role": "user", "content": plan_objective}],
+                        console, renderer,
+                        workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                        approval_policy=config.approval_policy, interactive=True,
+                    )
+                    last_turn = (plan_objective, "execute")
+                else:
+                    outcome = await run_ai_task_and_stream(
+                        client, renderer, console,
+                        session_id=workspace.session_id,
+                        objective=plan_objective, mode="execute",
+                        approval_policy=config.approval_policy, interactive=True,
+                        model=model_state.selected_model, provider=model_state.selected_provider,
+                    )
+                if standalone:
+                    renderer.finish()
                 local_state.update_plan(
                     workspace.session_id, plan_id,
                     status="completed" if outcome.status == "completed" else "failed",
@@ -664,13 +938,27 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
                         continue
                 renderer = StreamRenderer(console)
                 model_state = local_state.get_session_state(workspace.session_id)
-                outcome = await run_ai_task_and_stream(
-                    client, renderer, console,
-                    session_id=workspace.session_id, objective=intent.objective, mode=intent.mode,
-                    approval_policy=config.approval_policy, interactive=True,
-                    model=model_state.selected_model,
-                    provider=model_state.selected_provider,
-                )
+                if standalone:
+                    outcome = await run_local_agent_turn(
+                        provider_manager, provider_type, model, [{"role": "user", "content": intent.objective}],
+                        console, renderer,
+                        workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                        approval_policy=config.approval_policy, interactive=True,
+                        read_only=intent.mode in {"chat", "audit", "plan"},
+                    )
+                    renderer.finish()
+                    last_turn = (intent.objective, intent.mode)
+                    if intent.mode == "plan" and outcome.status == "completed" and outcome.summary:
+                        saved = local_state.save_plan(workspace.session_id, objective=intent.objective, content=outcome.summary)
+                        console.print(f"[green]Plan saved[/green] · {saved.id} · run /execute-plan {saved.id}")
+                else:
+                    outcome = await run_ai_task_and_stream(
+                        client, renderer, console,
+                        session_id=workspace.session_id, objective=intent.objective, mode=intent.mode,
+                        approval_policy=config.approval_policy, interactive=True,
+                        model=model_state.selected_model,
+                        provider=model_state.selected_provider,
+                    )
                 if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
                     console.print(Markdown(outcome.summary))
         except AuthRequiredError:
@@ -683,6 +971,11 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
                 local_state.update_instruction(workspace.session_id, str(queued_item.get("id")), "failed")
             print_error(console, str(e))
             continue
+        except Exception as e:
+            if queued_item:
+                local_state.update_instruction(workspace.session_id, str(queued_item.get("id")), "failed")
+            print_error(console, str(e))
+            continue
 
         if queued_item:
             local_state.update_instruction(workspace.session_id, str(queued_item.get("id")), "completed")
@@ -690,61 +983,3 @@ async def run_interactive(client: RemoteAPIClient, config: Config, workspace: Wo
         if outcome.status not in ("completed",):
             print_error(console, outcome.error or f"task {outcome.status}")
         console.print()
-
-# ============== REFERENCE HANDLING ==============
-
-def process_user_input(text: str, workspace_root: str) -> Dict[str, Any]:
-    """Process user input with @file and @folder references"""
-    from .references import process_references
-    
-    result = process_references(text, workspace_root)
-    
-    # Check if there are any files to read
-    if result['references']['files']:
-        print(f"\n📁 Loaded {len(result['references']['files'])} referenced files")
-        for f in result['references']['files']:
-            lines = len(f.content.split('\n'))
-            print(f"  - {f.path} ({lines} lines)")
-    
-    if result['references']['folders']:
-        print(f"\n📁 Loaded {len(result['references']['folders'])} referenced folders")
-        for folder in result['references']['folders']:
-            print(f"  - {folder.path} ({len(folder.files)} files)")
-    
-    return result
-
-def handle_reference_command(cmd: str, args: str, workspace_root: str) -> str:
-    """Handle reference-related commands"""
-    from .references import ReferenceResolver, InstructionManager
-    
-    resolver = ReferenceResolver(workspace_root)
-    instr_mgr = InstructionManager(workspace_root)
-    
-    if cmd == 'references':
-        if args:
-            # Show specific reference
-            ref = resolver._resolve_file(args)
-            if ref:
-                return f"=== {ref.path} ===\n{ref.get_context()}"
-            return f"❌ File '{args}' not found"
-        else:
-            # List all references in current conversation
-            return "📋 Use @filename to reference files in your prompts"
-    
-    elif cmd == 'instructions':
-        instructions = instr_mgr.get_all_instructions()
-        if not instructions:
-            return "No instruction files found. Create TAMFIS.md in project root."
-        
-        result = []
-        for name, content in instructions.items():
-            result.append(f"=== {name} ===\n{content[:500]}{'...' if len(content) > 500 else ''}")
-        return '\n\n'.join(result)
-    
-    elif cmd == 'create_instruction':
-        from .instructions import create_instruction_template
-        path = Path(workspace_root) / (args or 'TAMFIS.md')
-        create_instruction_template(path)
-        return f"✅ Created instruction template at {path}"
-    
-    return f"Unknown reference command: /{cmd}"

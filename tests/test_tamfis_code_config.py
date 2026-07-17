@@ -72,6 +72,47 @@ class LoadConfigTests(unittest.TestCase):
         cfg = config_module.load_config()
         self.assertEqual(cfg.approval_policy, "ask")  # falls back to the built-in default
 
+    def test_subagent_delegation_defaults_to_disabled(self):
+        cfg = config_module.load_config()
+        self.assertFalse(cfg.enable_subagent_delegation)
+
+    def test_subagent_delegation_enabled_via_config_file(self):
+        config_module.USER_CONFIG_PATH.write_text('enable_subagent_delegation = true\n')
+        cfg = config_module.load_config()
+        self.assertTrue(cfg.enable_subagent_delegation)
+        self.assertEqual(cfg.sources["enable_subagent_delegation"], "user config")
+
+    def test_subagent_delegation_enabled_via_env_var(self):
+        os.environ["TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION"] = "1"
+        try:
+            cfg = config_module.load_config()
+        finally:
+            del os.environ["TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION"]
+        self.assertTrue(cfg.enable_subagent_delegation)
+
+    def test_default_backend_defaults_to_standalone(self):
+        cfg = config_module.load_config()
+        self.assertEqual(cfg.default_backend, "standalone")
+
+    def test_default_backend_set_via_config_file(self):
+        config_module.USER_CONFIG_PATH.write_text('default_backend = "remote"\n')
+        cfg = config_module.load_config()
+        self.assertEqual(cfg.default_backend, "remote")
+        self.assertEqual(cfg.sources["default_backend"], "user config")
+
+    def test_default_backend_invalid_value_in_config_file_is_ignored(self):
+        config_module.USER_CONFIG_PATH.write_text('default_backend = "cloud"\n')
+        cfg = config_module.load_config()
+        self.assertEqual(cfg.default_backend, "standalone")
+
+    def test_default_backend_set_via_env_var(self):
+        os.environ["TAMFIS_CODE_DEFAULT_BACKEND"] = "remote"
+        try:
+            cfg = config_module.load_config()
+        finally:
+            del os.environ["TAMFIS_CODE_DEFAULT_BACKEND"]
+        self.assertEqual(cfg.default_backend, "remote")
+
     def test_credentials_roundtrip(self):
         creds = config_module.Credentials(access_token="tok", refresh_token="ref", user_id="u1", email="a@b.com")
         config_module.save_credentials(creds)

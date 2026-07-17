@@ -7,6 +7,7 @@ import asyncio
 import subprocess
 import json
 import re
+import uuid
 from pathlib import Path  # <-- Add this import
 
 class AgentStatus(Enum):
@@ -216,6 +217,53 @@ class DocGenerator(SubAgent):
         except:
             return []
 
+class DelegatedCodingAgent(SubAgent):
+    """Delegates its task to the real standalone agent loop (runner_local.py --
+    the same one `tamfis-code agent`/`exec`/`ask` and the interactive REPL
+    drive), instead of a local heuristic.
+
+    Unlike CodeAnalyzer/TestGenerator/DocGenerator, this one can actually act
+    on an arbitrary objective via the model -- calling a provider directly
+    and executing tools locally, with its own workspace/session. It's never
+    selected by AgentManager's keyword-based `get_agent()` routing
+    (capabilities=[]) since it's only meant to be dispatched explicitly via
+    `execute_tasks`.
+    """
+
+    def __init__(
+        self, *, manager, provider, model, console, workspace_root: str, session_id: int,
+        approval_policy: str = "ask", mode: str = "agent",
+    ):
+        super().__init__(
+            name="delegated_coding_agent",
+            description="Delegates a sub-objective to the real standalone agent loop",
+            capabilities=[],
+        )
+        self._manager = manager
+        self._provider = provider
+        self._model = model
+        self._console = console
+        self._workspace_root = workspace_root
+        self._session_id = session_id
+        self._approval_policy = approval_policy
+        self._mode = mode
+
+    async def execute(self, task: AgentTask) -> Dict[str, Any]:
+        from .render import StreamRenderer
+        from .runner_local import run_local_agent_turn
+
+        renderer = StreamRenderer(self._console)
+        outcome = await run_local_agent_turn(
+            self._manager, self._provider, self._model, [{"role": "user", "content": task.description}],
+            self._console, renderer,
+            workspace_root=self._workspace_root, session_id=self._session_id,
+            approval_policy=self._approval_policy, interactive=False,
+            read_only=self._mode in {"chat", "audit", "plan"},
+        )
+        renderer.finish()
+        return {"status": outcome.status, "summary": outcome.summary, "error": outcome.error}
+
+
 class AgentManager:
     """Manages subagents and task execution"""
     
@@ -280,3 +328,44 @@ class AgentManager:
             task.status = AgentStatus.FAILED
             task.error = str(e)
             return {"error": str(e), "task_id": task.id}
+
+    async def execute_tasks(
+        self, descriptions: List[str], *,
+        manager, provider, model, console, workspace_root, approval_policy: str = "ask",
+        mode: str = "agent", max_concurrency: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """Fan out N sub-objectives concurrently (bounded by max_concurrency),
+        each delegated to the standalone agent loop in its own local session.
+
+        Defaults to sequential (max_concurrency=1): whether concurrent tool
+        execution against the same workspace is safe in every case (two
+        sub-tasks editing overlapping files, concurrent state.json writers
+        from separate local sessions) hasn't been stress-tested -- raise the
+        cap only once you've validated that for your own workloads.
+        """
+        from .workspace import resolve_local_workspace
+
+        semaphore = asyncio.Semaphore(max(1, max_concurrency))
+
+        async def run_one(description: str) -> Dict[str, Any]:
+            async with semaphore:
+                task = AgentTask(id=f"delegated_{uuid.uuid4().hex[:8]}", description=description, status=AgentStatus.RUNNING)
+                self.tasks[task.id] = task
+                try:
+                    workspace = resolve_local_workspace(Path(workspace_root), discover=False)
+                    agent = DelegatedCodingAgent(
+                        manager=manager, provider=provider, model=model, console=console,
+                        workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                        approval_policy=approval_policy, mode=mode,
+                    )
+                    result = await agent.execute(task)
+                    task.result = result
+                    task.status = AgentStatus.COMPLETED if result.get("status") == "completed" else AgentStatus.FAILED
+                    task.error = result.get("error")
+                except Exception as e:
+                    result = {"error": str(e)}
+                    task.status = AgentStatus.FAILED
+                    task.error = str(e)
+                return {"task_id": task.id, "description": description, "status": task.status.value, "result": result}
+
+        return list(await asyncio.gather(*(run_one(description) for description in descriptions)))

@@ -13,13 +13,34 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from typing import Any, Optional
 
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.text import Text
 
+from .metrics import MetricsTracker
+
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
+
+# Mirrors runner.py's own `phase_by_event` mapping (used there to persist
+# SessionState.current_phase) purely for this renderer's live display -- kept
+# as a separate copy rather than importing runner.py's dict so this module
+# stays presentation-only and driven only by the events it already parses,
+# per its module docstring.
+_PHASE_BY_EVENT = {
+    "plan_created": "plan", "tool_call_requested": "execute",
+    "command_started": "execute", "file_mutation": "execute",
+    "approval_required": "waiting_for_approval", "task_diagnostics": "validate",
+    "ai_task_completed": "report", "ai_task_failed": "report",
+}
+
+# Chars-per-token is a rough English-text average, used only because
+# assistant_delta payloads carry raw text, not a real token count -- the
+# live panel labels this "~" to avoid presenting false precision.
+_CHARS_PER_TOKEN_ESTIMATE = 4
 
 
 def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *, completed: bool = False) -> str:
@@ -156,13 +177,64 @@ def _format_diagnostics_line(payload: dict[str, Any]) -> str:
 
 
 class StreamRenderer:
-    def __init__(self, console: Console):
+    def __init__(self, console: Console, objective: str = ""):
         self.console = console
         self._assistant_open = False
         self._tool_names_by_call_id: dict[str, str] = {}
         self._selected_provider: Optional[str] = None
         self.streamed_final_text = False  # True once any assistant_delta content is shown
         self.debug = os.environ.get("TAMFIS_CODE_DEBUG", "").lower() in {"1", "true", "yes"}
+
+        # Live task-visibility panel -- gated on the console actually being a
+        # TTY so redirected/piped output (`tamfis-code agent "..." > out.txt`)
+        # keeps today's clean plain-text behaviour untouched.
+        self._objective = objective
+        self._phase = "idle"
+        self._plan_steps: list[dict[str, Any]] = []
+        self._task_start = time.monotonic()
+        self._metrics = MetricsTracker()
+        self._is_tty = bool(getattr(console, "is_terminal", False))
+        self._live: Optional[Live] = None
+        if self._is_tty:
+            self._live = Live(self._build_panel(), console=self.console, refresh_per_second=8, transient=False)
+            self._live.start()
+
+    def _build_panel(self) -> Panel:
+        lines = []
+        if self._objective:
+            lines.append(f"[bold]{self._objective}[/bold]")
+        lines.append(f"[dim]phase:[/dim] {self._phase}")
+        for step in self._plan_steps:
+            status = step.get("status")
+            marker = "[green]✓[/green]" if status == "completed" else (
+                "[yellow]◉[/yellow]" if status == "in_progress" else "[dim]○[/dim]"
+            )
+            # No per-step completion event exists yet (see state.py's
+            # update_plan_steps docstring) -- statuses beyond the initial
+            # plan_created payload are a best-effort approximation, so this
+            # is labelled "~" rather than presented as precise.
+            lines.append(f"  {marker} {'~ ' if status == 'in_progress' else ''}{step.get('step') or ''}")
+        elapsed = time.monotonic() - self._task_start
+        tokens = self._metrics.metrics.tokens_used
+        if tokens:
+            lines.append(
+                f"[dim]~{tokens:,} tok (est.) · {self._metrics.metrics.tokens_per_second:.1f} tok/s · "
+                f"{elapsed:.1f}s[/dim]"
+            )
+        else:
+            lines.append(f"[dim]{elapsed:.1f}s[/dim]")
+        return Panel(Group(*(Text.from_markup(line) for line in lines)), border_style="cyan", expand=False)
+
+    def _refresh_live(self) -> None:
+        if self._live is not None:
+            self._live.update(self._build_panel())
+
+    def _record_tokens(self, content: str) -> None:
+        if not content:
+            return
+        estimated_tokens = max(1, len(content) // _CHARS_PER_TOKEN_ESTIMATE)
+        elapsed_ms = (time.monotonic() - self._task_start) * 1000
+        self._metrics.record(estimated_tokens, elapsed_ms)
 
     def _close_assistant(self) -> None:
         if self._assistant_open:
@@ -173,10 +245,14 @@ class StreamRenderer:
         event_type = event.get("event_type") or event.get("event") or event.get("type")
         payload = event.get("payload") or {}
 
+        if event_type in _PHASE_BY_EVENT and self._phase != _PHASE_BY_EVENT[event_type]:
+            self._phase = _PHASE_BY_EVENT[event_type]
+            self._refresh_live()
+
         if event_type == "assistant_delta":
             content = str(payload.get("content", ""))
             if not self._assistant_open:
-                self.console.print("[bold cyan]Remote AI[/bold cyan]")
+                self.console.print("[bold cyan]Assistant[/bold cyan]")
                 self._assistant_open = True
             # Whitespace/reasoning-only provider frames are not a visible
             # final answer. Marking them as displayed suppresses cli.py's
@@ -184,6 +260,8 @@ class StreamRenderer:
             # terminal even though the task completed with real text.
             if content.strip():
                 self.streamed_final_text = True
+            self._record_tokens(content)
+            self._refresh_live()
             self.console.print(content, end="")
             return
 
@@ -193,12 +271,18 @@ class StreamRenderer:
             content = str(payload.get("content", ""))
             items = payload.get("items") if isinstance(payload.get("items"), list) else []
             if items:
-                self.console.print(f"[bold cyan]{payload.get('title') or 'Plan'}[/bold cyan]")
-                for item in items:
-                    if not isinstance(item, dict) or item.get("status") == "context":
-                        continue
-                    marker = "◉" if item.get("status") == "in_progress" else "○"
-                    self.console.print(f"  [cyan]{marker}[/cyan] {item.get('step') or ''}")
+                self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
+                self._refresh_live()
+                # The live panel (when active) already shows this step list
+                # in place, updating as later events refresh it -- printing
+                # it again as a static scroll-log entry would just duplicate
+                # it. Non-TTY output (no live panel) keeps today's one-shot
+                # print, since that's the only place this ever showed up.
+                if self._live is None:
+                    self.console.print(f"[bold cyan]{payload.get('title') or 'Plan'}[/bold cyan]")
+                    for item in self._plan_steps:
+                        marker = "◉" if item.get("status") == "in_progress" else "○"
+                        self.console.print(f"  [cyan]{marker}[/cyan] {item.get('step') or ''}")
                 return
             if stage == "tool_execution":
                 match = _TOOL_ANNOUNCE_RE.search(content)
@@ -395,6 +479,9 @@ class StreamRenderer:
 
     def finish(self) -> None:
         self._close_assistant()
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
 
 
 def print_banner(console: Console, *, host: str, workspace_root: str, mode: str, approval_policy: str) -> None:

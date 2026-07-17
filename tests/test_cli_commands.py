@@ -13,8 +13,10 @@ from tamfis_code.cli import (
     _print_bg_hint,
     _project_root_for_target,
     _session_for_primary,
+    _use_remote,
     cli,
 )
+from tamfis_code.config import Config
 
 
 class ExplicitAbsolutePathsTests(unittest.TestCase):
@@ -186,6 +188,21 @@ class LogoutCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertIn("Logged out", result.output)
 
 
+class UseRemoteHelperTests(unittest.TestCase):
+    """The --remote flag always wins; otherwise a paid tenant's persistent
+    config.toml `default_backend = "remote"` makes every command use the
+    legacy backend without needing --remote on each invocation."""
+
+    def test_flag_true_is_remote_regardless_of_config(self):
+        self.assertTrue(_use_remote(Config(default_backend="standalone"), True))
+
+    def test_flag_false_defers_to_config_standalone(self):
+        self.assertFalse(_use_remote(Config(default_backend="standalone"), False))
+
+    def test_flag_false_defers_to_config_remote(self):
+        self.assertTrue(_use_remote(Config(default_backend="remote"), False))
+
+
 class WorkspaceGroupCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
     def test_workspace_list_without_known_session_fails_clearly(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -227,6 +244,137 @@ class ConfigCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
             result = self.runner.invoke(cli, ["--cwd", tmp, "config"])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("credential_storage", result.output)
+
+
+class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase):
+    """ask/agent/exec/chat/audit/plan default to the standalone local loop
+    (runner_local.py) now -- --remote is required to reach the legacy
+    RemoteAPIClient path, and --bg (server-side background execution) only
+    makes sense with --remote since a standalone process has no server to
+    keep a task alive after it exits."""
+
+    def test_bg_without_remote_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "ask", "do something", "--bg"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--bg requires --remote", result.output)
+
+    def test_execute_plan_bg_without_remote_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "execute-plan", "--bg"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--bg requires --remote", result.output)
+
+    def test_ask_without_remote_never_constructs_a_remote_client(self):
+        from tamfis_code.runner import TaskOutcome
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.RemoteAPIClient") as fake_remote_client, \
+                    patch("tamfis_code.runner_local.run_local_agent_turn", new=AsyncMock(return_value=TaskOutcome(status="completed", summary="hi"))):
+                result = self.runner.invoke(cli, ["--cwd", tmp, "chat", "hello", "--provider", "ollama"])
+            self.assertEqual(result.exit_code, 0, result.output)
+            fake_remote_client.assert_not_called()
+
+    def test_attach_is_not_supported_in_standalone_mode(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            probe = Path(tmp) / "probe.txt"
+            probe.write_text("x")
+            result = self.runner.invoke(cli, ["--cwd", tmp, "ask", "look at this", "--attach", str(probe)])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("not yet supported in standalone", result.output)
+
+    def test_default_backend_remote_in_config_uses_remote_without_the_flag(self):
+        # A paid TamfisGPT tenant sets this once instead of typing --remote
+        # on every single command.
+        config_module.USER_CONFIG_PATH.write_text('default_backend = "remote"\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli._run_ai_command", new=AsyncMock(return_value=0)) as fake_remote_run, \
+                    patch("tamfis_code.cli._run_local_ai_command", new=AsyncMock(return_value=0)) as fake_local_run:
+                self.runner.invoke(cli, ["--cwd", tmp, "ask", "do something"])
+            fake_remote_run.assert_called_once()
+            fake_local_run.assert_not_called()
+
+
+class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
+    """init/doctor/status/sessions/diffs/diff/revert/agents/run all default
+    to a local implementation now (state.py / safety.py-backed), with
+    --remote as the explicit opt-out to the legacy backend."""
+
+    def test_init_creates_a_local_session(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "init"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("standalone, local session", result.output)
+
+    def test_status_shows_local_session_without_remote_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "status"])
+            fake_client.assert_not_called()
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("standalone, local session", result.output)
+
+    def test_sessions_lists_known_local_sessions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            state_module.save_session_state(5, workspace_root=str(Path(tmp).resolve()))
+            result = self.runner.invoke(cli, ["--cwd", tmp, "sessions"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn(str(Path(tmp).resolve()), result.output)
+
+    def test_diffs_reads_local_mutation_ledger(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from tamfis_code.safety import record_mutation
+
+            record_mutation(1, path=f"{tmp}/x.py", operation="create", original_content=None, new_content="x = 1\n")
+            state_module.save_session_state(1, workspace_root=str(Path(tmp).resolve()))
+            result = self.runner.invoke(cli, ["--cwd", tmp, "diffs"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("create", result.output)
+
+    def test_diffs_remote_without_auth_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "diffs", "--remote"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Not authenticated", result.output)
+
+    def test_revert_unknown_mutation_reports_error_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "revert", "mut_doesnotexist"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No recorded mutation", result.output)
+
+    def test_run_executes_locally_without_remote_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "--approval", "auto", "run", "echo hi"])
+            fake_client.assert_not_called()
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("hi", result.output)
+
+    def test_run_bg_without_remote_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "run", "echo hi", "--bg"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("--bg requires --remote", result.output)
+
+    def test_doctor_reports_provider_status_without_remote_client(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "doctor"])
+            fake_client.assert_not_called()
+        self.assertIn("PROVIDER", result.output)
+
+    def test_retry_with_no_previous_turn_fails_clearly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "retry"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No previous turn", result.output)
+
+    def test_retry_task_id_without_remote_is_rejected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "retry", "some-task-id"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("only applies with --remote", result.output)
 
 
 if __name__ == "__main__":
