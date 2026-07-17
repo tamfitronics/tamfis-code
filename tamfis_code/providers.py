@@ -43,12 +43,16 @@ class ProviderManager:
             name="Hugging Face",
             base_url="https://router.huggingface.co/v1",
             api_key_env="HF_TOKEN",
-            default_model="meta-llama/Llama-3.2-3B-Instruct",
+            # meta-llama/Llama-3.2-3B-Instruct is no longer served by any
+            # provider HF's router enables for a standard token (confirmed
+            # live: 400 model_not_supported); Qwen2.5-7B-Instruct responds
+            # normally, so it's the default instead.
+            default_model="Qwen/Qwen2.5-7B-Instruct",
             models=[
                 # Text models
+                "Qwen/Qwen2.5-7B-Instruct",
                 "meta-llama/Llama-3.2-3B-Instruct",
                 "mistralai/Mistral-7B-Instruct-v0.3",
-                "Qwen/Qwen2.5-7B-Instruct",
                 # Vision models
                 "microsoft/Phi-3.5-vision-instruct",
                 "meta-llama/Llama-3.2-11B-Vision-Instruct",
@@ -100,6 +104,13 @@ class ProviderManager:
             base_url=os.environ.get("OLLAMA_BASE_URL", "http://localhost:11434/v1"),
             api_key_env="OLLAMA_API_KEY",
             default_model="llama3.2:3b",
+            # Deliberately the lowest weight of any provider (below OpenRouter's 1):
+            # Ollama needs no API key, so it's "available" merely by being installed
+            # and running. If it outranked keyed cloud providers, `auto` would pick
+            # a 3B local model over a properly configured HF/NVIDIA/OpenRouter
+            # account whenever Ollama happened to be running -- it should only be
+            # chosen when nothing else is configured, per the fallback in
+            # _select_best_provider below.
             models=[
                 "llama3.2:3b",
                 "llama3.2:1b",
@@ -121,7 +132,7 @@ class ProviderManager:
                 "llava:13b",
                 "bakllava:7b",
             ],
-            weight=4,
+            weight=0,
             reasoning_supported=True,
             vision_supported=True
         ),
@@ -339,7 +350,7 @@ class ProviderManager:
                     
         except Exception as e:
             print(f"[{config.name} Error] {e}")
-            fallback_chain = [ProviderType.OLLAMA, ProviderType.NVIDIA, ProviderType.HF]
+            fallback_chain = [ProviderType.NVIDIA, ProviderType.HF, ProviderType.OPENROUTER, ProviderType.OLLAMA]
             for fallback in fallback_chain:
                 if fallback != provider and self.get_client(fallback):
                     try:

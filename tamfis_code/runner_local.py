@@ -44,6 +44,37 @@ from .safety import READ_ONLY_TOOLS, classify_tool_call_risk
 MAX_AGENT_ROUNDS = 200
 
 
+def _latest_user_text(messages: list[dict[str, Any]]) -> str:
+    for message in reversed(messages):
+        if message.get("role") == "user":
+            return str(message.get("content") or "").strip().lower()
+    return ""
+
+
+def _is_plain_conversation(messages: list[dict[str, Any]]) -> bool:
+    """Return True for turns that cannot reasonably require repository tools.
+
+    This is intentionally conservative.  It prevents greetings and basic
+    conversational prompts from sending a large function catalogue to small
+    local models such as llama3.2:3b, which may serialize invented function
+    calls into ordinary assistant text instead of emitting tool_calls.
+    """
+    text = _latest_user_text(messages)
+    if not text:
+        return True
+    exact = {
+        "hi", "hello", "hey", "hi there", "hello there",
+        "good morning", "good afternoon", "good evening",
+        "how are you", "how are you?", "thanks", "thank you",
+    }
+    if text in exact:
+        return True
+    conversational_prefixes = (
+        "who are you", "what can you do", "tell me about yourself",
+    )
+    return text.startswith(conversational_prefixes)
+
+
 @dataclass
 class _StreamedToolCall:
     call_id: str = ""
@@ -63,10 +94,21 @@ async def _stream_one_completion(
     content_parts: list[str] = []
     tool_calls_by_index: dict[int, _StreamedToolCall] = {}
 
-    stream = await client.chat.completions.create(
-        model=model, messages=messages, stream=True,
-        temperature=0.2, max_tokens=4096, tools=tools, tool_choice="auto",
-    )
+    request_kwargs: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": True,
+        "temperature": 0.2,
+        "max_tokens": 4096,
+    }
+    # Do not send an empty tools array. Some OpenAI-compatible servers and
+    # small local models behave differently merely because tool mode is
+    # present, even when no tool is useful for the current turn.
+    if tools:
+        request_kwargs["tools"] = tools
+        request_kwargs["tool_choice"] = "auto"
+
+    stream = await client.chat.completions.create(**request_kwargs)
     async for chunk in stream:
         if not chunk.choices:
             continue
@@ -115,20 +157,40 @@ async def run_local_agent_turn(
     execution itself to safety.READ_ONLY_TOOLS -- used for chat/audit/plan
     modes, which must never mutate the workspace.
     """
-    mcp_server = MCPServer(workspace_root=workspace_root, session_id=session_id)
-    tools = mcp_server.tool_schemas_openai(names=list(READ_ONLY_TOOLS)) if read_only else mcp_server.tool_schemas_openai()
+    # Emit lifecycle events before any provider/network operation.  Without
+    # these, the Rich live panel remains at its constructor default (idle)
+    # while get_client()/chat.completions.create() is resolving or waiting.
+    renderer.handle_event({"event_type": "task_started", "payload": {"mode": "local"}})
+    renderer.handle_event({"event_type": "context_loading", "payload": {"workspace_root": workspace_root}})
 
-    # Real workspace awareness (git branch/dirty status, instruction file
-    # contents) -- replaces the context tamgpt6 used to assemble
-    # server-side. Prepended once per turn; harmless/idempotent if a caller
-    # ever already included its own system message (this one just goes
-    # first).
-    from .workspace import build_system_prompt
-    system_prompt = build_system_prompt(session_id, Path(workspace_root))
+    mcp_server = MCPServer(workspace_root=workspace_root, session_id=session_id)
+    if _is_plain_conversation(messages):
+        tools: list[dict[str, Any]] = []
+    elif read_only:
+        tools = mcp_server.tool_schemas_openai(names=list(READ_ONLY_TOOLS))
+    else:
+        tools = mcp_server.tool_schemas_openai()
+
+    # Plain conversation must not carry the full repository prompt. Besides
+    # wasting context, small local models can close an OpenAI-compatible
+    # stream without producing visible text when presented with a large coding
+    # system prompt for a trivial greeting. Repository-aware turns still get
+    # the complete workspace prompt (git branch/dirty status, instruction file
+    # contents -- replaces the context tamgpt6 used to assemble server-side).
+    if _is_plain_conversation(messages):
+        system_prompt = (
+            "You are TamfisGPT Code. Respond naturally and concisely to the "
+            "user. Do not invent or call tools for ordinary conversation."
+        )
+    else:
+        from .workspace import build_system_prompt
+        system_prompt = build_system_prompt(session_id, Path(workspace_root))
     working_messages = [{"role": "system", "content": system_prompt}, *messages]
     session_approved_risks: set[str] = set()
+    renderer.handle_event({"event_type": "context_reused", "payload": {"workspace_root": workspace_root}})
 
     for _round in range(max_rounds):
+        renderer.handle_event({"event_type": "routing_started", "payload": {"requested_provider": provider.value}})
         client = manager.get_client(provider)
         if not client:
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": f"Provider {provider.value} is not available (no client / no valid credentials)."}})
@@ -137,6 +199,14 @@ async def run_local_agent_turn(
         resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
         config = manager.PROVIDERS[resolved_provider]
         resolved_model = model or config.default_model
+        renderer.handle_event({
+            "event_type": "model_selected",
+            "payload": {"provider": resolved_provider.value, "model": resolved_model},
+        })
+        renderer.handle_event({
+            "event_type": "provider_request_started",
+            "payload": {"provider": resolved_provider.value, "model": resolved_model, "round": _round + 1},
+        })
 
         try:
             content, tool_calls = await _stream_one_completion(
@@ -147,6 +217,46 @@ async def run_local_agent_turn(
             return TaskOutcome(status="failed", error=str(exc))
 
         if not tool_calls:
+            # Some OpenAI-compatible servers occasionally terminate a streamed
+            # response with no content even though the same request succeeds
+            # non-streaming. Never silently report completion with a blank
+            # answer: retry once without streaming and render that canonical
+            # response. This also gives a clear error if the provider returned
+            # neither text nor tool calls.
+            if not content.strip():
+                fallback_kwargs: dict[str, Any] = {
+                    "model": resolved_model,
+                    "messages": working_messages,
+                    "stream": False,
+                    "temperature": 0.2,
+                    "max_tokens": 4096,
+                }
+                if tools:
+                    fallback_kwargs["tools"] = tools
+                    fallback_kwargs["tool_choice"] = "auto"
+                try:
+                    response = await client.chat.completions.create(**fallback_kwargs)
+                    message = response.choices[0].message if response.choices else None
+                    fallback_content = str(getattr(message, "content", None) or "")
+                    if fallback_content:
+                        content = fallback_content
+                        renderer.handle_event({
+                            "event_type": "assistant_delta",
+                            "payload": {"content": fallback_content},
+                        })
+                except Exception as exc:
+                    renderer.handle_event({
+                        "event_type": "ai_task_failed",
+                        "payload": {"error": f"Provider returned an empty stream; fallback failed: {exc}"},
+                    })
+                    return TaskOutcome(
+                        status="failed",
+                        error=f"Provider returned an empty stream; fallback failed: {exc}",
+                    )
+            if not content.strip():
+                error = "Provider completed without assistant text or tool calls."
+                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+                return TaskOutcome(status="failed", error=error)
             renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed"}})
             return TaskOutcome(status="completed", summary=content)
 

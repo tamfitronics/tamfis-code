@@ -31,10 +31,30 @@ _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 # stays presentation-only and driven only by the events it already parses,
 # per its module docstring.
 _PHASE_BY_EVENT = {
-    "plan_created": "plan", "tool_call_requested": "execute",
-    "command_started": "execute", "file_mutation": "execute",
-    "approval_required": "waiting_for_approval", "task_diagnostics": "validate",
-    "ai_task_completed": "report", "ai_task_failed": "report",
+    # Submission/context/model lifecycle.  These events are emitted by both
+    # the local provider loop and the remote SSE runner so the live card never
+    # sits at its constructor default while a network request is in flight.
+    "task_submitting": "submitting",
+    "task_submitted": "queued",
+    "task_started": "understand",
+    "context_loading": "understand",
+    "context_reused": "understand",
+    "context_rescanned": "understand",
+    "routing_started": "route",
+    "model_selected": "route",
+    "provider_request_started": "respond",
+    "assistant_delta": "respond",
+    "plan_created": "plan",
+    "tool_call_requested": "execute",
+    "tool_output": "execute",
+    "command_started": "execute",
+    "command_completed": "execute",
+    "command_failed": "execute",
+    "file_mutation": "execute",
+    "approval_required": "waiting_for_approval",
+    "task_diagnostics": "validate",
+    "ai_task_completed": "report",
+    "ai_task_failed": "report",
 }
 
 # Chars-per-token is a rough English-text average, used only because
@@ -196,7 +216,7 @@ class StreamRenderer:
         self._is_tty = bool(getattr(console, "is_terminal", False))
         self._live: Optional[Live] = None
         if self._is_tty:
-            self._live = Live(self._build_panel(), console=self.console, refresh_per_second=8, transient=False)
+            self._live = Live(self._build_panel(), console=self.console, refresh_per_second=8, transient=True)
             self._live.start()
 
     def _build_panel(self) -> Panel:
@@ -229,6 +249,12 @@ class StreamRenderer:
         if self._live is not None:
             self._live.update(self._build_panel())
 
+    def _stop_live(self) -> None:
+        """End the progress display before ordinary streamed output begins."""
+        if self._live is not None:
+            self._live.stop()
+            self._live = None
+
     def _record_tokens(self, content: str) -> None:
         if not content:
             return
@@ -252,6 +278,7 @@ class StreamRenderer:
         if event_type == "assistant_delta":
             content = str(payload.get("content", ""))
             if not self._assistant_open:
+                self._stop_live()
                 self.console.print("[bold cyan]Assistant[/bold cyan]")
                 self._assistant_open = True
             # Whitespace/reasoning-only provider frames are not a visible
