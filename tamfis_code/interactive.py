@@ -19,6 +19,7 @@ from rich.table import Table
 
 from . import state as local_state
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
+from .clipboard import copy_to_clipboard
 from .config import APPROVAL_MODES, CONFIG_DIR, Config, MODE_ALIASES
 from .doctor import run_doctor
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_unified_diff
@@ -52,6 +53,8 @@ $ <command>            explicit shell command
 /queue               show queued instructions
 /queue <instruction> append a follow-up instruction
 /cwd                 show the current workspace root
+/copy                copy the last assistant response to the clipboard (OSC 52 --
+                      works over plain SSH, no X11/Wayland/xclip required)
 /doctor              run connectivity/auth checks
 /resume [session_id]  switch to another session (most recent if omitted)
 /retry [task_id]      retry a failed task (most recent failure if omitted)
@@ -160,6 +163,7 @@ async def run_interactive(
     provider_manager = None
     provider_type = None
     last_turn: Optional[tuple[str, str]] = None  # (objective, mode) -- standalone /retry target
+    last_response_text: Optional[str] = None  # most recent completed answer -- /copy target
 
     if standalone:
         from .local_chat import resolve_provider_type
@@ -266,6 +270,14 @@ async def run_interactive(
             continue
         if text == "/cwd":
             console.print(workspace.workspace_root)
+            continue
+        if text == "/copy":
+            if not last_response_text:
+                console.print("[dim]Nothing to copy yet.[/dim]")
+            elif copy_to_clipboard(console, last_response_text):
+                console.print(f"[dim]Copied {len(last_response_text):,} characters to clipboard.[/dim]")
+            else:
+                console.print("[dim]Can't copy: output isn't attached to a terminal.[/dim]")
             continue
         if text == "/status":
             state = local_state.get_session_state(workspace.session_id)
@@ -833,6 +845,8 @@ async def run_interactive(
                     read_only=mode in {"chat", "audit", "plan"},
                 )
                 renderer.finish()
+                if outcome.status == "completed" and outcome.summary:
+                    last_response_text = outcome.summary
                 if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
                     console.print(Markdown(outcome.summary))
                 if outcome.status != "completed":
@@ -855,6 +869,8 @@ async def run_interactive(
                     session_id=workspace.session_id, task_id=task_id, mode=None,
                     approval_policy=config.approval_policy, interactive=True,
                 )
+                if outcome.status == "completed" and outcome.summary:
+                    last_response_text = outcome.summary
                 if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
                     console.print(Markdown(outcome.summary))
                 if outcome.status != "completed":
@@ -926,6 +942,8 @@ async def run_interactive(
                     status="completed" if outcome.status == "completed" else "failed",
                     execution_task_id=local_state.get_session_state(workspace.session_id).last_task_id,
                 )
+                if outcome.status == "completed" and outcome.summary:
+                    last_response_text = outcome.summary
                 if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
                     console.print(Markdown(outcome.summary))
             else:
@@ -959,6 +977,8 @@ async def run_interactive(
                         model=model_state.selected_model,
                         provider=model_state.selected_provider,
                     )
+                if outcome.status == "completed" and outcome.summary:
+                    last_response_text = outcome.summary
                 if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
                     console.print(Markdown(outcome.summary))
         except AuthRequiredError:
