@@ -208,6 +208,32 @@ class RunLocalAgentTurnTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(outcome.status, "completed")
             self.assertNotIn("No files were changed", outcome.summary)
 
+    def test_fake_tool_call_in_text_gets_a_caveat(self):
+        """Confirmed live on a plain "audit/check" objective (no change-request
+        verb, so the mutation-based caveat above wouldn't fire): the model wrote
+        out a fenced ```execute_command(...)``` block in its own prose instead of
+        actually calling the tool, and the turn completed with zero real
+        tool_calls. This is a much more specific signal than a verb heuristic --
+        our own tool names essentially never legitimately appear as a literal
+        function call in real prose."""
+        with tempfile.TemporaryDirectory() as ws:
+            rounds = [
+                [_chunk(_delta(content='Let\'s run it:\n```python\nexecute_command("pytest")\n```'))],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.OLLAMA, None,
+                [{"role": "user", "content": "check if the tests pass"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertIn("unexecuted tool call", outcome.summary)
+
     def test_denied_tool_call_does_not_execute(self):
         with tempfile.TemporaryDirectory() as ws:
             target = str(Path(ws) / "app.py")

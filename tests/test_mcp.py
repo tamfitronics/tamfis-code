@@ -203,6 +203,30 @@ class TestMCPServerWorkspaceScoped:
         assert 'matches 2 times' in result['result']
         assert target.read_text() == "x = 1\nx = 1\n"  # unchanged
 
+    @pytest.mark.asyncio
+    async def test_execute_command_cwd_actually_changes_directory(self):
+        """A model repeatedly tried to invent a 'directory'/other bogus
+        argument on execute_command to target a subdirectory, since the tool
+        had no way to express that other than shell-chaining `cd X && ...`
+        into the command string -- confirmed live it can then pick up an
+        unrelated ancestor's config (e.g. npm climbing to a stray parent
+        package.json). cwd is the real, supported way to do this now."""
+        subdir = Path(self.temp_dir) / "sub"
+        subdir.mkdir()
+        (subdir / "marker.txt").write_text("here")
+
+        result = await self.server.call_tool('execute_command', {'command': 'ls', 'cwd': 'sub'})
+
+        assert result['result']['success'] is True
+        assert 'marker.txt' in result['result']['stdout']
+
+    @pytest.mark.asyncio
+    async def test_execute_command_cwd_outside_workspace_is_blocked(self):
+        result = await self.server.call_tool('execute_command', {'command': 'ls', 'cwd': '/etc'})
+
+        assert result['result']['success'] is False
+        assert 'outside the workspace' in result['result']['error']
+
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

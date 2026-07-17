@@ -156,11 +156,21 @@ class MCPServer:
         
         self.register_tool(
             name="execute_command",
-            description="Execute a shell command",
+            description=(
+                "Execute a shell command. To run it in a subdirectory, pass cwd -- "
+                "do not chain `cd <dir> && ...` into the command string."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
                     "command": {"type": "string", "description": "Command to execute"},
+                    "cwd": {
+                        "type": "string",
+                        "description": (
+                            "Directory to run the command in, relative to the workspace root "
+                            "(or absolute). Defaults to the workspace root."
+                        ),
+                    },
                     "timeout": {"type": "integer", "description": "Timeout in seconds"}
                 },
                 "required": ["command"]
@@ -435,12 +445,19 @@ class MCPServer:
         except FileNotFoundError:
             return [{"error": "ripgrep (rg) not installed"}]
     
-    async def _execute_command(self, command: str, timeout: int = 60) -> Dict[str, Any]:
+    async def _execute_command(self, command: str, cwd: Optional[str] = None, timeout: int = 60) -> Dict[str, Any]:
+        try:
+            run_dir = self._resolve_in_workspace(cwd) if cwd else None
+        except PermissionError as e:
+            return {"error": str(e), "success": False}
+        if run_dir is not None and not run_dir.is_dir():
+            return {"error": f"cwd '{cwd}' is not a directory", "success": False}
         try:
             proc = await asyncio.create_subprocess_shell(
                 command,
                 stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
+                stderr=asyncio.subprocess.PIPE,
+                cwd=str(run_dir) if run_dir is not None else None,
             )
             stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
             return {

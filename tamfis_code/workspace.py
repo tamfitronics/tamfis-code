@@ -310,6 +310,13 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "common default port instead. The same applies to any other environment-specific "
         "value (host, container/process ID, file path, env var): find the real one via a "
         "tool call before using it, never assume it from a common default.",
+        "Before running any install/build/start command against a project (or one component "
+        "of a multi-component stack), first find out what kind of project it actually is -- "
+        "list_directory it and look for package.json (Node/npm), pyproject.toml/"
+        "requirements.txt (Python), go.mod (Go), Cargo.toml (Rust), Dockerfile/"
+        "docker-compose.yml, etc. Do not default to npm install/npm start just because a "
+        "component is called a 'backend' or is mentioned alongside a Node frontend -- run "
+        "the command that actually matches what's really there.",
         f"Workspace root: {context['working_directory']}",
     ]
     # discover_local_repository always sets repository_root (falling back to

@@ -23,6 +23,7 @@ changes to work with a local loop instead of remote SSE events.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
@@ -167,6 +168,23 @@ _CHANGE_REQUEST_VERBS = (
 
 def _looks_like_change_request(text: str) -> bool:
     return any(verb in text for verb in _CHANGE_REQUEST_VERBS)
+
+
+# Confirmed live: a weak model can write out a fenced code block like
+# ```python execute_command("...") ``` or a fake {"name": "execute_command",
+# "arguments": {...}} JSON blob in its own prose, as if narrating a tool call
+# it never actually made -- the round genuinely has zero real tool_calls, so
+# the turn completes normally with nothing having happened. This is a much
+# more precise signal than a verb heuristic: these are our own tool names,
+# so a real, legitimate answer essentially never needs to write one followed
+# by an opening paren.
+_FAKE_TOOL_CALL_RE = re.compile(
+    r"\b(?:read_file|write_file|edit_file|list_directory|search_code|execute_command|get_git_info|browser)\s*\("
+)
+
+
+def _looks_like_fake_tool_call(text: str) -> bool:
+    return bool(_FAKE_TOOL_CALL_RE.search(text))
 
 
 @dataclass
@@ -383,14 +401,23 @@ async def run_local_agent_turn(
                 error = "Provider completed without assistant text or tool calls."
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
-            # Confirmed live: a weak model can narrate "let's fix this" / "re-running
-            # the tests" in prose, complete with a fabricated "corrected" code block,
-            # without ever actually calling write_file/edit_file -- and the turn still
-            # completes normally since it simply stopped requesting tool calls. Never
-            # let that read as an unqualified success: if the objective clearly asked
-            # for a change and nothing was actually mutated, say so plainly instead of
-            # leaving the user to discover it themselves.
-            if not read_only and not any_mutation and _looks_like_change_request(_latest_user_text(messages)):
+            # Confirmed live, twice, in two different shapes: a weak model can narrate
+            # "let's fix this" with a fabricated "corrected" code block, or write a fake
+            # ```execute_command(...)``` / {"name": "execute_command", ...} block as if
+            # it had called the tool -- in both cases the round genuinely has zero real
+            # tool_calls, so the turn completes normally with nothing having happened.
+            # Never let either read as an unqualified success.
+            if _looks_like_fake_tool_call(content):
+                caveat = (
+                    "\n\n⚠ This response includes what looks like an unexecuted tool call "
+                    "(one of this agent's own tool names written out in text/code-block form) "
+                    "rather than a real action -- nothing beyond what's already listed above "
+                    "(if anything) actually happened. Ask again, more specifically, if you "
+                    "need this to actually run."
+                )
+                renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
+                content += caveat
+            elif not read_only and not any_mutation and _looks_like_change_request(_latest_user_text(messages)):
                 caveat = (
                     "\n\n⚠ No files were changed during this task, despite the request "
                     "asking for a fix/change. The response above may describe an edit "
