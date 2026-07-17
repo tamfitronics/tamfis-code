@@ -954,7 +954,7 @@ async def run_interactive(
                     if blocking_dirty_files(repo_state.get("dirty_files") or []):
                         print_error(console, "Existing uncommitted changes detected; execute mode is blocked to preserve user edits. Use /audit or /plan, or clean the worktree yourself.")
                         continue
-                renderer = StreamRenderer(console, objective=intent.objective)
+                renderer = StreamRenderer(console)
                 model_state = local_state.get_session_state(workspace.session_id)
                 if standalone:
                     outcome = await run_local_agent_turn(

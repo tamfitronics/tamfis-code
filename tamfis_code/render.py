@@ -19,6 +19,7 @@ from typing import Any, Optional
 from rich.console import Console, Group
 from rich.live import Live
 from rich.panel import Panel
+from rich.spinner import Spinner
 from rich.text import Text
 
 from .metrics import MetricsTracker
@@ -61,6 +62,39 @@ _PHASE_BY_EVENT = {
 # assistant_delta payloads carry raw text, not a real token count -- the
 # live panel labels this "~" to avoid presenting false precision.
 _CHARS_PER_TOKEN_ESTIMATE = 4
+
+# One friendly present-participle per phase for the single-line live status
+# (spinner + "Verb... (elapsed - tokens)"), grounded in what's actually
+# happening rather than picked at random -- "idle" is the constructor
+# default, never actually shown (task_started fires before the first
+# network call, see run_local_agent_turn).
+_VERB_BY_PHASE = {
+    "idle": "Working",
+    "submitting": "Submitting",
+    "queued": "Queued",
+    "understand": "Reading",
+    "route": "Routing",
+    "respond": "Responding",
+    "plan": "Planning",
+    "execute": "Working",
+    "waiting_for_approval": "Waiting",
+    "validate": "Checking",
+    "report": "Wrapping up",
+}
+
+
+def _format_elapsed(seconds: float) -> str:
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s"
+    minutes, secs = divmod(total, 60)
+    return f"{minutes}m {secs}s"
+
+
+def _format_token_count(n: int) -> str:
+    if n < 1000:
+        return str(n)
+    return f"{n / 1000:.1f}k"
 
 
 def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *, completed: bool = False) -> str:
@@ -221,33 +255,50 @@ def _format_diagnostics_line(payload: dict[str, Any]) -> str:
 
 
 class StreamRenderer:
-    def __init__(self, console: Console, objective: str = ""):
+    def __init__(self, console: Console):
         self.console = console
         self._assistant_open = False
+        # Printed at most once per StreamRenderer instance (i.e. once per
+        # overall user turn, however many tool-call rounds it takes) --
+        # _assistant_open alone used to gate this, so every round after a
+        # tool call reopened a brand new "Assistant" header, making a single
+        # turn with two tool rounds read as two separate answers instead of
+        # one continuous response with tool calls woven through it.
+        self._assistant_header_shown = False
         self._tool_names_by_call_id: dict[str, str] = {}
         self._selected_provider: Optional[str] = None
         self.streamed_final_text = False  # True once any assistant_delta content is shown
         self.debug = os.environ.get("TAMFIS_CODE_DEBUG", "").lower() in {"1", "true", "yes"}
 
-        # Live task-visibility panel -- gated on the console actually being a
-        # TTY so redirected/piped output (`tamfis-code agent "..." > out.txt`)
-        # keeps today's clean plain-text behaviour untouched.
-        self._objective = objective
+        # Live task-visibility status line -- gated on the console actually
+        # being a TTY so redirected/piped output (`tamfis-code agent "..." >
+        # out.txt`) keeps today's clean plain-text behaviour untouched.
+        # Single line + spinner (verb..."(elapsed - tokens)"), not a bordered
+        # panel: matches how Claude Code itself shows live progress, rather
+        # than a boxed multi-line status card.
         self._phase = "idle"
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
         self._metrics = MetricsTracker()
+        self._spinner = Spinner("dots", style="cyan")
         self._is_tty = bool(getattr(console, "is_terminal", False))
         self._live: Optional[Live] = None
         if self._is_tty:
-            self._live = Live(self._build_panel(), console=self.console, refresh_per_second=8, transient=True)
+            self._live = Live(self._build_status(), console=self.console, refresh_per_second=8, transient=True)
             self._live.start()
 
-    def _build_panel(self) -> Panel:
+    def _build_status(self) -> Any:
+        elapsed = time.monotonic() - self._task_start
+        tokens = self._metrics.metrics.tokens_used
+        detail_parts = [_format_elapsed(elapsed)]
+        if tokens:
+            detail_parts.append(f"↓ {_format_token_count(tokens)} tokens")
+        verb = _VERB_BY_PHASE.get(self._phase, self._phase)
+        label = f"[bold]{verb}…[/bold] [dim]({' · '.join(detail_parts)})[/dim]"
+        self._spinner.update(text=Text.from_markup(label))
+        if not self._plan_steps:
+            return self._spinner
         lines = []
-        if self._objective:
-            lines.append(f"[bold]{self._objective}[/bold]")
-        lines.append(f"[dim]phase:[/dim] {self._phase}")
         for step in self._plan_steps:
             status = step.get("status")
             marker = "[green]✓[/green]" if status == "completed" else (
@@ -258,20 +309,11 @@ class StreamRenderer:
             # plan_created payload are a best-effort approximation, so this
             # is labelled "~" rather than presented as precise.
             lines.append(f"  {marker} {'~ ' if status == 'in_progress' else ''}{step.get('step') or ''}")
-        elapsed = time.monotonic() - self._task_start
-        tokens = self._metrics.metrics.tokens_used
-        if tokens:
-            lines.append(
-                f"[dim]~{tokens:,} tok (est.) · {self._metrics.metrics.tokens_per_second:.1f} tok/s · "
-                f"{elapsed:.1f}s[/dim]"
-            )
-        else:
-            lines.append(f"[dim]{elapsed:.1f}s[/dim]")
-        return Panel(Group(*(Text.from_markup(line) for line in lines)), border_style="cyan", expand=False)
+        return Group(self._spinner, *(Text.from_markup(line) for line in lines))
 
     def _refresh_live(self) -> None:
         if self._live is not None:
-            self._live.update(self._build_panel())
+            self._live.update(self._build_status())
 
     def _stop_live(self) -> None:
         """End the progress display before ordinary streamed output begins."""
@@ -303,7 +345,9 @@ class StreamRenderer:
             content = str(payload.get("content", ""))
             if not self._assistant_open:
                 self._stop_live()
-                self.console.print("[bold cyan]Assistant[/bold cyan]")
+                if not self._assistant_header_shown:
+                    self.console.print("[bold cyan]Assistant[/bold cyan]")
+                    self._assistant_header_shown = True
                 self._assistant_open = True
             # Whitespace/reasoning-only provider frames are not a visible
             # final answer. Marking them as displayed suppresses cli.py's
