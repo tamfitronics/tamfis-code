@@ -57,7 +57,9 @@ class _FakeClient:
 class _FakeManager:
     def __init__(self, client):
         self._client = client
-        self.PROVIDERS = {ProviderType.OLLAMA: SimpleNamespace(default_model="fake-model")}
+        self.PROVIDERS = {
+            ProviderType.OLLAMA: SimpleNamespace(default_model="fake-model", context_window=32768)
+        }
 
     def get_client(self, provider):
         return self._client
@@ -172,11 +174,13 @@ class RunLocalAgentTurnTests(_StatePatchMixin, unittest.TestCase):
 
     def test_round_limit_terminates_instead_of_looping_forever(self):
         with tempfile.TemporaryDirectory() as ws:
-            read_args = '{"path": "."}'
-            # Every round returns another tool call, never plain content --
-            # must still terminate at max_rounds rather than hang/loop forever.
+            # Every round returns another tool call, never plain content, and
+            # each round's arguments differ (a distinct path) so the
+            # identical-repetition guard never fires -- this isolates the
+            # max_rounds safety valve from that separate guard, which has its
+            # own test below.
             rounds = [
-                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id=f"call_{i}", name="list_directory", arguments=read_args)]))]
+                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id=f"call_{i}", name="list_directory", arguments=f'{{"path": "dir_{i}"}}')]))]
                 for i in range(3)
             ]
             client = _FakeClient(rounds)
@@ -192,6 +196,55 @@ class RunLocalAgentTurnTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(outcome.status, "failed")
             self.assertIn("3 tool-call rounds", outcome.error)
             self.assertEqual(len(client.calls), 3)
+
+    def test_identical_tool_call_repeated_stops_before_max_rounds(self):
+        with tempfile.TemporaryDirectory() as ws:
+            # Same tool + same arguments every round: the model is stuck
+            # repeating itself (e.g. polling a health check that never
+            # changes), not making progress -- must stop well before
+            # max_rounds, unlike the varied-arguments case above.
+            read_args = '{"path": "."}'
+            rounds = [
+                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id=f"call_{i}", name="list_directory", arguments=read_args)]))]
+                for i in range(50)
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.OLLAMA, None, [{"role": "user", "content": "check repeatedly"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False, max_rounds=50,
+            ))
+
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn("stuck repeating", outcome.error)
+            # 3 identical rounds is enough to trip the guard -- nowhere near
+            # the 50-round cap.
+            self.assertLess(len(client.calls), 10)
+
+    def test_context_budget_exceeded_stops_before_request(self):
+        with tempfile.TemporaryDirectory() as ws:
+            # A provider config with a tiny context window: even the system
+            # prompt + one user message should already exceed it, so this
+            # must abort before ever calling the client -- never guaranteed
+            # to blow up with a real 400 from the provider.
+            client = _FakeClient(rounds=[])
+            manager = _FakeManager(client)
+            manager.PROVIDERS[ProviderType.OLLAMA].context_window = 10
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.OLLAMA, None,
+                [{"role": "user", "content": "a" * 2000}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn("context window", outcome.error)
+            self.assertEqual(len(client.calls), 0)
 
     def test_read_only_mode_refuses_mutating_tool_even_if_offered(self):
         with tempfile.TemporaryDirectory() as ws:

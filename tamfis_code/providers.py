@@ -30,6 +30,13 @@ class ProviderConfig:
     weight: int = 1
     reasoning_supported: bool = False
     vision_supported: bool = False
+    # Conservative combined input+output token ceiling for this provider's
+    # default/smaller models -- drifts just like the model lists above (a
+    # specific model may support more or less), so runner_local.py's budget
+    # check treats this as a safety floor, not an exact figure. Confirmed
+    # live for HF: Qwen2.5-7B-Instruct 400'd at inputs(29548)+max_new_tokens
+    # (4096) > 32769.
+    context_window: int = 32768
 
 
 class ProviderManager:
@@ -79,7 +86,8 @@ class ProviderManager:
             ],
             weight=3,
             reasoning_supported=True,
-            vision_supported=False
+            vision_supported=False,
+            context_window=128000,
         ),
         ProviderType.OPENROUTER: ProviderConfig(
             name="OpenRouter",
@@ -134,7 +142,12 @@ class ProviderManager:
             ],
             weight=0,
             reasoning_supported=True,
-            vision_supported=True
+            vision_supported=True,
+            # Ollama's serving context is whatever num_ctx the running model
+            # was pulled/configured with, commonly far smaller than the
+            # model's architectural maximum -- 8k is a conservative floor for
+            # the small models in this list, not a promise of the true limit.
+            context_window=8192,
         ),
     }
     

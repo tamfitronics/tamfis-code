@@ -43,6 +43,60 @@ from .safety import READ_ONLY_TOOLS, classify_tool_call_risk
 # something is genuinely stuck in a loop, not to cap normal work.
 MAX_AGENT_ROUNDS = 200
 
+# If the model requests the exact same tool call(s) (name + arguments,
+# unordered) this many rounds in a row, stop rather than let it spin: a
+# weaker model asked to check on something that never changes (a health
+# endpoint that's never up, a container ID it never filled in) will
+# otherwise repeat identically until MAX_AGENT_ROUNDS or a context-window
+# error ends it, burning a lot of time/tokens along the way. 2 tolerates a
+# legitimate one-off retry; 3 identical rounds in a row is not progress.
+MAX_CONSECUTIVE_IDENTICAL_ROUNDS = 2
+
+# Same 4-chars-per-token heuristic render.py uses for its live token counter
+# (_CHARS_PER_TOKEN_ESTIMATE) -- good enough to budget against a context
+# window, not meant to match a real tokenizer exactly.
+_CHARS_PER_TOKEN_ESTIMATE = 4
+MAX_TOKENS_PER_REQUEST = 4096
+# Leave headroom below the provider's stated context_window: it's a
+# conservative estimate already (see providers.py), and this estimate's own
+# char/token ratio is approximate too.
+_CONTEXT_SAFETY_MARGIN = 0.9
+
+
+def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
+    """Rough token estimate for a working-messages list, counting both
+    message content and any tool_calls argument strings (which can be large
+    for tools like write_file)."""
+    total_chars = 0
+    for message in messages:
+        total_chars += len(str(message.get("content") or ""))
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            total_chars += len(str(function.get("arguments") or ""))
+    return total_chars // _CHARS_PER_TOKEN_ESTIMATE
+
+
+def _trim_tool_outputs(messages: list[dict[str, Any]], target_tokens: int, keep_recent: int = 6) -> bool:
+    """Truncate older, large tool-result message contents in place to
+    reclaim context budget before a request would otherwise exceed the
+    provider's window. Never touches the system message or the most recent
+    `keep_recent` messages, since the model needs those intact to reason
+    about what it just did. Returns True if anything was trimmed."""
+    trimmed_any = False
+    boundary = max(1, len(messages) - keep_recent)
+    for message in messages[1:boundary]:
+        if message.get("role") != "tool":
+            continue
+        content = str(message.get("content") or "")
+        if len(content) > 400:
+            message["content"] = (
+                content[:200] + "\n...[truncated to reclaim context budget]...\n" + content[-100:]
+            )
+            trimmed_any = True
+        if _estimate_tokens(messages) <= target_tokens:
+            break
+    return trimmed_any
+
 
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
@@ -82,6 +136,12 @@ class _StreamedToolCall:
     arguments: str = ""
 
 
+def _tool_calls_signature(tool_calls: list[_StreamedToolCall]) -> tuple[tuple[str, str], ...]:
+    """Order-independent fingerprint of a round's tool calls, used to detect
+    the model repeating the exact same request(s) round after round."""
+    return tuple(sorted((tc.name, tc.arguments) for tc in tool_calls))
+
+
 async def _stream_one_completion(
     client, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     renderer: StreamRenderer,
@@ -99,7 +159,7 @@ async def _stream_one_completion(
         "messages": messages,
         "stream": True,
         "temperature": 0.2,
-        "max_tokens": 4096,
+        "max_tokens": MAX_TOKENS_PER_REQUEST,
     }
     # Do not send an empty tools array. Some OpenAI-compatible servers and
     # small local models behave differently merely because tool mode is
@@ -189,6 +249,9 @@ async def run_local_agent_turn(
     session_approved_risks: set[str] = set()
     renderer.handle_event({"event_type": "context_reused", "payload": {"workspace_root": workspace_root}})
 
+    previous_tool_calls_signature: Optional[tuple[tuple[str, str], ...]] = None
+    consecutive_identical_rounds = 0
+
     for _round in range(max_rounds):
         renderer.handle_event({"event_type": "routing_started", "payload": {"requested_provider": provider.value}})
         client = manager.get_client(provider)
@@ -199,6 +262,28 @@ async def run_local_agent_turn(
         resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
         config = manager.PROVIDERS[resolved_provider]
         resolved_model = model or config.default_model
+
+        # Never fire a request already guaranteed to blow the provider's
+        # context window -- confirmed live: HF 400'd with inputs(29548) +
+        # max_new_tokens(4096) > 32769 after a long tool-calling session grew
+        # working_messages unchecked. Try reclaiming budget from old, large
+        # tool outputs first; only give up if that's not enough.
+        token_budget = int(config.context_window * _CONTEXT_SAFETY_MARGIN) - MAX_TOKENS_PER_REQUEST
+        input_tokens = _estimate_tokens(working_messages)
+        if input_tokens > token_budget:
+            _trim_tool_outputs(working_messages, token_budget)
+            input_tokens = _estimate_tokens(working_messages)
+        if input_tokens > token_budget:
+            message = (
+                f"Stopping before round {_round + 1}: this turn has grown to "
+                f"~{input_tokens} estimated tokens, too large for "
+                f"{resolved_provider.value}'s ~{config.context_window}-token context "
+                "window even after trimming old tool output. Start a new turn to "
+                "continue (e.g. narrow the objective, or /clear stale context)."
+            )
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            return TaskOutcome(status="failed", error=message)
+
         renderer.handle_event({
             "event_type": "model_selected",
             "payload": {"provider": resolved_provider.value, "model": resolved_model},
@@ -229,7 +314,7 @@ async def run_local_agent_turn(
                     "messages": working_messages,
                     "stream": False,
                     "temperature": 0.2,
-                    "max_tokens": 4096,
+                    "max_tokens": MAX_TOKENS_PER_REQUEST,
                 }
                 if tools:
                     fallback_kwargs["tools"] = tools
@@ -259,6 +344,23 @@ async def run_local_agent_turn(
                 return TaskOutcome(status="failed", error=error)
             renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed"}})
             return TaskOutcome(status="completed", summary=content)
+
+        signature = _tool_calls_signature(tool_calls)
+        if signature == previous_tool_calls_signature:
+            consecutive_identical_rounds += 1
+        else:
+            consecutive_identical_rounds = 0
+        previous_tool_calls_signature = signature
+        if consecutive_identical_rounds >= MAX_CONSECUTIVE_IDENTICAL_ROUNDS:
+            names = ", ".join(sorted({tc.name for tc in tool_calls})) or "tool call"
+            message = (
+                f"Stopped after the same {names} request repeated "
+                f"{consecutive_identical_rounds + 1} rounds in a row with identical "
+                "arguments -- this usually means the model is stuck repeating itself "
+                "rather than making progress, not that it's legitimately polling."
+            )
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            return TaskOutcome(status="failed", error=message)
 
         working_messages.append({
             "role": "assistant", "content": content or "",
