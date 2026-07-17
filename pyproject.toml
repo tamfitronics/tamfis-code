@@ -1,6 +1,6 @@
 [project]
 name = "tamfis-code"
-version = "0.2.0"
+version = "0.2.3"
 description = "TamfisGPT Code -- standalone terminal coding agent (calls HF/NVIDIA NIM/OpenRouter/Ollama directly; --remote for the legacy TamfisGPT Remote backend)"
 readme = "README.md"
 requires-python = ">=3.10"

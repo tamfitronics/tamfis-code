@@ -17,7 +17,7 @@ See docs/REMOTE_AGENT_MASTER_SPEC.md, Phase 21, for the original --remote
 architecture's spec.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.2.3"
 
 # Bumped whenever a CLI release requires a minimum backend Remote API
 # contract version. Only meaningful for --remote; the standalone path has no
