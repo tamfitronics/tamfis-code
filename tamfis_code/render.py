@@ -164,6 +164,30 @@ def _bounded_preview(text: str, limit: int = 8_000) -> str:
     return f"{text[:head]}\n\n… {len(text) - limit:,} characters omitted …\n\n{text[-tail:]}"
 
 
+_RESULT_BLOCK_MAX_LINES = 20
+
+
+def _render_result_block(console: Console, *, ok: bool, label: str, content: str) -> None:
+    """Minimal, unboxed rendering for a completed tool call or shell command:
+    one status-glyph line plus dimmed, indented output -- not a bordered
+    Panel. Every tool/command result getting its own box (as command_started/
+    tool_call_requested's completions used to) produced exactly the
+    box-per-line noise a real agent session showed: a wall of boxes for
+    routine reads/greps/pip-freezes. Approval prompts still get a Panel
+    (see approval_required below) since those genuinely need to interrupt."""
+    glyph, style = ("✓", "green") if ok else ("✗", "red")
+    console.print(f"[{style}]{glyph}[/{style}] {label}")
+    body = content.strip("\n")
+    if not body:
+        return
+    lines = _bounded_preview(body).split("\n")
+    if len(lines) > _RESULT_BLOCK_MAX_LINES:
+        omitted = len(lines) - _RESULT_BLOCK_MAX_LINES
+        lines = lines[:_RESULT_BLOCK_MAX_LINES] + [f"… {omitted} more line{'s' if omitted != 1 else ''} …"]
+    for line in lines:
+        console.print(f"  [dim]{line}[/dim]")
+
+
 def _format_diagnostics_line(payload: dict[str, Any]) -> str:
     """One-line summary of a task_diagnostics event (see PHASE 17 note in
     tier_ii_gateway/api/remote.py's _run_remote_ai_task_background) -- the
@@ -359,7 +383,6 @@ class StreamRenderer:
             ):
                 return
             content, failed = _tool_result_message(payload)
-            style = "red" if failed else "green"
             result = result_envelope
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
             if not args and isinstance(result, dict):
@@ -367,11 +390,8 @@ class StreamRenderer:
                     "path": result.get("resolved_path") or result.get("path"),
                     "command": result.get("command"),
                 }
-            title = (
-                f"{_tool_action_label(tool, args, completed=True)} — failed"
-                if failed else _tool_action_label(tool, args, completed=True)
-            )
-            self.console.print(Panel(content, title=title, border_style=style, expand=False))
+            label = _tool_action_label(tool, args, completed=True)
+            _render_result_block(self.console, ok=not failed, label=label, content=content)
             return
 
         if event_type in ("artifact_generated", "diff_available"):
@@ -414,17 +434,11 @@ class StreamRenderer:
             stdout = str(payload.get("stdout", ""))
             stderr = str(payload.get("stderr", ""))
             exit_code = payload.get("exit_code")
-            style = "green" if event_type == "command_completed" and exit_code == 0 else "red"
+            ok = event_type == "command_completed" and exit_code == 0
             body = stdout.strip()
             if stderr.strip():
                 body = (body + "\n" + stderr.strip()).strip()
-            if not body:
-                body = (
-                    "Command completed successfully with no output"
-                    if event_type == "command_completed" and exit_code == 0
-                    else f"Command failed with exit code {exit_code}"
-                )
-            self.console.print(Panel(body, title=f"exit {exit_code}", border_style=style, expand=False))
+            _render_result_block(self.console, ok=ok, label=f"exit {exit_code}", content=body)
             return
 
         if event_type == "approval_required":

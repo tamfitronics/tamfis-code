@@ -55,14 +55,15 @@ class StreamRendererTests(unittest.TestCase):
         })
         self.assertIn("rm -rf build", console.file.getvalue())
 
-    def test_tool_output_success_and_failure_render_distinct_titles(self):
+    def test_tool_output_success_and_failure_render_distinctly(self):
         console = _console()
         renderer = StreamRenderer(console)
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "remote_exec", "content": "ok", "success": True}})
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "remote_exec", "content": "Error: bad", "success": False}})
         output = console.file.getvalue()
         self.assertIn("Ran command", output)
-        self.assertIn("failed", output)
+        self.assertIn("✓", output)
+        self.assertIn("✗", output)
 
     def test_empty_tool_completion_envelope_is_not_rendered_as_fake_result(self):
         console = _console()

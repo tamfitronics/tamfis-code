@@ -76,6 +76,31 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return total_chars // _CHARS_PER_TOKEN_ESTIMATE
 
 
+def _tool_output_for_render(result: dict[str, Any]) -> dict[str, Any]:
+    """Flatten MCPServer.call_tool()'s {"result": <actual>, "tool":, "success":}
+    envelope into the shape render.py's tool_output handler actually reads
+    (content/stdout/stderr/exit_code/error/success at the top level).
+
+    Without this, a real, successful tool call could render no visible line
+    at all: read_file's actual payload is a plain string (not under a
+    "content" key), list_directory's is a plain list, and execute_command's
+    nested dict uses "return_code" where render.py looks for "exit_code" --
+    render.py's suppression check (skip rendering a tool-completion envelope
+    with none of its recognized keys populated) was silently eating all
+    three. The model still sees the unflattened `result` via working_messages
+    either way; this only reshapes what the human display reads."""
+    flattened = dict(result)
+    inner = flattened.pop("result", None)
+    if isinstance(inner, str):
+        flattened.setdefault("content", inner)
+    elif isinstance(inner, list):
+        flattened.setdefault("content", f"{len(inner)} item(s)" if inner else "(empty)")
+    elif isinstance(inner, dict):
+        for key, value in inner.items():
+            flattened.setdefault("exit_code" if key == "return_code" else key, value)
+    return flattened
+
+
 def _trim_tool_outputs(messages: list[dict[str, Any]], target_tokens: int, keep_recent: int = 6) -> bool:
     """Truncate older, large tool-result message contents in place to
     reclaim context budget before a request would otherwise exceed the
@@ -393,7 +418,14 @@ async def run_local_agent_turn(
                         "working_directory": workspace_root, "reason": "The agent requested this command.",
                     },
                 })
-                decision = resolve_approval_decision(console, f"{tc.name}({json.dumps(arguments, default=str)})", risk, approval_policy, interactive)
+                # The event above already rendered the full command/cwd/reason/risk
+                # card (render.py's approval_required handler) -- display_preview=False
+                # so the prompt doesn't draw a second, less-informative panel for the
+                # same approval (matches runner.py's remote-path fix for the same trap).
+                decision = resolve_approval_decision(
+                    console, f"{tc.name}({json.dumps(arguments, default=str)})", risk, approval_policy, interactive,
+                    display_preview=False,
+                )
                 if decision == "approve_session":
                     session_approved_risks.add(risk)
                 elif decision == "deny":
@@ -403,7 +435,7 @@ async def run_local_agent_turn(
                     continue
 
             result = await mcp_server.call_tool(tc.name, arguments)
-            renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+            renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": _tool_output_for_render(result)}})
             working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result, default=str)})
 
             if tc.name in {"write_file", "edit_file"} and result.get("success"):
@@ -455,10 +487,8 @@ async def run_local_shell_command(
     body = stdout.strip()
     if stderr.strip():
         body = (body + "\n" + stderr.strip()).strip()
-    if not body:
-        body = "Command completed successfully with no output" if ok else f"Command failed with exit code {exit_code}"
-    from rich.panel import Panel
-    console.print(Panel(body, title=f"exit {exit_code}", border_style="green" if ok else "red"))
+    from .render import _render_result_block
+    _render_result_block(console, ok=ok, label=f"exit {exit_code}", content=body)
 
     outcome = TaskOutcome(status="completed", summary=stdout) if ok else TaskOutcome(status="failed", error=stderr or f"exit code {exit_code}")
     local_state.finish_action(session_id, action.id, status=outcome.status, summary=f"exit={exit_code}")

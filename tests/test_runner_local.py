@@ -10,7 +10,38 @@ from rich.console import Console
 
 from tamfis_code import state as state_module
 from tamfis_code.providers import ProviderType
-from tamfis_code.runner_local import run_local_agent_turn
+from tamfis_code.runner_local import _tool_output_for_render, run_local_agent_turn
+
+
+class ToolOutputForRenderTests(unittest.TestCase):
+    """MCPServer.call_tool() nests its actual return value under a "result"
+    key; render.py's tool_output handler only looks at top-level keys like
+    content/stdout/exit_code. Without flattening, a real successful call
+    could render nothing at all -- these lock in the three shapes that
+    actually come back from mcp.py's built-in tools."""
+
+    def test_string_result_becomes_content(self):
+        flattened = _tool_output_for_render({"result": "file contents", "tool": "read_file", "success": True})
+        self.assertEqual(flattened["content"], "file contents")
+
+    def test_list_result_becomes_a_summary_count(self):
+        flattened = _tool_output_for_render({
+            "result": [{"name": "a.py"}, {"name": "b.py"}], "tool": "list_directory", "success": True,
+        })
+        self.assertEqual(flattened["content"], "2 item(s)")
+
+    def test_empty_list_result_is_not_treated_as_missing(self):
+        flattened = _tool_output_for_render({"result": [], "tool": "list_directory", "success": True})
+        self.assertEqual(flattened["content"], "(empty)")
+
+    def test_execute_command_dict_maps_return_code_to_exit_code(self):
+        flattened = _tool_output_for_render({
+            "result": {"stdout": "hi\n", "stderr": "", "return_code": 0, "success": True},
+            "tool": "execute_command", "success": True,
+        })
+        self.assertEqual(flattened["stdout"], "hi\n")
+        self.assertEqual(flattened["exit_code"], 0)
+        self.assertNotIn("return_code", flattened)
 
 
 def _delta(content=None, tool_calls=None):
