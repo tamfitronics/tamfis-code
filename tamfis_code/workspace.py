@@ -299,6 +299,17 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "changing a file, call the tool that changes it before you say you've changed it. "
         "If you're unsure which file actually defines something, use read_file or "
         "search_code to find it first; do not guess a file's contents from its name.",
+        "Before checking whether any local service is 'healthy' or 'running', you must "
+        "first find its REAL configured port -- do not use 8080/3000/5000/8000 or any "
+        "other common default unless you have actually confirmed that's the real one. "
+        "Concrete required steps, in order: (1) search_code for \"port\" (or read "
+        "config.yaml/.env/docker-compose.yml/package.json, whichever exists) to find the "
+        "actual configured port; (2) only then curl/request that exact port. Getting ANY "
+        "HTTP response back from a guessed port is NOT evidence the intended service is "
+        "healthy -- an entirely different, unrelated process can easily be listening on a "
+        "common default port instead. The same applies to any other environment-specific "
+        "value (host, container/process ID, file path, env var): find the real one via a "
+        "tool call before using it, never assume it from a common default.",
         f"Workspace root: {context['working_directory']}",
     ]
     # discover_local_repository always sets repository_root (falling back to
