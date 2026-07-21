@@ -48,6 +48,40 @@ verified `agent/commercial-release-0.6.1` branch and draft PR #1. The
 and `tamfis-code==0.6.1` is publicly available on PyPI. There is no matching
 `tamfitronics/tamgpt6` repository. No PyPI secret was required or stored.
 
+Current release record:
+
+- Release commit: `72b9382` (`Release commercial standalone runtime 0.6.1`).
+- Status follow-up commit: `b804473` (`Update release status after PyPI deployment`).
+- Release tag: `v0.6.1`.
+- Draft PR: [tamfitronics/tamfis-code#1](https://github.com/tamfitronics/tamfis-code/pull/1).
+- Successful deployment run:
+  [GitHub Actions run 29875141492](https://github.com/tamfitronics/tamfis-code/actions/runs/29875141492).
+- Published package:
+  [PyPI tamfis-code 0.6.1](https://pypi.org/project/tamfis-code/0.6.1/).
+- The first CI attempt exposed that `rg` is not guaranteed on hosted/minimal
+  systems. `mcp.py` now falls back to bounded standard-library search, and
+  the corrected CI run passed before publishing.
+- Published-checkout CI passed **869 tests**; the local source checkout passed
+  **850 tests** with an isolated writable config directory. The difference is
+  the repository's retained historical Ollama-only test, which was removed
+  from the release branch because Ollama is not a supported provider in the
+  current provider registry.
+- TamGPT6 backend validation passed **8 tests** covering the OpenAI-compatible
+  client-tool path and admin API-key lifecycle.
+- The release artifact contains local tools, PTY/TTY support, approvals,
+  planning, durable state, live queue input, subscription routing, hooks,
+  swarm/delegation, OpenHands-compatible runtime pieces, and the client-side
+  tool execution contract.
+- GitHub token credentials were used only through environment-backed commands;
+  no token was committed. The token was exposed once in a command-generated
+  remote URL during the initial push and must be revoked/rotated by the
+  account owner.
+
+Known deployment boundary: the GitHub branch/PR is still a draft and requires
+the repository owner to review and merge it. PyPI 0.6.1 is already published;
+future releases should use the existing `publish.yml` Trusted Publishing
+workflow and a new version tag.
+
 ## Live-reported: execute_command's `environment` argument also crashed the same way (2026-07-21, v0.4.42)
 
 Direct follow-up to v0.4.41 below, same session: user pasted another live crash, `'str' object has no attribute 'items'`. Same root cause, same tool, different parameter: `_execute_command`'s `environment: Optional[Dict[str, str]] = None` is only a type hint, and `env.update({str(k): str(v) for k, v in environment.items()})` assumed a real dict unconditionally. A real tool call sent `environment` as something other than an actual object (most likely a JSON-encoded string), and `.items()` crashed exactly as reported.
