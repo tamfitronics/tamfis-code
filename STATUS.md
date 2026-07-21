@@ -13,7 +13,7 @@ already superseded by same-day code changes).
 **Rule going forward: don't create a new dated audit file for tamfis-code.
 Update this one.**
 
-## Post-release plan progress, model routing, and evidence fix (2026-07-22, working tree)
+## Post-release plan progress, model routing, evidence, and fallback fix (2026-07-22, working tree)
 
 Fixed the remaining plan-visibility gap identified after v0.6.1:
 
@@ -41,11 +41,16 @@ Fixed the remaining plan-visibility gap identified after v0.6.1:
 - Final completions now use a compact `Summary / Changes / Verification /
   Remaining issues` contract with flat, non-nested bullets; durable plan and
   progress panels remain the single source of truth for execution tracking.
+- HTTP 400 responses containing NVIDIA's `DEGRADED function cannot be
+  invoked` route error are now retryable, so AUTO switches to the next
+  eligible model/provider instead of stopping with a checkpointed failure.
+  Unrelated HTTP 400 errors remain non-retryable.
 
 Verification after this fix: **854 tests passed** with an isolated writable
 config directory (3 existing collection/deprecation warnings). These changes
-are assigned to release **0.6.2**; GitHub/PyPI publication is the remaining
-release step for this working tree.
+are assigned to release **0.6.3**; GitHub/PyPI publication is the remaining
+release step for this working tree. The preceding 0.6.2 tag is already in its
+hosted publication workflow and will not be rewritten.
 
 ## Release gate and live queue UX (2026-07-21, v0.6.1)
 

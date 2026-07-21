@@ -156,6 +156,21 @@ def test_generic_open_stream_failure_is_retryable():
     assert ProviderManager.is_retryable_provider_error(exc)
 
 
+def test_nvidia_degraded_function_400_is_retryable():
+    exc = RuntimeError(
+        "Error code: 400 - {'status': 400, 'title': 'Bad Request', "
+        "'detail': \"Function id 'abc': DEGRADED function cannot be invoked\"}"
+    )
+    assert ProviderManager.is_retryable_provider_error(exc)
+
+
+def test_unrelated_http_400_is_not_retryable():
+    class BadRequest(Exception):
+        status_code = 400
+
+    assert not ProviderManager.is_retryable_provider_error(BadRequest("invalid request"))
+
+
 def test_nim_account_entitlement_404_is_retryable():
     # Live-reported: moonshotai/kimi-k2.6 returns a real 404 with this exact
     # shape when the account has no deployment access to that specific

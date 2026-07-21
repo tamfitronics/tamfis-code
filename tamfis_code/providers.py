@@ -621,6 +621,17 @@ class ProviderManager:
 
         status = cls.provider_error_status(exc)
         if status is not None:
+            # NVIDIA can return HTTP 400 when a model's registered function
+            # is degraded or unavailable. This is a route/model capability
+            # failure, not a malformed user request; AUTO must continue with
+            # the next eligible provider instead of stopping the task.
+            if status == 400:
+                message = str(exc).lower()
+                if (
+                    "degraded function cannot be invoked" in message
+                    or "function cannot be invoked" in message
+                ):
+                    return True
             return status in {
                 401,
                 402,
@@ -674,6 +685,8 @@ class ProviderManager:
             # provider/model is exactly the right response -- this is an
             # account-entitlement failure, not a bad request.
             "not found for account",
+            "degraded function cannot be invoked",
+            "function cannot be invoked",
         )
         return any(marker in message for marker in retryable_markers)
 
