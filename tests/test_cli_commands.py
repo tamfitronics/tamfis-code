@@ -1,3 +1,4 @@
+import asyncio
 import os
 import tempfile
 import unittest
@@ -271,17 +272,73 @@ class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase
         with tempfile.TemporaryDirectory() as tmp:
             with patch("tamfis_code.cli.RemoteAPIClient") as fake_remote_client, \
                     patch("tamfis_code.runner_local.run_local_agent_turn", new=AsyncMock(return_value=TaskOutcome(status="completed", summary="hi"))):
-                result = self.runner.invoke(cli, ["--cwd", tmp, "chat", "hello", "--provider", "ollama"])
+                result = self.runner.invoke(cli, ["--cwd", tmp, "chat", "hello", "--provider", "nvidia"])
             self.assertEqual(result.exit_code, 0, result.output)
             fake_remote_client.assert_not_called()
 
-    def test_attach_is_not_supported_in_standalone_mode(self):
+    def test_standalone_chat_is_interactive_when_stdin_is_a_real_tty(self):
+        """Confirmed live: `interactive` was hardcoded False for every
+        one-shot command (agent/ask/chat/audit/plan/run/retry), regardless
+        of whether a real human was sitting at an attached terminal -- the
+        default "ask" approval policy's (y)es/(n)o/(a)lways prompt could
+        never appear at all, no matter what; every risky action was
+        silently denied instead. It must now follow sys.stdin.isatty().
+
+        Calls _run_local_ai_command directly rather than through
+        CliRunner.invoke() -- CliRunner replaces sys.stdin with its own
+        captured-output stream for the duration of invoke(), which would
+        make a patched sys.stdin.isatty() irrelevant by the time the
+        command body actually runs.
+        """
+        from tamfis_code.cli import _run_local_ai_command
+        from tamfis_code.runner import TaskOutcome
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.sys.stdin.isatty", return_value=True), \
+                    patch(
+                        "tamfis_code.runner_local.run_local_agent_turn",
+                        new=AsyncMock(return_value=TaskOutcome(status="completed", summary="hi")),
+                    ) as fake_turn:
+                exit_code = asyncio.run(
+                    _run_local_ai_command(Config(), Path(tmp), "hello", "chat", "auto", "nvidia", ())
+                )
+            self.assertEqual(exit_code, 0)
+            self.assertTrue(fake_turn.call_args.kwargs.get("interactive"))
+
+    def test_standalone_chat_stays_non_interactive_when_stdin_is_piped(self):
+        from tamfis_code.cli import _run_local_ai_command
+        from tamfis_code.runner import TaskOutcome
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.sys.stdin.isatty", return_value=False), \
+                    patch(
+                        "tamfis_code.runner_local.run_local_agent_turn",
+                        new=AsyncMock(return_value=TaskOutcome(status="completed", summary="hi")),
+                    ) as fake_turn:
+                exit_code = asyncio.run(
+                    _run_local_ai_command(Config(), Path(tmp), "hello", "chat", "auto", "nvidia", ())
+                )
+            self.assertEqual(exit_code, 0)
+            self.assertFalse(fake_turn.call_args.kwargs.get("interactive"))
+
+    def test_attach_is_passed_to_standalone_turn_as_an_explicit_read_only_input(self):
+        from tamfis_code.runner import TaskOutcome
+
         with tempfile.TemporaryDirectory() as tmp:
             probe = Path(tmp) / "probe.txt"
             probe.write_text("x")
-            result = self.runner.invoke(cli, ["--cwd", tmp, "ask", "look at this", "--attach", str(probe)])
-        self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("not yet supported in standalone", result.output)
+            with patch(
+                "tamfis_code.runner_local.run_local_agent_turn",
+                new=AsyncMock(return_value=TaskOutcome(status="completed", summary="inspected")),
+            ) as fake_turn:
+                result = self.runner.invoke(
+                    cli, ["--cwd", tmp, "ask", "look at this", "--attach", str(probe), "--provider", "nvidia"],
+                )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(fake_turn.call_args.kwargs["attachment_paths"], (str(probe.resolve()),))
+        messages = fake_turn.call_args.args[3]
+        self.assertIn(str(probe.resolve()), messages[0]["content"])
+        self.assertEqual(messages[-1], {"role": "user", "content": "look at this"})
 
     def test_default_backend_remote_in_config_uses_remote_without_the_flag(self):
         # A paid TamfisGPT tenant sets this once instead of typing --remote
@@ -293,6 +350,70 @@ class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase
                 self.runner.invoke(cli, ["--cwd", tmp, "ask", "do something"])
             fake_remote_run.assert_called_once()
             fake_local_run.assert_not_called()
+
+
+class AgentCmdDelegateTests(_CliConfigIsolationMixin, unittest.TestCase):
+    """agent-cmd delegate had zero dedicated CLI test coverage before this
+    -- only AgentManager.execute_tasks itself (tests/test_agents_delegation.py)
+    was tested, not the CLI command that dispatches to it."""
+
+    def test_delegate_disabled_by_default_exits_with_invalid_args(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "agent-cmd", "delegate", "--task", "fix the bug"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Subagent delegation is disabled", result.output)
+
+    def test_delegate_with_no_task_shows_usage_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(
+                cli, ["--cwd", tmp, "agent-cmd", "delegate"],
+                env={"TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION": "1"},
+            )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("Please specify at least one --task", result.output)
+
+    def test_delegate_reports_per_task_results(self):
+        captured = {}
+
+        async def fake_execute_tasks(self, descriptions, **kwargs):
+            captured["descriptions"] = descriptions
+            captured["max_concurrency"] = kwargs.get("max_concurrency")
+            return [
+                {"task_id": "t1", "description": descriptions[0], "status": "completed", "result": {"summary": "did thing one"}},
+                {"task_id": "t2", "description": descriptions[1], "status": "failed", "result": {"error": "boom"}},
+            ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.agents.AgentManager.execute_tasks", new=fake_execute_tasks):
+                result = self.runner.invoke(
+                    cli,
+                    ["--cwd", tmp, "agent-cmd", "delegate", "--task", "fix bug a", "--task", "write tests for b", "--max-concurrency", "2"],
+                    env={"TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION": "1"},
+                )
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(captured["descriptions"], ["fix bug a", "write tests for b"])
+        self.assertEqual(captured["max_concurrency"], 2)
+        self.assertIn("✅ fix bug a", result.output)
+        self.assertIn("did thing one", result.output)
+        self.assertIn("❌ write tests for b", result.output)
+        self.assertIn("boom", result.output)
+
+
+class AgentCommandNamingCollisionHelpTests(_CliConfigIsolationMixin, unittest.TestCase):
+    """`agent-cmd` and `agents` are similarly-named but functionally
+    distinct commands -- a real naming footgun, not fixed by renaming
+    (would break scripts/muscle memory) but by making each command's
+    --help cross-reference the other so the distinction is discoverable."""
+
+    def test_agent_cmd_help_mentions_agents(self):
+        result = self.runner.invoke(cli, ["agent-cmd", "--help"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("tamfis-code agents", result.output)
+
+    def test_agents_help_mentions_agent_cmd(self):
+        result = self.runner.invoke(cli, ["agents", "--help"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("tamfis-code agent-cmd", result.output)
 
 
 class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
@@ -321,6 +442,29 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn(str(Path(tmp).resolve()), result.output)
 
+    def test_sessions_hides_swarm_child_sessions_unless_all(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = str(Path(tmp).resolve())
+            state_module.save_session_state(5, workspace_root=root)
+            state_module.save_session_state(6, workspace_root=root, is_swarm_child=True, parent_session_id=5, swarm_label="child")
+            result = self.runner.invoke(cli, ["--cwd", tmp, "sessions"])
+            result_all = self.runner.invoke(cli, ["--cwd", tmp, "sessions", "--all"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output.count(root), 1)
+        self.assertEqual(result_all.output.count(root), 2)
+
+    def test_sessions_hides_swarm_child_with_no_known_parent(self):
+        # Live-caught regression (agent-cmd delegate has no pre-existing
+        # session to record as a parent) -- is_swarm_child alone must still
+        # hide it, independent of parent_session_id being None.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = str(Path(tmp).resolve())
+            state_module.save_session_state(7, workspace_root=root, is_swarm_child=True, parent_session_id=None, swarm_label="no parent")
+            result = self.runner.invoke(cli, ["--cwd", tmp, "sessions"])
+            result_all = self.runner.invoke(cli, ["--cwd", tmp, "sessions", "--all"])
+        self.assertEqual(result.output.count(root), 0)
+        self.assertEqual(result_all.output.count(root), 1)
+
     def test_diffs_reads_local_mutation_ledger(self):
         with tempfile.TemporaryDirectory() as tmp:
             from tamfis_code.safety import record_mutation
@@ -343,6 +487,68 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertNotEqual(result.exit_code, 0)
         self.assertIn("No recorded mutation", result.output)
 
+    def test_revert_turn_id_reverts_every_mutation_from_that_turn(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from tamfis_code.safety import record_mutation
+
+            a, b = Path(tmp) / "a.py", Path(tmp) / "b.py"
+            a.write_text("new a\n")
+            b.write_text("new b\n")
+            record_mutation(1, path=str(a), operation="update", original_content="old a\n", new_content="new a\n", transaction_id="turn_cli1")
+            record_mutation(1, path=str(b), operation="update", original_content="old b\n", new_content="new b\n", transaction_id="turn_cli1")
+            state_module.save_session_state(1, workspace_root=str(Path(tmp).resolve()))
+            result = self.runner.invoke(cli, ["--cwd", tmp, "revert", "turn_cli1"])
+            self.assertEqual(result.exit_code, 0, result.output)
+            self.assertIn("Reverted 2 mutation(s)", result.output)
+            self.assertEqual(a.read_text(), "old a\n")
+            self.assertEqual(b.read_text(), "old b\n")
+
+    def test_revert_unknown_turn_id_reports_error_not_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(cli, ["--cwd", tmp, "revert", "turn_doesnotexist"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No recorded mutations", result.output)
+
+    def test_diffs_shows_the_turn_column(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            from tamfis_code.safety import record_mutation
+
+            record_mutation(1, path=f"{tmp}/x.py", operation="create", original_content=None, new_content="x = 1\n", transaction_id="turn_visible")
+            state_module.save_session_state(1, workspace_root=str(Path(tmp).resolve()))
+            result = self.runner.invoke(cli, ["--cwd", tmp, "diffs"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("turn_visible", result.output)
+
+    def test_resume_shows_incomplete_plan_step_progress(self):
+        # Before this, `tamfis-code resume` showed only a conversation
+        # summary -- a plan left mid-execution was invisible once resumed.
+        with tempfile.TemporaryDirectory() as tmp:
+            state_module.save_session_state(
+                7, workspace_root=str(Path(tmp).resolve()),
+                saved_plans=[{
+                    "id": "plan_cli_resume1", "objective": "fix the login bug",
+                    "steps": [
+                        {"index": 0, "step": "Read auth.py", "status": "completed"},
+                        {"index": 1, "step": "Fix the bug", "status": "in_progress"},
+                    ],
+                }],
+                active_plan_id="plan_cli_resume1",
+            )
+            with patch("tamfis_code.interactive.run_interactive", new=AsyncMock(return_value=None)):
+                result = self.runner.invoke(cli, ["--cwd", tmp, "resume", "7"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Plan in progress", result.output)
+        self.assertIn("Read auth.py", result.output)
+        self.assertIn("Fix the bug", result.output)
+
+    def test_mcp_server_command_runs_stdio_server_scoped_to_the_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.mcp_stdio_server.run_stdio_server", new=AsyncMock(return_value=None)) as fake_run:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "mcp-server"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        fake_run.assert_called_once()
+        self.assertEqual(fake_run.call_args.args[0], str(Path(tmp)))
+
     def test_run_executes_locally_without_remote_client(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
@@ -363,6 +569,20 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
                 result = self.runner.invoke(cli, ["--cwd", tmp, "doctor"])
             fake_client.assert_not_called()
         self.assertIn("PROVIDER", result.output)
+
+    def test_doctor_reports_local_session_diagnostics_by_default(self):
+        # `doctor` (no --remote) used to stop at the provider connectivity
+        # table and never report anything about actual local turns run in
+        # this directory, even though state.py already records tool-call
+        # outcomes, plan progress, and estimated context usage for exactly
+        # this purpose -- run_doctor() (where that reporting lived) was
+        # only ever reached via the separate --remote code path.
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "doctor"])
+            fake_client.assert_not_called()
+        self.assertIn("Local session context usage", result.output)
+        self.assertIn("Local tool-call success rate", result.output)
 
     def test_retry_with_no_previous_turn_fails_clearly(self):
         with tempfile.TemporaryDirectory() as tmp:

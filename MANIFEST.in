@@ -1,0 +1,3 @@
+include README.md
+include USAGE_INSTALL_RELEASE.md
+include pyproject.toml

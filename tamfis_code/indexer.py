@@ -31,6 +31,10 @@ class CodeFile:
     exports: List[str] = field(default_factory=list)
     size: int = 0
     lines: int = 0
+    # Populated at index time from the real filesystem (mtime_ns, size) --
+    # compared against the current filesystem state on a later index() call
+    # to skip re-parsing files that have not changed.
+    mtime_ns: int = 0
 
 class CodeIndexer:
     """Index and search code files"""
@@ -67,37 +71,78 @@ class CodeIndexer:
         default_index_path = Path.home() / '.tamfis' / 'index' / hashlib.sha256(str(self.root_path.resolve()).encode()).hexdigest()[:16]
         self.index_path = index_path or default_index_path
         self.files: Dict[str, CodeFile] = {}
+        self.last_skipped_count = 0
         self.index_path.mkdir(parents=True, exist_ok=True)
         self.ignore_patterns = [
-            '*.pyc', '__pycache__', '.git', '.env', 'venv', 
+            '*.pyc', '__pycache__', '.git', '.env', 'venv',
             'node_modules', '.idea', '.vscode', '*.log', '*.tmp',
             '.DS_Store', 'Thumbs.db', '.pytest_cache', '.mypy_cache',
-            '.coverage', 'htmlcov', '.tox', '.eggs', '*.egg-info'
+            '.coverage', 'htmlcov', '.tox', '.eggs', '*.egg-info',
+            # Packaging output -- without these, a built/installed package
+            # tree (e.g. setuptools' build/lib/... copy of the whole source
+            # tree) gets indexed alongside real source, producing duplicate,
+            # potentially stale search results (confirmed live: `index -s`
+            # returned the same symbol twice, once from build/lib/... after
+            # source had already moved on).
+            'build', 'dist',
         ]
     
     def index(self, paths: List[str] = None, force: bool = False):
-        """Index files in the workspace"""
+        """Index files in the workspace.
+
+        Files whose (size, mtime) match the previous index are skipped --
+        their previously-parsed CodeFile entry is kept as-is rather than
+        re-read/re-parsed -- unless force=True. Before this, `force` was
+        accepted but never read anywhere in this method, and every call did
+        a full re-parse of every matching file regardless of what had
+        actually changed since the last run. A fresh CodeIndexer (a new CLI
+        invocation) loads the previous on-disk index first so this applies
+        across process runs, not just repeated calls within one process.
+        """
+        defaulted_to_whole_root = not paths
         if not paths:
             paths = [str(self.root_path)]
-        
+        if not self.files:
+            self.load_index()
+
         indexed_count = 0
+        self.last_skipped_count = 0
+        visited: Set[str] = set()
         for path_str in paths:
             path = Path(path_str)
             if path.is_file():
-                if self._index_file(path):
+                visited.add(str(path))
+                if self._index_file(path, force=force):
                     indexed_count += 1
+                else:
+                    self.last_skipped_count += 1
             elif path.is_dir():
-                indexed_count += self._index_directory(path)
-        
+                parsed, skipped, dir_visited = self._index_directory(path, force=force)
+                indexed_count += parsed
+                self.last_skipped_count += skipped
+                visited |= dir_visited
+
+        # Prune files deleted since the last index -- only when this call
+        # covered the whole root (the common case: `index()` with no
+        # explicit paths), since a scoped/explicit file list intentionally
+        # says nothing about files outside it.
+        if defaulted_to_whole_root:
+            root_str = str(self.root_path.resolve())
+            for key in [k for k in self.files if k.startswith(root_str) and k not in visited]:
+                del self.files[key]
+
         self._save_index()
         return indexed_count
-    
-    def _index_directory(self, directory: Path) -> int:
-        """Recursively index a directory"""
-        count = 0
+
+    def _index_directory(self, directory: Path, *, force: bool = False):
+        """Recursively index a directory. Returns (parsed_count,
+        skipped_unchanged_count, visited_paths)."""
+        parsed = 0
+        skipped = 0
+        visited: Set[str] = set()
         # Check for .gitignore patterns
         ignore_patterns = self._load_gitignore(directory)
-        
+
         for path in directory.rglob('*'):
             if path.is_file():
                 # Skip ignored files
@@ -105,9 +150,12 @@ class CodeIndexer:
                     continue
                 ext = path.suffix.lower()
                 if ext in self.SUPPORTED_LANGUAGES:
-                    if self._index_file(path):
-                        count += 1
-        return count
+                    visited.add(str(path))
+                    if self._index_file(path, force=force):
+                        parsed += 1
+                    else:
+                        skipped += 1
+        return parsed, skipped, visited
     
     def _load_gitignore(self, directory: Path) -> List[str]:
         """Load .gitignore patterns"""
@@ -142,18 +190,32 @@ class CodeIndexer:
                     return True
         return False
     
-    def _index_file(self, file_path: Path) -> bool:
-        """Index a single file"""
+    def _index_file(self, file_path: Path, *, force: bool = False) -> bool:
+        """Index a single file. Returns True if it was actually (re)parsed;
+        False if it was skipped -- unsupported extension, unreadable, or
+        unchanged (same size and mtime as the existing entry) and not
+        force=True, in which case the existing CodeFile entry is left in
+        place untouched."""
         ext = file_path.suffix.lower()
         if ext not in self.SUPPORTED_LANGUAGES:
             return False
-        
+
+        key = str(file_path)
+        try:
+            stat = file_path.stat()
+        except OSError:
+            return False
+
+        existing = self.files.get(key)
+        if not force and existing is not None and existing.mtime_ns == stat.st_mtime_ns and existing.size == stat.st_size:
+            return False
+
         language = self.SUPPORTED_LANGUAGES[ext]
         try:
             content = file_path.read_text(encoding='utf-8', errors='ignore')
         except Exception:
             return False
-        
+
         # Parse symbols based on language
         if language == 'python':
             symbols = self._parse_python(content, file_path)
@@ -169,15 +231,16 @@ class CodeIndexer:
             imports = []
         
         code_file = CodeFile(
-            path=str(file_path),
+            path=key,
             language=language,
             symbols=symbols,
             imports=imports,
-            size=file_path.stat().st_size,
-            lines=len(content.split('\n'))
+            size=stat.st_size,
+            lines=len(content.split('\n')),
+            mtime_ns=stat.st_mtime_ns,
         )
-        
-        self.files[str(file_path)] = code_file
+
+        self.files[key] = code_file
         return True
     
     def _parse_python(self, content: str, file_path: Path) -> List[CodeSymbol]:
@@ -453,6 +516,7 @@ class CodeIndexer:
                 'language': code_file.language,
                 'size': code_file.size,
                 'lines': code_file.lines,
+                'mtime_ns': code_file.mtime_ns,
                 'imports': code_file.imports,
                 'symbols': [
                     {
@@ -501,6 +565,7 @@ class CodeIndexer:
                 imports=data.get('imports', []),
                 size=data.get('size', 0),
                 lines=data.get('lines', 0),
+                mtime_ns=data.get('mtime_ns', 0),
             )
     
     def search_symbol(self, query: str, kind: Optional[str] = None) -> List[CodeSymbol]:

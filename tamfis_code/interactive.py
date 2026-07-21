@@ -11,8 +11,11 @@ from pathlib import Path
 from typing import Optional
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.keys import Keys
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.table import Table
@@ -20,17 +23,43 @@ from rich.table import Table
 from . import state as local_state
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .clipboard import copy_to_clipboard
-from .config import APPROVAL_MODES, CONFIG_DIR, Config, MODE_ALIASES
+from .config import (
+    APPROVAL_MODES,
+    CONFIG_DIR,
+    Config,
+    MODE_ALIASES,
+    mode_label_for_policy,
+    next_mode_in_cycle,
+)
+from .agent_definitions import PROJECT_AGENTS_RELATIVE as AGENT_DEFINITIONS_PROJECT_RELATIVE
+from .agent_definitions import USER_AGENTS_DIR as AGENT_DEFINITIONS_USER_DIR
+from .custom_commands import (
+    PROJECT_COMMANDS_RELATIVE,
+    USER_COMMANDS_DIR,
+    CustomCommand,
+    expand_custom_command,
+    load_custom_commands,
+)
 from .doctor import run_doctor
-from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_unified_diff
-from .runner import resolve_approval_decision, retry_task_and_stream, run_ai_task_and_stream, run_shell_command
+from .live_input import LiveInputListener
+from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
+from .runner import resolve_approval_decision_async, retry_task_and_stream, run_ai_task_and_stream, run_shell_command
 from .runner_local import run_local_agent_turn, run_local_shell_command
+from .pty import LocalPtyBroker
 from .safety import revert_mutation as local_revert_mutation
+from .safety import revert_transaction as local_revert_transaction
 from .tasks import find_recent_task
 from .workspace import (
     WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository,
     find_resumable_session, resolve_local_workspace,
 )
+
+# A pasted block strictly longer than this many lines is collapsed to a
+# placeholder in the input line (Claude Code/Codex-style) instead of
+# dumping the whole thing inline and scrolling the terminal -- a short
+# paste of a few lines stays visible and directly editable, matching how
+# those tools only collapse genuinely large pastes.
+PASTE_COLLAPSE_LINE_THRESHOLD = 3
 
 HELP_TEXT = """\
 Natural-language text submits a full coding-agent task (mode: coding).
@@ -62,10 +91,16 @@ $ <command>            explicit shell command
 /delegate <a> | <b>  run objectives a, b, ... as concurrent delegated sub-tasks
                       (requires enable_subagent_delegation = true in config.toml,
                       or TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION=1)
+/swarm <a> | <b>     like /delegate, but with a live aggregate status display and
+                      a higher default concurrency; read-only by default -- add
+                      --mutate to allow file edits (requires an auto-approving
+                      mode: auto, accept-edits, etc., since sub-tasks can't prompt)
 /diffs [n]           show the last n file mutations in this session (default 10)
 /diff [mutation_id]  show a semantic unified diff (latest if omitted)
 /revert <mutation_id> restore a file to its content before that mutation (or
                       delete it, if that mutation created the file)
+/revert <turn_id>     revert every mutation from one turn together (the
+                      "turn_..." id shown alongside each mutation in /diffs)
 /detach              exit without cancelling anything server-side (same as /exit --
                       nothing in this REPL ties a task's lifetime to this process; see
                       `tamfis-code attach <session_id>` in another terminal to reconnect)
@@ -74,6 +109,9 @@ $ <command>            explicit shell command
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
+Shift+Tab            cycle mode without typing a command (shown in the prompt as [mode]);
+                     also works while a task is already running, not just at this prompt
+Ctrl+T               while a task is running: open the "queue next" input editor
 /model               show the active model route
 /model list [route]  list coding models (route: hf or openrouter)
 /model auto          restore Hugging Face -> OpenRouter automatic routing
@@ -91,12 +129,136 @@ Not yet implemented in this pass: /notifications.
 """
 
 
+# Single source of truth for slash-command tab-completion. Names here
+# mirror the literal strings the dispatch checks further down this file
+# actually match against (`text == "/xxx"` / `text.startswith("/xxx ")`) --
+# kept as a plain tuple rather than parsed out of HELP_TEXT above, since
+# HELP_TEXT is free-form prose (multi-line descriptions, indentation,
+# argument placeholders) that isn't reliably machine-parseable.
+SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
+    ("/help", "show this help"),
+    ("/status", "show session/workspace/approval status"),
+    ("/context", "show cached repository/task context"),
+    ("/reports", "show the repository report index"),
+    ("/queue", "show or append queued instructions"),
+    ("/cwd", "show the current workspace root"),
+    ("/copy", "copy the last assistant response to the clipboard"),
+    ("/doctor", "run connectivity/auth checks"),
+    ("/resume", "switch to another session"),
+    ("/retry", "retry a failed task"),
+    ("/agents", "list sessions and their latest task status"),
+    ("/delegate", "run objectives as concurrent delegated sub-tasks"),
+    ("/swarm", "fan out independent sub-tasks concurrently (opt-in, safe-by-default read-only)"),
+    ("/diffs", "show recent file mutations in this session"),
+    ("/diff", "show a semantic unified diff"),
+    ("/revert", "restore a file to its content before a mutation"),
+    ("/detach", "exit without cancelling anything server-side"),
+    ("/clear", "clear the screen"),
+    ("/compact", "save a durable checkpoint of the current task context"),
+    ("/permissions", "show approval policy and immutable server safeguards"),
+    ("/mode", "show or switch the active approval mode"),
+    ("/model", "show or switch the active model route"),
+    ("/tools", "show the tools exposed to tamfis-code tasks"),
+    ("/commands", "list user-defined custom slash commands loaded from .md files"),
+    ("/agent-types", "list declarative subagent types available to /delegate and /swarm"),
+    ("/pty", "manage a persistent background terminal"),
+    ("/exit", "quit"),
+    ("/quit", "quit"),
+    ("/run", "explicit shell command"),
+    ("/shell", "explicit shell command"),
+    ("/chat", "conversational/read-only coding assistance"),
+    ("/audit", "AI audit mode (read-only)"),
+    ("/plan", "create or show a saved executable plan"),
+    ("/plans", "list saved plans for this session"),
+    ("/execute-plan", "execute a saved plan"),
+    ("/agent", "full coding-agent mode (inspect + edit + verify)"),
+    ("/execute", "AI execute mode (tools + approval policy)"),
+)
+
+
+class _SlashCommandCompleter(Completer):
+    """Tab-completion for slash-commands only. Deliberately inert for
+    natural-language input -- offers nothing once the line doesn't start
+    with "/", or once a command name is already complete and a space
+    follows -- so it never gets in the way of typing an ordinary
+    objective, which is most of what gets typed into this REPL.
+
+    `custom_commands`, if given, is the SAME dict object the REPL loop
+    refreshes every turn via load_custom_commands (mutated in place, not
+    replaced) -- this completer always reflects the latest set without
+    needing to be reconstructed when a command file changes mid-session.
+    """
+
+    def __init__(self, custom_commands: Optional[dict[str, CustomCommand]] = None) -> None:
+        self._custom_commands = custom_commands if custom_commands is not None else {}
+
+    def get_completions(self, document, complete_event):
+        text = document.text_before_cursor
+        if not text.startswith("/") or " " in text:
+            return
+        for name, description in SLASH_COMMANDS:
+            if name.startswith(text):
+                yield Completion(name, start_position=-len(text), display_meta=description)
+        built_in_names = {name for name, _ in SLASH_COMMANDS}
+        for name, command in self._custom_commands.items():
+            full = f"/{name}"
+            if full in built_in_names or not full.startswith(text):
+                continue
+            yield Completion(full, start_position=-len(text), display_meta=command.description)
+
+
 class Intent:
     def __init__(self, kind: str, *, command: str = "", objective: str = "", mode: str = "coding"):
         self.kind = kind
         self.command = command
         self.objective = objective
         self.mode = mode
+
+
+# Bounds standalone in-session conversation history (see run_interactive's
+# conversation_history) -- kept generous since runner_local.py's own
+# compaction/rollover already handles the actual provider token budget;
+# this just stops one very long-lived REPL process from growing the list
+# forever in memory.
+MAX_STANDALONE_HISTORY_TURNS = 30
+
+
+def _append_turn_to_history(
+    history: list[dict[str, str]], *, objective: str, answer: Optional[str],
+) -> None:
+    """Record one completed standalone turn for the NEXT turn's context.
+
+    Only a completed turn with real answer text is worth remembering --
+    a failed/denied/cancelled turn's objective is still recorded (so a
+    follow-up like "try again but skip the tests" has something to refer
+    to), but with no assistant turn to pair it with.
+    """
+    history.append({"role": "user", "content": objective})
+    if answer:
+        history.append({"role": "assistant", "content": answer})
+    del history[: max(0, len(history) - MAX_STANDALONE_HISTORY_TURNS * 2)]
+
+
+def paste_placeholder(data: str, count: int) -> Optional[tuple[str, str]]:
+    """For one bracketed-paste event's raw data: normalize line endings
+    (some terminals, e.g. iTerm2, paste \\r\\n -- matches prompt_toolkit's
+    own default Keys.BracketedPaste handling), then decide whether it's
+    long enough to collapse to a placeholder rather than insert verbatim.
+
+    Returns None for a short paste (insert `data` normally, unchanged
+    behaviour) or `(placeholder, normalized_text)` for a long one -- the
+    caller inserts `placeholder` into the buffer and remembers
+    `normalized_text` under that key so the real content can be
+    substituted back in once the line is submitted.
+    """
+    normalized = data.replace("\r\n", "\n").replace("\r", "\n")
+    if not normalized:
+        return None
+    line_count = normalized.count("\n") + (0 if normalized.endswith("\n") else 1)
+    if line_count <= PASTE_COLLAPSE_LINE_THRESHOLD:
+        return None
+    placeholder = f"[Pasted text #{count} +{line_count} lines]"
+    return placeholder, normalized
 
 
 def contextualize_short_reply(raw: str, *, has_context: bool) -> str:
@@ -121,7 +283,7 @@ def contextualize_short_reply(raw: str, *, has_context: bool) -> str:
     return text
 
 
-def parse_intent(raw: str) -> Intent:
+def parse_intent(raw: str, custom_commands: Optional[dict[str, CustomCommand]] = None) -> Intent:
     text = raw.strip()
     if text.startswith("$ "):
         return Intent("shell", command=text[2:].strip())
@@ -143,6 +305,15 @@ def parse_intent(raw: str) -> Intent:
         return Intent("ai", objective=text[9:].strip(), mode="execute")
     if text.startswith("/ask "):
         return Intent("ai", objective=text[5:].strip(), mode="coding")
+    # User-defined custom commands (custom_commands.py) -- checked last, so
+    # every built-in slash command above always wins on a name collision.
+    # Only a real "/<name>" shape is eligible (not a bare natural-language
+    # objective that happens to start with a slash character).
+    if custom_commands and text.startswith("/"):
+        name, _, arguments = text[1:].partition(" ")
+        command = custom_commands.get(name)
+        if command is not None:
+            return Intent("ai", objective=expand_custom_command(command, arguments.strip()), mode="coding")
     return Intent("ai", objective=text, mode="coding")
 
 
@@ -154,16 +325,32 @@ async def run_interactive(
     TamfisGPT Remote Workspace backend, no login -- AI turns/shell commands
     run through runner_local.py's local agent loop calling `provider`
     directly instead. A handful of features that are inherently remote-server
-    concepts (background PTY terminals, a remote model catalog) have no
-    local equivalent yet and degrade to a clear message rather than crashing;
-    everything else (diffs/revert, resume, agents listing, retry, delegate,
-    doctor) has a real local implementation in this mode.
+    concepts (such as the remote model catalog) remain remote-only, while
+    background PTY terminals, diffs/revert, resume, agents listing, retry,
+    delegate, and doctor all have local implementations in this mode.
     """
     standalone = client is None
     provider_manager = None
     provider_type = None
     last_turn: Optional[tuple[str, str]] = None  # (objective, mode) -- standalone /retry target
     last_response_text: Optional[str] = None  # most recent completed answer -- /copy target
+    # Standalone-only: run_local_agent_turn's `messages` param used to be
+    # rebuilt as a single fresh `[{"role": "user", "content": objective}]`
+    # on every turn -- confirmed live, this made the interactive session
+    # provider-side amnesiac. "yes" got expanded by contextualize_short_reply
+    # into "Yes. Proceed with the action or next step you just proposed."
+    # and sent as the ENTIRE conversation, with no prior turn attached at
+    # all -- the model had no idea what it had just proposed. Bounded to
+    # the last MAX_STANDALONE_HISTORY_TURNS turns (not unbounded -- a very
+    # long session shouldn't grow this list forever); oversized individual
+    # messages within it are still handled by runner_local.py's existing
+    # compaction (including old user-turn compaction) and rollover.
+    saved_history = local_state.get_session_state(workspace.session_id).conversation_history if standalone else []
+    conversation_history: list[dict[str, str]] = [
+        {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
+        for item in saved_history
+        if item.get("role") in {"user", "assistant"} and item.get("content")
+    ][-MAX_STANDALONE_HISTORY_TURNS * 2:]
 
     if standalone:
         from .local_chat import resolve_provider_type
@@ -183,18 +370,23 @@ async def run_interactive(
         console, host=(f"local:{provider}" if standalone else config.api_base),
         workspace_root=workspace.workspace_root, mode="interactive", approval_policy=config.approval_policy,
     )
-    console.print("[dim]Type /help for commands. Paste up to 1,000,000 characters; Alt+Enter adds a newline. Ctrl+D or Ctrl+C exits.[/dim]\n")
+    console.print(
+        "[dim]Type /help for commands. Paste up to 1,000,000 characters; Alt+Enter adds a newline. "
+        "Shift+Tab cycles mode (manual/accept-edits/auto/plan) -- works while a task is running too, "
+        "not just at this prompt. Ctrl+T opens a visible `queue next>` editor while a task is running; "
+        "your submitted text is acknowledged with a queue id and applied at the next safe round boundary. "
+        "Ctrl+D or Ctrl+C exits.[/dim]\n"
+    )
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
     bindings = KeyBindings()
     # Local only: which byte offset this REPL has already displayed per PTY
     # id, so /pty read shows only new output. The server (RemotePtySession/
-    # pty_broker's ring buffer) is the durable source of truth -- losing
-    # this dict on restart just means the next /pty read re-shows output
-    # already seen, never data loss. (Remote mode only -- standalone has no
-    # PTY backend at all yet, see the /pty handler below.)
+    # pty_broker's or LocalPtyBroker's ring buffer is the source of truth;
+    # losing this dict only means the next read re-shows buffered output.
     pty_offsets: dict[str, int] = {}
+    local_pty = LocalPtyBroker(cwd=workspace.workspace_root) if standalone else None
 
     @bindings.add("enter")
     def _submit(event) -> None:
@@ -204,15 +396,125 @@ async def run_interactive(
     def _newline(event) -> None:
         event.current_buffer.insert_text("\n")
 
+    @bindings.add("s-tab")
+    def _cycle_mode(event) -> None:
+        # Claude-Code-style quick mode switch: manual -> accept-edits ->
+        # auto -> plan -> manual, without leaving the input line or having
+        # to know the /mode command exists. The prompt's mode indicator
+        # (see _prompt_message below) re-renders immediately because
+        # prompt_toolkit re-evaluates a callable `message=` on invalidate.
+        config.approval_policy = next_mode_in_cycle(config.approval_policy)
+        event.app.invalidate()
+
+    # Reported live: pasting a long block (clipboard paste, terminal
+    # bracketed-paste mode) inserted the entire raw text into the input
+    # line -- unlike Claude Code/Codex, which collapse a large paste to a
+    # short placeholder (e.g. "[Pasted text #1 +86 lines]") while editing,
+    # substituting the real text back in only once the line is submitted.
+    # prompt_toolkit's own default Keys.BracketedPaste binding
+    # (key_binding/bindings/basic.py) just inserts the raw data verbatim --
+    # there was no collapsing logic anywhere in this codebase to begin
+    # with, not a regression. `pending_pastes` maps each placeholder to its
+    # real text for the CURRENT line only; reset before every prompt below
+    # and consumed right after it returns, so placeholders never leak
+    # across turns or get treated as literal user-typed text if the
+    # objective happens to echo one back.
+    pending_pastes: dict[str, str] = {}
+    paste_counter = 0
+
+    @bindings.add(Keys.BracketedPaste)
+    def _collapse_large_paste(event) -> None:
+        nonlocal paste_counter
+        collapsed = paste_placeholder(event.data, paste_counter + 1)
+        if collapsed is None:
+            event.current_buffer.insert_text(event.data.replace("\r\n", "\n").replace("\r", "\n"))
+            return
+        placeholder, normalized = collapsed
+        paste_counter += 1
+        pending_pastes[placeholder] = normalized
+        event.current_buffer.insert_text(placeholder)
+
+    def _prompt_message() -> HTML:
+        return HTML(f"tamfis-code <ansicyan>[{mode_label_for_policy(config.approval_policy)}]</ansicyan>> ")
+
     # multiline=True is essential for bracketed terminal paste: embedded
     # newlines remain part of one objective instead of submitting the first
     # line and treating the remainder as accidental follow-up commands.  The
     # bindings retain familiar Enter-to-submit behaviour.
+    # Mutated in place (not reassigned) every loop iteration below, so the
+    # completer -- constructed once, here -- always reflects the latest
+    # command files without needing to be rebuilt.
+    custom_commands: dict[str, CustomCommand] = load_custom_commands(workspace.workspace_root)
     session: PromptSession = PromptSession(
         history=FileHistory(str(history_path)), multiline=True, key_bindings=bindings,
+        completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
     )
 
+    async def _run_saved_plan(plan_id_arg: Optional[str]) -> bool:
+        """Execute a saved plan by id (or the most recent if plan_id_arg is
+        falsy) -- shared by /execute-plan and the plan-mode "execute now?"
+        gate below, so there is exactly one real execution path, not two
+        that could silently drift apart. Returns whether a plan was found
+        and actually run."""
+        nonlocal last_turn, last_response_text
+        plan = local_state.get_plan(workspace.session_id, plan_id_arg or None)
+        if plan is None:
+            print_error(console, "Plan not found. Use /plans to list saved plans.")
+            return False
+        repo_state = local_state.get_session_state(workspace.session_id).repository_context
+        if blocking_dirty_files(repo_state.get("dirty_files") or []):
+            print_error(console, "Existing uncommitted changes detected; plan execution is blocked to preserve user edits.")
+            return False
+        plan_id = str(plan["id"])
+        local_state.update_plan(workspace.session_id, plan_id, status="executing")
+        renderer = StreamRenderer(console, mode_label=mode_label_for_policy(config.approval_policy))
+        model_state = local_state.get_session_state(workspace.session_id)
+        plan_objective = local_state.plan_execution_objective(plan)
+        if standalone:
+            live_input = LiveInputListener(session_id=workspace.session_id, renderer=renderer, cli_config=config)
+            live_input.start()
+            try:
+                outcome = await run_local_agent_turn(
+                    provider_manager, provider_type, model,
+                    [*conversation_history, {"role": "user", "content": plan_objective}],
+                    console, renderer,
+                    workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                    approval_policy=config.approval_policy, interactive=True, cli_config=config,
+                    allow_swarm_tool=True,
+                )
+            finally:
+                live_input.stop()
+            _append_turn_to_history(
+                conversation_history, objective=plan_objective,
+                answer=outcome.summary if outcome.status == "completed" else None,
+            )
+            last_turn = (plan_objective, "execute")
+        else:
+            outcome = await run_ai_task_and_stream(
+                client, renderer, console,
+                session_id=workspace.session_id,
+                objective=plan_objective, mode="execute",
+                approval_policy=config.approval_policy, interactive=True,
+                model=model_state.selected_model, provider=model_state.selected_provider,
+                config=config,
+            )
+        if standalone:
+            renderer.finish()
+        local_state.update_plan(
+            workspace.session_id, plan_id,
+            status="completed" if outcome.status == "completed" else "failed",
+            execution_task_id=local_state.get_session_state(workspace.session_id).last_task_id,
+        )
+        if outcome.status == "completed" and outcome.summary:
+            last_response_text = outcome.summary
+        if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
+            console.print(Markdown(outcome.summary))
+        return True
+
     while True:
+        fresh_custom_commands = load_custom_commands(workspace.workspace_root)
+        custom_commands.clear()
+        custom_commands.update(fresh_custom_commands)
         queued_item = next((item for item in local_state.get_session_state(workspace.session_id).queued_user_instructions
                             if item.get("status") == "queued"), None)
         if queued_item and queued_item.get("classification") not in {"pause", "cancel"}:
@@ -224,8 +526,10 @@ async def run_interactive(
             console.print(f"[yellow]◆ {queued_item.get('classification')} boundary reached[/yellow]")
             continue
         else:
+            pending_pastes.clear()
+            paste_counter = 0
             try:
-                text = await session.prompt_async("tamfis-code> ")
+                text = await session.prompt_async(_prompt_message)
             except KeyboardInterrupt:
             # NOTE: this used to just `continue`, silently redrawing the
             # prompt -- Ctrl+C appeared to do nothing at all, with no
@@ -238,6 +542,8 @@ async def run_interactive(
                 break
             except EOFError:
                 break
+            for placeholder, real_text in pending_pastes.items():
+                text = text.replace(placeholder, real_text)
 
         text = text.strip()
         if not text:
@@ -253,6 +559,8 @@ async def run_interactive(
             # exits. /detach exists as a documented, discoverable alias
             # matching the Phase 19 slash-command surface, not because it
             # behaves differently from /exit today.
+            if local_pty is not None:
+                local_pty.close()
             break
         # A bare "/" fell all the way through to parse_intent() before, which
         # doesn't treat "/" as a prefix of anything (every command check
@@ -263,8 +571,7 @@ async def run_interactive(
             console.print(HELP_TEXT)
             if standalone:
                 console.print(
-                    "[dim]Standalone mode: /pty and /model list have no local equivalent yet (they need a "
-                    "persistent server / remote model catalog) -- everything else above (diffs/revert, resume, "
+                    "[dim]Standalone mode: /model list needs the remote model catalog; /pty, diffs/revert, resume, "
                     "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
                 )
             continue
@@ -386,7 +693,7 @@ async def run_interactive(
                         if pcfg:
                             table.add_row(pcfg.name, ", ".join(pcfg.models) or pcfg.default_model)
                             shown = True
-                    console.print(table if shown else "[dim]Unknown provider. Use hf, nvidia, openrouter, or ollama.[/dim]")
+                    console.print(table if shown else "[dim]Unknown provider. Use hf, nvidia, or openrouter.[/dim]")
                     continue
                 if parts[0].lower() == "auto":
                     provider_type = ProviderType.AUTO
@@ -396,7 +703,7 @@ async def run_interactive(
                 try:
                     provider_type = _resolve_provider_type(parts[0])
                 except ValueError as exc:
-                    print_error(console, f"{exc} Usage: /model auto | /model <hf|nvidia|openrouter|ollama> [model-id]")
+                    print_error(console, f"{exc} Usage: /model auto | /model <tamfis|hf|nvidia|openrouter> [model-id]")
                     continue
                 model_id = parts[1] if len(parts) > 1 else "auto"
                 if len(parts) > 2:
@@ -475,6 +782,7 @@ async def run_interactive(
                 table.add_row("write_file", "Create or fully replace a file", "Workspace-boundary check + approval + mutation ledger")
                 table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
                 table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
+                table.add_row("web_search", "Tavily (if TAVILY_API_KEY set) or DuckDuckGo fallback", "Read-only; self-contained, no monorepo required")
                 console.print(table)
                 console.print(
                     "[dim]This is the real local tool set (mcp.py) the standalone agent loop uses -- "
@@ -498,14 +806,50 @@ async def run_interactive(
             console.print("[dim]Use glob_files with patterns like '*.tsx' or 'src/**/*.tsx'. Do not paste a full filesystem path into pattern; use path for the search root instead.[/dim]")
             console.print("[dim]Native coding tools above do not require Codex Apps, Claude Apps, or MCP. Optional connector tools appear only when a real gateway is enabled and successfully discovered.[/dim]")
             continue
-        if text == "/pty" or text.startswith("/pty "):
-            if standalone:
-                print_error(
-                    console,
-                    "Background terminals require --remote (a persistent server to host them) -- "
-                    "there's no standalone equivalent yet. Use $ <command> or /run for one-off local commands.",
+        if text == "/commands":
+            if not custom_commands:
+                console.print(
+                    "[dim]No custom commands found. Add one at "
+                    f"{USER_COMMANDS_DIR / '<name>.md'} (every session) or "
+                    f"{Path(workspace.workspace_root) / PROJECT_COMMANDS_RELATIVE / '<name>.md'} "
+                    "(this project only) -- see README.md's Custom commands section.[/dim]"
                 )
                 continue
+            table = Table(show_header=True, header_style="bold")
+            table.add_column("Command")
+            table.add_column("Description")
+            table.add_column("Source")
+            for name, command in sorted(custom_commands.items()):
+                table.add_row(f"/{name}", command.description, command.source)
+            console.print(table)
+            continue
+        if text == "/agent-types":
+            from .agent_definitions import load_agent_definitions
+            definitions = load_agent_definitions(workspace.workspace_root)
+            if not definitions:
+                console.print(
+                    "[dim]No declarative subagent types found. Add one at "
+                    f"{AGENT_DEFINITIONS_USER_DIR / '<name>.md'} (every session) or "
+                    f"{Path(workspace.workspace_root) / AGENT_DEFINITIONS_PROJECT_RELATIVE / '<name>.md'} "
+                    "(this project only) -- see README.md's Declarative subagent types section. "
+                    "Use with: /delegate --agent <name> ... or /swarm --agent <name> ....[/dim]"
+                )
+                continue
+            table = Table(show_header=True, header_style="bold")
+            table.add_column("Agent type")
+            table.add_column("Description")
+            table.add_column("Model")
+            table.add_column("Provider")
+            table.add_column("Source")
+            for name, definition in sorted(definitions.items()):
+                table.add_row(
+                    name, definition.description, definition.model or "(shared)",
+                    definition.provider or "(shared)", definition.source,
+                )
+            console.print(table)
+            console.print("[dim]Use with: /delegate --agent <name> ... or /swarm --agent <name> ....[/dim]")
+            continue
+        if text == "/pty" or text.startswith("/pty "):
             arg = text[len("/pty"):].strip()
             parts = arg.split(maxsplit=1)
             sub = parts[0].lower() if parts else "list"
@@ -513,11 +857,21 @@ async def run_interactive(
 
             if sub == "start":
                 shell_command = rest.strip() or "bash"
+                if standalone:
+                    try:
+                        local_session = local_pty.start(shell_command)  # type: ignore[union-attr]
+                    except (OSError, ValueError) as exc:
+                        print_error(console, f"Could not start terminal: {exc}")
+                        continue
+                    pty_offsets[local_session.id] = 0
+                    console.print(f"[green]Started local background terminal[/green] {local_session.id[:8]}  pid={local_session.pid}")
+                    console.print(f"[dim]/pty send {local_session.id[:8]} <text>   /pty read {local_session.id[:8]}   /pty kill {local_session.id[:8]}[/dim]")
+                    continue
                 try:
                     pty = await client.start_pty(workspace.session_id, shell_command=shell_command)
-                    decision = resolve_approval_decision(
+                    decision = await resolve_approval_decision_async(
                         console, f"[background terminal] {shell_command}", str(pty.get("safety_tier", "medium")),
-                        config.approval_policy, interactive=True,
+                        config.approval_policy, interactive=True, config=config,
                     )
                     if decision != "approve_once":
                         await client.deny_pty(pty["id"])
@@ -533,6 +887,18 @@ async def run_interactive(
                 continue
 
             if sub == "list":
+                if standalone:
+                    sessions_list = list(local_pty.sessions.values())  # type: ignore[union-attr]
+                    if not sessions_list:
+                        console.print("[dim]No background terminals in this session. Use /pty start.[/dim]")
+                        continue
+                    table = Table(show_header=True, header_style="bold")
+                    for column in ("ID", "STATUS", "COMMAND", "PID"):
+                        table.add_column(column)
+                    for item in sessions_list:
+                        table.add_row(item.id[:8], item.status, item.command[:40], str(item.pid))
+                    console.print(table)
+                    continue
                 try:
                     sessions_list = await client.list_pty(workspace.session_id)
                 except (AuthRequiredError, RemoteAPIError) as e:
@@ -569,14 +935,21 @@ async def run_interactive(
                     print_error(console, "Usage: /pty send <id> <text>")
                     continue
                 try:
-                    await client.write_pty(target_id, payload)
+                    if standalone:
+                        local_pty.write(target_id, payload)  # type: ignore[union-attr]
+                    else:
+                        await client.write_pty(target_id, payload)
                 except (AuthRequiredError, RemoteAPIError) as e:
                     print_error(console, str(e))
                 continue
 
             if sub == "read":
                 try:
-                    result = await client.read_pty(target_id, since=pty_offsets.get(target_id, 0))
+                    if standalone:
+                        session, data, offset = local_pty.read(target_id, since=pty_offsets.get(target_id, 0))  # type: ignore[union-attr]
+                        result = {"data": data, "offset": offset, "alive": session.status == "running", "status": session.status}
+                    else:
+                        result = await client.read_pty(target_id, since=pty_offsets.get(target_id, 0))
                 except (AuthRequiredError, RemoteAPIError) as e:
                     print_error(console, str(e))
                     continue
@@ -589,7 +962,11 @@ async def run_interactive(
 
             if sub == "kill":
                 try:
-                    result = await client.kill_pty(target_id)
+                    if standalone:
+                        session = local_pty.kill(target_id)  # type: ignore[union-attr]
+                        result = {"status": session.status}
+                    else:
+                        result = await client.kill_pty(target_id)
                 except (AuthRequiredError, RemoteAPIError) as e:
                     print_error(console, str(e))
                     continue
@@ -606,17 +983,26 @@ async def run_interactive(
         if text == "/mode" or text.startswith("/mode "):
             arg = text[len("/mode"):].strip().lower()
             if not arg:
-                console.print(f"Current mode: [bold]{config.approval_policy}[/bold]")
+                console.print(f"Current mode: [bold]{mode_label_for_policy(config.approval_policy)}[/bold] ({config.approval_policy})")
                 console.print(
                     "[dim]/mode manual        prompt for every risky action (the default)\n"
                     "/mode accept-edits  auto-approve safe/medium-risk actions, still prompt for dangerous ones\n"
-                    "/mode auto           never prompt (server safeguards still apply)\n"
-                    "/mode plan           read-only: propose without executing[/dim]"
+                    "/mode auto           auto-approves everything, never prompts (server safeguards still apply)\n"
+                    "/mode plan           read-only: propose without executing\n"
+                    "Shift+Tab            cycle manual -> accept-edits -> auto -> plan without typing a command\n"
+                    "                     (also works mid-task, not just here); Ctrl+T mid-task queues a follow-up\n"
+                    "Other raw policy values also work directly (--approval-only, no short alias): safe, workspace,\n"
+                    "read-only, plan-only, suggest, full-auto, and 'never' -- note 'never' means DENY everything\n"
+                    "(the opposite of what it sounds like; it is not a synonym for 'auto').[/dim]"
                 )
                 continue
             resolved = MODE_ALIASES.get(arg, arg if arg in APPROVAL_MODES else None)
             if resolved is None:
-                print_error(console, f"Unknown mode '{arg}'. Use manual, accept-edits, auto, or plan.")
+                print_error(
+                    console,
+                    f"Unknown mode '{arg}'. Use manual, accept-edits, auto, or plan "
+                    "(or a raw policy value: safe, workspace, read-only, plan-only, suggest, full-auto, never).",
+                )
                 continue
             config.approval_policy = resolved
             console.print(f"[green]Mode set to[/green] {arg} [dim]({resolved})[/dim]")
@@ -636,7 +1022,7 @@ async def run_interactive(
                 for column in ("PROVIDER", "CONFIGURED", "KEY"):
                     table.add_column(column)
                 for name, info in status["config"].items():
-                    configured = "[green]yes[/green]" if info["api_key_set"] or name == "ollama" else "[dim]no[/dim]"
+                    configured = "[green]yes[/green]" if info["api_key_set"] or name == "tier_iv" else "[dim]no[/dim]"
                     table.add_row(name, configured, info["key_preview"])
                 console.print(table)
                 console.print(
@@ -646,12 +1032,16 @@ async def run_interactive(
                 continue
             await run_doctor(config, console, Path(workspace.workspace_root), session_id=workspace.session_id)
             continue
-        if text == "/agents":
+        if text == "/agents" or text == "/agents --all":
+            show_all = text.endswith("--all")
             if standalone:
                 for sid in local_state.all_known_session_ids():
                     sess_state = local_state.get_session_state(sid)
+                    if sess_state.is_swarm_child and not show_all:
+                        continue
                     marker = " *" if sid == workspace.session_id else ""
-                    console.print(f"  {sid}  {sess_state.workspace_root or sess_state.primary_workspace}{marker}")
+                    label = f"  (swarm: {sess_state.swarm_label})" if sess_state.is_swarm_child else ""
+                    console.print(f"  {sid}  {sess_state.workspace_root or sess_state.primary_workspace}{marker}{label}")
                 continue
             try:
                 sessions_list = await client.list_sessions()
@@ -671,9 +1061,14 @@ async def run_interactive(
                 )
                 continue
             arg = text[len("/delegate"):].strip()
+            delegate_agent_type: Optional[str] = None
+            if arg.startswith("--agent "):
+                _rest = arg[len("--agent "):].lstrip()
+                delegate_agent_type, _, arg = _rest.partition(" ")
+                arg = arg.strip()
             descriptions = [part.strip() for part in arg.split("|") if part.strip()]
             if not descriptions:
-                print_error(console, "Usage: /delegate <objective 1> | <objective 2> | ...")
+                print_error(console, "Usage: /delegate [--agent <name>] <objective 1> | <objective 2> | ...")
                 continue
             # Delegation always runs through the standalone local loop
             # (agents.py's DelegatedCodingAgent) regardless of whether this
@@ -692,8 +1087,60 @@ async def run_interactive(
             results = await manager.execute_tasks(
                 descriptions, manager=delegate_manager, provider=delegate_provider, model=model,
                 console=console, workspace_root=workspace.workspace_root,
-                approval_policy=config.approval_policy,
+                approval_policy=config.approval_policy, parent_session_id=workspace.session_id,
+                agent_types=[delegate_agent_type] * len(descriptions) if delegate_agent_type else None,
             )
+            for r in results:
+                marker = "✅" if r["status"] == "completed" else "❌"
+                console.print(f"{marker} {r['description']}")
+                summary = (r.get("result") or {}).get("summary") or (r.get("result") or {}).get("error")
+                if summary:
+                    console.print(f"   {summary}")
+            continue
+        if text == "/swarm" or text.startswith("/swarm "):
+            if not config.enable_subagent_delegation:
+                print_error(
+                    console,
+                    "Subagent delegation is disabled. Enable it with enable_subagent_delegation = true "
+                    "in config.toml, or TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION=1.",
+                )
+                continue
+            arg = text[len("/swarm"):].strip()
+            mutate = False
+            for flag in ("--mutate", "--edit"):
+                if arg.endswith(flag):
+                    mutate = True
+                    arg = arg[: -len(flag)].strip()
+                    break
+            swarm_agent_type: Optional[str] = None
+            if arg.startswith("--agent "):
+                _rest = arg[len("--agent "):].lstrip()
+                swarm_agent_type, _, arg = _rest.partition(" ")
+                arg = arg.strip()
+            descriptions = [part.strip() for part in arg.split("|") if part.strip()]
+            if not descriptions:
+                print_error(console, "Usage: /swarm [--agent <name>] <objective 1> | <objective 2> | ... [--mutate]")
+                continue
+            swarm_manager = provider_manager
+            swarm_provider = provider_type
+            if swarm_manager is None:
+                from .local_chat import resolve_provider_type as _resolve_provider_type
+                from .providers import ProviderManager as _ProviderManager
+
+                swarm_manager = _ProviderManager()
+                swarm_provider = _resolve_provider_type("auto")
+            from .swarm import run_swarm
+            try:
+                results = await run_swarm(
+                    descriptions, manager=swarm_manager, provider=swarm_provider, model=model,
+                    console=console, workspace_root=workspace.workspace_root,
+                    session_id=workspace.session_id, approval_policy=config.approval_policy,
+                    mutate=mutate,
+                    agent_types=[swarm_agent_type] * len(descriptions) if swarm_agent_type else None,
+                )
+            except ValueError as e:
+                print_error(console, str(e))
+                continue
             for r in results:
                 marker = "✅" if r["status"] == "completed" else "❌"
                 console.print(f"{marker} {r['description']}")
@@ -724,9 +1171,10 @@ async def run_interactive(
                 mutation_id = m.get("mutation_id") if standalone else m.get("id")
                 status = m.get("revert_status")
                 marker = " [reverted]" if status == "reverted" else (" [revert failed]" if status == "revert_failed" else "")
+                turn_suffix = f"  (turn {m.get('transaction_id')})" if standalone and m.get("transaction_id") else ""
                 console.print(
                     f"  {mutation_id}  {m.get('operation')}  {m.get('path')}  "
-                    f"+{m.get('lines_added')}/-{m.get('lines_removed')}{marker}"
+                    f"+{m.get('lines_added')}/-{m.get('lines_removed')}{marker}{turn_suffix}"
                 )
             continue
         if text == "/diff" or text.startswith("/diff "):
@@ -754,9 +1202,19 @@ async def run_interactive(
         if text == "/revert" or text.startswith("/revert "):
             arg = text[len("/revert"):].strip()
             if not arg:
-                print_error(console, "Usage: /revert <mutation_id> -- see /diffs for recent mutation ids.")
+                print_error(console, "Usage: /revert <mutation_id | turn_id> -- see /diffs for recent mutation ids; a turn_... id reverts every mutation from that turn together.")
                 continue
             if standalone:
+                if arg.startswith("turn_"):
+                    try:
+                        result = local_revert_transaction(workspace.session_id, arg)
+                    except ValueError as e:
+                        print_error(console, str(e))
+                        continue
+                    console.print(f"[green]Reverted {len(result['reverted'])} mutation(s)[/green] from turn {arg}")
+                    if result["error"]:
+                        print_error(console, f"Stopped after a failure: {result['error']} -- still pending: {', '.join(result['remaining'])}")
+                    continue
                 try:
                     result = local_revert_mutation(workspace.session_id, arg)
                 except ValueError as e:
@@ -801,6 +1259,7 @@ async def run_interactive(
                 console.print(f"[green]Resumed session {workspace.session_id}[/green]  workspace_root={workspace.workspace_root}")
                 if target_state.conversation_summary:
                     console.print(f"[dim]{target_state.conversation_summary[-1000:]}[/dim]")
+                print_resume_plan_status(console, target_state)
                 continue
             try:
                 if arg:
@@ -836,15 +1295,26 @@ async def run_interactive(
                 if mode in {"coding", "agent", "execute"} and blocking_dirty_files(repo_state.get("dirty_files") or []):
                     print_error(console, "Existing uncommitted changes detected; retry is blocked to preserve user edits.")
                     continue
-                renderer = StreamRenderer(console)
-                outcome = await run_local_agent_turn(
-                    provider_manager, provider_type, model, [{"role": "user", "content": objective}],
-                    console, renderer,
-                    workspace_root=workspace.workspace_root, session_id=workspace.session_id,
-                    approval_policy=config.approval_policy, interactive=True,
-                    read_only=mode in {"chat", "audit", "plan"},
-                )
+                renderer = StreamRenderer(console, mode_label=mode_label_for_policy(config.approval_policy))
+                live_input = LiveInputListener(session_id=workspace.session_id, renderer=renderer, cli_config=config)
+                live_input.start()
+                try:
+                    outcome = await run_local_agent_turn(
+                        provider_manager, provider_type, model,
+                        [*conversation_history, {"role": "user", "content": objective}],
+                        console, renderer,
+                        workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                        approval_policy=config.approval_policy, interactive=True,
+                        read_only=mode in {"chat", "audit", "plan"}, cli_config=config,
+                        allow_swarm_tool=True,
+                    )
+                finally:
+                    live_input.stop()
                 renderer.finish()
+                _append_turn_to_history(
+                    conversation_history, objective=objective,
+                    answer=outcome.summary if outcome.status == "completed" else None,
+                )
                 if outcome.status == "completed" and outcome.summary:
                     last_response_text = outcome.summary
                 if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
@@ -867,7 +1337,7 @@ async def run_interactive(
                 outcome = await retry_task_and_stream(
                     client, renderer, console,
                     session_id=workspace.session_id, task_id=task_id, mode=None,
-                    approval_policy=config.approval_policy, interactive=True,
+                    approval_policy=config.approval_policy, interactive=True, config=config,
                 )
                 if outcome.status == "completed" and outcome.summary:
                     last_response_text = outcome.summary
@@ -887,9 +1357,13 @@ async def run_interactive(
         reply_state = local_state.get_session_state(workspace.session_id)
         text = contextualize_short_reply(
             text,
-            has_context=bool(reply_state.last_task_id or reply_state.conversation_summary or reply_state.active_plan_id),
+            has_context=bool(
+                reply_state.last_task_id or reply_state.conversation_summary
+                or reply_state.active_plan_id or reply_state.active_task
+                or reply_state.turn_checkpoint or reply_state.conversation_history
+            ),
         )
-        intent = parse_intent(text)
+        intent = parse_intent(text, custom_commands=custom_commands)
         try:
             if intent.kind == "shell":
                 if not intent.command:
@@ -898,54 +1372,16 @@ async def run_interactive(
                     outcome = await run_local_shell_command(
                         console, workspace_root=workspace.workspace_root, session_id=workspace.session_id,
                         command=intent.command, approval_policy=config.approval_policy, interactive=True,
+                        config=config,
                     )
                 else:
                     outcome = await run_shell_command(
                         client, console,
                         session_id=workspace.session_id, command=intent.command,
-                        approval_policy=config.approval_policy, interactive=True,
+                        approval_policy=config.approval_policy, interactive=True, config=config,
                     )
             elif intent.kind == "saved_plan":
-                plan = local_state.get_plan(workspace.session_id, intent.command or None)
-                if plan is None:
-                    print_error(console, "Plan not found. Use /plans to list saved plans.")
-                    continue
-                repo_state = local_state.get_session_state(workspace.session_id).repository_context
-                if blocking_dirty_files(repo_state.get("dirty_files") or []):
-                    print_error(console, "Existing uncommitted changes detected; plan execution is blocked to preserve user edits.")
-                    continue
-                plan_id = str(plan["id"])
-                local_state.update_plan(workspace.session_id, plan_id, status="executing")
-                renderer = StreamRenderer(console)
-                model_state = local_state.get_session_state(workspace.session_id)
-                plan_objective = local_state.plan_execution_objective(plan)
-                if standalone:
-                    outcome = await run_local_agent_turn(
-                        provider_manager, provider_type, model, [{"role": "user", "content": plan_objective}],
-                        console, renderer,
-                        workspace_root=workspace.workspace_root, session_id=workspace.session_id,
-                        approval_policy=config.approval_policy, interactive=True,
-                    )
-                    last_turn = (plan_objective, "execute")
-                else:
-                    outcome = await run_ai_task_and_stream(
-                        client, renderer, console,
-                        session_id=workspace.session_id,
-                        objective=plan_objective, mode="execute",
-                        approval_policy=config.approval_policy, interactive=True,
-                        model=model_state.selected_model, provider=model_state.selected_provider,
-                    )
-                if standalone:
-                    renderer.finish()
-                local_state.update_plan(
-                    workspace.session_id, plan_id,
-                    status="completed" if outcome.status == "completed" else "failed",
-                    execution_task_id=local_state.get_session_state(workspace.session_id).last_task_id,
-                )
-                if outcome.status == "completed" and outcome.summary:
-                    last_response_text = outcome.summary
-                if outcome.status == "completed" and outcome.summary and not renderer.streamed_final_text:
-                    console.print(Markdown(outcome.summary))
+                await _run_saved_plan(intent.command)
             else:
                 if not intent.objective:
                     continue
@@ -954,21 +1390,53 @@ async def run_interactive(
                     if blocking_dirty_files(repo_state.get("dirty_files") or []):
                         print_error(console, "Existing uncommitted changes detected; execute mode is blocked to preserve user edits. Use /audit or /plan, or clean the worktree yourself.")
                         continue
-                renderer = StreamRenderer(console)
+                renderer = StreamRenderer(console, mode_label=mode_label_for_policy(config.approval_policy))
                 model_state = local_state.get_session_state(workspace.session_id)
                 if standalone:
-                    outcome = await run_local_agent_turn(
-                        provider_manager, provider_type, model, [{"role": "user", "content": intent.objective}],
-                        console, renderer,
-                        workspace_root=workspace.workspace_root, session_id=workspace.session_id,
-                        approval_policy=config.approval_policy, interactive=True,
-                        read_only=intent.mode in {"chat", "audit", "plan"},
-                    )
+                    live_input = LiveInputListener(session_id=workspace.session_id, renderer=renderer, cli_config=config)
+                    live_input.start()
+                    try:
+                        outcome = await run_local_agent_turn(
+                            provider_manager, provider_type, model,
+                            [*conversation_history, {"role": "user", "content": intent.objective}],
+                            console, renderer,
+                            workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                            approval_policy=config.approval_policy, interactive=True,
+                            read_only=intent.mode in {"chat", "audit", "plan"}, cli_config=config,
+                            allow_swarm_tool=True,
+                        )
+                    finally:
+                        live_input.stop()
                     renderer.finish()
+                    _append_turn_to_history(
+                        conversation_history, objective=intent.objective,
+                        answer=outcome.summary if outcome.status == "completed" else None,
+                    )
                     last_turn = (intent.objective, intent.mode)
                     if intent.mode == "plan" and outcome.status == "completed" and outcome.summary:
                         saved = local_state.save_plan(workspace.session_id, objective=intent.objective, content=outcome.summary)
-                        console.print(f"[green]Plan saved[/green] · {saved.id} · run /execute-plan {saved.id}")
+                        console.print(f"[green]Plan saved[/green] · {saved.id}")
+                        # Real gated plan-mode UX (Claude Code's Plan Mode
+                        # equivalent): the plan above was produced entirely
+                        # read-only (mode="plan" -> read_only=True), and
+                        # nothing has been executed yet -- this is the one
+                        # explicit approval checkpoint between "here's the
+                        # plan" and any tool actually mutating the
+                        # workspace. Declining leaves it saved for later
+                        # (/execute-plan, or /plan again to revise first).
+                        if console.is_terminal:
+                            try:
+                                answer = console.input(
+                                    "[cyan]Execute this plan now?[/cyan] [dim](y/N)[/dim] "
+                                ).strip().lower()
+                            except (KeyboardInterrupt, EOFError):
+                                answer = ""
+                            if answer in ("y", "yes"):
+                                await _run_saved_plan(saved.id)
+                            else:
+                                console.print(f"[dim]Not executed. Run /execute-plan {saved.id} when ready.[/dim]")
+                        else:
+                            console.print(f"[dim]Run /execute-plan {saved.id} to execute.[/dim]")
                 else:
                     outcome = await run_ai_task_and_stream(
                         client, renderer, console,
@@ -976,6 +1444,7 @@ async def run_interactive(
                         approval_policy=config.approval_policy, interactive=True,
                         model=model_state.selected_model,
                         provider=model_state.selected_provider,
+                        config=config,
                     )
                 if outcome.status == "completed" and outcome.summary:
                     last_response_text = outcome.summary

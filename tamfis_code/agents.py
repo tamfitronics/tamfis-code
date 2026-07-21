@@ -233,6 +233,8 @@ class DelegatedCodingAgent(SubAgent):
     def __init__(
         self, *, manager, provider, model, console, workspace_root: str, session_id: int,
         approval_policy: str = "ask", mode: str = "agent",
+        renderer_factory: Optional[Callable[[], Any]] = None,
+        extra_system_prompt: Optional[str] = None,
     ):
         super().__init__(
             name="delegated_coding_agent",
@@ -247,14 +249,32 @@ class DelegatedCodingAgent(SubAgent):
         self._session_id = session_id
         self._approval_policy = approval_policy
         self._mode = mode
+        # None (the default) preserves every existing caller's exact prior
+        # behavior: a real StreamRenderer on the shared console. Only a
+        # concurrent swarm run (execute_tasks with max_concurrency > 1)
+        # passes one, to avoid N concurrent rich.live.Live regions on one
+        # Console -- see swarm.BufferedSubagentRenderer.
+        self._renderer_factory = renderer_factory
+        # A declarative subagent type's own prompt (agent_definitions.py) --
+        # prepended as a real system message ahead of the objective, not
+        # merged into it, so the underlying model still sees the actual
+        # task description as a distinct user turn.
+        self._extra_system_prompt = extra_system_prompt
 
     async def execute(self, task: AgentTask) -> Dict[str, Any]:
-        from .render import StreamRenderer
         from .runner_local import run_local_agent_turn
 
-        renderer = StreamRenderer(self._console)
+        if self._renderer_factory is not None:
+            renderer = self._renderer_factory()
+        else:
+            from .render import StreamRenderer
+            renderer = StreamRenderer(self._console)
+        messages: list[dict[str, str]] = []
+        if self._extra_system_prompt:
+            messages.append({"role": "system", "content": self._extra_system_prompt})
+        messages.append({"role": "user", "content": task.description})
         outcome = await run_local_agent_turn(
-            self._manager, self._provider, self._model, [{"role": "user", "content": task.description}],
+            self._manager, self._provider, self._model, messages,
             self._console, renderer,
             workspace_root=self._workspace_root, session_id=self._session_id,
             approval_policy=self._approval_policy, interactive=False,
@@ -333,30 +353,87 @@ class AgentManager:
         self, descriptions: List[str], *,
         manager, provider, model, console, workspace_root, approval_policy: str = "ask",
         mode: str = "agent", max_concurrency: int = 1,
+        parent_session_id: Optional[int] = None,
+        renderer_factory: Optional[Callable[[str, str], Any]] = None,
+        agent_types: Optional[List[Optional[str]]] = None,
     ) -> List[Dict[str, Any]]:
         """Fan out N sub-objectives concurrently (bounded by max_concurrency),
         each delegated to the standalone agent loop in its own local session.
 
+        Each sub-task gets its own child session (workspace.
+        resolve_swarm_subtask_workspace) rather than resolve_local_workspace's
+        usual same-workspace_root reuse -- concurrent sub-tasks sharing one
+        session_id would race on state.json's single-value fields
+        (current_phase/running_action/active_task/...), which aren't
+        merge-safe the way queued_user_instructions/saved_plans are.
+        parent_session_id (the caller's own session, when known -- may be
+        None, e.g. a one-shot `agent-cmd delegate` invocation with no
+        pre-existing session) is recorded as best-effort context; every
+        child is unconditionally tagged is_swarm_child=True regardless,
+        which is the actual filter default session listings use.
+
         Defaults to sequential (max_concurrency=1): whether concurrent tool
         execution against the same workspace is safe in every case (two
-        sub-tasks editing overlapping files, concurrent state.json writers
-        from separate local sessions) hasn't been stress-tested -- raise the
-        cap only once you've validated that for your own workloads.
-        """
-        from .workspace import resolve_local_workspace
+        sub-tasks editing overlapping files) hasn't been stress-tested --
+        raise the cap only once you've validated that for your own workloads.
 
+        renderer_factory(task_id, description), when given, is called once
+        per sub-task to build its renderer instead of the default real
+        StreamRenderer on the shared console -- required at max_concurrency
+        > 1 (see swarm.BufferedSubagentRenderer) to avoid N concurrent
+        rich.live.Live regions colliding on one Console. None (the default)
+        preserves today's exact behavior for every existing caller.
+
+        agent_types, when given, is a list the same length as descriptions
+        (None entries mean "no override" -- every existing caller omitting
+        this parameter entirely is unaffected). A named entry resolves a
+        declarative subagent type (agent_definitions.py: `.tamfis/agents/
+        <name>.md` or the user config equivalent) for just that one
+        sub-task -- its system_prompt is prepended ahead of the sub-task's
+        own objective, and its model/provider (if the definition sets them)
+        override this call's shared model/provider for that sub-task only.
+        An unknown agent type name is a no-op (falls back to the shared
+        model/provider/no extra prompt) rather than failing the whole
+        fan-out over one bad name.
+        """
+        from .agent_definitions import load_agent_definitions
+        from .local_chat import resolve_provider_type
+        from .workspace import resolve_swarm_subtask_workspace
+
+        definitions = load_agent_definitions(workspace_root) if agent_types else {}
+        resolved_agent_types: List[Optional[str]] = (
+            list(agent_types) if agent_types is not None else [None] * len(descriptions)
+        )
         semaphore = asyncio.Semaphore(max(1, max_concurrency))
 
-        async def run_one(description: str) -> Dict[str, Any]:
+        async def run_one(description: str, agent_type: Optional[str]) -> Dict[str, Any]:
             async with semaphore:
                 task = AgentTask(id=f"delegated_{uuid.uuid4().hex[:8]}", description=description, status=AgentStatus.RUNNING)
                 self.tasks[task.id] = task
                 try:
-                    workspace = resolve_local_workspace(Path(workspace_root), discover=False)
+                    workspace = resolve_swarm_subtask_workspace(
+                        Path(workspace_root), parent_session_id=parent_session_id, label=description[:80],
+                    )
+                    task_provider, task_model, extra_system_prompt = provider, model, None
+                    definition = definitions.get(agent_type) if agent_type else None
+                    if definition is not None:
+                        extra_system_prompt = definition.system_prompt
+                        if definition.model:
+                            task_model = definition.model
+                        if definition.provider:
+                            try:
+                                task_provider = resolve_provider_type(definition.provider)
+                            except ValueError:
+                                pass
                     agent = DelegatedCodingAgent(
-                        manager=manager, provider=provider, model=model, console=console,
+                        manager=manager, provider=task_provider, model=task_model, console=console,
                         workspace_root=workspace.workspace_root, session_id=workspace.session_id,
                         approval_policy=approval_policy, mode=mode,
+                        renderer_factory=(
+                            (lambda tid=task.id, desc=description: renderer_factory(tid, desc))
+                            if renderer_factory is not None else None
+                        ),
+                        extra_system_prompt=extra_system_prompt,
                     )
                     result = await agent.execute(task)
                     task.result = result
@@ -368,4 +445,7 @@ class AgentManager:
                     task.error = str(e)
                 return {"task_id": task.id, "description": description, "status": task.status.value, "result": result}
 
-        return list(await asyncio.gather(*(run_one(description) for description in descriptions)))
+        return list(await asyncio.gather(*(
+            run_one(description, resolved_agent_types[i] if i < len(resolved_agent_types) else None)
+            for i, description in enumerate(descriptions)
+        )))
