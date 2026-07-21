@@ -125,12 +125,17 @@ class LiveInputListener:
 
     def _dispatch(self) -> None:
         buf = bytes(self._buf)
-        if buf == _CTRL_T:
+        # os.read() is allowed to return more than one byte. A keypress can
+        # therefore arrive together with terminal noise or a paste prefix;
+        # equality-only matching silently discarded Ctrl+T in that case and
+        # made the in-task editor appear broken. Consume the control byte
+        # wherever it occurs, while keeping the editor single-flight.
+        if _CTRL_T in buf:
             self._buf.clear()
             if self._interject_task is None or self._interject_task.done():
                 self._interject_task = asyncio.ensure_future(self._interject())
             return
-        if buf == _SHIFT_TAB:
+        if _SHIFT_TAB in buf:
             self._buf.clear()
             self._cycle_mode()
             return

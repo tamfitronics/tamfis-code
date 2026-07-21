@@ -174,6 +174,20 @@ class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCa
         import asyncio
         asyncio.run(_run())
 
+    def test_ctrl_t_is_detected_when_read_with_adjacent_terminal_bytes(self):
+        async def _run():
+            renderer = StreamRenderer(_console())
+            cfg = _config("ask")
+            listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+            with patch.object(listener, "_interject", new_callable=AsyncMock) as mocked:
+                listener._buf = bytearray(b"x" + _CTRL_T + b"y")
+                listener._dispatch()
+                await asyncio.sleep(0)
+                mocked.assert_awaited_once()
+
+        import asyncio
+        asyncio.run(_run())
+
         import asyncio
         asyncio.run(_run())
 

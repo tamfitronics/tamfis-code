@@ -79,6 +79,17 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             scope = _detect_workspace_scope(str(root), "fix the bug")
             self.assertEqual(scope, [root.resolve()])
 
+    def test_explicit_absolute_project_path_expands_scope_from_admin_cwd(self):
+        with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as admin:
+            project = Path(parent) / "tamfisseo"
+            project.mkdir()
+            (project / "package.json").write_text("{}")
+            scope = _detect_workspace_scope(
+                str(Path(admin)),
+                f"check the project at {project / 'package.json'} and fix its bugs",
+            )
+            self.assertEqual(scope, [project.resolve()])
+
     def test_explicitly_named_root_is_honored_even_if_archived(self):
         """A user who explicitly names a backup directory is making a
         deliberate request -- classification only governs *implicit*

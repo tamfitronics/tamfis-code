@@ -275,7 +275,11 @@ def _objective_excluded_names(workspace_root: str, objective: str) -> set[str]:
 def _detect_workspace_scope(workspace_root: str, objective: str) -> list[Path]:
     """Resolve the smallest useful set of project roots for this turn.
 
-    Exact directory names mentioned by the user win.  A request containing
+    Exact directory names mentioned by the user win. Explicit absolute paths
+    in the objective are also authoritative task-local scope expansions. This
+    matters when the CLI is launched from a parent/admin checkout but the
+    user names a sibling project such as `/home/tamfisseo/package.json`.
+    A request containing
     "stack" under /home/tamfisgpt selects the canonical TamfisGPT stack roots.
     Otherwise, when the workspace itself is a project, it remains the scope;
     when it is merely a parent directory, only immediate child projects are
@@ -288,6 +292,32 @@ def _detect_workspace_scope(workspace_root: str, objective: str) -> list[Path]:
     """
     root = Path(workspace_root).expanduser().resolve()
     lowered = (objective or "").lower()
+
+    # CWD is the default boundary, but an explicitly named existing absolute
+    # project path is an intentional request to inspect that project. Resolve
+    # package/manifests to their containing project directory and keep the
+    # expansion bounded to the project marker -- never treat an arbitrary
+    # absolute path or filesystem parent as a workspace.
+    explicit_roots: list[Path] = []
+    for raw_path in re.findall(r"(?<![\w.-])/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+", objective or ""):
+        candidate = Path(raw_path.rstrip(".,;:)]}"))
+        try:
+            candidate = candidate.resolve()
+            if candidate.is_file():
+                candidate = candidate.parent
+            if candidate.is_dir() and _is_project_root(candidate):
+                explicit_roots.append(candidate)
+        except OSError:
+            continue
+    if explicit_roots:
+        deduped: list[Path] = []
+        seen_explicit: set[str] = set()
+        for candidate in explicit_roots:
+            key = str(candidate)
+            if key not in seen_explicit:
+                seen_explicit.add(key)
+                deduped.append(candidate)
+        return deduped
 
     try:
         children = [child for child in root.iterdir() if child.is_dir()]

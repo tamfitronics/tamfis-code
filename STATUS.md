@@ -13,7 +13,7 @@ already superseded by same-day code changes).
 **Rule going forward: don't create a new dated audit file for tamfis-code.
 Update this one.**
 
-## Post-release plan progress, model routing, evidence, and fallback fix (2026-07-22, working tree)
+## Post-release CWD scope, live input, plan progress, model routing, evidence, and fallback fixes (2026-07-22, working tree)
 
 Fixed the remaining plan-visibility gap identified after v0.6.1:
 
@@ -45,12 +45,17 @@ Fixed the remaining plan-visibility gap identified after v0.6.1:
   invoked` route error are now retryable, so AUTO switches to the next
   eligible model/provider instead of stopping with a checkpointed failure.
   Unrelated HTTP 400 errors remain non-retryable.
+- Task scope now honors explicit existing absolute project paths in the user
+  objective, so a launch from an admin checkout cannot silently constrain a
+  request for `/home/tamfisseo` to `/home/tamfisgpt`.
+- Ctrl+T live input now detects the control byte even when the terminal groups
+  it with adjacent bytes, persists the queued instruction, acknowledges its
+  queue ID, and leaves it for the next safe agent-round boundary.
 
 Verification after this fix: **854 tests passed** with an isolated writable
 config directory (3 existing collection/deprecation warnings). These changes
-are assigned to release **0.6.3**; GitHub/PyPI publication is the remaining
-release step for this working tree. The preceding 0.6.2 tag is already in its
-hosted publication workflow and will not be rewritten.
+are assigned to release **0.6.4**; GitHub/PyPI publication is the remaining
+release step for this working tree. Earlier release tags are not rewritten.
 
 ## Release gate and live queue UX (2026-07-21, v0.6.1)
 
