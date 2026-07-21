@@ -42,11 +42,11 @@ Verification completed:
 - The source release includes `USAGE_INSTALL_RELEASE.md` through
   `MANIFEST.in`.
 
-Deployment status: GitHub repository `tamfitronics/tamfis-code` is reachable
-using the configured GitHub token and is being updated from the verified
-source tree. There is no matching `tamfitronics/tamgpt6` repository. PyPI
-upload remains pending until a PyPI/Twine token is configured; no PyPI secret
-was present in `tamgpt6/.env` or `~/.pypirc`.
+Deployment status: GitHub repository `tamfitronics/tamfis-code` now has the
+verified `agent/commercial-release-0.6.1` branch and draft PR #1. The
+`v0.6.1` GitHub Actions Trusted Publishing workflow completed successfully,
+and `tamfis-code==0.6.1` is publicly available on PyPI. There is no matching
+`tamfitronics/tamgpt6` repository. No PyPI secret was required or stored.
 
 ## Live-reported: execute_command's `environment` argument also crashed the same way (2026-07-21, v0.4.42)
 
