@@ -96,17 +96,13 @@ def test_openrouter_default_is_not_openai_family():
     assert all(not model.startswith("openai/") for model in cfg.models)
 
 
-def test_nvidia_default_model_is_not_loop_prone_nemotron_or_unentitled_kimi():
-    # Live-reported regression: moonshotai/kimi-k2.6 was tried as the
-    # default to avoid nemotron's occasional lexical-loop corruption, but
-    # confirmed live (real HTTP calls against a real account) to be a hard,
-    # permanent 404 -- listed in NVIDIA's general /v1/models catalog but
-    # with no actual deployment access on an ordinary API key. A default
-    # that 404s outright is strictly worse than nemotron's occasional loop.
+def test_nvidia_default_model_is_tool_capable_and_not_unentitled_kimi():
+    # The plain Llama route is fluent but has been observed fabricating local
+    # tool results. Use the verified NVIDIA reasoning/tool route instead;
+    # never use the account-unentitled Kimi route as the default.
     default_model = ProviderManager.PROVIDERS[ProviderType.NVIDIA].default_model
-    assert default_model != "nvidia/nemotron-3-super-120b-a12b"
     assert default_model != "moonshotai/kimi-k2.6"
-    assert default_model == "meta/llama-3.1-70b-instruct"
+    assert default_model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
 
 
 def test_kimi_k2_6_is_still_selectable_on_openrouter_and_hf():
@@ -124,6 +120,12 @@ def test_kimi_k2_6_is_still_selectable_on_openrouter_and_hf():
     # behavior change to AUTO routing.
     assert ProviderManager.PROVIDERS[ProviderType.OPENROUTER].default_model != "moonshotai/kimi-k2.6"
     assert ProviderManager.PROVIDERS[ProviderType.HF].default_model != "moonshotai/Kimi-K2.6"
+
+
+def test_openrouter_paid_coding_default_is_qwen_coder():
+    config = ProviderManager.PROVIDERS[ProviderType.OPENROUTER]
+    assert config.default_model == "qwen/qwen3-coder"
+    assert config.default_model in config.models
 
 
 def test_remote_fallback_candidates_stay_in_policy_order():

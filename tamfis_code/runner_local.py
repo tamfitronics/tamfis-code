@@ -96,6 +96,18 @@ NARRATED_TOOL_CORRECTION = (
     "Only provide a final answer after the requested inspection or action actually ran."
 )
 
+# Keep the user-facing completion readable even when a provider streams a
+# long audit. Plans and live progress already have their own durable renderer
+# panels; the model must not recreate those as a second, drifting bullet list.
+FINAL_RESPONSE_FORMAT_INSTRUCTION = (
+    "When you finish, write a concise evidence-backed response using exactly these "
+    "sections when applicable: Summary, Changes, Verification, and Remaining issues. "
+    "Use one short bullet per concrete fact under a section; do not emit nested or "
+    "unrelated bullet lists, do not repeat the execution plan, and do not claim a "
+    "tool ran unless a real tool result appears in the conversation. If no files "
+    "changed, say so plainly under Summary."
+)
+
 # Same one-chance-then-fallback shape as narrated tool intent, for the
 # distinct failure of giving up outright instead of narrating.
 MAX_CAPITULATION_RETRIES_PER_PROVIDER = 1
@@ -1947,7 +1959,7 @@ def _looks_like_capitulation(text: str) -> bool:
 # same way: refuse the round, ask for a real tool call, and fall back
 # across providers the same one-chance-then-switch way as narrated intent.
 _FABRICATED_TOOL_RESULT_RE = re.compile(
-    r"the\s+\w+\s+tool\s+(?:has\s+)?(?:found|returned|shows?|revealed|indicates?)|"
+    r"the\s+\w+\s+tool\s+(?:has\s+)?(?:found|returned|executed|ran|shows?|revealed|indicates?)|"
     r"(?:the\s+)?results?\s+(?:suggest|indicate)s?\b|"
     r"i\s+encountered\s+an?\s+(?:access|permission)\s+issue|"
     r"(?:here\s+are\s+the\s+)?allowed\s+directories\s+(?:are|include|where\s+i\s+can)|"
@@ -2929,6 +2941,10 @@ async def run_local_agent_turn(
     # it survives later compaction and remains authoritative in every round.
     insert_at = 1 if working_messages and working_messages[0].get("role") == "system" else 0
     working_messages.insert(insert_at, scope_message)
+    working_messages.insert(insert_at + 1, {
+        "role": "system",
+        "content": FINAL_RESPONSE_FORMAT_INSTRUCTION,
+    })
     if resumed_from_checkpoint or resumed_from_legacy or _requests_autonomous_execution(incoming_objective):
         working_messages.insert(insert_at + 1, {"role": "system", "content": RESUME_EXECUTION_INSTRUCTION})
     checkpoint_mode = str(prior_checkpoint.get("mode") or ("read_only" if read_only else "execute"))

@@ -226,22 +226,14 @@ class ProviderManager:
             name="NVIDIA NIM",
             base_url="https://integrate.api.nvidia.com/v1",
             api_key_env="NVIDIA_API_KEY",
-            # meta/llama-3.1-70b-instruct is the stable coding/tool default.
-            # Nemotron remains selectable, but live streams have produced
-            # corrupted lexical loops that pass an ordinary finish-reason
-            # check. moonshotai/kimi-k2.6 was tried as the default before
-            # this -- confirmed live (real HTTP calls, real account) that
-            # it's a hard, permanent 404 ("Function ... Not found for
-            # account"), not a transient outage: it's listed in NVIDIA's
-            # general /v1/models catalog but this account (and, going by
-            # the entitlement-shaped error, likely most ordinary NVIDIA API
-            # keys -- third-party marketplace models commonly need separate
-            # enablement NVIDIA's own first-party models don't) has no
-            # actual deployment access to it. A default that 404s outright
-            # for typical accounts is strictly worse than nemotron's
-            # occasional loop -- confirmed the replacement actually works
-            # live before switching to it.
-            default_model="meta/llama-3.1-70b-instruct",
+            # The plain Llama instruct route can answer fluently but has
+            # repeatedly narrated/fabricated local tool results in this CLI.
+            # This NVIDIA reasoning model was verified to return genuine
+            # tool_calls and to accept reasoning parameters without the
+            # indefinite stream stall seen on the plain instruct models.
+            # Keep the older models selectable for accounts where this route
+            # is not enabled, but do not make them the automatic coding path.
+            default_model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
             models=[
                 "nvidia/nemotron-3-super-120b-a12b",
                 "nvidia/nemotron-3-ultra-550b-a55b",
@@ -303,7 +295,10 @@ class ProviderManager:
             name="OpenRouter",
             base_url="https://openrouter.ai/api/v1",
             api_key_env="OPENROUTER_API_KEY",
-            default_model="google/gemini-2.5-flash",
+            # Paid coding/repair work gets a coder-tuned route. Routine work
+            # still uses the free model below, so this does not turn every
+            # inspection into a paid request.
+            default_model="qwen/qwen3-coder",
             # Used for plain chat/Q&A/inspection -- anything that isn't
             # deep research or genuinely demanding coding/analysis work --
             # so routine turns don't spend paid OpenRouter credits at all.

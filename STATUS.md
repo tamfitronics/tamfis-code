@@ -13,6 +13,40 @@ already superseded by same-day code changes).
 **Rule going forward: don't create a new dated audit file for tamfis-code.
 Update this one.**
 
+## Post-release plan progress, model routing, and evidence fix (2026-07-22, working tree)
+
+Fixed the remaining plan-visibility gap identified after v0.6.1:
+
+- `plan_created` and every `plan_step_progress` event now print a durable
+  scrollback snapshot instead of relying on Rich's transient Live region.
+- Each visible item now shows an explicit status: `pending`, `in_progress`,
+  `completed`, or `failed`.
+- Progress remains visible after assistant streaming starts and the spinner is
+  stopped.
+- Remote `plan_step_progress` events are now persisted into the active saved
+  plan, matching the local orchestrator path.
+- Added a regression test covering plan creation, Live shutdown, and a later
+  completed/in-progress transition.
+- Automatic coding routes no longer default to NVIDIA's general
+  `meta/llama-3.1-70b-instruct`, which repeatedly produced narrated tool
+  claims in this workflow. NVIDIA now defaults to the verified
+  `nvidia/nemotron-3-nano-omni-30b-a3b-reasoning` route; OpenRouter's paid
+  coding route now defaults to `qwen/qwen3-coder`. TamfisGPT subscription
+  routing remains preferred when `TAMFIS_API_KEY` is configured.
+- Kimi remains listed only as an explicit selectable model; it is not an
+  automatic route and cannot spend credits unless the user chooses it.
+- The fabricated-result guard now rejects transcript-style claims such as
+  `list_directory tool has found ...` and `execute_command tool has executed
+  ...` unless real tool-call evidence exists. Added direct regression tests.
+- Final completions now use a compact `Summary / Changes / Verification /
+  Remaining issues` contract with flat, non-nested bullets; durable plan and
+  progress panels remain the single source of truth for execution tracking.
+
+Verification after this fix: **854 tests passed** with an isolated writable
+config directory (3 existing collection/deprecation warnings). These changes
+are assigned to release **0.6.2**; GitHub/PyPI publication is the remaining
+release step for this working tree.
+
 ## Release gate and live queue UX (2026-07-21, v0.6.1)
 
 Commercial-readiness verification completed for the portable standalone

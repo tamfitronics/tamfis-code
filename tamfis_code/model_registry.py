@@ -59,6 +59,24 @@ MODELS: dict[str, ModelRecord] = {
         ModelCapabilities(vision=True, long_context=True), 1000000,
         ("long_context_review", "repository_search", "vision_assisted_coding"), "high", "medium",
     ),
+    "qwen/qwen3-coder": ModelRecord(
+        "qwen/qwen3-coder", "openrouter",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 256000,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "medium",
+    ),
+    "deepseek/deepseek-chat-v3-0324": ModelRecord(
+        "deepseek/deepseek-chat-v3-0324", "openrouter",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 128000,
+        ("repository_search", "multi_file_edit", "debugging", "planning"),
+        "high", "low",
+    ),
+    "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning": ModelRecord(
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning", "nvidia",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 128000,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "medium",
+    ),
     "Qwen/Qwen2.5-7B-Instruct": ModelRecord(
         "Qwen/Qwen2.5-7B-Instruct", "hf",
         ModelCapabilities(long_context=False), 32768,

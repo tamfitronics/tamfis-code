@@ -546,7 +546,7 @@ async def _stream_task(
                 continue
 
             phase_by_event = {
-                "plan_created": "plan", "tool_call_requested": "execute",
+                "plan_created": "plan", "plan_step_progress": "execute", "tool_call_requested": "execute",
                 "command_started": "execute", "file_mutation": "execute",
                 "approval_required": "waiting_for_approval", "task_diagnostics": "validate",
                 "ai_task_completed": "report", "ai_task_failed": "report",
@@ -564,6 +564,13 @@ async def _stream_task(
                 # `last_plan_items` is what carries this forward in that case.
                 state = local_state.get_session_state(session_id)
                 if state.active_plan_id:
+                    local_state.update_plan_steps(session_id, state.active_plan_id, items)
+
+            if event_type == "plan_step_progress":
+                items = payload.get("items") if isinstance(payload.get("items"), list) else []
+                last_plan_items = items
+                state = local_state.get_session_state(session_id)
+                if state.active_plan_id and items:
                     local_state.update_plan_steps(session_id, state.active_plan_id, items)
 
             if event_type == "file_mutation":

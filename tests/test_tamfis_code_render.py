@@ -396,6 +396,32 @@ class StreamRendererTests(unittest.TestCase):
             renderer.finish()
         self.assertIn("inspect mission pipeline", console.file.getvalue())
 
+    def test_plan_progress_is_durable_after_live_panel_stops(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.handle_event({
+                "event_type": "plan_created",
+                "payload": {"title": "Plan", "items": [
+                    {"step": "Inspect", "status": "pending"},
+                    {"step": "Fix", "status": "pending"},
+                ]},
+            })
+            renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": "Working."}})
+            renderer.handle_event({
+                "event_type": "plan_step_progress",
+                "payload": {"items": [
+                    {"step": "Inspect", "status": "completed"},
+                    {"step": "Fix", "status": "in_progress"},
+                ]},
+            })
+        finally:
+            renderer.finish()
+        output = console.file.getvalue()
+        self.assertIn("Plan progress", output)
+        self.assertIn("Inspect · completed", output)
+        self.assertIn("Fix · in_progress", output)
+
     def test_approval_gate_suspends_and_resumes_the_live_status_line(self):
         # Regression guard: Rich's Live redraws on its own timer, independent
         # of a blocking console.input() approval prompt -- without suspending

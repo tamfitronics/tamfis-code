@@ -432,6 +432,32 @@ class StreamRenderer:
         if self._live is not None:
             self._live.update(self._build_status())
 
+    def _print_plan_snapshot(
+        self, items: list[dict[str, Any]], *, title: str,
+        assumptions: Optional[list[Any]] = None, risks: Optional[list[Any]] = None,
+    ) -> None:
+        """Print an authoritative plan snapshot to scrollback.
+
+        Rich Live is intentionally transient for the spinner, so it cannot
+        be the source of truth for a plan users need to follow. Every plan
+        creation and every status transition gets a durable snapshot here.
+        """
+        table = Table.grid(padding=(0, 1))
+        table.add_column(width=4, justify="right", style="cyan")
+        table.add_column(ratio=1)
+        for index, item in enumerate(items, start=1):
+            status = str(item.get("status") or "pending")
+            marker = "✓" if status == "completed" else (
+                "✗" if status == "failed" else ("▶" if status == "in_progress" else "○")
+            )
+            table.add_row(f"{index}. {marker}", f"{item.get('step') or ''} · {status}")
+        body: list[Any] = [table]
+        if assumptions:
+            body.extend([Text("Assumptions", style="bold"), Text(" • " + "\n • ".join(map(str, assumptions)))])
+        if risks:
+            body.extend([Text("Risks", style="bold yellow"), Text(" • " + "\n • ".join(map(str, risks)))])
+        self.console.print(Panel(Group(*body), title=title, border_style="cyan", expand=False))
+
     def _stop_live(self) -> None:
         """End the progress display before ordinary streamed output begins."""
         if self._live is not None:
@@ -574,14 +600,15 @@ class StreamRenderer:
             return
 
         if event_type == "plan_step_progress":
-            # In-place step-status refresh (see engine.py's
-            # _sync_plan_progress) -- unlike plan_created, this never
-            # reprints the plan banner or touches the spinner phase; it
-            # only updates the live step markers, silently, every round.
+            # Update both the live view and durable scrollback. The live view
+            # may already have been stopped when assistant output began, so
+            # refreshing it alone makes progress appear to disappear.
+            self._close_assistant()
             items = payload.get("items") if isinstance(payload.get("items"), list) else []
             if items:
                 self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
                 self._refresh_live()
+                self._print_plan_snapshot(self._plan_steps, title=payload.get("title") or "Plan progress")
             return
 
         if event_type == "plan_created":
@@ -595,21 +622,12 @@ class StreamRenderer:
                 # Rich's TTY Live region is transient and is stopped when
                 # assistant output begins. Always print a durable snapshot;
                 # otherwise the plan disappears at execution start.
-                table = Table.grid(padding=(0, 1))
-                table.add_column(width=4, justify="right", style="cyan")
-                table.add_column(ratio=1)
-                for index, item in enumerate(self._plan_steps, start=1):
-                    status = item.get("status")
-                    marker = "✓" if status == "completed" else ("▶" if status == "in_progress" else "○")
-                    table.add_row(f"{index}. {marker}", str(item.get("step") or ""))
                 assumptions = payload.get("assumptions") or []
                 risks = payload.get("risks") or []
-                body: list[Any] = [table]
-                if assumptions:
-                    body.extend([Text("Assumptions", style="bold"), Text(" • " + "\n • ".join(map(str, assumptions)))])
-                if risks:
-                    body.extend([Text("Risks", style="bold yellow"), Text(" • " + "\n • ".join(map(str, risks)))])
-                self.console.print(Panel(Group(*body), title=payload.get("title") or "Execution plan", border_style="cyan", expand=False))
+                self._print_plan_snapshot(
+                    self._plan_steps, title=payload.get("title") or "Execution plan",
+                    assumptions=assumptions, risks=risks,
+                )
                 return
             if stage == "tool_execution":
                 match = _TOOL_ANNOUNCE_RE.search(content)

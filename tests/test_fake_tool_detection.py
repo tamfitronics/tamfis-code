@@ -25,6 +25,7 @@ from tamfis_code.runner_local import (
     _looks_like_narrated_tool_intent,
     _requests_autonomous_execution,
     _requests_no_confirmation,
+    _looks_like_fabricated_tool_result,
 )
 
 
@@ -54,6 +55,16 @@ class FakeToolCallDetectionTests(unittest.TestCase):
 
     def test_unregistered_function_looking_text_is_not_flagged(self):
         self.assertFalse(_looks_like_fake_tool_call("def calculate_total(items): return sum(items)"))
+
+    def test_transcript_style_list_directory_claim_is_fabricated_result(self):
+        self.assertTrue(_looks_like_fabricated_tool_result(
+            "The list_directory tool has found the following files and directories."
+        ))
+
+    def test_transcript_style_execute_command_claim_is_fabricated_result(self):
+        self.assertTrue(_looks_like_fabricated_tool_result(
+            "The execute_command tool has executed the npm test command."
+        ))
 
 
 class NarratedToolIntentDetectionTests(unittest.TestCase):
