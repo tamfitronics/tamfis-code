@@ -111,7 +111,7 @@ $ <command>            explicit shell command
 /mode <name>         switch mode: manual | accept-edits | auto | plan
 Shift+Tab            cycle mode without typing a command (shown in the prompt as [mode]);
                      also works while a task is already running, not just at this prompt
-Ctrl+T               while a task is running: open the "queue next" input editor
+Ctrl+Y               while a task is running: open the "queue next" input editor (configurable)
 /model               show the active model route
 /model list [route]  list coding models (route: hf or openrouter)
 /model auto          restore Hugging Face -> OpenRouter automatic routing
@@ -373,9 +373,9 @@ async def run_interactive(
     console.print(
         "[dim]Type /help for commands. Paste up to 1,000,000 characters; Alt+Enter adds a newline. "
         "Shift+Tab cycles mode (manual/accept-edits/auto/plan) -- works while a task is running too, "
-        "not just at this prompt. Ctrl+T opens a visible `queue next>` editor while a task is running; "
+        "not just at this prompt. Ctrl+Y opens a visible `queue next>` editor while a task is running; "
         "your submitted text is acknowledged with a queue id and applied at the next safe round boundary. "
-        "Ctrl+D or Ctrl+C exits.[/dim]\n"
+        "The queue shortcut defaults to Ctrl+Y (Ctrl+T is reserved by Termius); Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
@@ -990,7 +990,7 @@ async def run_interactive(
                     "/mode auto           auto-approves everything, never prompts (server safeguards still apply)\n"
                     "/mode plan           read-only: propose without executing\n"
                     "Shift+Tab            cycle manual -> accept-edits -> auto -> plan without typing a command\n"
-                    "                     (also works mid-task, not just here); Ctrl+T mid-task queues a follow-up\n"
+                    "                     (also works mid-task, not just here); Ctrl+Y mid-task queues a follow-up\n"
                     "Other raw policy values also work directly (--approval-only, no short alias): safe, workspace,\n"
                     "read-only, plan-only, suggest, full-auto, and 'never' -- note 'never' means DENY everything\n"
                     "(the opposite of what it sounds like; it is not a synonym for 'auto').[/dim]"

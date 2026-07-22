@@ -32,7 +32,7 @@ mutation ledger on the local machine.
 
 ## Interactive queue controls
 
-While a task is running, press `Ctrl+T` to open `queue next>`. The submitted
+While a task is running, press `Ctrl+Y` to open `queue next>`. The submitted
 line is echoed with a durable queue ID, then applied at the next safe model
 round boundary. Multiple queued updates are processed in order. A second
 terminal can enqueue the same session with:

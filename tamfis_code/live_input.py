@@ -9,7 +9,7 @@ just when an approval prompt happens to be showing:
   runner.py's approval-gate Shift+Tab handler (`_prompt`'s own binding)
   already read from and write to, so this is not a second, competing mode
   concept, just another writer of the same value.
-- Ctrl+T opens a real line editor for the next instruction and queues it
+- Ctrl+Y opens a real line editor for the next instruction and queues it
   through the on-disk queue a second
   terminal's `tamfis-code queue "..."` already used
   (runner_local.py's `_claim_live_queued_instructions` polls it at the top
@@ -50,7 +50,25 @@ except ImportError:  # Windows -- no termios/tty; this feature just disables its
     _TTY_AVAILABLE = False
 
 _SHIFT_TAB = b"\x1b[Z"
-_CTRL_T = b"\x14"
+# Ctrl+T is reserved by Termius for opening a new terminal. Keep the queue
+# shortcut on Ctrl+Y by default, while allowing an operator to choose a local
+# key explicitly when another terminal client owns it.
+_CTRL_T = b"\x14"  # legacy/exported test constant; no longer the default
+_CTRL_Y = b"\x19"
+_QUEUE_KEY_ENV = "TAMFIS_CODE_QUEUE_KEY"
+
+
+def queue_key_bytes() -> tuple[bytes, str]:
+    value = os.environ.get(_QUEUE_KEY_ENV, "ctrl-y").strip().lower().replace(" ", "")
+    if value in {"ctrl-t", "^t"}:
+        return _CTRL_T, "Ctrl+T"
+    if value in {"ctrl-y", "^y", ""}:
+        return _CTRL_Y, "Ctrl+Y"
+    # Single control letters are convenient for terminal clients without
+    # reliable multi-key escape support: ctrl-a through ctrl-z.
+    if value.startswith("ctrl-") and len(value) == 6 and "a" <= value[-1] <= "z":
+        return bytes([ord(value[-1]) - ord("a") + 1]), f"Ctrl+{value[-1].upper()}"
+    return _CTRL_Y, "Ctrl+Y"
 _ESCAPE_PREFIXES = (b"\x1b", b"\x1b[")
 
 
@@ -127,10 +145,11 @@ class LiveInputListener:
         buf = bytes(self._buf)
         # os.read() is allowed to return more than one byte. A keypress can
         # therefore arrive together with terminal noise or a paste prefix;
-        # equality-only matching silently discarded Ctrl+T in that case and
+        # equality-only matching silently discarded the queue control byte in that case and
         # made the in-task editor appear broken. Consume the control byte
         # wherever it occurs, while keeping the editor single-flight.
-        if _CTRL_T in buf:
+        queue_key, _ = queue_key_bytes()
+        if queue_key in buf:
             self._buf.clear()
             if self._interject_task is None or self._interject_task.done():
                 self._interject_task = asyncio.ensure_future(self._interject())

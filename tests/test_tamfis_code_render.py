@@ -188,7 +188,7 @@ class StreamRendererTests(unittest.TestCase):
             renderer.live_input_listener = object()
             console.print(renderer._build_status())
             output = console.file.getvalue()
-            self.assertIn("Ctrl+T queue next>", output)
+            self.assertIn("Ctrl+Y queue next>", output)
             self.assertIn("Ctrl+C/Ctrl+D exit", output)
         finally:
             renderer.finish()

@@ -420,7 +420,9 @@ class StreamRenderer:
             # opens the coordinated editor without competing with Rich Live;
             # this footer is rebuilt on every refresh and therefore never
             # disappears behind the spinner or plan rows.
-            lines.append("  [cyan]Input:[/cyan] Ctrl+T queue next> · Ctrl+C/Ctrl+D exit")
+            from .live_input import queue_key_bytes
+            _, queue_label = queue_key_bytes()
+            lines.append(f"  [cyan]Input:[/cyan] {queue_label} queue next> · Ctrl+C/Ctrl+D exit")
         if tip:
             lines.append(f"  [dim]{tip}[/dim]")
         for step in self._plan_steps:

@@ -8,7 +8,7 @@ from rich.console import Console
 
 from tamfis_code import state as state_module
 from tamfis_code.config import Config, next_mode_in_cycle
-from tamfis_code.live_input import LiveInputListener, _CTRL_T, _SHIFT_TAB
+from tamfis_code.live_input import LiveInputListener, _CTRL_T, _CTRL_Y, _SHIFT_TAB
 from tamfis_code.render import StreamRenderer
 
 
@@ -144,7 +144,7 @@ class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCa
             cfg = _config("ask")
             listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
             with patch.object(listener, "_interject", side_effect=_noop) as mocked:
-                listener._buf = bytearray(_CTRL_T)
+                listener._buf = bytearray(_CTRL_Y)
                 listener._dispatch()
                 self.assertEqual(bytes(listener._buf), b"")
                 await asyncio.sleep(0)  # let the scheduled task actually run
@@ -161,7 +161,7 @@ class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCa
                 await gate.wait()
 
             with patch.object(listener, "_interject", side_effect=_blocked) as mocked:
-                listener._buf = bytearray(_CTRL_T)
+                listener._buf = bytearray(_CTRL_Y)
                 listener._dispatch()
                 await asyncio.sleep(0)
                 listener._buf = bytearray(_CTRL_T)
@@ -180,7 +180,7 @@ class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCa
             cfg = _config("ask")
             listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
             with patch.object(listener, "_interject", new_callable=AsyncMock) as mocked:
-                listener._buf = bytearray(b"x" + _CTRL_T + b"y")
+                listener._buf = bytearray(b"x" + _CTRL_Y + b"y")
                 listener._dispatch()
                 await asyncio.sleep(0)
                 mocked.assert_awaited_once()
