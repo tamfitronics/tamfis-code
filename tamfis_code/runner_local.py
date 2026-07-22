@@ -1183,6 +1183,14 @@ def _legacy_resume_messages(state, incoming_objective: str) -> tuple[list[dict[s
 # the tail of the accumulated text, and triggers within a couple KB of a
 # genuine loop, long before the content can grow large enough to matter.
 _DEGENERATE_REPETITION_RE = re.compile(r"(.{6,200}?)\1{4,}", re.DOTALL)
+# A separate guard for a common context-confusion failure: the model starts
+# replaying a synthetic transcript ("then the user said ... then the
+# assistant responded ...") instead of answering the current task. The
+# individual paragraphs are often too long or slightly varied for the
+# contiguous backreference above, so count the unmistakable transcript
+# markers in the rolling tail.
+_CONVERSATION_ECHO_USER_MARKER = re.compile(r"\bthen\s+the\s+user\s+said\b", re.IGNORECASE)
+_CONVERSATION_ECHO_ASSISTANT_MARKER = re.compile(r"\bthen\s+the\s+assistant\s+(?:said|responded)\b", re.IGNORECASE)
 _DEGENERATE_REPETITION_TAIL_WINDOW = 8_000
 _STREAM_QUALITY_LAG_CHARS = 1_024
 _CORRUPTED_STREAM_MIN_CHARS = 600
@@ -2277,6 +2285,12 @@ async def _stream_one_completion(
                     if _DEGENERATE_REPETITION_RE.search(tail_buffer):
                         quality_failure_reason = "degenerate_repetition"
                         break
+                    if (
+                        len(_CONVERSATION_ECHO_USER_MARKER.findall(tail_buffer)) >= 3
+                        and len(_CONVERSATION_ECHO_ASSISTANT_MARKER.findall(tail_buffer)) >= 3
+                    ):
+                        quality_failure_reason = "conversation_echo"
+                        break
                     if _corrupted_lexical_stream_index(tail_buffer) is not None:
                         quality_failure_reason = "corrupted_output"
                         break
@@ -2308,6 +2322,8 @@ async def _stream_one_completion(
             diagnosis = (
                 "Detected corrupted provider token output; discarding it and requesting a clean route."
                 if quality_failure_reason == "corrupted_output"
+                else "Detected a repeated conversation transcript; discarding it and requesting a clean route."
+                if quality_failure_reason == "conversation_echo"
                 else "Detected the model repeating itself in a loop; discarding that completion."
             )
             renderer.handle_event({
@@ -3634,7 +3650,7 @@ async def run_local_agent_turn(
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
                 return TaskOutcome(status="failed", error=message)
 
-        if finish_reason in {"degenerate_repetition", "corrupted_output"}:
+        if finish_reason in {"degenerate_repetition", "conversation_echo", "corrupted_output"}:
             failed_quality_provider = resolved_provider
             quality_failed_providers.add(failed_quality_provider)
             checkpoint_partial_parts.clear()
@@ -3677,6 +3693,8 @@ async def run_local_agent_turn(
             reason_text = (
                 "corrupted token output"
                 if finish_reason == "corrupted_output"
+                else "a repeated conversation transcript"
+                if finish_reason == "conversation_echo"
                 else "a degenerate repetition loop"
             )
             error = (

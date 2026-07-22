@@ -767,6 +767,29 @@ class RunLocalAgentTurnTests(_StatePatchMixin, unittest.TestCase):
             )
             self.assertNotIn(looping_phrase, visible)
 
+    def test_repeated_conversation_transcript_is_stopped_early(self):
+        with tempfile.TemporaryDirectory() as ws:
+            rounds = [[
+                _chunk(_delta(content=(
+                    'Then the user said "audit the site". Then the assistant responded '
+                    "with a long analysis. " if index % 2 else
+                    'Then the user said "continue until fixed". Then the assistant responded '
+                    "with another long analysis. "
+                ))) for index in range(20)
+            ]]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "summarize the site"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn("repeated conversation transcript", outcome.error)
+            self.assertEqual(len(client.calls), 1)
+
     def test_change_request_completed_with_no_mutation_gets_a_caveat(self):
         """Confirmed live: a weak model can narrate "I'll fix this" -- complete
         with a fabricated "corrected" code block -- without ever calling
