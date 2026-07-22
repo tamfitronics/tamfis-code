@@ -25,6 +25,7 @@ class OrchestrationRun:
     validation: ValidationReport | None = None
     route: dict[str, Any] = field(default_factory=dict)
     repair_attempts: int = 0
+    reasoning_plan: bool = False
 
 
 class AgentOrchestrator:
@@ -165,6 +166,22 @@ class AgentOrchestrator:
             tool_records=[item.to_dict() for item in self.run.tool_records],
             any_mutation=any_mutation, final_text=final_text,
         )
+        if (
+            self.run.reasoning_plan
+            and self.run.profile.task_type.value == "audit"
+            and self.run.plan is not None
+        ):
+            pending = [
+                step.name for step in self.run.plan.steps
+                if step.status in {"pending", "in_progress"}
+            ]
+            if pending:
+                report.passed = False
+                report.unresolved.append(
+                    "Execution plan incomplete; pending steps: " + "; ".join(pending)
+                )
+                if report.severity == "pass":
+                    report.severity = "warning"
         self.run.validation = report
         state = local_state.get_session_state(self.session_id)
         local_state.save_session_state(

@@ -3230,6 +3230,7 @@ async def run_local_agent_turn(
         )
         if reasoning_plan is not None and orchestrator.run is not None:
             orchestrator.replace_plan(reasoning_plan)
+            orchestrator.run.reasoning_plan = True
             plan_message = {
                 "role": "system",
                 "content": _plan_message_content(
@@ -3260,6 +3261,7 @@ async def run_local_agent_turn(
     fabricated_result_retries: dict[ProviderType, int] = {}
     fabricated_result_failed_providers: set[ProviderType] = set()
     quality_failed_providers: set[ProviderType] = set()
+    plan_completion_retries = 0
 
     async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
         """Turn accumulated completion output into the turn's final
@@ -4133,6 +4135,42 @@ async def run_local_agent_turn(
                 orchestrator.fail(error)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
+
+            pending_plan_steps = []
+            if orchestrator.run is not None and orchestrator.run.reasoning_plan and orchestrator.run.plan is not None:
+                pending_plan_steps = [
+                    step.name for step in orchestrator.run.plan.steps
+                    if step.status in {"pending", "in_progress"}
+                ]
+            if (
+                tools and task_profile.requires_tools
+                and getattr(task_profile.task_type, "value", "") == "audit"
+                and pending_plan_steps
+                and plan_completion_retries < 2
+            ):
+                plan_completion_retries += 1
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({
+                    "role": "system",
+                    "content": (
+                        "The audit is not complete. The execution plan still has pending steps: "
+                        + "; ".join(pending_plan_steps)
+                        + ". Continue inspecting the remaining workspace and recover from any failed read "
+                        "with a focused alternative path. Do not provide the final report until every plan "
+                        "step has either completed with evidence or is explicitly reported as blocked."
+                    ),
+                })
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "The model attempted to finish before the audit plan was complete; "
+                            "requesting the remaining inspection steps."
+                        )
+                    },
+                })
+                _persist_turn_checkpoint()
+                continue
 
             return await _finalize_completed_answer(content, finish_reason)
 
