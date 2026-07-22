@@ -119,6 +119,20 @@ class LiveInputListener:
 
         bindings = KeyBindings()
 
+        # Some SSH/terminal clients emit focus-in/focus-out as CSI sequences
+        # (ESC [ I / ESC [ O).  Because ``escape`` is also the intentional
+        # cancel binding below, prompt_toolkit can otherwise dispatch the
+        # first byte as a cancellation and leak the trailing ``I``/``O`` into
+        # the prompt.  Consume those complete sequences before the bare-Esc
+        # binding gets a chance to act.
+        @bindings.add("escape", "[", "I")
+        def _ignore_focus_in(event) -> None:
+            return
+
+        @bindings.add("escape", "[", "O")
+        def _ignore_focus_out(event) -> None:
+            return
+
         @bindings.add("escape")
         def _cancel_running_turn(event) -> None:
             # Match the interrupt affordance offered by other terminal agents:
