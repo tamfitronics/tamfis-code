@@ -181,6 +181,18 @@ class StreamRendererTests(unittest.TestCase):
         self.assertNotIn("Tip:", output)
         renderer.finish()
 
+    def test_running_status_keeps_live_input_affordance_visible(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.live_input_listener = object()
+            console.print(renderer._build_status())
+            output = console.file.getvalue()
+            self.assertIn("Ctrl+T queue next>", output)
+            self.assertIn("Ctrl+C/Ctrl+D exit", output)
+        finally:
+            renderer.finish()
+
     def test_all_tips_reference_real_commands_only(self):
         # Every tip must name a command that actually exists in cli.py's
         # registered command set (or a real REPL slash command) -- this

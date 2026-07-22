@@ -411,9 +411,16 @@ class StreamRenderer:
         label = f"{mode_tag}[bold]{verb}…[/bold] [dim]({' · '.join(detail_parts)})[/dim]"
         self._spinner.update(text=Text.from_markup(label))
         tip = _current_tip(elapsed)
-        if not self._plan_steps and not tip:
+        if not self._plan_steps and not tip and self.live_input_listener is None:
             return self._spinner
         lines = []
+        if self.live_input_listener is not None:
+            # The ordinary REPL editor is suspended while the agent owns the
+            # terminal, but the input affordance must remain visible. Ctrl+T
+            # opens the coordinated editor without competing with Rich Live;
+            # this footer is rebuilt on every refresh and therefore never
+            # disappears behind the spinner or plan rows.
+            lines.append("  [cyan]Input:[/cyan] Ctrl+T queue next> · Ctrl+C/Ctrl+D exit")
         if tip:
             lines.append(f"  [dim]{tip}[/dim]")
         for step in self._plan_steps:

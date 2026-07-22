@@ -13,7 +13,7 @@ already superseded by same-day code changes).
 **Rule going forward: don't create a new dated audit file for tamfis-code.
 Update this one.**
 
-## Post-release repetition, CWD scope, live input, plan progress, model routing, evidence, and fallback fixes (2026-07-22, working tree)
+## Post-release persistent input, repeated-content, CWD scope, live input, plan progress, model routing, evidence, and fallback fixes (2026-07-22, working tree)
 
 Fixed the remaining plan-visibility gap identified after v0.6.1:
 
@@ -56,10 +56,17 @@ Fixed the remaining plan-visibility gap identified after v0.6.1:
   mid-stream and switch provider/recover, instead of being accepted as a
   10,000-line answer. Final output remains bounded and evidence validation
   still applies.
+- Added repeated-content detection for long analysis, bullet, and code
+  segments replayed three times with formatting between them. This catches
+  sitemap/SEO-style repeated paragraphs that do not match the transcript
+  markers or contiguous repetition regex.
+- The live execution footer now persistently shows `Input: Ctrl+T queue next>`
+  and `Ctrl+C/Ctrl+D exit`, including when there is no plan or rotating tip;
+  the input affordance no longer disappears behind the spinner.
 
 Verification after this fix: **854 tests passed** with an isolated writable
 config directory (3 existing collection/deprecation warnings). These changes
-are assigned to release **0.6.5**; GitHub/PyPI publication is the remaining
+are assigned to release **0.6.7**; GitHub/PyPI publication is the remaining
 release step for this working tree. Earlier release tags are not rewritten.
 
 ## Release gate and live queue UX (2026-07-21, v0.6.1)
