@@ -21,6 +21,7 @@ from tamfis_code.runner_local import (
     _messages_with_vision_content,
     _novel_continuation,
     _parse_swarm_tasks,
+    _next_audit_plan_file,
     _preview_diff_for_tool_call,
     _tool_output_for_render,
     _looks_like_change_request,
@@ -41,6 +42,29 @@ class ChangeRequestDetectionTests(unittest.TestCase):
 
     def test_past_tense_fixed_is_not_a_new_mutation_request(self):
         self.assertFalse(_looks_like_change_request("the bug is fixed; report the result"))
+
+
+class AuditRecoveryTests(unittest.TestCase):
+    def test_selects_only_existing_file_inside_scope_from_pending_step(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "functions.php"
+            target.write_text("<?php return true;\n", encoding="utf-8")
+            plan = SimpleNamespace(steps=[
+                SimpleNamespace(status="pending", name=f"Read {target} for audit evidence"),
+            ])
+            self.assertEqual(_next_audit_plan_file(plan, [root]), target.resolve())
+
+    def test_does_not_escape_scope_or_invent_missing_file(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as other:
+            root = Path(tmp)
+            outside = Path(other) / "secret.php"
+            outside.write_text("<?php\n", encoding="utf-8")
+            plan = SimpleNamespace(steps=[
+                SimpleNamespace(status="pending", name=f"Read {outside}"),
+                SimpleNamespace(status="pending", name=f"Read {root / 'missing.php'}"),
+            ])
+            self.assertIsNone(_next_audit_plan_file(plan, [root]))
 
 
 class StreamQualityTests(unittest.TestCase):

@@ -1442,6 +1442,91 @@ def _normalise_tool_result(
     return normalised
 
 
+_AUDIT_PLAN_PATH_RE = re.compile(r"(?<![\w])/(?:[^\s,;()\[\]{}<>]+)")
+
+
+def _next_audit_plan_file(plan: Any, scope_roots: list[Path]) -> Optional[Path]:
+    """Return the first safe, concrete file named by an unfinished audit step.
+
+    This is deliberately narrow: it never invents a path, traverses a
+    directory, or executes a command.  It only turns an already-approved
+    reasoning-plan step containing an absolute path into the equivalent
+    read-only tool operation when a provider failed to emit native tool JSON.
+    """
+    if plan is None:
+        return None
+    for step in plan.steps:
+        if step.status not in {"pending", "in_progress"}:
+            continue
+        for raw in _AUDIT_PLAN_PATH_RE.findall(str(step.name)):
+            candidate = Path(raw.rstrip(".:")).expanduser()
+            try:
+                resolved = candidate.resolve()
+                if not resolved.is_file():
+                    continue
+                if any(_is_within(resolved, root.resolve()) for root in scope_roots):
+                    return resolved
+            except OSError:
+                continue
+    return None
+
+
+async def _recover_audit_plan_file(
+    *,
+    mcp_server: MCPServer,
+    orchestrator: AgentOrchestrator,
+    renderer: StreamRenderer,
+    working_messages: list[dict[str, Any]],
+    plan: Any,
+    scope_roots: list[Path],
+    objective: str,
+    round_number: int,
+) -> bool:
+    """Execute one concrete pending audit read after a malformed completion."""
+    path = _next_audit_plan_file(plan, scope_roots)
+    if path is None:
+        return False
+    call_id = f"audit_recovery_{round_number}_{uuid.uuid4().hex[:8]}"
+    arguments = {"path": str(path)}
+    # Keep the conversation protocol valid even though the provider omitted
+    # its native tool call: every synthetic result has a matching assistant
+    # tool_calls message and is visibly marked as runtime recovery.
+    working_messages.append({
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {"name": "read_file", "arguments": json.dumps(arguments)},
+        }],
+    })
+    envelope = ToolEnvelope(
+        tool_call_id=call_id,
+        tool_name="read_file",
+        arguments=arguments,
+        purpose=f"Recover pending audit inspection for: {objective[:160]}",
+        cwd=str(path.parent),
+    )
+    result = await mcp_server.call_tool("read_file", arguments)
+    result = _normalise_tool_result("read_file", arguments, result, str(scope_roots[0]))
+    envelope.finish(result=result, success=bool(result.get("success")))
+    orchestrator.record_tool(envelope)
+    renderer.handle_event({
+        "event_type": "diagnostics",
+        "payload": {"content": f"Recovered pending audit read through read_file: {path}"},
+    })
+    renderer.handle_event({
+        "event_type": "tool_output",
+        "payload": {"tool": "read_file", "result": _tool_output_for_render(result)},
+    })
+    working_messages.append({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "content": json.dumps(result, default=str),
+    })
+    return True
+
+
 async def _nonstream_one_completion(
     client,
     *,
@@ -3261,6 +3346,7 @@ async def run_local_agent_turn(
     fabricated_result_retries: dict[ProviderType, int] = {}
     fabricated_result_failed_providers: set[ProviderType] = set()
     quality_failed_providers: set[ProviderType] = set()
+    audit_recovery_reads = 0
     plan_completion_retries = 0
 
     async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
@@ -3775,6 +3861,32 @@ async def run_local_agent_turn(
                 finish_reason = "degenerate_repetition"
 
         if finish_reason in {"degenerate_repetition", "conversation_echo", "repeated_content", "corrupted_output"}:
+            # A malformed completion must not prevent a concrete audit plan
+            # from progressing.  If the plan already names an exact file,
+            # consume that read-only step locally before spending another
+            # provider attempt on the same broken response.
+            if (
+                tools
+                and task_profile.requires_tools
+                and getattr(task_profile.task_type, "value", "") == "audit"
+                and orchestrator.run is not None
+                and orchestrator.run.reasoning_plan
+                and orchestrator.run.plan is not None
+                and audit_recovery_reads < 8
+                and await _recover_audit_plan_file(
+                    mcp_server=mcp_server,
+                    orchestrator=orchestrator,
+                    renderer=renderer,
+                    working_messages=working_messages,
+                    plan=orchestrator.run.plan,
+                    scope_roots=scope_roots,
+                    objective=objective,
+                    round_number=_round,
+                )
+            ):
+                audit_recovery_reads += 1
+                _persist_turn_checkpoint()
+                continue
             failed_quality_provider = resolved_provider
             quality_failed_providers.add(failed_quality_provider)
             checkpoint_partial_parts.clear()
@@ -3912,6 +4024,33 @@ async def run_local_agent_turn(
                 orchestrator.fail(error)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
+
+            # Some compatible models provide useful planning prose but omit
+            # the structured tool call entirely.  For a concrete audit plan,
+            # recover the next exact file read before treating the prose as a
+            # narrated-tool failure or switching providers.
+            if (
+                tools
+                and task_profile.requires_tools
+                and getattr(task_profile.task_type, "value", "") == "audit"
+                and orchestrator.run is not None
+                and orchestrator.run.reasoning_plan
+                and orchestrator.run.plan is not None
+                and audit_recovery_reads < 8
+                and await _recover_audit_plan_file(
+                    mcp_server=mcp_server,
+                    orchestrator=orchestrator,
+                    renderer=renderer,
+                    working_messages=working_messages,
+                    plan=orchestrator.run.plan,
+                    scope_roots=scope_roots,
+                    objective=objective,
+                    round_number=_round,
+                )
+            ):
+                audit_recovery_reads += 1
+                _persist_turn_checkpoint()
+                continue
 
             # "Let me check..." is a promise, not evidence that a repository
             # check happened.  Keep it in the transcript, explicitly require
