@@ -152,9 +152,9 @@ class ProviderManager:
     PRIORITY_ORDER: tuple[ProviderType, ...] = (
         ProviderType.TIER_IV,
         ProviderType.TAMFIS,
+        ProviderType.HF,
         ProviderType.NVIDIA,
         ProviderType.OPENROUTER,
-        ProviderType.HF,
     )
 
     PROVIDERS: Dict[ProviderType, ProviderConfig] = {
@@ -254,6 +254,9 @@ class ProviderManager:
                 "google/gemma-2-27b-it",
                 "microsoft/phi-3-medium-128k-instruct",
             ],
+            # HF is the preferred external coding route: its automatic model
+            # is the official Qwen 3.6 coding model. NVIDIA remains the first
+            # mature fallback when HF is unavailable or its account is out.
             priority=1,
             weight=4,
             reasoning_supported=True,
@@ -293,7 +296,7 @@ class ProviderManager:
                 # have to mean losing access to this model entirely.
                 "moonshotai/Kimi-K2.6",
             ],
-            priority=3,
+            priority=0,
             weight=3,
             reasoning_supported=False,
             vision_supported=True,
@@ -301,7 +304,7 @@ class ProviderManager:
             coding_quality=5,
             tool_calling=True,
             structured_output=True,
-            long_context=False,
+            long_context=True,
         ),
         ProviderType.OPENROUTER: ProviderConfig(
             name="OpenRouter",
@@ -339,7 +342,10 @@ class ProviderManager:
                 # comment).
                 "moonshotai/kimi-k2.6",
             ],
-            priority=2,
+            # OpenRouter is last in AUTO because paid coding routes can fail
+            # with HTTP 402 when the account has no credits. It remains
+            # explicitly selectable and is still tried after HF/NVIDIA.
+            priority=3,
             weight=2,
             reasoning_supported=True,
             vision_supported=True,

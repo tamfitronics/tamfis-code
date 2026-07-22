@@ -80,14 +80,14 @@ def _manager_with(*providers):
     return manager
 
 
-def test_auto_prefers_nvidia_for_audit():
-    manager = _manager_with(ProviderType.NVIDIA, ProviderType.OPENROUTER)
-    assert manager._select_best_provider(classify_task("audit the whole repository")) == ProviderType.NVIDIA
+def test_auto_prefers_hf_qwen36_for_audit():
+    manager = _manager_with(ProviderType.HF, ProviderType.NVIDIA, ProviderType.OPENROUTER)
+    assert manager._select_best_provider(classify_task("audit the whole repository")) == ProviderType.HF
 
 
 def test_auto_prefers_openrouter_for_edit_when_nvidia_unavailable():
     manager = _manager_with(ProviderType.OPENROUTER, ProviderType.HF)
-    assert manager._select_best_provider(classify_task("fix and refactor the code")) == ProviderType.OPENROUTER
+    assert manager._select_best_provider(classify_task("fix and refactor the code")) == ProviderType.HF
 
 
 def test_openrouter_default_is_not_openai_family():
@@ -151,7 +151,7 @@ def test_remote_fallback_candidates_stay_in_policy_order():
     # Use a tool-requiring task that does not require long context, so HF is
     # eligible; long-context tasks correctly skip its 32k route.
     assert manager.fallback_candidates(ProviderType.NVIDIA, classify_task("inspect app.py")) == [
-        ProviderType.OPENROUTER, ProviderType.HF,
+        ProviderType.HF, ProviderType.OPENROUTER,
     ]
 
 
@@ -223,9 +223,9 @@ def test_standalone_provider_manager_excludes_tier_iv_from_routing_order():
     manager.runtime_mode = "standalone"
     assert ProviderType.TIER_IV not in manager.routing_order
     assert manager.fallback_chain_names(ProviderType.NVIDIA) == [
-        ProviderType.TAMFIS.value,
-        ProviderType.OPENROUTER.value,
-        ProviderType.HF.value,
+            ProviderType.TAMFIS.value,
+            ProviderType.HF.value,
+            ProviderType.OPENROUTER.value,
     ]
 
 

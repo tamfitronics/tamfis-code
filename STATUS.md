@@ -90,10 +90,15 @@ Fixed the remaining plan-visibility gap identified after v0.6.1:
   from the interrupted turn checkpoint, with a bounded preview retained for
   `continue` recovery. Planning responses with repetition/corruption are
   discarded silently and the durable deterministic plan remains active.
+- Automatic standalone routing now prefers HF with Qwen 3.6 for long-context
+  coding/audit work. NVIDIA is the mature fallback; OpenRouter is last in the
+  automatic chain because its paid Qwen route can return HTTP 402. This
+  prevents a credit-exhausted OpenRouter turn from bouncing back to NVIDIA
+  before trying the configured HF Qwen 3.6 route.
 
 Verification after this fix: **864 tests passed** with an isolated writable
 config directory (3 existing collection/deprecation warnings). These changes
-are assigned to release **0.6.10**; GitHub/PyPI publication is the remaining
+are assigned to release **0.6.11**; GitHub/PyPI publication is the remaining
 release step for this working tree. Earlier release tags are not rewritten.
 
 ## Release gate and live queue UX (2026-07-21, v0.6.1)
