@@ -5,6 +5,7 @@ from rich.console import Console
 
 from types import SimpleNamespace
 
+from tamfis_code import __version__
 from tamfis_code.render import (
     StreamRenderer,
     _tool_action_label,
@@ -266,6 +267,7 @@ class StreamRendererTests(unittest.TestCase):
             approval_policy="ask",
         )
         output = console.file.getvalue()
+        self.assertIn(f"TamfisGPT Code v{__version__}", output)
         self.assertIn("Runtime: standalone", output)
         self.assertIn("Provider: auto (nvidia, openrouter, hf, in capability-ranked order)", output)
         self.assertNotIn("Host: local:auto", output)

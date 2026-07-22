@@ -23,6 +23,7 @@ from rich.table import Table
 from rich.spinner import Spinner
 from rich.text import Text
 
+from . import __version__
 from .metrics import MetricsTracker
 from .safety import redact_secrets
 
@@ -994,7 +995,7 @@ def resume_live_if_active(renderer: Any) -> None:
 
 
 def print_banner(console: Console, *, host: str, workspace_root: str, mode: str, approval_policy: str) -> None:
-    console.print(Text("TamfisGPT Code", style="bold cyan"))
+    console.print(Text(f"TamfisGPT Code v{__version__}", style="bold cyan"))
     console.print(Text("by Tamfis Nig. Ltd", style="dim"))
     console.print(f"[dim]Workspace:[/dim] {workspace_root}")
     if host.startswith("local:"):
