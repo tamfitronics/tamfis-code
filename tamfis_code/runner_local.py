@@ -1191,6 +1191,34 @@ _DEGENERATE_REPETITION_RE = re.compile(r"(.{6,200}?)\1{4,}", re.DOTALL)
 # markers in the rolling tail.
 _CONVERSATION_ECHO_USER_MARKER = re.compile(r"\bthen\s+the\s+user\s+said\b", re.IGNORECASE)
 _CONVERSATION_ECHO_ASSISTANT_MARKER = re.compile(r"\bthen\s+the\s+assistant\s+(?:said|responded)\b", re.IGNORECASE)
+_REPEATED_LONG_SEGMENT_MIN_CHARS = 120
+
+
+def _has_repeated_long_segment(text: str) -> bool:
+    """Detect a long sentence/paragraph/code fragment replayed three times.
+
+    Repetition can be non-contiguous: a model may repeat the same analysis
+    paragraph while changing only headings, bullets, or surrounding code.
+    Exact contiguous backreferences therefore miss it. Short fragments are
+    intentionally ignored to avoid flagging legitimate repeated terms.
+    """
+    raw_text = text or ""
+    # Preserve paragraph-sized units first. Splitting on sentence boundaries
+    # alone loses the repeated block when a provider inserts a blank line
+    # between copies of an otherwise short three-sentence analysis.
+    paragraphs = re.split(r"\n{2,}", raw_text)
+    segments = list(paragraphs)
+    segments.extend(
+        sentence
+        for paragraph in paragraphs
+        for sentence in re.split(r"(?<=[.!?])\s+", paragraph)
+    )
+    counts: Counter[str] = Counter()
+    for segment in segments:
+        normalized = re.sub(r"\s+", " ", segment).strip().casefold()
+        if len(normalized) >= _REPEATED_LONG_SEGMENT_MIN_CHARS:
+            counts[normalized] += 1
+    return any(count >= 3 for count in counts.values())
 _DEGENERATE_REPETITION_TAIL_WINDOW = 8_000
 _STREAM_QUALITY_LAG_CHARS = 1_024
 _CORRUPTED_STREAM_MIN_CHARS = 600
@@ -2291,6 +2319,9 @@ async def _stream_one_completion(
                     ):
                         quality_failure_reason = "conversation_echo"
                         break
+                    if _has_repeated_long_segment(tail_buffer):
+                        quality_failure_reason = "repeated_content"
+                        break
                     if _corrupted_lexical_stream_index(tail_buffer) is not None:
                         quality_failure_reason = "corrupted_output"
                         break
@@ -2324,6 +2355,8 @@ async def _stream_one_completion(
                 if quality_failure_reason == "corrupted_output"
                 else "Detected a repeated conversation transcript; discarding it and requesting a clean route."
                 if quality_failure_reason == "conversation_echo"
+                else "Detected a repeated analysis/code segment; discarding it and requesting a clean route."
+                if quality_failure_reason == "repeated_content"
                 else "Detected the model repeating itself in a loop; discarding that completion."
             )
             renderer.handle_event({
@@ -2748,7 +2781,7 @@ async def _attempt_reasoning_plan(
         evidence_summary=evidence_summary,
     )
     try:
-        content, _tool_calls, _finish_reason = await _stream_one_completion(
+        content, _tool_calls, finish_reason = await _stream_one_completion(
             client, model=model, messages=prompt_messages, tools=[],
             renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
         )
@@ -2756,6 +2789,17 @@ async def _attempt_reasoning_plan(
         renderer.handle_event({
             "event_type": "diagnostics",
             "payload": {"content": f"Planning request failed ({exc}); using the existing plan."},
+        })
+        return None
+    if finish_reason in {"degenerate_repetition", "conversation_echo", "repeated_content", "corrupted_output"}:
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {
+                "content": (
+                    f"Planning output was rejected ({finish_reason}); the repeated/corrupt plan was not shown "
+                    "or archived as a completed answer. Continuing with the durable execution plan."
+                )
+            },
         })
         return None
     plan = parse_reasoning_plan(content, objective=objective)
@@ -3650,7 +3694,18 @@ async def run_local_agent_turn(
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
                 return TaskOutcome(status="failed", error=message)
 
-        if finish_reason in {"degenerate_repetition", "conversation_echo", "corrupted_output"}:
+        # A provider can repeat across reconnects or agent rounds even when
+        # each individual stream stays below the per-stream quality window.
+        # Check the complete candidate before it reaches the final-answer
+        # path; otherwise a repeated analysis is incorrectly accepted and the
+        # no-mutation warning makes it look like a completed task.
+        if finish_reason not in {"degenerate_repetition", "conversation_echo", "repeated_content", "corrupted_output"}:
+            if _has_repeated_long_segment(content):
+                finish_reason = "repeated_content"
+            elif _DEGENERATE_REPETITION_RE.search(content[-_DEGENERATE_REPETITION_TAIL_WINDOW:]):
+                finish_reason = "degenerate_repetition"
+
+        if finish_reason in {"degenerate_repetition", "conversation_echo", "repeated_content", "corrupted_output"}:
             failed_quality_provider = resolved_provider
             quality_failed_providers.add(failed_quality_provider)
             checkpoint_partial_parts.clear()
@@ -3695,6 +3750,8 @@ async def run_local_agent_turn(
                 if finish_reason == "corrupted_output"
                 else "a repeated conversation transcript"
                 if finish_reason == "conversation_echo"
+                else "repeated analysis/code content"
+                if finish_reason == "repeated_content"
                 else "a degenerate repetition loop"
             )
             error = (
@@ -3702,7 +3759,25 @@ async def run_local_agent_turn(
                 "The invalid completion was discarded, and no clean fallback provider was available. "
                 "The turn is checkpointed; type `continue` after enabling another provider."
             )
-            _persist_turn_checkpoint(status="interrupted", last_error=error)
+            evidence_id = ""
+            try:
+                evidence_id = evidence_store.store_segment(
+                    session_id,
+                    objective=objective,
+                    messages=[*working_messages, {"role": "assistant", "content": content}],
+                    summary=f"Rejected provider output: {reason_text}",
+                )
+            except Exception:
+                # Checkpointing must remain available even if the optional
+                # append-only evidence archive is unavailable.
+                pass
+            if evidence_id:
+                error += f" Archived rejected output as {evidence_id}."
+            _persist_turn_checkpoint(
+                partial_assistant=_bounded_text(content, head=1200, tail=400, label="rejected output"),
+                status="interrupted",
+                last_error=error,
+            )
             orchestrator.fail(error)
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
             return TaskOutcome(status="failed", error=error)

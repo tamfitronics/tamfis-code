@@ -790,6 +790,27 @@ class RunLocalAgentTurnTests(_StatePatchMixin, unittest.TestCase):
             self.assertIn("repeated conversation transcript", outcome.error)
             self.assertEqual(len(client.calls), 1)
 
+    def test_repeated_long_analysis_segment_is_stopped_early(self):
+        with tempfile.TemporaryDirectory() as ws:
+            paragraph = (
+                "This means the sitemap endpoint is incomplete because it generates only "
+                "the root URL and does not include all discoverable pages of the website. "
+            )
+            # Put the same long segment into separate paragraphs so this is
+            # non-contiguous repetition, unlike the short-phrase regression.
+            rounds = [[_chunk(_delta(content=(paragraph + "\n\n"))) for _ in range(12)]]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "summarize the sitemap behavior"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn("repeated analysis/code content", outcome.error)
+
     def test_change_request_completed_with_no_mutation_gets_a_caveat(self):
         """Confirmed live: a weak model can narrate "I'll fix this" -- complete
         with a fabricated "corrected" code block -- without ever calling
@@ -1055,6 +1076,30 @@ class RunLocalAgentTurnTests(_StatePatchMixin, unittest.TestCase):
             checkpoint = state_module.get_session_state(1).turn_checkpoint
             self.assertEqual(checkpoint["status"], "interrupted")
             self.assertIn("without issuing a registered tool call", checkpoint["last_error"])
+
+    def test_repeated_final_analysis_is_rejected_and_archived(self):
+        with tempfile.TemporaryDirectory() as ws:
+            repeated = (
+                "But first, let's check if there is a better way to generate the sitemap. "
+                "Looking at the code, the endpoint only includes the root URL. "
+                "To fix this, we need to change the endpoint and generate all URLs."
+            )
+            client = _FakeClient([
+                [_chunk(_delta(content="not a JSON plan"))],
+                [_chunk(_delta(content=(repeated + "\n\n") * 4))],
+            ])
+            outcome = asyncio.run(run_local_agent_turn(
+                _FakeManager(client), ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "fix the sitemap endpoint"}],
+                self._console(), _RecordingRenderer(), workspace_root=ws, session_id=1,
+                approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "failed")
+            checkpoint = state_module.get_session_state(1).turn_checkpoint
+            self.assertEqual(checkpoint["status"], "interrupted")
+            self.assertIn("repeated analysis", checkpoint["last_error"])
+            self.assertIn("evidence_", checkpoint["last_error"])
 
     def test_resume_objective_keeps_original_task_and_later_clarification(self):
         checkpoint = {

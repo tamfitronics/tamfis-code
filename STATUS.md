@@ -13,7 +13,7 @@ already superseded by same-day code changes).
 **Rule going forward: don't create a new dated audit file for tamfis-code.
 Update this one.**
 
-## Post-release provider expansion, persistent input, repeated-content, CWD scope, live input, plan progress, model routing, evidence, and fallback fixes (2026-07-22, working tree)
+## Post-release repetition circuit-breaker, provider expansion, persistent input, CWD scope, live input, plan progress, model routing, evidence, and fallback fixes (2026-07-22, working tree)
 
 Fixed the remaining plan-visibility gap identified after v0.6.1:
 
@@ -79,10 +79,21 @@ Fixed the remaining plan-visibility gap identified after v0.6.1:
 - During execution the live status now contains a bordered `Input` panel,
   so the queue affordance remains visible even when plans/tips are absent;
   Ctrl+Y opens the editable prompt without competing with Rich Live.
+- Repetition detection now preserves paragraph-sized blocks before applying
+  sentence-level checks. This catches repeated multi-sentence analyses such
+  as the sitemap response that previously bypassed detection because every
+  sentence was shorter than the threshold.
+- A whole-candidate check now catches repetition spanning reconnects or agent
+  rounds before finalization. Invalid output is rejected instead of reaching
+  the misleading no-files-changed/validation-incomplete completion path.
+- Rejected output is appended to the durable evidence archive and referenced
+  from the interrupted turn checkpoint, with a bounded preview retained for
+  `continue` recovery. Planning responses with repetition/corruption are
+  discarded silently and the durable deterministic plan remains active.
 
-Verification after this fix: **863 tests passed** with an isolated writable
+Verification after this fix: **864 tests passed** with an isolated writable
 config directory (3 existing collection/deprecation warnings). These changes
-are assigned to release **0.6.9**; GitHub/PyPI publication is the remaining
+are assigned to release **0.6.10**; GitHub/PyPI publication is the remaining
 release step for this working tree. Earlier release tags are not rewritten.
 
 ## Release gate and live queue UX (2026-07-21, v0.6.1)
