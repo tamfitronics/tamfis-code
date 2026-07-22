@@ -1,5 +1,5 @@
 """Task/command execution + streaming loop, shared by interactive and
-non-interactive commands. Supports multiple providers: Ollama, HF, NVIDIA,
+non-interactive commands. Supports multiple providers: HF, NVIDIA,
 OpenRouter, and auto-fallback.
 """
 
@@ -17,7 +17,8 @@ from rich.console import Console
 from rich.panel import Panel
 
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
-from .render import StreamRenderer
+from .config import Config, mode_label_for_policy, next_mode_in_cycle
+from .render import StreamRenderer, resume_live_if_active, suspend_live_if_active
 from . import state as local_state
 from .providers import ProviderManager, ProviderType
 
@@ -33,7 +34,7 @@ except (TypeError, ValueError):
     MAX_TASK_STREAM_RECONNECTS = 12
 
 # Allowed providers - expanded from just hf/openrouter
-ALLOWED_PROVIDERS = ["hf", "huggingface", "or", "openrouter", "ollama", "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None]
+ALLOWED_PROVIDERS = ["hf", "huggingface", "or", "openrouter", "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None]
 PROVIDER_ALIASES = {"hf": "huggingface", "nvidia": "nvidia_nim", "or": "openrouter"}
 
 # Provider name mapping
@@ -41,7 +42,6 @@ PROVIDER_NAME_MAP = {
     "hf": "Hugging Face",
     "huggingface": "Hugging Face",
     "openrouter": "OpenRouter",
-    "ollama": "Ollama (Local)",
     "nvidia": "NVIDIA NIM",
     "nvidia_nim": "NVIDIA NIM",
     "gemini": "Google Gemini",
@@ -65,21 +65,69 @@ class TaskOutcome:
     plan_items: list[dict[str, Any]] = field(default_factory=list)
 
 
-def resolve_approval_decision(
-    console: Console, command_text: str, risk: str, approval_policy: str, interactive: bool,
-    *, display_preview: bool = True,
-) -> str:
-    risk = (risk or "medium").lower()
+def _decision_for_policy(policy: str, risk: str, interactive: bool) -> Optional[str]:
+    """The decision `policy` implies without asking, or None when a live
+    prompt is genuinely required (the "ask"/"manual" family, or a
+    dangerous action under a policy that only auto-approves non-dangerous
+    ones). Factored out of resolve_approval_decision so _prompt's Shift+Tab
+    mode switch can re-check it after a switch without recursing back
+    through resolve_approval_decision into itself."""
 
-    if approval_policy in {"auto", "full-auto"}:
+    risk = (risk or "medium").lower()
+    if policy in {"auto", "full-auto"}:
         return "approve_once"
-    if approval_policy in {"safe", "workspace", "accept-edits"}:
-        return "approve_once" if risk != "dangerous" else ("deny" if not interactive else _prompt(console, command_text, risk, display_preview))
-    if approval_policy in {"read-only", "plan-only", "suggest", "never"}:
+    if policy in {"safe", "workspace", "accept-edits"}:
+        if risk != "dangerous":
+            return "approve_once"
+        return "deny" if not interactive else None
+    if policy in {"read-only", "plan-only", "suggest", "never"}:
         return "deny"
     if not interactive:
         return "deny"
-    return _prompt(console, command_text, risk, display_preview)
+    return None
+
+
+def resolve_approval_decision(
+    console: Console, command_text: str, risk: str, approval_policy: str, interactive: bool,
+    *, display_preview: bool = True, config: Optional[Config] = None,
+) -> str:
+    """`approval_policy` is a snapshot; when `config` is also given (the
+    live, mutable object interactive.py's REPL loop reads its own prompt
+    indicator from), a policy switch made at the approval prompt below
+    takes effect for THIS decision immediately, not just future ones --
+    config.approval_policy always wins over the (possibly stale) snapshot
+    once both are available. `config` is optional and omitted by every
+    non-interactive/one-shot caller (cli.py, agents.py, tests), which keep
+    exactly today's plain-string, no-mode-switch behaviour."""
+
+    live_policy = config.approval_policy if config is not None else approval_policy
+    decision = _decision_for_policy(live_policy, risk, interactive)
+    if decision is not None:
+        return decision
+    return _prompt(console, command_text, risk, display_preview, config=config)
+
+
+
+
+async def resolve_approval_decision_async(
+    console: Console, command_text: str, risk: str, approval_policy: str, interactive: bool,
+    *, display_preview: bool = True, config: Optional[Config] = None,
+) -> str:
+    """Async-safe approval resolver for callers already running an event loop.
+
+    The synchronous resolver remains available for one-shot and compatibility
+    callers. Interactive REPL callers must use this function so Prompt Toolkit
+    runs through ``prompt_async`` rather than nesting ``asyncio.run`` inside
+    the active application loop.
+    """
+
+    live_policy = config.approval_policy if config is not None else approval_policy
+    decision = _decision_for_policy(live_policy, risk, interactive)
+    if decision is not None:
+        return decision
+    return await _prompt_async(
+        console, command_text, risk, display_preview, config=config,
+    )
 
 
 def approval_command_preview(command_text: str, limit: int = APPROVAL_PREVIEW_CHARS) -> str:
@@ -115,11 +163,142 @@ def _install_sigint_watcher() -> tuple[asyncio.Event, "Any"]:
     return event, uninstall
 
 
-def _prompt(console: Console, command_text: str, risk: str, display_preview: bool = True) -> str:
+_MODE_SWITCH_SENTINEL = "\x00tamfis-mode-switch-decided\x00"
+
+
+def _prompt(
+    console: Console, command_text: str, risk: str, display_preview: bool = True,
+    *, config: Optional[Config] = None,
+) -> str:
     if display_preview:
         console.print(Panel(approval_command_preview(command_text), title=f"Approval required — risk: {risk}", border_style="magenta", expand=False))
+
+    if config is None:
+        # No live Config to switch and reflect a mode change against --
+        # every non-interactive/one-shot caller (cli.py, agents.py, tests)
+        # takes this exact, unchanged path.
+        while True:
+            answer = console.input("[bold]Approve? (y)es / (n)o / (a)lways this session: [/bold]").strip().lower()
+            if answer in ("y", "yes"):
+                return "approve_once"
+            if answer in ("a", "always"):
+                return "approve_session"
+            if answer in ("n", "no", ""):
+                return "deny"
+
+    # Interactive REPL: the same Shift+Tab mode cycle as the main prompt
+    # (interactive.py's `_cycle_mode`) works right here too. This is the
+    # moment someone most wants it -- mid-turn, facing a live decision --
+    # mirroring Claude Code's own Shift+Tab-at-a-permission-gate behaviour
+    # rather than only being able to change mode between turns.
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.key_binding import KeyBindings
+
+    bindings = KeyBindings()
+
+    @bindings.add("s-tab")
+    def _cycle_mode(event: Any) -> None:
+        config.approval_policy = next_mode_in_cycle(config.approval_policy)
+        implied = _decision_for_policy(config.approval_policy, risk, True)
+        if implied is not None:
+            # The new mode already answers this decision by itself (e.g.
+            # cycled into "auto") -- submit immediately rather than making
+            # the user separately press Enter on an empty line.
+            event.app.exit(result=_MODE_SWITCH_SENTINEL)
+        else:
+            event.app.invalidate()
+
+    def _message() -> HTML:
+        mode = mode_label_for_policy(config.approval_policy)
+        return HTML(
+            f"<ansicyan>[{mode}]</ansicyan> Approve? (y)es / (n)o / (a)lways this session "
+            f"<i>(Shift+Tab: change mode)</i>: "
+        )
+
+    session: PromptSession = PromptSession(key_bindings=bindings)
     while True:
-        answer = console.input("[bold]Approve? (y)es / (n)o / (a)lways this session: [/bold]").strip().lower()
+        raw_answer = session.prompt(_message)
+        if raw_answer == _MODE_SWITCH_SENTINEL:
+            implied = _decision_for_policy(config.approval_policy, risk, True)
+            if implied is not None:
+                return implied
+            continue  # switched into another still-interactive mode ("ask"/"manual") -- keep prompting
+        answer = raw_answer.strip().lower()
+        if answer in ("y", "yes"):
+            return "approve_once"
+        if answer in ("a", "always"):
+            return "approve_session"
+        if answer in ("n", "no", ""):
+            return "deny"
+
+
+
+
+async def _prompt_async(
+    console: Console, command_text: str, risk: str, display_preview: bool = True,
+    *, config: Optional[Config] = None,
+) -> str:
+    """Prompt for approval without blocking or nesting the running event loop."""
+
+    if display_preview:
+        console.print(Panel(
+            approval_command_preview(command_text),
+            title=f"Approval required — risk: {risk}",
+            border_style="magenta",
+            expand=False,
+        ))
+
+    if config is None:
+        while True:
+            # This is an intentionally blocking human approval boundary.
+            # Using asyncio.to_thread here can deadlock in constrained CLI
+            # workers whose executor has no available worker (and made even
+            # a mocked approval hang forever in the full suite). It still
+            # avoids the original bug this async path exists for: no nested
+            # asyncio.run/event loop is created.
+            answer = console.input(
+                "[bold]Approve? (y)es / (n)o / (a)lways this session: [/bold]"
+            )
+            answer = answer.strip().lower()
+            if answer in ("y", "yes"):
+                return "approve_once"
+            if answer in ("a", "always"):
+                return "approve_session"
+            if answer in ("n", "no", ""):
+                return "deny"
+
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
+    from prompt_toolkit.key_binding import KeyBindings
+
+    bindings = KeyBindings()
+
+    @bindings.add("s-tab")
+    def _cycle_mode(event: Any) -> None:
+        config.approval_policy = next_mode_in_cycle(config.approval_policy)
+        implied = _decision_for_policy(config.approval_policy, risk, True)
+        if implied is not None:
+            event.app.exit(result=_MODE_SWITCH_SENTINEL)
+        else:
+            event.app.invalidate()
+
+    def _message() -> HTML:
+        mode = mode_label_for_policy(config.approval_policy)
+        return HTML(
+            f"<ansicyan>[{mode}]</ansicyan> Approve? (y)es / (n)o / (a)lways this session "
+            f"<i>(Shift+Tab: change mode)</i>: "
+        )
+
+    session: PromptSession = PromptSession(key_bindings=bindings)
+    while True:
+        raw_answer = await session.prompt_async(_message)
+        if raw_answer == _MODE_SWITCH_SENTINEL:
+            implied = _decision_for_policy(config.approval_policy, risk, True)
+            if implied is not None:
+                return implied
+            continue
+        answer = raw_answer.strip().lower()
         if answer in ("y", "yes"):
             return "approve_once"
         if answer in ("a", "always"):
@@ -190,6 +369,7 @@ async def run_ai_task_and_stream(
     model: str = "auto",
     provider: Optional[str] = None,
     attachments: Optional[list[dict[str, Any]]] = None,
+    config: Optional[Config] = None,
 ) -> TaskOutcome:
     # Normalize aliases at the boundary. Explicit routes are never silently
     # replaced with auto or a different provider.
@@ -199,7 +379,7 @@ async def run_ai_task_and_stream(
     console.print(f"[dim]Using provider: {provider_name}[/dim]")
 
     # Preserve auto selection for Tier IV. The CLI must not silently pin
-    # automatic requests to Ollama or OpenRouter; the orchestration layer
+    # automatic requests to a specific provider; the orchestration layer
     # has provider health, capability and workspace-tier information.
     if provider == "auto":
         provider = "auto"
@@ -225,7 +405,7 @@ async def run_ai_task_and_stream(
         outcome = await _stream_task(
             client, renderer, console, session_id=session_id, task_id=task_id,
             approval_policy=approval_policy, interactive=interactive,
-            from_event_id=stream_cursor,
+            from_event_id=stream_cursor, config=config,
         )
     except BaseException:
         local_state.finish_action(session_id, action.id, status="failed", summary="stream failed")
@@ -261,6 +441,7 @@ async def retry_task_and_stream(
     mode: Optional[str],
     approval_policy: str,
     interactive: bool,
+    config: Optional[Config] = None,
 ) -> TaskOutcome:
     retried = await client.retry_task(task_id, mode)
     new_task_id = str(retried["task_id"])
@@ -271,7 +452,7 @@ async def retry_task_and_stream(
         client, renderer, console,
         session_id=session_id, task_id=new_task_id,
         approval_policy=approval_policy, interactive=interactive,
-        from_event_id=stream_cursor,
+        from_event_id=stream_cursor, config=config,
     )
     await _print_command_budget_if_notable(client, console, new_task_id)
     return outcome
@@ -286,13 +467,14 @@ async def attach_and_stream(
     task_id: str,
     approval_policy: str,
     interactive: bool,
+    config: Optional[Config] = None,
 ) -> TaskOutcome:
     from_event_id = local_state.get_session_state(session_id).last_event_id
     return await _stream_task(
         client, renderer, console,
         session_id=session_id, task_id=task_id,
         approval_policy=approval_policy, interactive=interactive,
-        from_event_id=from_event_id, on_interrupt="detach",
+        from_event_id=from_event_id, on_interrupt="detach", config=config,
     )
 
 
@@ -308,6 +490,7 @@ async def _stream_task(
     from_event_id: int = 0,
     on_interrupt: str = "cancel",
     reconnect_attempt: int = 0,
+    config: Optional[Config] = None,
 ) -> TaskOutcome:
     outcome: Optional[TaskOutcome] = None
     last_assistant_content: Optional[str] = None
@@ -363,7 +546,7 @@ async def _stream_task(
                 continue
 
             phase_by_event = {
-                "plan_created": "plan", "tool_call_requested": "execute",
+                "plan_created": "plan", "plan_step_progress": "execute", "tool_call_requested": "execute",
                 "command_started": "execute", "file_mutation": "execute",
                 "approval_required": "waiting_for_approval", "task_diagnostics": "validate",
                 "ai_task_completed": "report", "ai_task_failed": "report",
@@ -381,6 +564,13 @@ async def _stream_task(
                 # `last_plan_items` is what carries this forward in that case.
                 state = local_state.get_session_state(session_id)
                 if state.active_plan_id:
+                    local_state.update_plan_steps(session_id, state.active_plan_id, items)
+
+            if event_type == "plan_step_progress":
+                items = payload.get("items") if isinstance(payload.get("items"), list) else []
+                last_plan_items = items
+                state = local_state.get_session_state(session_id)
+                if state.active_plan_id and items:
                     local_state.update_plan_steps(session_id, state.active_plan_id, items)
 
             if event_type == "file_mutation":
@@ -440,18 +630,32 @@ async def _stream_task(
                 # Render the full command/cwd/reason/risk card before asking
                 # for a decision. The prompt then stays compact and does not
                 # duplicate a less-informative second approval panel.
-                renderer.handle_event(event)
                 command_id = payload.get("command_id")
-                if command_id is not None and command_id not in prompted_command_ids:
+                is_new_prompt = command_id is not None and command_id not in prompted_command_ids
+                # Suspend the live status line BEFORE the panel prints, not
+                # just before the blocking prompt -- its background refresh
+                # thread redraws on its own timer regardless of what else is
+                # writing to the console, so suspending only right before
+                # resolve_approval_decision still let a stray spinner frame
+                # render between the panel and the prompt (confirmed live via
+                # a pty capture of the equivalent local-loop path).
+                if is_new_prompt:
                     prompted_command_ids.add(command_id)
-                    decision = resolve_approval_decision(
-                        console,
-                        str(payload.get("command", "")),
-                        str(payload.get("risk_level", "medium")),
-                        approval_policy,
-                        interactive,
-                        display_preview=False,
-                    )
+                    suspend_live_if_active(renderer)
+                renderer.handle_event(event)
+                if is_new_prompt:
+                    try:
+                        decision = await resolve_approval_decision_async(
+                            console,
+                            str(payload.get("command", "")),
+                            str(payload.get("risk_level", "medium")),
+                            approval_policy,
+                            interactive,
+                            display_preview=False,
+                            config=config,
+                        )
+                    finally:
+                        resume_live_if_active(renderer)
                     try:
                         await client.approve_command(command_id, decision)
                     except RemoteAPIError:
@@ -517,7 +721,7 @@ async def _stream_task(
                     session_id=session_id, task_id=task_id,
                     approval_policy=approval_policy, interactive=interactive,
                     from_event_id=cursor, on_interrupt=on_interrupt,
-                    reconnect_attempt=reconnect_attempt + 1,
+                    reconnect_attempt=reconnect_attempt + 1, config=config,
                 )
             outcome = TaskOutcome(status="detached", summary=task_id)
         else:
@@ -533,6 +737,7 @@ async def run_shell_command(
     command: str,
     approval_policy: str,
     interactive: bool,
+    config: Optional[Config] = None,
 ) -> TaskOutcome:
     action = local_state.start_action(
         session_id, action_type="shell_command", purpose="Run an explicit Remote command",
@@ -559,9 +764,9 @@ async def run_shell_command(
             status = str(cmd.get("status", ""))
             if status == "pending_approval" and not prompted:
                 prompted = True
-                decision = resolve_approval_decision(
+                decision = await resolve_approval_decision_async(
                     console, str(cmd.get("command_text", command)), str(cmd.get("safety_tier", "medium")),
-                    approval_policy, interactive,
+                    approval_policy, interactive, config=config,
                 )
                 await client.approve_command(command_id, decision)
             if status in TERMINAL_COMMAND_STATUSES:

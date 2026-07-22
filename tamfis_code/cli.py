@@ -36,7 +36,7 @@ from .api_client import (
 )
 from .config import APPROVAL_MODES, CONFIG_DIR, Config, Credentials, load_config
 from .doctor import run_doctor
-from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_unified_diff
+from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
 from .runner import (
     ACTIVE_TASK_STATUSES,
     attach_and_stream, follow_session_logs, retry_task_and_stream,
@@ -44,6 +44,16 @@ from .runner import (
 )
 from .tasks import find_recent_task
 from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, resolve_workspace
+from .local_chat import _PROVIDER_ALIASES
+
+# Derived from the real alias table (local_chat.py) rather than hand-typed,
+# so a --provider Choice list can't silently drift out of sync with what
+# resolve_provider_type() actually accepts -- it used to include "gemini"
+# and "apiframe", neither of which was ever a real alias: both passed Click
+# validation and then failed with "Unknown local provider" inside
+# resolve_provider_type every time.
+_PROVIDER_CHOICES = sorted(_PROVIDER_ALIASES.keys())
+_PROVIDER_HELP = "tamfis/tamfisgpt (subscription API), hf, nvidia, openrouter, or auto (default)."
 
 EXIT_OK = 0
 EXIT_TASK_FAILED = 1
@@ -87,10 +97,10 @@ def async_command(fn):
 
 @click.group(invoke_without_command=True)
 @click.option("--debug", is_flag=True, default=False, help="Show structured event and tool diagnostics.")
-@click.option("--approval", "approval_policy", type=click.Choice(APPROVAL_MODES), default=None, help="Override the configured approval policy for this invocation.")
+@click.option("--approval", "approval_policy", type=click.Choice(APPROVAL_MODES), default=None, help="Override the configured approval policy for this invocation. Note: 'never' means deny everything outright -- the opposite of 'auto'/'full-auto' (which mean never PROMPT, i.e. auto-approve). It is not a synonym for auto-approve.")
 @click.option("--api-base", "api_base", default=None, help="Override the configured Remote API base URL.")
 @click.option("--cwd", "cwd_override", type=click.Path(exists=True, file_okay=False), default=None, help="Treat this directory as the workspace instead of the current directory.")
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default) -- which provider the bare (no-subcommand) interactive REPL calls directly.")
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default) -- which provider the bare (no-subcommand) interactive REPL calls directly.")
 @click.option("--model", default=None, help="Provider-specific model id for the bare interactive REPL; defaults to that provider's default model.")
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend for the bare interactive REPL instead of calling a provider directly.")
 @click.version_option(__version__, prog_name="tamfis-code")
@@ -412,7 +422,7 @@ async def init(ctx: click.Context, remote: bool):
 
 
 @cli.command()
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default).")
 @click.option("--remote", is_flag=True, default=False, help="Check the legacy TamfisGPT Remote Workspace backend instead of local provider connectivity.")
 @click.pass_context
 @async_command
@@ -423,6 +433,7 @@ async def doctor(ctx: click.Context, provider: str, remote: bool):
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
+        from .doctor import _STATUS_STYLE, _diagnose_local_session
         from .local_chat import resolve_provider_type
         from .providers import get_provider_status
         from .workspace import resolve_local_workspace
@@ -437,15 +448,23 @@ async def doctor(ctx: click.Context, provider: str, remote: bool):
             table.add_column(column)
         any_configured = False
         for name, info in status["config"].items():
-            configured = bool(info["api_key_set"]) or name == "ollama"
+            configured = bool(info["api_key_set"]) or name == "tier_iv"
             any_configured = any_configured or configured
             table.add_row(name, "[green]yes[/green]" if configured else "[dim]no[/dim]", info["key_preview"])
         console.print(table)
         console.print(f"[dim]Currently selected: {provider_type.value}  · auto would pick: {status['default']}[/dim]")
         workspace = resolve_local_workspace(workspace_root, discover=False)
         console.print(f"[green]Local session ready[/green]  session_id={workspace.session_id}  workspace_root={workspace.workspace_root}")
+        # Session-local diagnostics from actual recorded local turns
+        # (context usage, tool-call success rate, plan progress,
+        # unresolved validation issues) -- this default/local branch used
+        # to stop at provider connectivity and never report any of this,
+        # even though state.py already records it all during real runs.
+        for result in _diagnose_local_session(workspace_root):
+            style = _STATUS_STYLE[result.status]
+            console.print(f"[{style}]{result.status:8}[/{style}] {result.name}  [dim]{result.detail}[/dim]")
         if not any_configured:
-            print_error(console, "No provider is configured (set HF_TOKEN / NVIDIA_API_KEY / OPENROUTER_API_KEY, or run Ollama locally).")
+            print_error(console, "No provider is configured (set HF_TOKEN / NVIDIA_API_KEY / OPENROUTER_API_KEY).")
             raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
         return
 
@@ -470,6 +489,20 @@ async def doctor(ctx: click.Context, provider: str, remote: bool):
         raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
 
 
+@cli.command(name="mcp-server")
+@click.pass_context
+@async_command
+async def mcp_server_command(ctx: click.Context):
+    """Serve this workspace's read-only tools (read_file, list_directory, search_code,
+    find_references, get_git_info) over stdio as a real MCP server, so another agent or
+    IDE with MCP support can drive tamfis-code directly. Runs until stdin closes.
+    Point an MCP client at: tamfis-code --cwd <this repo> mcp-server"""
+    workspace_root: Path = ctx.obj["workspace_root"]
+    from .mcp_stdio_server import run_stdio_server
+
+    await run_stdio_server(str(workspace_root))
+
+
 @cli.command(name="config")
 @click.pass_context
 def config_command(ctx: click.Context):
@@ -488,9 +521,10 @@ def config_command(ctx: click.Context):
 
 @cli.command()
 @click.option("--remote", is_flag=True, default=False, help="List sessions on the legacy TamfisGPT Remote Workspace backend instead of known local sessions.")
+@click.option("--all", "show_all", is_flag=True, default=False, help="Also include swarm sub-task child sessions, hidden by default.")
 @click.pass_context
 @async_command
-async def sessions(ctx: click.Context, remote: bool):
+async def sessions(ctx: click.Context, remote: bool, show_all: bool):
     """List known sessions (local by default, or --remote)."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
@@ -501,6 +535,8 @@ async def sessions(ctx: click.Context, remote: bool):
             table.add_column(col)
         for sid in local_state.all_known_session_ids():
             sess_state = local_state.get_session_state(sid)
+            if sess_state.is_swarm_child and not show_all:
+                continue
             table.add_row(str(sid), sess_state.workspace_root or sess_state.primary_workspace)
         console.print(table)
         return
@@ -814,7 +850,10 @@ async def _run_ai_command(
         from .interactive import contextualize_short_reply
         objective = contextualize_short_reply(
             objective,
-            has_context=bool(state.last_task_id or state.conversation_summary or state.active_plan_id),
+            has_context=bool(
+                state.last_task_id or state.conversation_summary or state.active_plan_id
+                or state.active_task or state.turn_checkpoint or state.conversation_history
+            ),
         )
 
         for requested_path in _explicit_absolute_paths(objective):
@@ -922,7 +961,14 @@ async def _run_ai_command(
             outcome = await run_ai_task_and_stream(
                 client, renderer, console,
                 session_id=workspace.session_id, objective=objective, mode=mode,
-                approval_policy=config.approval_policy, interactive=False,  # one-shot commands never block on a human prompt
+                # A one-shot command is still a live human sitting at a real
+                # terminal watching it stream, unless stdin has been
+                # redirected/piped (a script, CI, etc.) -- confirmed live:
+                # hardcoding this to False meant the default "ask" approval
+                # policy's (y)es/(n)o prompt could never actually appear for
+                # `agent`/`ask`/`chat`/`audit`/`plan`, no matter what;
+                # every risky action was silently denied instead.
+                approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
                 model=model, provider=provider,
                 attachments=attachments,
             )
@@ -962,15 +1008,27 @@ async def _run_local_ai_command(
     """
     from .local_chat import resolve_provider_type
     from .providers import ProviderManager
-    from .runner_local import run_local_agent_turn
+    from .runner_local import (
+        _is_resume_request,
+        build_vision_content_blocks,
+        is_vision_image_path,
+        run_local_agent_turn,
+    )
     from .safety import READ_ONLY_TOOLS
     from .workspace import resolve_local_workspace
 
     console = Console(no_color=not config.colour)
 
-    if attachment_paths:
-        print_error(console, "--attach is not yet supported in standalone (local provider) mode.")
-        return EXIT_INVALID_ARGS
+    resolved_attachments: list[str] = []
+    for raw_path in attachment_paths:
+        attachment_path = Path(raw_path).expanduser().resolve()
+        if not attachment_path.is_file():
+            print_error(console, f"Attachment not found: {attachment_path}")
+            return EXIT_INVALID_ARGS
+        if attachment_path.stat().st_size > 10 * 1024 * 1024:
+            print_error(console, f"Standalone task attachments are limited to 10 MB: {attachment_path}")
+            return EXIT_INVALID_ARGS
+        resolved_attachments.append(str(attachment_path))
 
     try:
         provider_type = resolve_provider_type(provider)
@@ -982,7 +1040,11 @@ async def _run_local_ai_command(
 
     from .interactive import contextualize_short_reply
     objective = contextualize_short_reply(
-        objective, has_context=bool(state.last_task_id or state.conversation_summary or state.active_plan_id),
+        objective,
+        has_context=bool(
+            state.last_task_id or state.conversation_summary or state.active_plan_id
+            or state.active_task or state.turn_checkpoint or state.conversation_history
+        ),
     )
 
     for requested_path in _explicit_absolute_paths(objective):
@@ -1053,15 +1115,58 @@ async def _run_local_ai_command(
     # recover both the objective AND the mode that was actually used --
     # without this, retry had no way to know whether the last turn was
     # e.g. "agent" vs "chat" and always guessed "coding".
-    local_state.save_session_state(workspace.session_id, active_task={"objective": objective, "mode": mode})
+    # Preserve the prior objective until run_local_agent_turn has had a
+    # chance to recover it. Overwriting active_task with the literal word
+    # "continue" destroys the last useful legacy resume pointer.
+    if not _is_resume_request(objective):
+        local_state.save_session_state(workspace.session_id, active_task={"objective": objective, "mode": mode})
     print_banner(console, host=f"local:{provider_type.value}", workspace_root=workspace.workspace_root, mode=mode, approval_policy=config.approval_policy)
     renderer = StreamRenderer(console)
     manager = ProviderManager()
+    turn_messages: list[dict[str, str]] = []
+    image_attachments = [p for p in resolved_attachments if is_vision_image_path(p)]
+    other_attachments = [p for p in resolved_attachments if not is_vision_image_path(p)]
+    if other_attachments:
+        attachment_lines = "\n".join(f"- {path}" for path in other_attachments)
+        turn_messages.append({
+            "role": "system",
+            "content": (
+                "The user explicitly attached the following exact local files for this turn. "
+                "They are read-only inputs outside the workspace boundary; use read_file for text "
+                "or extract_archive for ZIP/TAR variants. Extract, edit, and repackage outputs must "
+                f"stay inside the approved workspace.\n{attachment_lines}"
+            ),
+        })
+    image_content_blocks = build_vision_content_blocks(image_attachments) if image_attachments else None
+    if image_attachments:
+        image_lines = "\n".join(f"- {path}" for path in image_attachments)
+        turn_messages.append({
+            "role": "system",
+            "content": (
+                "The user explicitly attached the following image(s) for this turn. If your model "
+                "supports vision, they are included directly in your next user message as real image "
+                "content -- look at them, don't call read_file on them (it can't decode binary image "
+                "bytes into anything meaningful). If your model does not support vision, you were not "
+                "shown the pixels; say so plainly instead of guessing what the image contains.\n"
+                f"{image_lines}"
+            ),
+        })
+        if not any(config.vision_supported for config in ProviderManager.PROVIDERS.values()):
+            console.print(
+                "[yellow]No configured provider supports vision -- the attached image(s) "
+                "will be described by path only, not actually seen.[/yellow]"
+            )
+    turn_messages.append({"role": "user", "content": objective})
     outcome = await run_local_agent_turn(
-        manager, provider_type, model if model != "auto" else None, [{"role": "user", "content": objective}],
+        manager, provider_type, model if model != "auto" else None, turn_messages,
         console, renderer,
         workspace_root=workspace.workspace_root, session_id=workspace.session_id,
-        approval_policy=config.approval_policy, interactive=False, read_only=read_only_mode,
+        # See the matching comment in _run_ai_command -- a one-shot command
+        # is still an attended terminal unless stdin is redirected/piped.
+        approval_policy=config.approval_policy, interactive=sys.stdin.isatty(), read_only=read_only_mode,
+        cli_config=config, allow_swarm_tool=True,
+        attachment_paths=tuple(resolved_attachments),
+        image_content_blocks=image_content_blocks,
     )
     renderer.finish()
 
@@ -1089,7 +1194,7 @@ def _ai_command(mode: str, help_text: str):
     @click.option("--bg", "background", is_flag=True, default=False, help="Submit and return immediately; the task keeps running server-side. Use `tamfis-code agents`/`attach`/`logs` to check on it.")
     @click.option("--model", default="auto", show_default=True, help="Catalog model id, or auto.")
     @click.option("--mode", "mode_override", type=click.Choice(["auto", "coding", "chat", "audit", "plan", "agent", "execute"]), default=None, help="Override this command's task mode.")
-    @click.option("--provider", type=click.Choice(["auto", "hf", "huggingface", "or", "openrouter", "ollama", "nvidia", "nvidia_nim", "gemini", "apiframe"]), default=None, help="Pin this task to a specific provider.")
+    @click.option("--provider", type=click.Choice(_PROVIDER_CHOICES), default=None, help=_PROVIDER_HELP + " Pin one for this task.")
     @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend (tamgpt6) instead of calling a provider directly. Deprecated -- standalone (the default) is the supported path going forward.")
     @click.pass_context
     def command(ctx: click.Context, objective: Optional[str], read_stdin: bool, prompt_file: Optional[Path], attachment_paths: tuple[str, ...], background: bool, model: str, mode_override: Optional[str], provider: Optional[str], remote: bool):
@@ -1145,7 +1250,7 @@ cli.command(name="exec")(_ai_command("execute", "Run a tool-using engineering ta
 @click.argument("plan_id", required=False)
 @click.option("--bg", "background", is_flag=True, default=False, help="Execute the plan server-side and return immediately (requires --remote).")
 @click.option("--model", default="auto", show_default=True)
-@click.option("--provider", type=click.Choice(["auto", "hf", "huggingface", "or", "openrouter", "ollama", "nvidia", "nvidia_nim", "gemini", "apiframe"]), default=None)
+@click.option("--provider", type=click.Choice(_PROVIDER_CHOICES), default=None)
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend instead of calling a provider directly.")
 @click.pass_context
 def execute_plan_command(
@@ -1210,7 +1315,10 @@ async def run(ctx: click.Context, command: str, background: bool, remote: bool):
         workspace = resolve_local_workspace(workspace_root, discover=False)
         outcome = await run_local_shell_command(
             console, workspace_root=workspace.workspace_root, session_id=workspace.session_id,
-            command=command, approval_policy=config.approval_policy, interactive=False,
+            # See the matching comment in _run_ai_command -- a one-shot
+            # command is still an attended terminal unless stdin is
+            # redirected/piped.
+            command=command, approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
         )
         if outcome.status != "completed":
             raise SystemExit(EXIT_TASK_FAILED)
@@ -1233,7 +1341,10 @@ async def run(ctx: click.Context, command: str, background: bool, remote: bool):
             outcome = await run_shell_command(
                 client, console,
                 session_id=workspace.session_id, command=command,
-                approval_policy=config.approval_policy, interactive=False,  # one-shot commands never block on a human prompt
+                # See the matching comment in _run_ai_command -- a one-shot
+                # command is still an attended terminal unless stdin is
+                # redirected/piped.
+                approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
             )
         except AuthRequiredError:
             print_error(console, "Not authenticated -- run `tamfis-code login` first.")
@@ -1248,7 +1359,7 @@ async def run(ctx: click.Context, command: str, background: bool, remote: bool):
 
 @cli.command()
 @click.argument("session_id", type=int, required=False, default=None)
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default).")
 @click.option("--model", default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.option("--remote", is_flag=True, default=False, help="Resume a session on the legacy TamfisGPT Remote Workspace backend instead of a local one.")
 @click.pass_context
@@ -1277,6 +1388,7 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
         console.print(f"[green]Resumed session {workspace.session_id}[/green]  workspace_root={workspace.workspace_root}")
         if target_state.conversation_summary:
             console.print(f"[dim]{target_state.conversation_summary[-1000:]}[/dim]")
+        print_resume_plan_status(console, target_state)
         await run_interactive(None, config, workspace, provider=provider, model=model)
         return
 
@@ -1314,7 +1426,7 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
 
 @cli.command()
 @click.argument("task_id", required=False, default=None)
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default).")
 @click.option("--model", default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.option("--remote", is_flag=True, default=False, help="Retry a task on the legacy TamfisGPT Remote Workspace backend instead of resending locally.")
 @click.pass_context
@@ -1368,7 +1480,10 @@ async def retry(ctx: click.Context, task_id: Optional[str], provider: str, model
             outcome = await retry_task_and_stream(
                 client, renderer, console,
                 session_id=workspace.session_id, task_id=task_id, mode=None,
-                approval_policy=config.approval_policy, interactive=False,  # one-shot commands never block on a human prompt
+                # See the matching comment in _run_ai_command -- a one-shot
+                # command is still an attended terminal unless stdin is
+                # redirected/piped.
+                approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
             )
         except AuthRequiredError:
             print_error(console, "Not authenticated -- run `tamfis-code login` first.")
@@ -1405,12 +1520,13 @@ async def diffs(ctx: click.Context, n: int, remote: bool):
             console.print("[dim]No file mutations recorded yet in this session.[/dim]")
             return
         table = Table(show_header=True, header_style="bold")
-        for col in ("ID", "OP", "PATH", "+/-", "STATUS"):
+        for col in ("ID", "OP", "PATH", "+/-", "STATUS", "TURN"):
             table.add_column(col)
         for m in mutations:
             table.add_row(
                 str(m.get("mutation_id")), str(m.get("operation")), str(m.get("path")),
                 f"+{m.get('lines_added')}/-{m.get('lines_removed')}", str(m.get("revert_status")),
+                str(m.get("transaction_id") or ""),
             )
         console.print(table)
         return
@@ -1503,16 +1619,27 @@ def changes_command(ctx: click.Context):
 @click.pass_context
 @async_command
 async def revert(ctx: click.Context, mutation_id: str, remote: bool):
-    """Revert one file mutation by id (see `tamfis-code diffs`) -- restores the file to its content before that change, or deletes it if that mutation created the file."""
+    """Revert one file mutation by id (see `tamfis-code diffs`), or every mutation from one turn by its transaction id (the "turn_..." id shown alongside each mutation in `tamfis-code diffs`) -- restores each file to its content before that change, or deletes it if that mutation created the file."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
-        from .safety import revert_mutation
+        from .safety import revert_mutation, revert_transaction
         from .workspace import resolve_local_workspace
 
         workspace = resolve_local_workspace(workspace_root, discover=False)
+        if mutation_id.startswith("turn_"):
+            try:
+                result = revert_transaction(workspace.session_id, mutation_id)
+            except ValueError as exc:
+                print_error(console, str(exc))
+                raise SystemExit(EXIT_TASK_FAILED)
+            console.print(f"[green]Reverted {len(result['reverted'])} mutation(s)[/green] from turn {mutation_id}")
+            if result["error"]:
+                print_error(console, f"Stopped after a failure: {result['error']} -- {len(result['remaining'])} mutation(s) in this turn still not reverted: {', '.join(result['remaining'])}")
+                raise SystemExit(EXIT_TASK_FAILED)
+            return
         try:
             result = revert_mutation(workspace.session_id, mutation_id)
         except ValueError as exc:
@@ -1547,7 +1674,10 @@ async def revert(ctx: click.Context, mutation_id: str, remote: bool):
 @click.pass_context
 @async_command
 async def agents(ctx: click.Context, remote: bool):
-    """List sessions and each one's most recent task/status -- what's running, backgrounded, or waiting on approval."""
+    """List sessions and each one's most recent task/status -- what's running, backgrounded, or waiting on approval.
+
+    Not to be confused with `tamfis-code agent-cmd` (run/list/delegate to sub-agents) --
+    similarly-named but unrelated commands."""
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
 
@@ -1813,116 +1943,20 @@ def completion_cmd(shell: str):
     click.echo(generators[shell]())
 
 
-@cli.group()
-def session():
-    """Manage sessions"""
-    pass
-
-
-@session.command('list')
-@click.option('--limit', '-l', default=20, help='Number of sessions to list')
-def session_list(limit: int):
-    """List all sessions"""
-    from .sessions import SessionManager
-    from datetime import datetime
-    
-    manager = SessionManager()
-    sessions = manager.list_sessions(limit)
-    
-    if not sessions:
-        click.echo("📋 No sessions found")
-        return
-    
-    click.echo("📋 Recent Sessions:")
-    for s in sessions:
-        age = (datetime.now() - s.updated_at).total_seconds()
-        if age < 60:
-            age_str = f"{int(age)}s ago"
-        elif age < 3600:
-            age_str = f"{int(age/60)}m ago"
-        elif age < 86400:
-            age_str = f"{int(age/3600)}h ago"
-        else:
-            age_str = f"{int(age/86400)}d ago"
-        
-        msg_count = len(s.messages)
-        status = "🟢" if s.is_active else "🔴"
-        click.echo(f"  {status} {s.id} | {s.name} | {msg_count} msgs | {age_str}")
-
-
-@session.command('resume')
-@click.argument('session_id')
-def session_resume(session_id: str):
-    """Resume a session by ID"""
-    from .sessions import SessionManager
-    
-    manager = SessionManager()
-    session = manager.load(session_id)
-    
-    if not session:
-        click.echo(f"❌ Session '{session_id}' not found")
-        return
-    
-    click.echo(f"🔄 Resuming session: {session.name}")
-    # Pass to interactive mode
-    from .interactive import run_interactive
-    # This would need proper context - simplified for now
-    click.echo("Interactive resume not fully implemented in this version")
-
-
-@session.command('delete')
-@click.argument('session_id')
-@click.option('--force', '-f', is_flag=True, help='Force delete without confirmation')
-def session_delete(session_id: str, force: bool):
-    """Delete a session"""
-    from .sessions import SessionManager
-    
-    if not force:
-        click.confirm(f"Delete session '{session_id}'?", abort=True)
-    
-    manager = SessionManager()
-    manager.delete(session_id)
-    click.echo("✅ Session deleted")
-
-
-@session.command('fork')
-@click.argument('session_id')
-@click.option('--name', '-n', help='New session name')
-def session_fork(session_id: str, name: str):
-    """Fork a session (create a copy)"""
-    from .sessions import SessionManager
-    
-    manager = SessionManager()
-    new_session = manager.fork_session(session_id, name)
-    
-    if not new_session:
-        click.echo(f"❌ Session '{session_id}' not found")
-        return
-    
-    click.echo(f"✅ Forked to session: {new_session.id} ({new_session.name})")
-
-
-@session.command('clean')
-@click.option('--days', '-d', default=30, help='Delete sessions older than N days')
-def session_clean(days: int):
-    """Clean old sessions"""
-    from .sessions import SessionManager
-    
-    manager = SessionManager()
-    count = manager.delete_old(days)
-    click.echo(f"✅ Deleted {count} sessions older than {days} days")
-
-
 @cli.command('agent-cmd')
 @click.argument('action', type=click.Choice(['list', 'run', 'info', 'delegate']))
 @click.option('--task', '-t', 'tasks', multiple=True, help='Task description (repeatable for delegate)')
 @click.option('--file', '-f', help='File to operate on')
 @click.option('--max-concurrency', default=1, show_default=True, help='Max concurrent delegated sub-tasks')
-@click.option('--provider', default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option('--provider', default="auto", help="hf, nvidia, openrouter, or auto (default).")
 @click.option('--model', default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.pass_context
 def agent_cmd(ctx: click.Context, action: str, tasks: tuple[str, ...], file: str, max_concurrency: int, provider: str, model: Optional[str]):
-    """Run subagents for various tasks"""
+    """Run subagents for various tasks (analyze/test/doc-gen, or delegate objectives to concurrent sub-tasks).
+
+    Not to be confused with `tamfis-code agents` (list sessions and their status) --
+    similarly-named but unrelated commands. See also `/swarm` and `/delegate` in the
+    interactive REPL, which run through this same delegation machinery."""
     import asyncio
     import json
     from .agents import AgentManager
@@ -2118,16 +2152,6 @@ def main() -> None:
 if __name__ == "__main__":
     cli()
 
-@session.command('create')
-@click.argument('name', required=False)
-def session_create(name: Optional[str]):
-    """Create a new session"""
-    from .sessions import SessionManager
-    
-    manager = SessionManager()
-    session = manager.create_session(name)
-    click.echo(f"✅ Session created: {session.id} - {session.name}")
-
 @cli.command('providers')
 @click.pass_context
 def providers_command(ctx: click.Context):
@@ -2155,7 +2179,7 @@ def providers_command(ctx: click.Context):
             p.get("name", "Unknown"), 
             status_str, 
             p.get("default_model", "-"), 
-            str(p.get("weight", 0)),
+            str(p.get("priority", 999)),
             reasoning_str
         )
     
@@ -2165,7 +2189,7 @@ def providers_command(ctx: click.Context):
 
 @cli.command('local')
 @click.argument('objective', required=False)
-@click.option('--provider', default="auto", help="hf, nvidia, openrouter, ollama, or auto (default).")
+@click.option('--provider', default="auto", help="hf, nvidia, openrouter, or auto (default).")
 @click.option('--model', default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.option('--no-tools', 'no_tools', is_flag=True, default=False, help="Disable read-only repo tools (read_file/list_directory/search_code/get_git_info) for this turn.")
 @click.option('--agent', 'full_agent', is_flag=True, default=False, help="Full read/write/execute tool access (write_file/edit_file/execute_command) via the local risk/approval/mutation-ledger layer, instead of read-only Q&A. Standalone -- no TamfisGPT backend involved.")
@@ -2173,9 +2197,9 @@ def providers_command(ctx: click.Context):
 @click.pass_context
 def local_command(ctx: click.Context, objective: Optional[str], provider: str, model: Optional[str], no_tools: bool, full_agent: bool, run_repl: bool):
     """Offline chat with a directly-configured LLM provider -- no TamfisGPT
-    account, login, or network round-trip to the backend at all. Ollama
-    needs no API key and runs fully on-device; HF/NVIDIA/OpenRouter are
-    available if you've set your own key in the environment.
+    account, login, or network round-trip to the backend at all.
+    HF/NVIDIA/OpenRouter are available if you've set your own key in the
+    environment.
 
     Read-only repo tools (read_file/list_directory/search_code/get_git_info)
     are available so the model can answer questions about this directory.
@@ -2211,6 +2235,7 @@ def local_command(ctx: click.Context, objective: Optional[str], provider: str, m
                 manager, provider_type, model, messages, console, renderer,
                 workspace_root=workspace.workspace_root, session_id=workspace.session_id,
                 approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
+                cli_config=config, allow_swarm_tool=True,
             )
             renderer.finish()
             if outcome.status != "completed":
@@ -2310,7 +2335,14 @@ def screenshot_cmd(ctx: click.Context, url_or_path: str, width: int, height: int
                 raise ValueError("Live browser screenshots use PNG; pass --format png.")
             from .mcp import get_browser_tool_class
 
-            result = get_browser_tool_class()().execute(
+            browser_tool_class = get_browser_tool_class()
+            if browser_tool_class is None:
+                raise RuntimeError(
+                    "Live browser screenshots need a co-located tamgpt6 checkout "
+                    "(sibling directory, TAMFIS_MONOREPO_ROOT, or running from inside "
+                    "one) -- none was found. A local file/image path doesn't need this."
+                )
+            result = browser_tool_class().execute(
                 url=url_or_path,
                 action="screenshot",
                 viewport_width=width,

@@ -20,18 +20,303 @@ from .api_client import RemoteAPIClient
 from . import state as local_state
 
 REUSABLE_STATUSES = {"idle", "active"}
-INSTRUCTION_NAMES = {"AGENTS.md", "CLAUDE.md", "CODEX.md", "CONTRIBUTING.md", "README.md"}
+INSTRUCTION_NAMES = {
+    "AGENTS.md", "CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis",
+    "CONTRIBUTING.md", "README.md",
+}
 REPORT_RE = re.compile(
     r"(report|audit|analysis|architecture|implementation|codex|claude|tamfis[-_ ]?code|"
     r"terminal|agent|roadmap|plan|findings|gaps|status|handover|review)", re.I,
 )
 REPORT_SUFFIXES = {".md", ".txt", ".json", ".yaml", ".yml", ".toml", ".log", ".pdf", ".docx"}
-IGNORED_PARTS = {".git", "node_modules", ".venv", "venv", "dist", "build", "__pycache__"}
+IGNORED_PARTS = {
+    ".git", ".cache", ".config", ".local", ".tox", ".nox",
+    "node_modules", "vendor", "site-packages", ".venv", "venv",
+    "dist", "build", "__pycache__", "output", "uploads", "tmp",
+}
 DISPOSABLE_UNTRACKED_PARTS = {
     "__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache",
     ".tox", ".nox", ".coverage", "htmlcov", ".DS_Store",
 }
 MAX_INDEX_FILES = 20_000
+
+MANIFEST_LANGUAGE_MAP = {
+    "package.json": ("JavaScript/TypeScript", "npm"),
+    "pyproject.toml": ("Python", "pip"),
+    "requirements.txt": ("Python", "pip"),
+    "setup.py": ("Python", "pip"),
+    "setup.cfg": ("Python", "pip"),
+    "Cargo.toml": ("Rust", "cargo"),
+    "go.mod": ("Go", "go"),
+    "pom.xml": ("Java", "maven"),
+    "build.gradle": ("Java/Kotlin", "gradle"),
+    "composer.json": ("PHP", "composer"),
+    "Gemfile": ("Ruby", "bundler"),
+}
+
+
+# Cheap, name/marker-based signals only (never a content scan) for
+# classifying a *candidate* workspace root discovered under a parent
+# directory -- used by runner_local.py's multi-stack scoping so a stale
+# backup or a generated build output isn't silently treated as an equally
+# valid target alongside the real, actively-developed stacks.
+# WordPress installs frequently have neither package.json NOR composer.json
+# -- a plain WP site/theme/plugin checkout is just PHP files with no
+# dependency manifest at all -- so MANIFEST_LANGUAGE_MAP's filename->language
+# lookup alone silently detects nothing for one of the most common web
+# stacks. Confirmed live: with no language/framework signal in the workspace
+# facts handed to the model, it fell back to guessing Node/React conventions
+# (looking for package.json) even when the user's own objective said
+# "this is a WordPress site, not a React component."
+_WORDPRESS_CORE_MARKERS = frozenset({
+    "wp-config.php", "wp-load.php", "wp-settings.php", "wp-cron.php",
+    "wp-login.php", "wp-blog-header.php", "wp-mail.php",
+})
+_WORDPRESS_THEME_HEADER_RE = re.compile(r"Theme Name\s*:", re.I)
+_WORDPRESS_PLUGIN_HEADER_RE = re.compile(r"Plugin Name\s*:", re.I)
+
+_PROJECT_MARKER_NAMES = frozenset(MANIFEST_LANGUAGE_MAP) | _WORDPRESS_CORE_MARKERS | {
+    ".git", "Dockerfile", "docker-compose.yml", "docker-compose.yaml",
+    "compose.yml", "compose.yaml",
+}
+_DEPENDENCY_DIR_NAMES = {"node_modules", "vendor", ".venv", "venv", "site-packages"}
+_ARCHIVED_NAME_MARKERS = ("backup", "backups", "bak", "archive", "archived")
+_GENERATED_NAME_MARKERS = ("dist", "build", "generated", "_generated", ".generated", "output")
+_LEGACY_NAME_MARKERS = ("legacy", "deprecated", "-old", "_old", "old-", "old_")
+
+STACK_ROLES = ("active", "dependency", "legacy", "generated", "archived", "unrelated")
+
+
+def has_project_marker(path: Path) -> bool:
+    try:
+        return path.is_dir() and any((path / marker).exists() for marker in _PROJECT_MARKER_NAMES)
+    except OSError:
+        return False
+
+
+def classify_root(path: Path) -> str:
+    """Classify a candidate workspace root: active/dependency/legacy/
+    generated/archived/unrelated. Best-effort and local-signal-only --
+    a stack that doesn't match any marker just isn't a project root at all
+    ("unrelated"), it isn't evidence of anything more.
+    """
+    name = path.name.lower()
+    if not path.is_dir():
+        return "unrelated"
+    if name in _DEPENDENCY_DIR_NAMES:
+        return "dependency"
+    if any(marker in name for marker in _ARCHIVED_NAME_MARKERS):
+        return "archived"
+    if any(marker in name for marker in _GENERATED_NAME_MARKERS):
+        return "generated"
+    if any(marker in name for marker in _LEGACY_NAME_MARKERS):
+        return "legacy"
+    if not has_project_marker(path):
+        return "unrelated"
+    return "active"
+
+
+def _project_metadata(root: Path, files: list[Path]) -> dict[str, Any]:
+    """Build bounded, model-facing metadata for the current project root."""
+    root = Path(root).resolve()
+
+    # Prefer top-level files when duplicate names occur deeper in the tree.
+    by_name: dict[str, Path] = {}
+    for path in files:
+        current = by_name.get(path.name)
+        if current is None:
+            by_name[path.name] = path
+            continue
+        try:
+            if len(path.relative_to(root).parts) < len(current.relative_to(root).parts):
+                by_name[path.name] = path
+        except ValueError:
+            continue
+
+    manifests = [
+        str(by_name[name])
+        for name in MANIFEST_LANGUAGE_MAP
+        if name in by_name
+    ]
+    languages = {
+        MANIFEST_LANGUAGE_MAP[name][0]
+        for name in by_name
+        if name in MANIFEST_LANGUAGE_MAP
+    }
+    package_managers = {
+        MANIFEST_LANGUAGE_MAP[name][1]
+        for name in by_name
+        if name in MANIFEST_LANGUAGE_MAP
+    }
+    frameworks: set[str] = set()
+
+    package_json = by_name.get("package.json")
+    if package_json is not None:
+        try:
+            package_text = package_json.read_text(
+                encoding="utf-8", errors="replace"
+            ).lower()
+        except OSError:
+            package_text = ""
+        for marker, label in (
+            ('"react"', "React"),
+            ('"vite"', "Vite"),
+            ('"next"', "Next.js"),
+            ('"hono"', "Hono"),
+            ('"vue"', "Vue"),
+            ('"@angular/core"', "Angular"),
+            ('"@nestjs/core"', "NestJS"),
+            ('"express"', "Express"),
+        ):
+            if marker in package_text:
+                frameworks.add(label)
+
+    if "manage.py" in by_name:
+        frameworks.add("Django")
+    if "alembic.ini" in by_name:
+        frameworks.add("Alembic")
+
+    detected = _discover_project_type(root)
+    language = detected.get("language")
+    framework = detected.get("framework")
+    package_manager = detected.get("package_manager")
+    if language and language != "unknown":
+        # _discover_project_type distinguishes JavaScript vs TypeScript (via
+        # tsconfig.json); MANIFEST_LANGUAGE_MAP's package.json entry above
+        # only ever adds the generic "JavaScript/TypeScript". When both
+        # fire for the same Node project, prefer the more specific label
+        # instead of reporting both for one project (confirmed live: a
+        # plain style.css + package.json project listed detected_languages
+        # as both "JavaScript" and "JavaScript/TypeScript").
+        if str(language) in {"JavaScript", "TypeScript"}:
+            languages.discard("JavaScript/TypeScript")
+        languages.add(str(language))
+    if framework:
+        frameworks.add(str(framework))
+    if package_manager:
+        package_managers.add(str(package_manager))
+
+    # WordPress is the authoritative primary stack when core/theme/plugin
+    # markers are present. A package.json inside a theme/plugin (or even at
+    # the site root for asset tooling) must not relabel the site itself as a
+    # JavaScript/TypeScript application or make npm its primary package
+    # manager. Keep those manifests in project_manifests for evidence, but
+    # expose only the runtime stack here.
+    is_wordpress = "WordPress" in frameworks
+    if is_wordpress:
+        languages = {"PHP"}
+        package_managers = {
+            "composer" if (root / "composer.json").is_file() else "none"
+        }
+
+    test_commands: list[str] = []
+    build_commands: list[str] = []
+    if not is_wordpress and ((root / "pyproject.toml").exists() or (root / "pytest.ini").exists()):
+        test_commands.append("pytest -q")
+    if not is_wordpress and (root / "package.json").exists():
+        test_commands.append("npm test")
+        build_commands.append("npm run build")
+    if not is_wordpress and (root / "Cargo.toml").exists():
+        test_commands.append("cargo test")
+        build_commands.append("cargo build")
+    if not is_wordpress and (root / "go.mod").exists():
+        test_commands.append("go test ./...")
+        build_commands.append("go build ./...")
+    if (root / "composer.json").exists():
+        test_commands.append("composer test")
+
+    service_files = sorted({
+        str(path)
+        for path in files
+        if path.suffix == ".service"
+        or path.name.endswith("-capacity.conf")
+        or path.name in {
+            "docker-compose.yml",
+            "docker-compose.yaml",
+            "compose.yml",
+            "compose.yaml",
+            "Caddyfile",
+        }
+    })
+
+    important_dirs: list[str] = []
+    try:
+        for path in root.iterdir():
+            if not path.is_dir() or path.name in IGNORED_PARTS:
+                continue
+            important_dirs.append(str(path))
+            if len(important_dirs) >= 50:
+                break
+    except OSError:
+        pass
+
+    return {
+        "project_manifests": manifests,
+        "detected_languages": sorted(languages),
+        "package_managers": sorted(package_managers),
+        "frameworks": sorted(frameworks),
+        "important_directories": important_dirs,
+        "test_commands": test_commands,
+        "build_commands": build_commands,
+        "service_definitions": service_files,
+        "service_endpoint_facts": _service_endpoint_facts(root, files),
+    }
+
+
+def _service_endpoint_facts(root: Path, files: list[Path]) -> list[dict[str, Any]]:
+    """Extract bounded, source-labelled endpoint evidence from repository
+    configuration. A proxy listener/upstream is deliberately not labelled an
+    application port; only an application process bind is strong evidence for
+    that claim. This keeps model-facing facts portable without hard-coding any
+    TamfisGPT/VPS ports into the installed package."""
+    root = Path(root).resolve()
+    facts: list[dict[str, Any]] = []
+    candidates = [
+        path for path in files
+        if path.suffix == ".service"
+        or path.name.endswith("-capacity.conf")
+        or path.name in {
+            "Caddyfile", "docker-compose.yml", "docker-compose.yaml",
+            "compose.yml", "compose.yaml",
+        }
+    ][:80]
+
+    def add(path: Path, role: str, port: str, evidence: str) -> None:
+        try:
+            source = str(path.resolve().relative_to(root))
+        except ValueError:
+            source = str(path)
+        fact = {
+            "role": role, "port": int(port), "source": source,
+            "evidence": evidence.strip()[:240],
+        }
+        if fact not in facts:
+            facts.append(fact)
+
+    for path in candidates:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")[:64_000]
+        except OSError:
+            continue
+        if path.name == "Caddyfile":
+            for match in re.finditer(r"(?m)^\s*(?P<address>(?:https?://)?[^\s{]*:(?P<port>\d{2,5}))\s*\{", text):
+                add(path, "proxy_listener", match.group("port"), match.group(0))
+            for match in re.finditer(r"(?m)^\s*reverse_proxy\s+(?P<address>[^\s#]+:(?P<port>\d{2,5}))", text):
+                add(path, "proxy_upstream", match.group("port"), match.group(0))
+            continue
+
+        for match in re.finditer(
+            r"(?m)^\s*(?:ExecStart=.*\b(?:gunicorn|uvicorn)\b.*?--bind|"
+            r"ExecStart=.*\buvicorn\b.*?--port)\s+(?P<address>[^\s]+?[:=])?(?P<port>\d{2,5})(?:\s|$)",
+            text,
+        ):
+            add(path, "application_process_bind", match.group("port"), match.group(0))
+
+        if path.name.endswith((".yml", ".yaml")):
+            for match in re.finditer(r"(?m)^\s*-\s*[\"']?(?P<host>\d{2,5}):(?P<container>\d{2,5})[\"']?\s*$", text):
+                add(path, "container_published_port", match.group("host"), match.group(0))
+                add(path, "container_internal_port", match.group("container"), match.group(0))
+    return facts[:100]
 
 
 @dataclass
@@ -58,12 +343,18 @@ def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True
     already used) rather than minting a new one on every invocation; a
     fresh id is allocated via `_next_local_session_id()` (one past the
     highest session id state.py already knows about) when no match exists.
+
+    Swarm sub-task child sessions (is_swarm_child, see
+    resolve_swarm_subtask_workspace) are deliberately excluded from this
+    match -- they share the same workspace_root by design, but are not a
+    session an ordinary caller should ever land back in.
     """
     workspace_root = str((cwd or Path.cwd()).resolve())
 
     local_match = next((
         sid for sid in reversed(local_state.all_known_session_ids())
         if local_state.get_session_state(sid).primary_workspace == workspace_root
+        and not local_state.get_session_state(sid).is_swarm_child
     ), None)
     session_id = local_match if local_match is not None else _next_local_session_id()
 
@@ -71,6 +362,40 @@ def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True
     if discover:
         discover_local_repository(session_id, Path(workspace_root))
     return WorkspaceContext(session_id=session_id, workspace_root=workspace_root)
+
+
+def resolve_swarm_subtask_workspace(
+    workspace_root: Path, *, parent_session_id: Optional[int] = None, label: str = "",
+) -> WorkspaceContext:
+    """Like resolve_local_workspace, but for a concurrent swarm sub-task:
+    always mints a fresh session id instead of reusing the same-
+    workspace_root match resolve_local_workspace intentionally does.
+
+    Concurrent sub-tasks sharing one session_id would race on state.json's
+    single-value fields (current_phase/running_action/active_task/...) --
+    only queued_user_instructions/saved_plans are merge-safe there. Giving
+    each concurrent sub-task its own child session (same real filesystem
+    workspace_root, distinct state.json row, tagged is_swarm_child=True so
+    it can be filtered out of default session listings) sidesteps that
+    without adding locking to state.py's persistence layer, which every
+    other command in this codebase also depends on.
+
+    parent_session_id is best-effort context (None when there's no
+    pre-existing session to record -- e.g. `agent-cmd delegate` is a
+    one-shot CLI invocation with no "current session" at all) -- it is
+    NOT what marks this as a swarm child for hide/show purposes; that's
+    is_swarm_child, always True here regardless of whether a real parent
+    was known. A live-caught bug briefly used parent_session_id is not
+    None as that marker, which silently failed to hide any child session
+    minted with no real parent (confirmed via agent-cmd delegate).
+    """
+    resolved_root = str(Path(workspace_root).resolve())
+    session_id = _next_local_session_id()
+    local_state.save_session_state(
+        session_id, workspace_root=resolved_root,
+        parent_session_id=parent_session_id, is_swarm_child=True, swarm_label=label,
+    )
+    return WorkspaceContext(session_id=session_id, workspace_root=resolved_root)
 
 
 async def _get_or_create_local_server(client: RemoteAPIClient) -> dict:
@@ -178,12 +503,53 @@ def _git(root: Path, *args: str) -> str:
 
 
 def _indexable_files(root: Path) -> list[Path]:
+    def allowed(path: Path) -> bool:
+        try:
+            parts = path.relative_to(root).parts
+        except ValueError:
+            return False
+        return not any(
+            part in IGNORED_PARTS
+            or (part.startswith(".") and part not in {".github", ".tamfis"})
+            for part in parts
+        )
+
     output = _git(root, "ls-files", "-co", "--exclude-standard")
     if output:
-        return [root / item for item in output.splitlines()[:MAX_INDEX_FILES]]
+        result: list[Path] = []
+        seen: set[Path] = set()
+
+        def append_file(path: Path) -> bool:
+            if not allowed(path) or not path.is_file() or path in seen:
+                return False
+            seen.add(path)
+            result.append(path)
+            return len(result) >= MAX_INDEX_FILES
+
+        for item in output.splitlines():
+            path = root / item
+            if not allowed(path):
+                continue
+            if path.is_dir():
+                # A parent Git repository reports a nested repository as one
+                # directory entry (for example `backend/`) rather than listing
+                # its files. Expand only that named directory, applying the
+                # exact same cache/dependency/hidden filters and global bound.
+                # Otherwise model context sees the project name but none of
+                # its manifests, instructions, service units, or source.
+                try:
+                    nested_paths = path.rglob("*")
+                    for nested in nested_paths:
+                        if append_file(nested):
+                            return result
+                except OSError:
+                    continue
+            elif append_file(path):
+                break
+        return result
     found: list[Path] = []
     for path in root.rglob("*"):
-        if any(part in IGNORED_PARTS for part in path.parts):
+        if not allowed(path):
             continue
         if path.is_file():
             found.append(path)
@@ -223,6 +589,194 @@ def _report_title(path: Path) -> str:
     return path.stem.replace("_", " ").replace("-", " ")
 
 
+
+
+
+def _discover_project_type(workspace_root: Path) -> dict[str, Any]:
+    """Detect the primary project type from bounded, local filesystem signals.
+
+    The function deliberately inspects only the root and a few conventional
+    source directories. It never recursively scans the wider host.
+    """
+    root = Path(workspace_root).expanduser().resolve()
+
+    def result(
+        language: str,
+        *,
+        framework: Optional[str] = None,
+        package_manager: Optional[str] = None,
+    ) -> dict[str, Any]:
+        value: dict[str, Any] = {
+            "language": language,
+            "package_manager": package_manager,
+        }
+        if framework:
+            value["framework"] = framework
+        return value
+
+    def has_any(*names: str) -> bool:
+        return any((root / name).exists() for name in names)
+
+    # WordPress must be checked before generic PHP/Node detection. A site may
+    # contain package.json in a theme while WordPress remains the primary stack.
+    wordpress_core = (
+        (root / "wp-content").is_dir()
+        and ((root / "wp-admin").is_dir() or (root / "wp-includes").is_dir())
+    ) or any((root / marker).is_file() for marker in _WORDPRESS_CORE_MARKERS)
+
+    wordpress_theme = False
+    style_css = root / "style.css"
+    if not wordpress_core and style_css.is_file():
+        try:
+            wordpress_theme = bool(
+                _WORDPRESS_THEME_HEADER_RE.search(
+                    style_css.read_text(encoding="utf-8", errors="replace")[:4000]
+                )
+            )
+        except OSError:
+            wordpress_theme = False
+
+    wordpress_plugin = False
+    if not wordpress_core and not wordpress_theme:
+        try:
+            candidates = [
+                path for path in root.iterdir()
+                if path.is_file() and path.suffix.lower() == ".php"
+            ][:100]
+        except OSError:
+            candidates = []
+        for candidate in candidates:
+            try:
+                header = candidate.read_text(
+                    encoding="utf-8", errors="replace"
+                )[:4000]
+            except OSError:
+                continue
+            if _WORDPRESS_PLUGIN_HEADER_RE.search(header):
+                wordpress_plugin = True
+                break
+
+    if wordpress_core or wordpress_theme or wordpress_plugin:
+        return result(
+            "PHP",
+            framework="WordPress",
+            package_manager="composer" if (root / "composer.json").is_file() else None,
+        )
+
+    # Python frameworks and projects.
+    if (root / "manage.py").is_file():
+        return result("Python", framework="Django", package_manager="pip")
+
+    if has_any("pyproject.toml", "requirements.txt", "setup.py", "setup.cfg", "Pipfile", "poetry.lock"):
+        framework: Optional[str] = None
+        likely_files = [root / "main.py", root / "app.py"]
+        for directory in (root, root / "src", root / "app"):
+            if directory.is_dir():
+                try:
+                    likely_files.extend(list(directory.glob("*.py"))[:50])
+                except OSError:
+                    pass
+        for path in likely_files:
+            if not path.is_file():
+                continue
+            try:
+                sample = path.read_text(encoding="utf-8", errors="replace")[:12000]
+            except OSError:
+                continue
+            if "FastAPI(" in sample or "from fastapi" in sample:
+                framework = "FastAPI"
+                break
+            if "from flask" in sample or "Flask(" in sample:
+                framework = "Flask"
+                break
+        return result("Python", framework=framework, package_manager="pip")
+
+    try:
+        root_python = any(root.glob("*.py"))
+    except OSError:
+        root_python = False
+    if root_python:
+        return result("Python", package_manager="pip")
+
+    # Node.js / JavaScript / TypeScript.
+    package_json = root / "package.json"
+    if package_json.is_file():
+        import json
+
+        dependencies: dict[str, Any] = {}
+        package_manager = "npm"
+        if (root / "pnpm-lock.yaml").is_file():
+            package_manager = "pnpm"
+        elif (root / "yarn.lock").is_file():
+            package_manager = "yarn"
+        try:
+            payload = json.loads(package_json.read_text(encoding="utf-8"))
+            dependencies = {
+                **(payload.get("dependencies") or {}),
+                **(payload.get("devDependencies") or {}),
+            }
+        except (OSError, ValueError, TypeError):
+            dependencies = {}
+
+        framework = None
+        for key, label in (
+            ("next", "Next.js"),
+            ("react", "React"),
+            ("vue", "Vue"),
+            ("@angular/core", "Angular"),
+            ("@nestjs/core", "NestJS"),
+            ("hono", "Hono"),
+            ("express", "Express"),
+        ):
+            if key in dependencies:
+                framework = label
+                break
+        language = "TypeScript" if (root / "tsconfig.json").is_file() else "JavaScript"
+        return result(language, framework=framework, package_manager=package_manager)
+
+    # Other manifest-driven stacks.
+    checks = (
+        (("composer.json",), "PHP", None, "composer"),
+        (("Cargo.toml", "Cargo.lock"), "Rust", None, "cargo"),
+        (("go.mod", "go.sum"), "Go", None, "go"),
+        (("pom.xml",), "Java", None, "maven"),
+        (("build.gradle.kts",), "Kotlin", None, "gradle"),
+        (("build.gradle",), "Java/Kotlin", None, "gradle"),
+        (("Gemfile", "Rakefile"), "Ruby", None, "bundler"),
+        (("Package.swift",), "Swift", None, "swift"),
+        (("pubspec.yaml", "pubspec.yml"), "Dart", "Flutter", "pub"),
+        (("mix.exs",), "Elixir", None, "mix"),
+        (("project.clj",), "Clojure", None, "lein"),
+        (("deps.edn",), "Clojure", None, "clojure"),
+        (("stack.yaml",), "Haskell", None, "stack"),
+        (("cabal.project",), "Haskell", None, "cabal"),
+        (("build.sbt",), "Scala", None, "sbt"),
+        (("cpanfile",), "Perl", None, "cpanm"),
+        (("Makefile.PL",), "Perl", None, "perl"),
+    )
+    for names, language, framework, manager in checks:
+        if has_any(*names):
+            return result(
+                language,
+                framework=framework,
+                package_manager=manager,
+            )
+
+    try:
+        if any(root.glob("*.csproj")):
+            return result("C#", framework=".NET", package_manager="dotnet")
+        if any(root.glob("*.fsproj")):
+            return result("F#", framework=".NET", package_manager="dotnet")
+        if any(root.glob("*.rockspec")):
+            return result("Lua", package_manager="luarocks")
+        if any(root.glob("*.php")):
+            return result("PHP", package_manager=None)
+    except OSError:
+        pass
+
+    return result("unknown", package_manager=None)
+
+
 def discover_local_repository(session_id: int, workspace_root: Path, *, force: bool = False) -> dict[str, Any]:
     """Cache local CLI context until Git HEAD or dirty-file count changes.
 
@@ -235,9 +789,15 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
     branch = _git(root, "branch", "--show-current") or None
     head = _git(root, "rev-parse", "HEAD") or "no-head"
     dirty_lines = _git(root, "status", "--short").splitlines()
-    fingerprint = hashlib.sha256(
-        f"{root}|{head}|{'|'.join(dirty_lines)}".encode()
-    ).hexdigest()
+    fingerprint_inputs = [str(root), head, *dirty_lines]
+    for name in sorted(set(MANIFEST_LANGUAGE_MAP) | INSTRUCTION_NAMES):
+        path = root / name
+        if path.is_file():
+            try:
+                fingerprint_inputs.append(f"{name}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+            except OSError:
+                pass
+    fingerprint = hashlib.sha256("|".join(fingerprint_inputs).encode()).hexdigest()
     current = local_state.get_session_state(session_id)
     if not force and current.discovery_fingerprint == fingerprint and current.repository_context:
         return current.repository_context
@@ -265,6 +825,7 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
         "blocking_dirty_files": blocking_dirty_files(dirty_lines)[:100],
         "instruction_files": sorted(instructions), "indexed_file_count": len(files),
         "indexed_at": datetime.now(timezone.utc).isoformat(),
+        **_project_metadata(root, files),
     }
     local_state.save_session_state(
         session_id, repository_root=str(root), current_working_directory=str(workspace_root.resolve()),
@@ -299,6 +860,23 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "changing a file, call the tool that changes it before you say you've changed it. "
         "If you're unsure which file actually defines something, use read_file or "
         "search_code to find it first; do not guess a file's contents from its name.",
+        "When calling write_file to create a new source file, the path's extension must "
+        "match the real language of the content you're writing (.py, .js, .ts, .go, .php, "
+        ".css, etc.) -- never fall back to a generic '.txt' (or any other wrong extension) "
+        "for code, even as a placeholder you intend to rename later. Match whatever filename "
+        "or extension the user's request itself specifies; otherwise use the extension "
+        "the target language and the rest of the project actually use.",
+        "Never call list_directory (or any other read-only tool) again with the exact same "
+        "arguments you already used earlier in this same task -- you already have that "
+        "result; re-issuing it is not progress and will end the task early as a stuck loop. "
+        "For a broad request (e.g. \"audit the entire system for vulnerabilities\") that "
+        "doesn't name a specific file or directory: list_directory the top level ONCE, then "
+        "immediately act on what it actually returned -- read_file a specific file it "
+        "listed, list_directory a specific subdirectory it named, or search_code for a "
+        "concrete pattern -- rather than re-listing the same path while you decide what to "
+        "do. If the request is too broad to make that concrete next choice at all, say so "
+        "and ask the user to narrow it (a specific component, directory, or concern) instead "
+        "of stalling on repeated top-level listings.",
         "Before checking whether any local service is 'healthy' or 'running', you must "
         "first find its REAL configured port -- do not use 8080/3000/5000/8000 or any "
         "other common default unless you have actually confirmed that's the real one. "
@@ -307,16 +885,25 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "actual configured port; (2) only then curl/request that exact port. Getting ANY "
         "HTTP response back from a guessed port is NOT evidence the intended service is "
         "healthy -- an entirely different, unrelated process can easily be listening on a "
-        "common default port instead. The same applies to any other environment-specific "
+        "common default port instead. A Caddy/Nginx/Apache listener or reverse_proxy upstream "
+        "is proxy topology, not proof of an application's own process bind or service identity; "
+        "never relabel a proxy port as the application port. Prefer a service unit's ExecStart "
+        "bind, a container's explicit internal/published port mapping, or a live process command, "
+        "and cite that exact evidence in the answer. The same applies to any other environment-specific "
         "value (host, container/process ID, file path, env var): find the real one via a "
         "tool call before using it, never assume it from a common default.",
         "Before running any install/build/start command against a project (or one component "
         "of a multi-component stack), first find out what kind of project it actually is -- "
         "list_directory it and look for package.json (Node/npm), pyproject.toml/"
-        "requirements.txt (Python), go.mod (Go), Cargo.toml (Rust), Dockerfile/"
-        "docker-compose.yml, etc. Do not default to npm install/npm start just because a "
-        "component is called a 'backend' or is mentioned alongside a Node frontend -- run "
-        "the command that actually matches what's really there.",
+        "requirements.txt (Python), go.mod (Go), Cargo.toml (Rust), composer.json (PHP), "
+        "wp-config.php/wp-load.php/a wp-content directory (WordPress -- often has NO "
+        "package.json or composer.json at all; do not assume Node just because it's a web "
+        "project), Dockerfile/docker-compose.yml, etc. Do not default to npm install/npm "
+        "start (or assume Node/React at all) just because a component is called a "
+        "'backend'/'site'/'package' or is mentioned alongside a Node frontend -- and never "
+        "override an explicit statement in the user's own objective about what kind of "
+        "project this is (e.g. 'this is a WordPress site, not a React component') with your "
+        "own guess; run the command/inspection that actually matches what's really there.",
         f"Workspace root: {context['working_directory']}",
     ]
     # discover_local_repository always sets repository_root (falling back to
@@ -332,6 +919,20 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
             )
     else:
         lines.append("This directory is not a Git repository.")
+
+    endpoint_facts = context.get("service_endpoint_facts") or []
+    if endpoint_facts:
+        rendered = []
+        for fact in endpoint_facts[:30]:
+            rendered.append(
+                f"- {fact.get('role')} port {fact.get('port')} from "
+                f"{fact.get('source')}: {fact.get('evidence')}"
+            )
+        lines.append(
+            "Repository service-endpoint evidence (configuration evidence only; live status still "
+            "requires a matching process/health check). Roles are not interchangeable:\n"
+            + "\n".join(rendered)
+        )
 
     instruction_files = context.get("instruction_files") or []
     remaining_budget = MAX_INSTRUCTION_CHARS

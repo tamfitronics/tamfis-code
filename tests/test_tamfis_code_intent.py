@@ -1,5 +1,6 @@
 import unittest
 
+from tamfis_code.custom_commands import CustomCommand
 from tamfis_code.interactive import parse_intent
 
 
@@ -65,6 +66,34 @@ class ParseIntentTests(unittest.TestCase):
         # AI path, same as plain prose.
         intent = parse_intent("/unknown-command do a thing")
         self.assertEqual(intent.kind, "ai")
+
+    def test_custom_command_expands_into_an_ai_objective(self):
+        commands = {
+            "review": CustomCommand(
+                name="review", description="", template="Review $ARGUMENTS for bugs.", source="user config",
+            )
+        }
+        intent = parse_intent("/review app.py", custom_commands=commands)
+        self.assertEqual(intent.kind, "ai")
+        self.assertEqual(intent.mode, "coding")
+        self.assertEqual(intent.objective, "Review app.py for bugs.")
+
+    def test_custom_command_with_no_arguments_still_expands(self):
+        commands = {"standup": CustomCommand(name="standup", description="", template="Summarize today's changes.", source="user config")}
+        intent = parse_intent("/standup", custom_commands=commands)
+        self.assertEqual(intent.objective, "Summarize today's changes.")
+
+    def test_built_in_command_wins_over_a_same_named_custom_command(self):
+        commands = {"plan": CustomCommand(name="plan", description="", template="should never be used", source="user config")}
+        intent = parse_intent("/plan fix the bug", custom_commands=commands)
+        self.assertEqual(intent.mode, "plan")
+        self.assertEqual(intent.objective, "fix the bug")
+
+    def test_unknown_slash_command_with_custom_commands_present_still_falls_through(self):
+        commands = {"review": CustomCommand(name="review", description="", template="x", source="user config")}
+        intent = parse_intent("/totally-unknown", custom_commands=commands)
+        self.assertEqual(intent.kind, "ai")
+        self.assertEqual(intent.objective, "/totally-unknown")
 
 
 if __name__ == "__main__":

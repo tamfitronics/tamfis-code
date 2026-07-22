@@ -18,11 +18,14 @@ from typing import Any, Optional
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.table import Table
 from rich.spinner import Spinner
 from rich.text import Text
 
 from .metrics import MetricsTracker
+from .safety import redact_secrets
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 
@@ -44,6 +47,7 @@ _PHASE_BY_EVENT = {
     "routing_started": "route",
     "model_selected": "route",
     "provider_request_started": "respond",
+    "reasoning_delta": "reasoning",
     "assistant_delta": "respond",
     "plan_created": "plan",
     "tool_call_requested": "execute",
@@ -56,6 +60,18 @@ _PHASE_BY_EVENT = {
     "task_diagnostics": "validate",
     "ai_task_completed": "report",
     "ai_task_failed": "report",
+    "orchestrator_understand": "understand",
+    "orchestrator_inspect": "inspect",
+    "orchestrator_route": "route",
+    "orchestrator_plan": "plan",
+    "orchestrator_execute": "execute",
+    "orchestrator_observe": "observe",
+    "orchestrator_repair": "repair",
+    "orchestrator_validate": "validate",
+    "orchestrator_report": "report",
+    "orchestrator_waiting_for_approval": "waiting_for_approval",
+    "orchestrator_completed": "report",
+    "orchestrator_failed": "report",
 }
 
 # Chars-per-token is a rough English-text average, used only because
@@ -72,15 +88,58 @@ _VERB_BY_PHASE = {
     "idle": "Working",
     "submitting": "Submitting",
     "queued": "Queued",
-    "understand": "Reading",
+    "understand": "Understanding",
+    "inspect": "Inspecting",
     "route": "Routing",
+    "reasoning": "Thinking",
     "respond": "Responding",
     "plan": "Planning",
     "execute": "Working",
+    "observe": "Observing",
+    "repair": "Repairing",
     "waiting_for_approval": "Waiting",
     "validate": "Checking",
     "report": "Wrapping up",
 }
+
+
+# Rotating hints shown under the live status line during longer-running
+# turns -- every one names a real, working command/flag (verified against
+# this session's own testing), not a guessed or aspirational one. Kept
+# short: this is a passing hint, not documentation.
+_TIPS = [
+    "Tip: `tamfis-code diffs` lists recent file changes; `tamfis-code revert <id>` undoes one.",
+    "Tip: `tamfis-code resume` picks up your last session where it left off.",
+    "Tip: `/mode` in the REPL changes the approval policy without restarting.",
+    "Tip: `tamfis-code plan \"...\"` saves a plan without touching any files.",
+    "Tip: `tamfis-code index . -s <name>` searches this codebase by symbol name.",
+    "Tip: `tamfis-code screenshot <url>` takes a real browser screenshot.",
+    "Tip: `tamfis-code enforce` runs this workspace's own test suite.",
+    "Tip: `tamfis-code providers` shows which AI providers are configured and healthy.",
+    "Tip: Ctrl+C exits `tamfis-code` cleanly, mid-turn or not.",
+    "Tip: `/compact` in the REPL saves a context checkpoint you can return to later.",
+    "Tip: `tamfis-code tools list` shows every tool this agent knows how to call.",
+    "Tip: `--approval` (or `/mode`) controls how much gets auto-approved: ask/safe/full-auto/never/...",
+]
+
+# Seconds of elapsed time before the first tip appears, and how long each
+# stays up -- avoids tip noise on turns that finish almost instantly.
+_TIP_START_AFTER_SECONDS = 4.0
+_TIP_ROTATE_EVERY_SECONDS = 8.0
+
+# Streaming output is coalesced into readable blocks. Re-rendering a complete
+# Markdown document for every one-character provider delta is quadratic and
+# was the direct cause of the painfully slow terminal typing experience.
+_ASSISTANT_REFRESH_INTERVAL_SECONDS = 0.08
+_ASSISTANT_REFRESH_MIN_CHARS = 96
+_ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|```\s*$)")
+
+
+def _current_tip(elapsed: float) -> Optional[str]:
+    if elapsed < _TIP_START_AFTER_SECONDS or not _TIPS:
+        return None
+    index = int((elapsed - _TIP_START_AFTER_SECONDS) // _TIP_ROTATE_EVERY_SECONDS) % len(_TIPS)
+    return _TIPS[index]
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -101,10 +160,13 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
     """Translate implementation identifiers into concise engineering actions."""
     arguments = arguments or {}
     normalized = (name or "tool").strip().lower().replace("-", "_").rsplit("/", 1)[-1]
+    command_target = arguments.get("command")
     target = str(
         arguments.get("path") or arguments.get("file_path") or arguments.get("pattern")
-        or arguments.get("query") or arguments.get("command") or ""
+        or arguments.get("query") or command_target or ""
     ).strip()
+    if command_target and target == str(command_target).strip():
+        target = redact_secrets(target)
     verbs = {
         "read_file": ("Reading", "Read"),
         "glob_files": ("Finding repository files", "Found repository files"),
@@ -255,8 +317,19 @@ def _format_diagnostics_line(payload: dict[str, Any]) -> str:
 
 
 class StreamRenderer:
-    def __init__(self, console: Console):
+    def __init__(self, console: Console, *, mode_label: Optional[str] = None):
         self.console = console
+        # Live-reported: switching mode (Shift+Tab) while a task is
+        # actively streaming only ever printed a one-time scrolling
+        # "◆ Mode switched to X" line (live_input.py's _cycle_mode) that
+        # the next few lines of streamed output push off-screen -- unlike
+        # Claude Code, where the current mode is a persistent, always-
+        # visible part of the UI, not a message you can miss. `_mode_label`
+        # is folded into the persistent Live status line itself (see
+        # _build_status) instead, and set_mode_label() below forces an
+        # immediate refresh so a switch is visible the instant it happens,
+        # not just on the status line's next natural per-token update.
+        self._mode_label = mode_label
         self._assistant_open = False
         # Printed at most once per StreamRenderer instance (i.e. once per
         # overall user turn, however many tool-call rounds it takes) --
@@ -280,12 +353,43 @@ class StreamRenderer:
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
         self._metrics = MetricsTracker()
+        # Real reasoning-phase timing (see provider_protocols.py's
+        # reasoning_content extraction) -- None/None until a reasoning delta
+        # actually arrives; _thought_seconds freezes once real answer
+        # content starts, and stays visible in the status line for the rest
+        # of the turn the way Claude Code's own "thought for Xs" does.
+        self._reasoning_start: Optional[float] = None
+        self._reasoning_last: Optional[float] = None
+        self._thought_seconds: Optional[float] = None
         self._spinner = Spinner("dots", style="cyan")
         self._is_tty = bool(getattr(console, "is_terminal", False))
         self._live: Optional[Live] = None
+        # Accumulated text for the assistant block currently streaming, and
+        # the Live handle re-rendering it as Markdown on every delta (TTY
+        # only -- see the assistant_delta branch below for why non-TTY output
+        # stays raw). Reset in _close_assistant() so each block between tool
+        # rounds gets its own buffer instead of concatenating onto the last.
+        self._assistant_buffer = ""
+        self._assistant_pending = ""
+        self._assistant_rendered_length = 0
+        self._assistant_last_refresh = 0.0
+        self._assistant_live: Optional[Live] = None
+        # Set by live_input.py's LiveInputListener.start() for the duration
+        # of one interactive turn; None for every other caller (one-shot
+        # CLI commands, tests, the --remote path) -- suspend_live/resume_live
+        # above only touch it when it's actually present.
+        self.live_input_listener: Optional[Any] = None
         if self._is_tty:
             self._live = Live(self._build_status(), console=self.console, refresh_per_second=8, transient=True)
             self._live.start()
+
+    def set_mode_label(self, label: str) -> None:
+        """Update the persistent status line's mode tag and refresh
+        immediately -- called by live_input.py's Shift+Tab handler so a
+        mid-task mode switch is visible the instant it happens, not just
+        via a scrolling diagnostic line that later output pushes away."""
+        self._mode_label = label
+        self._refresh_live()
 
     def _build_status(self) -> Any:
         elapsed = time.monotonic() - self._task_start
@@ -293,12 +397,41 @@ class StreamRenderer:
         detail_parts = [_format_elapsed(elapsed)]
         if tokens:
             detail_parts.append(f"↓ {_format_token_count(tokens)} tokens")
+        if self._thought_seconds is not None:
+            detail_parts.append(f"thought for {_format_elapsed(self._thought_seconds)}")
+        elif self._reasoning_start is not None:
+            # Still actively reasoning -- live-incrementing, not yet frozen.
+            detail_parts.append(f"thought for {_format_elapsed(time.monotonic() - self._reasoning_start)}")
         verb = _VERB_BY_PHASE.get(self._phase, self._phase)
-        label = f"[bold]{verb}…[/bold] [dim]({' · '.join(detail_parts)})[/dim]"
+        # The literal brackets are escaped (\[...]) because Text.from_markup
+        # below would otherwise parse "[accept-edits]" itself as an
+        # (invalid, silently-dropped) markup tag rather than visible text --
+        # confirmed by a test failure where the whole tag vanished.
+        mode_tag = f"[cyan]\\[{self._mode_label}][/cyan] " if self._mode_label else ""
+        label = f"{mode_tag}[bold]{verb}…[/bold] [dim]({' · '.join(detail_parts)})[/dim]"
         self._spinner.update(text=Text.from_markup(label))
-        if not self._plan_steps:
+        tip = _current_tip(elapsed)
+        if not self._plan_steps and not tip and self.live_input_listener is None:
             return self._spinner
         lines = []
+        if self.live_input_listener is not None:
+            # Keep a real, persistent input box in the live task display. The
+            # ordinary REPL editor is suspended while the agent owns the
+            # terminal, but the box remains visible and Ctrl+Y opens the
+            # coordinated editor without competing with Rich Live.
+            from .live_input import queue_key_bytes
+            _, queue_label = queue_key_bytes()
+            input_box = Panel(
+                Text(
+                    f"{queue_label} queue next>  · type a follow-up when opened · Ctrl+C/Ctrl+D exit"
+                ),
+                title="Input",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+            lines.append(input_box)
+        if tip:
+            lines.append(Text.from_markup(f"  [dim]{tip}[/dim]"))
         for step in self._plan_steps:
             status = step.get("status")
             marker = "[green]✓[/green]" if status == "completed" else (
@@ -308,18 +441,82 @@ class StreamRenderer:
             # update_plan_steps docstring) -- statuses beyond the initial
             # plan_created payload are a best-effort approximation, so this
             # is labelled "~" rather than presented as precise.
-            lines.append(f"  {marker} {'~ ' if status == 'in_progress' else ''}{step.get('step') or ''}")
-        return Group(self._spinner, *(Text.from_markup(line) for line in lines))
+            lines.append(Text.from_markup(
+                f"  {marker} {'~ ' if status == 'in_progress' else ''}{step.get('step') or ''}"
+            ))
+        return Group(self._spinner, *lines)
 
     def _refresh_live(self) -> None:
         if self._live is not None:
             self._live.update(self._build_status())
+
+    def _print_plan_snapshot(
+        self, items: list[dict[str, Any]], *, title: str,
+        assumptions: Optional[list[Any]] = None, risks: Optional[list[Any]] = None,
+    ) -> None:
+        """Print an authoritative plan snapshot to scrollback.
+
+        Rich Live is intentionally transient for the spinner, so it cannot
+        be the source of truth for a plan users need to follow. Every plan
+        creation and every status transition gets a durable snapshot here.
+        """
+        table = Table.grid(padding=(0, 1))
+        table.add_column(width=4, justify="right", style="cyan")
+        table.add_column(ratio=1)
+        for index, item in enumerate(items, start=1):
+            status = str(item.get("status") or "pending")
+            marker = "✓" if status == "completed" else (
+                "✗" if status == "failed" else ("▶" if status == "in_progress" else "○")
+            )
+            table.add_row(f"{index}. {marker}", f"{item.get('step') or ''} · {status}")
+        body: list[Any] = [table]
+        if assumptions:
+            body.extend([Text("Assumptions", style="bold"), Text(" • " + "\n • ".join(map(str, assumptions)))])
+        if risks:
+            body.extend([Text("Risks", style="bold yellow"), Text(" • " + "\n • ".join(map(str, risks)))])
+        self.console.print(Panel(Group(*body), title=title, border_style="cyan", expand=False))
 
     def _stop_live(self) -> None:
         """End the progress display before ordinary streamed output begins."""
         if self._live is not None:
             self._live.stop()
             self._live = None
+
+    def suspend_live(self) -> None:
+        """Stop the live status line before a blocking interactive prompt.
+
+        Rich's Live redraws the terminal on its own refresh timer
+        (refresh_per_second=8) independent of whatever else is writing to
+        the console; a blocking `console.input()` call for an approval
+        decision has no way to coordinate with that redraw, so the prompt
+        can be silently overwritten/garbled while a human is trying to
+        answer it. Approval gates must be visible and durable, not raced
+        by a spinner -- call this before prompting, then resume_live()
+        after the decision is made. Safe to call when already suspended or
+        when no live line exists at all (non-TTY output).
+
+        Also stops the streaming-assistant Markdown Live (if one is open --
+        see the assistant_delta handler) and pauses live_input_listener (if
+        attached -- see live_input.py): both would otherwise race a blocking
+        prompt for the same terminal/fd exactly like the status line does.
+        """
+        self._stop_live()
+        if self._assistant_live is not None:
+            self._assistant_live.stop()
+            self._assistant_live = None
+        if self.live_input_listener is not None:
+            self.live_input_listener.pause()
+
+    def resume_live(self) -> None:
+        """Restore the live status line after suspend_live(); a no-op on
+        non-TTY output or if a live line is already active. Does not
+        restart the assistant Live -- the next assistant_delta lazily
+        recreates it from the still-intact buffer if a block was open."""
+        if self.live_input_listener is not None:
+            self.live_input_listener.resume()
+        if self._is_tty and self._live is None and not self._assistant_open:
+            self._live = Live(self._build_status(), console=self.console, refresh_per_second=8, transient=True)
+            self._live.start()
 
     def _record_tokens(self, content: str) -> None:
         if not content:
@@ -328,10 +525,55 @@ class StreamRenderer:
         elapsed_ms = (time.monotonic() - self._task_start) * 1000
         self._metrics.record(estimated_tokens, elapsed_ms)
 
+    def _flush_assistant(self, *, force: bool = False) -> None:
+        """Flush buffered assistant text in coherent blocks.
+
+        Providers may emit one character per network frame. Rendering every
+        frame independently makes Rich repeatedly parse the full Markdown
+        document and produces the impression of one-character-per-second
+        typing. We retain true streaming, but refresh only at sentence/block
+        boundaries, after a useful amount of text, or on finalisation.
+        """
+        if not self._assistant_pending:
+            return
+        # Redirected output has no Live refresh loop to flush the final small
+        # fragment later. Emit each non-TTY delta promptly; TTY output keeps
+        # the coalesced Markdown refresh path for smooth interactive rendering.
+        force = force or not self._is_tty
+        now = time.monotonic()
+        boundary = bool(_ASSISTANT_SENTENCE_BOUNDARY_RE.search(self._assistant_pending))
+        enough_text = len(self._assistant_pending) >= _ASSISTANT_REFRESH_MIN_CHARS
+        interval_elapsed = now - self._assistant_last_refresh >= _ASSISTANT_REFRESH_INTERVAL_SECONDS
+        if not force and not boundary and not (enough_text and interval_elapsed):
+            return
+        self._assistant_buffer += self._assistant_pending
+        self._assistant_pending = ""
+        self._assistant_last_refresh = now
+        if self._is_tty:
+            document = Markdown(self._assistant_buffer)
+            if self._assistant_live is None:
+                self._assistant_live = Live(document, console=self.console, refresh_per_second=12)
+                self._assistant_live.start()
+            else:
+                self._assistant_live.update(document, refresh=True)
+        else:
+            delta = self._assistant_buffer[self._assistant_rendered_length:]
+            if delta:
+                self.console.print(delta, end="")
+                self._assistant_rendered_length = len(self._assistant_buffer)
+
     def _close_assistant(self) -> None:
         if self._assistant_open:
+            self._flush_assistant(force=True)
+            if self._assistant_live is not None:
+                self._assistant_live.stop()
+                self._assistant_live = None
             self.console.print()
             self._assistant_open = False
+            self._assistant_buffer = ""
+            self._assistant_pending = ""
+            self._assistant_rendered_length = 0
+            self._assistant_last_refresh = 0.0
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("event_type") or event.get("event") or event.get("type")
@@ -341,8 +583,22 @@ class StreamRenderer:
             self._phase = _PHASE_BY_EVENT[event_type]
             self._refresh_live()
 
+        if event_type == "reasoning_delta":
+            content = str(payload.get("content", ""))
+            if content:
+                now = time.monotonic()
+                if self._reasoning_start is None:
+                    self._reasoning_start = now
+                self._reasoning_last = now
+                self._refresh_live()
+                if self.debug:
+                    self.console.print(f"[dim italic]{content}[/dim italic]", end="")
+            return
+
         if event_type == "assistant_delta":
             content = str(payload.get("content", ""))
+            if content and self._reasoning_start is not None and self._thought_seconds is None:
+                self._thought_seconds = (self._reasoning_last or self._reasoning_start) - self._reasoning_start
             if not self._assistant_open:
                 self._stop_live()
                 if not self._assistant_header_shown:
@@ -357,7 +613,20 @@ class StreamRenderer:
                 self.streamed_final_text = True
             self._record_tokens(content)
             self._refresh_live()
-            self.console.print(content, end="")
+            self._assistant_pending += content
+            self._flush_assistant()
+            return
+
+        if event_type == "plan_step_progress":
+            # Update both the live view and durable scrollback. The live view
+            # may already have been stopped when assistant output began, so
+            # refreshing it alone makes progress appear to disappear.
+            self._close_assistant()
+            items = payload.get("items") if isinstance(payload.get("items"), list) else []
+            if items:
+                self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
+                self._refresh_live()
+                self._print_plan_snapshot(self._plan_steps, title=payload.get("title") or "Plan progress")
             return
 
         if event_type == "plan_created":
@@ -368,16 +637,15 @@ class StreamRenderer:
             if items:
                 self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
                 self._refresh_live()
-                # The live panel (when active) already shows this step list
-                # in place, updating as later events refresh it -- printing
-                # it again as a static scroll-log entry would just duplicate
-                # it. Non-TTY output (no live panel) keeps today's one-shot
-                # print, since that's the only place this ever showed up.
-                if self._live is None:
-                    self.console.print(f"[bold cyan]{payload.get('title') or 'Plan'}[/bold cyan]")
-                    for item in self._plan_steps:
-                        marker = "◉" if item.get("status") == "in_progress" else "○"
-                        self.console.print(f"  [cyan]{marker}[/cyan] {item.get('step') or ''}")
+                # Rich's TTY Live region is transient and is stopped when
+                # assistant output begins. Always print a durable snapshot;
+                # otherwise the plan disappears at execution start.
+                assumptions = payload.get("assumptions") or []
+                risks = payload.get("risks") or []
+                self._print_plan_snapshot(
+                    self._plan_steps, title=payload.get("title") or "Execution plan",
+                    assumptions=assumptions, risks=risks,
+                )
                 return
             if stage == "tool_execution":
                 match = _TOOL_ANNOUNCE_RE.search(content)
@@ -438,17 +706,27 @@ class StreamRenderer:
             _render_result_block(self.console, ok=not failed, label=label, content=content)
             return
 
-        if event_type in ("artifact_generated", "diff_available"):
+        if event_type in (
+            "artifact_generated", "file_generated", "image_generated",
+            "video_generated", "diff_available",
+        ):
             self._close_assistant()
-            filename = payload.get("filename") or "generated file"
+            filename = payload.get("filename") or payload.get("name") or "generated file"
             size = payload.get("size_bytes")
             size_text = f" ({size} bytes)" if size else ""
-            url = payload.get("download_url") or payload.get("file_url")
+            url = (
+                payload.get("download_url") or payload.get("file_url")
+                or payload.get("image_url") or payload.get("video_url") or payload.get("url")
+            )
             body = f"{filename}{size_text}"
             if url:
                 body += f"\n{url}"
             validated = payload.get("validated")
-            title = "File generated" + (" · validated" if validated is True else "")
+            kind_title = {
+                "image_generated": "Image generated",
+                "video_generated": "Video generated",
+            }.get(event_type, "File generated")
+            title = kind_title + (" · validated" if validated is True else "")
             self.console.print(Panel(body, title=title, border_style="blue", expand=False))
             return
 
@@ -520,15 +798,43 @@ class StreamRenderer:
                     expand=False,
                 )
             )
+            diff_text = payload.get("diff")
+            if diff_text:
+                print_unified_diff(self.console, str(diff_text), title="Proposed change")
+            return
+
+        if event_type == "context_rollover":
+            self._close_assistant()
+            before = payload.get("before_tokens")
+            after = payload.get("after_tokens")
+            self.console.print(
+                f"[dim]· Internal context checkpointed and continued "
+                f"(~{before} → ~{after} estimated tokens) -- same task, still running[/dim]"
+            )
+            return
+
+        if event_type == "workspace_scope":
+            # Fires on every single turn (workspace scope is always
+            # computed) -- routine internal bookkeeping with nothing
+            # actionable in it on the happy path, so (like context_reused/
+            # context_rescanned/model_selected below) it's debug-only. This
+            # was the biggest single contributor to feeling "bloated"
+            # compared to Claude Code's own clean default: 3+ setup lines
+            # printed before the model even starts, every turn, with no way
+            # to turn them off.
+            self._close_assistant()
+            if self.debug:
+                self.console.print(f"[dim]· {payload.get('content', '')}[/dim]")
             return
 
         if event_type in ("context_reused", "context_rescanned"):
             self._close_assistant()
-            reason = payload.get("reason", "unknown")
-            if event_type == "context_reused":
-                self.console.print("[dim]· Reusing workspace context — repository unchanged since last turn[/dim]")
-            else:
-                self.console.print(f"[dim]· Workspace rescanned (reason: {reason})[/dim]")
+            if self.debug:
+                reason = payload.get("reason", "unknown")
+                if event_type == "context_reused":
+                    self.console.print("[dim]· Reusing workspace context — repository unchanged since last turn[/dim]")
+                else:
+                    self.console.print(f"[dim]· Workspace rescanned (reason: {reason})[/dim]")
             return
 
         if event_type == "task_diagnostics":
@@ -540,9 +846,22 @@ class StreamRenderer:
             self._close_assistant()
             provider = payload.get("provider") or "unknown"
             self._selected_provider = str(provider)
-            model = payload.get("model") or "unknown"
+            # FIX: an empty resolved model (Tier IV/NIM routes leave
+            # config.default_model blank by design, letting the provider
+            # pick its own default) previously showed as "Model: unknown"
+            # in --debug output -- misleading, since nothing is actually
+            # unknown here; the provider is just resolving its own default.
+            model = payload.get("model") or "(provider default)"
             reason = payload.get("selection_reason") or "explicit selection or orchestration routing"
-            self.console.print(f"[dim]· Provider: {provider} · Model: {model} · {reason}[/dim]")
+            if self.debug:
+                self.console.print(f"[dim]· Provider: {provider} · Model: {model} · {reason}[/dim]")
+            else:
+                # Persist the authoritative route in the scrollback. The
+                # previous debug-only display made "local:auto" in the
+                # banner look like local Ollama even when AUTO had selected
+                # NVIDIA/OpenRouter/HF; users could not tell which provider
+                # was actually responsible for a slow or bad response.
+                self.console.print(f"[dim]· Using {provider} · {model}[/dim]")
             return
 
         if event_type == "ai_task_failed":
@@ -569,10 +888,38 @@ class StreamRenderer:
             self._live = None
 
 
+def suspend_live_if_active(renderer: Any) -> None:
+    """Call renderer.suspend_live() if the renderer supports it.
+
+    Renderer test doubles (recording stubs used across the test suite)
+    don't implement the live-status protocol at all -- this lets callers
+    (runner.py, runner_local.py) unconditionally suspend/resume around an
+    approval prompt without every such double needing the method.
+    """
+    method = getattr(renderer, "suspend_live", None)
+    if callable(method):
+        method()
+
+
+def resume_live_if_active(renderer: Any) -> None:
+    method = getattr(renderer, "resume_live", None)
+    if callable(method):
+        method()
+
+
 def print_banner(console: Console, *, host: str, workspace_root: str, mode: str, approval_policy: str) -> None:
     console.print(Text("TamfisGPT Code", style="bold cyan"))
+    console.print(Text("by Tamfis Nig. Ltd", style="dim"))
     console.print(f"[dim]Workspace:[/dim] {workspace_root}")
-    console.print(f"[dim]Mode:[/dim] {mode}   [dim]Approval:[/dim] {approval_policy}   [dim]Host:[/dim] {host}")
+    if host.startswith("local:"):
+        route = host.split(":", 1)[1] or "auto"
+        route_label = "auto (nvidia, openrouter, hf, in capability-ranked order)" if route == "auto" else route
+        console.print(
+            f"[dim]Mode:[/dim] {mode}   [dim]Approval:[/dim] {approval_policy}   "
+            f"[dim]Runtime:[/dim] standalone   [dim]Provider:[/dim] {route_label}"
+        )
+    else:
+        console.print(f"[dim]Mode:[/dim] {mode}   [dim]Approval:[/dim] {approval_policy}   [dim]Host:[/dim] {host}")
 
 
 def print_error(console: Console, message: str) -> None:
@@ -631,3 +978,37 @@ def print_unified_diff(console: Console, diff_text: str, *, title: str = "Change
         else:
             style = "dim"
         console.print(Text(line, style=None if no_color else style), soft_wrap=True)
+
+
+def print_resume_plan_status(console: Console, state: Any) -> None:
+    """Show the resumed session's active saved plan and its step progress.
+
+    Before this, both `tamfis-code resume` and the REPL's `/resume` showed
+    only a conversation summary -- a plan left mid-execution (some steps
+    completed, one in_progress or failed, others still pending) became
+    completely invisible the moment a session was resumed, even though
+    state.py has carried this real, up-to-date step-status data (see
+    orchestrator/engine.py's _advance_plan_step) since the fix for #11.
+    A no-op if there's no saved plan, or the saved plan has nothing left
+    outstanding (every step already completed).
+    """
+    if not state.saved_plans:
+        return
+    plan = next(
+        (p for p in reversed(state.saved_plans) if p.get("id") == state.active_plan_id),
+        state.saved_plans[-1],
+    )
+    steps = plan.get("steps") or []
+    if not steps or all(step.get("status") == "completed" for step in steps):
+        return
+    no_color = bool(getattr(console, "no_color", False))
+    objective = plan.get("objective") or "no objective recorded"
+    console.print(f"Plan in progress ({objective}):" if no_color else f"[bold cyan]Plan in progress[/bold cyan] ({objective}):")
+    markers = {"completed": "✓", "in_progress": "◉", "failed": "✗"}
+    colors = {"completed": "green", "in_progress": "yellow", "failed": "red"}
+    for step in steps:
+        status = step.get("status", "pending")
+        glyph = markers.get(status, "○")
+        color = colors.get(status)
+        marker = glyph if no_color or color is None else f"[{color}]{glyph}[/{color}]"
+        console.print(f"  {marker} {step.get('step') or ''}")

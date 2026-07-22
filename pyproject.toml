@@ -1,7 +1,7 @@
 [project]
 name = "tamfis-code"
-version = "0.2.3"
-description = "TamfisGPT Code -- standalone terminal coding agent (calls HF/NVIDIA NIM/OpenRouter/Ollama directly; --remote for the legacy TamfisGPT Remote backend)"
+version = "0.6.11"
+description = "TamfisGPT Code -- portable subscription-backed terminal coding agent with local tools, PTY, plans, queues, and approvals"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
@@ -10,16 +10,24 @@ dependencies = [
     "rich>=13.0",
     "prompt_toolkit>=3.0",
     # Provider calls (providers.py) go through the openai SDK's client against
-    # each vendor's OpenAI-compatible endpoint (HF, NVIDIA NIM, OpenRouter,
-    # Ollama) -- this was imported but never declared, only working because a
+    # each vendor's OpenAI-compatible endpoint (HF, NVIDIA NIM, OpenRouter)
+    # -- this was imported but never declared, only working because a
     # copy happened to already be installed system-wide.
     "openai>=1.30",
+    # Outbound MCP server (`tamfis-code mcp-server`, mcp_stdio_server.py) --
+    # was already installed system-wide and imported ad hoc; same class of
+    # undeclared-dependency gap as openai/pytest-asyncio above, now fixed.
+    "mcp>=1.2",
+    "fastapi>=0.115",
+    "uvicorn>=0.34",
+    "websockets>=13",
 ]
 
 [project.scripts]
 tamfis-code = "tamfis_code.cli:main"
 tamgpt-code = "tamfis_code.cli:main"
 tamfis = "tamfis_code.cli:main"
+tamfis-code-server = "tamfis_code.openhands.agent_server:main"
 
 [project.urls]
 Homepage = "https://github.com/tamfitronics/tamfis-code"
@@ -40,5 +48,14 @@ dev = [
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
-[tool.setuptools]
-packages = ["tamfis_code"]
+[tool.setuptools.packages.find]
+include = ["tamfis_code*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+norecursedirs = [
+    "tests.backup.*",
+    ".git",
+    ".pytest_cache",
+    "__pycache__",
+]

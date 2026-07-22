@@ -7,6 +7,47 @@ from tamfis_code import config as config_module
 from tamfis_code import state as state_module
 
 
+class PortableConfigDirectoryTests(unittest.TestCase):
+    def test_explicit_override_is_platform_independent(self):
+        resolved = config_module.resolve_config_dir(
+            environment={"TAMFIS_CODE_CONFIG_HOME": "/portable/tamfis-data"},
+            platform="win32", home=Path("/unused"),
+        )
+        self.assertEqual(resolved, Path("/portable/tamfis-data"))
+
+    def test_linux_uses_xdg_then_home_config_fallback(self):
+        self.assertEqual(
+            config_module.resolve_config_dir(
+                environment={"XDG_CONFIG_HOME": "/xdg/config"},
+                platform="linux", home=Path("/users/alice"),
+            ),
+            Path("/xdg/config/tamfis-code"),
+        )
+        self.assertEqual(
+            config_module.resolve_config_dir(
+                environment={}, platform="linux", home=Path("/users/alice"),
+            ),
+            Path("/users/alice/.config/tamfis-code"),
+        )
+
+    def test_macos_uses_application_support(self):
+        self.assertEqual(
+            config_module.resolve_config_dir(
+                environment={}, platform="darwin", home=Path("/Users/alice"),
+            ),
+            Path("/Users/alice/Library/Application Support/tamfis-code"),
+        )
+
+    def test_windows_uses_appdata(self):
+        self.assertEqual(
+            config_module.resolve_config_dir(
+                environment={"APPDATA": "/Users/Alice/AppData/Roaming"},
+                platform="win32", home=Path("/Users/Alice"),
+            ),
+            Path("/Users/Alice/AppData/Roaming/tamfis-code"),
+        )
+
+
 class LoadConfigTests(unittest.TestCase):
     def setUp(self):
         # config.py computes CONFIG_DIR/CREDENTIALS_PATH/USER_CONFIG_PATH
@@ -209,6 +250,57 @@ class DurableSessionStateTests(unittest.TestCase):
         reloaded = state_module.get_plan(11, saved.id)
         self.assertEqual(reloaded["status"], "completed")
         self.assertEqual(reloaded["execution_task_id"], "task-exec")
+
+
+class ModeCycleTests(unittest.TestCase):
+    """Shift+Tab mode cycling for the interactive REPL (see interactive.py's
+    _cycle_mode keybinding) -- manual -> accept-edits -> auto -> plan -> ..."""
+
+    def test_mode_label_for_policy_reverses_the_alias_map(self):
+        self.assertEqual(config_module.mode_label_for_policy("ask"), "manual")
+        self.assertEqual(config_module.mode_label_for_policy("plan-only"), "plan")
+        self.assertEqual(config_module.mode_label_for_policy("accept-edits"), "accept-edits")
+        self.assertEqual(config_module.mode_label_for_policy("auto"), "auto")
+
+    def test_mode_label_for_policy_falls_back_to_the_raw_value(self):
+        # --approval-only values with no short /mode alias (e.g. "safe",
+        # "workspace", "never") must still render as something, not crash.
+        self.assertEqual(config_module.mode_label_for_policy("safe"), "safe")
+
+    def test_next_mode_in_cycle_advances_in_order(self):
+        self.assertEqual(config_module.next_mode_in_cycle("ask"), "accept-edits")
+        self.assertEqual(config_module.next_mode_in_cycle("accept-edits"), "auto")
+        self.assertEqual(config_module.next_mode_in_cycle("auto"), "plan-only")
+
+    def test_next_mode_in_cycle_wraps_back_to_manual(self):
+        self.assertEqual(config_module.next_mode_in_cycle("plan-only"), "ask")
+
+    def test_next_mode_in_cycle_starts_the_cycle_from_an_unlabeled_policy(self):
+        # A policy set via --approval with no short /mode name (e.g. "safe")
+        # must still land somewhere in the cycle, not raise or get stuck --
+        # it starts the cycle fresh from "manual" rather than guessing a
+        # position for a policy the named cycle doesn't know about.
+        self.assertEqual(config_module.next_mode_in_cycle("safe"), "ask")
+
+
+class NeverPolicyNamingFootgunDisambiguationTests(unittest.TestCase):
+    """"never" means deny-everything -- the opposite of what its name
+    suggests next to "auto"/"full-auto" (which mean never PROMPT, i.e.
+    auto-approve). Confirmed this was a real, live-reachable footgun:
+    /mode's own help text described "auto" as "never prompt" right next to
+    an unrelated policy actually named "never", and the /mode error message
+    claimed only 4 values were valid when "never" (and 5 other raw values)
+    were silently accepted too."""
+
+    def test_never_is_a_valid_approval_mode(self):
+        self.assertIn("never", config_module.APPROVAL_MODES)
+
+    def test_never_has_no_short_mode_alias(self):
+        # It must never be reachable via a short, easily-confused alias --
+        # only by typing the raw value out, which is the source of truth
+        # for exactly what it does.
+        self.assertNotIn("never", config_module.MODE_ALIASES)
+        self.assertNotIn("never", config_module.MODE_ALIASES.values())
 
 
 if __name__ == "__main__":

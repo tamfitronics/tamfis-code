@@ -33,6 +33,8 @@ STATE_PATH = CONFIG_DIR / "state.json"
 MAX_ACTION_HISTORY = 250
 MAX_CHECKPOINTS = 50
 MAX_SAVED_PLANS = 50
+MAX_CONVERSATION_MESSAGES = 60
+MAX_TURN_CHECKPOINT_MESSAGES = 80
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)([^\s]+)"),
@@ -134,13 +136,38 @@ class SessionState:
     unresolved_issues: list[dict[str, Any]] = field(default_factory=list)
     running_action: Optional[dict[str, Any]] = None
     conversation_summary: str = ""
+    # Durable standalone conversation context and the currently executing
+    # provider/tool turn.  These are deliberately separate: completed turns
+    # feed ordinary follow-ups, while turn_checkpoint lets a fresh process
+    # continue after Ctrl+C, SSH loss, provider disconnect, or process death
+    # without guessing what "proceed" refers to or repeating completed tools.
+    conversation_history: list[dict[str, Any]] = field(default_factory=list)
+    turn_checkpoint: Optional[dict[str, Any]] = None
     context_checkpoints: list[dict[str, Any]] = field(default_factory=list)
     saved_plans: list[dict[str, Any]] = field(default_factory=list)
     active_plan_id: Optional[str] = None
     discovery_fingerprint: str = ""
     selected_model: str = "auto"
     selected_provider: Optional[str] = None
+    estimated_context_tokens: int = 0
     updated_at: str = ""
+    # Set only for a swarm sub-task's own child session (see
+    # workspace.resolve_swarm_subtask_workspace) -- None for every ordinary
+    # session. Lets concurrent swarm sub-tasks over the same workspace_root
+    # each get their own SessionState row instead of racing on single-value
+    # fields (current_phase/running_action/active_task/...) of one shared
+    # session the way resolve_local_workspace's same-workspace_root reuse
+    # would otherwise cause. May itself be None (e.g. `agent-cmd delegate`
+    # is a one-shot CLI invocation with no pre-existing session to record
+    # as a parent) -- is_swarm_child below is the actual "hide this from
+    # default listings" marker; parent_session_id is best-effort context,
+    # not the tag itself. Live-caught bug: an earlier version used
+    # `parent_session_id is not None` as the hide/show filter directly,
+    # which silently failed to hide any child session minted with no real
+    # parent to record (confirmed live via `agent-cmd delegate`).
+    parent_session_id: Optional[int] = None
+    is_swarm_child: bool = False
+    swarm_label: str = ""
 
 
 def _load_raw() -> dict[str, Any]:
@@ -191,6 +218,48 @@ def _save_raw(data: dict[str, Any]) -> None:
             pass
 
 
+def _save_memory_snapshot(state: SessionState) -> None:
+    """Write the canonical, human-readable realtime session memory mirror."""
+    memory_dir = CONFIG_DIR / ".memory"
+    memory_dir.mkdir(parents=True, exist_ok=True)
+    if stat.S_IMODE(os.stat(memory_dir).st_mode) != stat.S_IRWXU:
+        os.chmod(memory_dir, stat.S_IRWXU)
+    payload = _sanitize({
+        "schema_version": 1,
+        "session_id": state.session_id,
+        "workspace_root": state.workspace_root,
+        "primary_workspace": state.primary_workspace,
+        "updated_at": state.updated_at,
+        "current_phase": state.current_phase,
+        "execution_status": state.execution_status,
+        "active_task": state.active_task,
+        "running_action": state.running_action,
+        "turn_checkpoint": state.turn_checkpoint,
+        "conversation_history": state.conversation_history[-MAX_CONVERSATION_MESSAGES:],
+        "conversation_summary": state.conversation_summary,
+        "recent_completed_actions": state.completed_actions[-25:],
+        "pending_actions": state.pending_actions[-25:],
+        "recent_context_checkpoints": state.context_checkpoints[-10:],
+        "modified_files": state.modified_files[-50:],
+        "validation_results": state.validation_results[-20:],
+        "unresolved_issues": state.unresolved_issues[-20:],
+    })
+    target = memory_dir / f"session-{state.session_id}.json"
+    fd, temp_name = tempfile.mkstemp(prefix=f".session-{state.session_id}-", suffix=".json", dir=memory_dir)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temp_name, stat.S_IRUSR | stat.S_IWUSR)
+        os.replace(temp_name, target)
+    finally:
+        try:
+            os.unlink(temp_name)
+        except FileNotFoundError:
+            pass
+
+
 def get_session_state(session_id: int) -> SessionState:
     raw = _load_raw().get(str(session_id))
     if not raw:
@@ -223,6 +292,7 @@ def put_session_state(state: SessionState) -> None:
     state.updated_at = _now()
     data[str(state.session_id)] = asdict(state)
     _save_raw(data)
+    _save_memory_snapshot(state)
 
 
 def save_session_state(
@@ -249,6 +319,52 @@ def save_session_state(
     for key, value in updates.items():
         if key in SessionState.__dataclass_fields__ and key != "session_id":
             setattr(state, key, value)
+    put_session_state(state)
+
+
+def save_turn_checkpoint(
+    session_id: int, *, objective: str, mode: str,
+    messages: list[dict[str, Any]], partial_assistant: str = "",
+    status: str = "running", last_error: str = "",
+) -> None:
+    """Atomically persist the resumable portion of a local agent turn.
+
+    The runner already compacts oversized tool results before a provider
+    request.  Keeping only the newest bounded message window here prevents a
+    long-running REPL from growing state.json forever while retaining native
+    tool_call/tool-result pairs needed for protocol-correct continuation.
+    """
+    state = get_session_state(session_id)
+    state.turn_checkpoint = {
+        "objective": objective,
+        "mode": mode,
+        "status": status,
+        "messages": messages[-MAX_TURN_CHECKPOINT_MESSAGES:],
+        "partial_assistant": partial_assistant,
+        "last_error": last_error,
+        "updated_at": _now(),
+    }
+    put_session_state(state)
+
+
+def clear_turn_checkpoint(session_id: int) -> None:
+    state = get_session_state(session_id)
+    state.turn_checkpoint = None
+    put_session_state(state)
+
+
+def remember_conversation_turn(
+    session_id: int, *, objective: str, answer: str, clear_checkpoint: bool = False,
+) -> None:
+    """Append a completed local turn to durable, bounded session memory."""
+    state = get_session_state(session_id)
+    history = [*state.conversation_history, {"role": "user", "content": objective}]
+    if answer:
+        history.append({"role": "assistant", "content": answer})
+    state.conversation_history = history[-MAX_CONVERSATION_MESSAGES:]
+    state.conversation_summary = answer[-4000:] if answer else state.conversation_summary
+    if clear_checkpoint:
+        state.turn_checkpoint = None
     put_session_state(state)
 
 

@@ -3,12 +3,12 @@ TamfisGPT backend, account, or network round-trip to tamgpt6 at all.
 
 This is a deliberately separate, second model-routing path from the Remote
 Workspace backend's Tier IV orchestration -- see providers.py's module
-docstring. It exists for genuine offline/local use (Ollama needs no API key
-and runs fully on-device); it does not replicate the backend's model
-health/fallback/quota-tracking, and it never exposes mutating tools (see
-local_tools.py). Real conversational value only: read-only repo inspection
-via tool-calling, no file writes, no shell execution, no approval gate
-(nothing here can mutate anything, so none is needed).
+docstring. It exists for genuine directly-configured-provider use with no
+TamfisGPT account or server round-trip; it does not replicate the backend's
+model health/fallback/quota-tracking, and it never exposes mutating tools
+(see local_tools.py). Real conversational value only: read-only repo
+inspection via tool-calling, no file writes, no shell execution, no
+approval gate (nothing here can mutate anything, so none is needed).
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ _PROVIDER_ALIASES = {
     "hf": ProviderType.HF, "huggingface": ProviderType.HF,
     "nvidia": ProviderType.NVIDIA, "nvidia_nim": ProviderType.NVIDIA,
     "or": ProviderType.OPENROUTER, "openrouter": ProviderType.OPENROUTER,
-    "ollama": ProviderType.OLLAMA,
+    "tamfis": ProviderType.TAMFIS, "tamfisgpt": ProviderType.TAMFIS,
     "auto": ProviderType.AUTO,
 }
 
@@ -63,7 +63,11 @@ async def run_local_turn(
         if not client:
             raise RuntimeError(f"Provider {provider.value} is not available (no client / no valid credentials).")
         config = manager.PROVIDERS[provider if provider != ProviderType.AUTO else manager._select_best_provider()]
-        resolved_model = model or config.default_model
+        # No task_profile here (local/offline chat has no classify_task
+        # concept) -- select_model(..., None) treats that as "not a
+        # demanding task", which for OpenRouter means its free-tier model,
+        # matching the same credit-saving default as the standalone loop.
+        resolved_model = model or manager.select_model(config, None)
 
         kwargs: Dict[str, Any] = {}
         if tools_client is not None:
