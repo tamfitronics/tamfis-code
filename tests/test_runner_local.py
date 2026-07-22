@@ -23,10 +23,24 @@ from tamfis_code.runner_local import (
     _parse_swarm_tasks,
     _preview_diff_for_tool_call,
     _tool_output_for_render,
+    _looks_like_change_request,
     build_vision_content_blocks,
     is_vision_image_path,
     run_local_agent_turn,
 )
+
+
+class ChangeRequestDetectionTests(unittest.TestCase):
+    def test_audit_report_bugs_to_be_fixed_is_not_current_mutation_request(self):
+        self.assertFalse(_looks_like_change_request(
+            "audit the full WordPress site and report bugs to be fixed then we continue"
+        ))
+
+    def test_explicit_fix_request_remains_a_mutation_request(self):
+        self.assertTrue(_looks_like_change_request("fix the login bug in page-login.php"))
+
+    def test_past_tense_fixed_is_not_a_new_mutation_request(self):
+        self.assertFalse(_looks_like_change_request("the bug is fixed; report the result"))
 
 
 class StreamQualityTests(unittest.TestCase):

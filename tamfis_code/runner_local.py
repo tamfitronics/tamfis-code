@@ -1870,7 +1870,22 @@ _CHANGE_REQUEST_VERBS = (
 
 
 def _looks_like_change_request(text: str) -> bool:
-    return any(verb in text for verb in _CHANGE_REQUEST_VERBS)
+    value = (text or "").lower()
+    # Inspection requests often mention defects "to be fixed" or "for
+    # fixing" as the subject of a later turn. Those are not current mutation
+    # instructions. The old substring check also treated "fixed" and
+    # "fixes" as active requests, which produced the no-files-changed warning
+    # after legitimate audits.
+    value = re.sub(
+        r"\b(?:to\s+be|that\s+(?:need|needs)\s+to\s+be|for)\s+"
+        r"(?:fix(?:ed|es|ing)?|repair(?:ed|s|ing)?|patch(?:ed|es|ing)?)\b",
+        "",
+        value,
+    )
+    return bool(re.search(
+        r"\b(?:" + "|".join(map(re.escape, _CHANGE_REQUEST_VERBS)) + r")\b",
+        value,
+    ))
 
 
 # Confirmed live: a weak model can decide a fix is "done" (in prose only,
