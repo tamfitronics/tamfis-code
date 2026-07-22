@@ -13,7 +13,7 @@ already superseded by same-day code changes).
 **Rule going forward: don't create a new dated audit file for tamfis-code.
 Update this one.**
 
-## Post-release terminal-safe input, persistent input, repeated-content, CWD scope, live input, plan progress, model routing, evidence, and fallback fixes (2026-07-22, working tree)
+## Post-release provider expansion, persistent input, repeated-content, CWD scope, live input, plan progress, model routing, evidence, and fallback fixes (2026-07-22, working tree)
 
 Fixed the remaining plan-visibility gap identified after v0.6.1:
 
@@ -66,10 +66,23 @@ Fixed the remaining plan-visibility gap identified after v0.6.1:
 - Ctrl+T is no longer used because Termius reserves it for opening a new
   terminal. The default queue shortcut is now Ctrl+Y and is configurable via
   `TAMFIS_CODE_QUEUE_KEY` (`ctrl-a` through `ctrl-z`).
+- Hugging Face now prefers the official hosted `Qwen/Qwen3.6-35B-A3B`
+  coding route, with `Qwen/Qwen3.6-27B`,
+  `Qwen/Qwen3-Coder-480B-A35B-Instruct`, and HF DeepSeek V4 Pro/Flash in
+  the mature selectable pool. The obsolete Qwen 2.5 routes were removed from
+  the HF provider inventory so automatic fallback cannot downgrade to them.
+- NVIDIA now exposes its current hosted `deepseek-ai/deepseek-v4-pro` and
+  `deepseek-ai/deepseek-v4-flash` routes, while retaining the live-verified
+  Nemotron route as the automatic default. OpenRouter's DeepSeek V4 routes
+  are also listed for explicit use; a 402 credit error remains retryable and
+  AUTO falls through to configured HF/NVIDIA credentials.
+- During execution the live status now contains a bordered `Input` panel,
+  so the queue affordance remains visible even when plans/tips are absent;
+  Ctrl+Y opens the editable prompt without competing with Rich Live.
 
-Verification after this fix: **854 tests passed** with an isolated writable
+Verification after this fix: **863 tests passed** with an isolated writable
 config directory (3 existing collection/deprecation warnings). These changes
-are assigned to release **0.6.8**; GitHub/PyPI publication is the remaining
+are assigned to release **0.6.9**; GitHub/PyPI publication is the remaining
 release step for this working tree. Earlier release tags are not rewritten.
 
 ## Release gate and live queue UX (2026-07-21, v0.6.1)

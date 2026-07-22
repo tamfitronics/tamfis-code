@@ -415,16 +415,23 @@ class StreamRenderer:
             return self._spinner
         lines = []
         if self.live_input_listener is not None:
-            # The ordinary REPL editor is suspended while the agent owns the
-            # terminal, but the input affordance must remain visible. Ctrl+T
-            # opens the coordinated editor without competing with Rich Live;
-            # this footer is rebuilt on every refresh and therefore never
-            # disappears behind the spinner or plan rows.
+            # Keep a real, persistent input box in the live task display. The
+            # ordinary REPL editor is suspended while the agent owns the
+            # terminal, but the box remains visible and Ctrl+Y opens the
+            # coordinated editor without competing with Rich Live.
             from .live_input import queue_key_bytes
             _, queue_label = queue_key_bytes()
-            lines.append(f"  [cyan]Input:[/cyan] {queue_label} queue next> · Ctrl+C/Ctrl+D exit")
+            input_box = Panel(
+                Text(
+                    f"{queue_label} queue next>  · type a follow-up when opened · Ctrl+C/Ctrl+D exit"
+                ),
+                title="Input",
+                border_style="cyan",
+                padding=(0, 1),
+            )
+            lines.append(input_box)
         if tip:
-            lines.append(f"  [dim]{tip}[/dim]")
+            lines.append(Text.from_markup(f"  [dim]{tip}[/dim]"))
         for step in self._plan_steps:
             status = step.get("status")
             marker = "[green]✓[/green]" if status == "completed" else (
@@ -434,8 +441,10 @@ class StreamRenderer:
             # update_plan_steps docstring) -- statuses beyond the initial
             # plan_created payload are a best-effort approximation, so this
             # is labelled "~" rather than presented as precise.
-            lines.append(f"  {marker} {'~ ' if status == 'in_progress' else ''}{step.get('step') or ''}")
-        return Group(self._spinner, *(Text.from_markup(line) for line in lines))
+            lines.append(Text.from_markup(
+                f"  {marker} {'~ ' if status == 'in_progress' else ''}{step.get('step') or ''}"
+            ))
+        return Group(self._spinner, *lines)
 
     def _refresh_live(self) -> None:
         if self._live is not None:

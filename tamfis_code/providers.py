@@ -241,6 +241,12 @@ class ProviderManager:
                 # text), reasoning_effort and reasoning_budget both work
                 # without hanging (unlike the plain instruct models below).
                 "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+                # NVIDIA currently exposes these DeepSeek V4 hosted routes
+                # as mature coding/agent models. They remain selectable
+                # fallbacks; the verified Nemotron route stays the default
+                # until an account-specific smoke test proves otherwise.
+                "deepseek-ai/deepseek-v4-pro",
+                "deepseek-ai/deepseek-v4-flash",
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
                 "moonshotai/kimi-k2.6",
@@ -262,10 +268,16 @@ class ProviderManager:
             name="Hugging Face",
             base_url="https://router.huggingface.co/v1",
             api_key_env="HF_TOKEN",
-            default_model="Qwen/Qwen2.5-7B-Instruct",
+            # HF Router delegates these official models to its configured
+            # Inference Provider. Prefer the strong Qwen 3.6 coding route;
+            # older small instruct models remain explicit fallbacks only.
+            default_model="Qwen/Qwen3.6-35B-A3B",
             models=[
-                "Qwen/Qwen2.5-7B-Instruct",
-                "Qwen/Qwen2.5-Coder-32B-Instruct",
+                "Qwen/Qwen3.6-35B-A3B",
+                "Qwen/Qwen3.6-27B",
+                "Qwen/Qwen3-Coder-480B-A35B-Instruct",
+                "deepseek-ai/DeepSeek-V4-Pro",
+                "deepseek-ai/DeepSeek-V4-Flash",
                 "meta-llama/Llama-3.2-3B-Instruct",
                 "mistralai/Mistral-7B-Instruct-v0.3",
                 "microsoft/Phi-3.5-vision-instruct",
@@ -285,8 +297,8 @@ class ProviderManager:
             weight=3,
             reasoning_supported=False,
             vision_supported=True,
-            context_window=32768,
-            coding_quality=2,
+            context_window=262144,
+            coding_quality=5,
             tool_calling=True,
             structured_output=True,
             long_context=False,
@@ -309,6 +321,8 @@ class ProviderManager:
                 # Deliberately excludes openai/* defaults.
                 "google/gemini-2.5-flash",
                 "qwen/qwen3-coder",
+                "deepseek/deepseek-v4-pro",
+                "deepseek/deepseek-v4-flash",
                 "deepseek/deepseek-chat-v3-0324",
                 "anthropic/claude-sonnet-4",
                 "meta-llama/llama-3.3-70b-instruct:free",

@@ -128,6 +128,24 @@ def test_openrouter_paid_coding_default_is_qwen_coder():
     assert config.default_model in config.models
 
 
+def test_hf_prefers_official_qwen36_coding_route_and_keeps_deepseek_fallbacks():
+    config = ProviderManager.PROVIDERS[ProviderType.HF]
+    assert config.default_model == "Qwen/Qwen3.6-35B-A3B"
+    assert config.default_model in config.models
+    assert "Qwen/Qwen3.6-27B" in config.models
+    assert "Qwen/Qwen3-Coder-480B-A35B-Instruct" in config.models
+    assert "deepseek-ai/DeepSeek-V4-Pro" in config.models
+    assert config.coding_quality >= 5
+    assert config.context_window >= 262144
+
+
+def test_nvidia_exposes_deepseek_v4_routes_without_replacing_verified_default():
+    config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
+    assert config.default_model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    assert "deepseek-ai/deepseek-v4-pro" in config.models
+    assert "deepseek-ai/deepseek-v4-flash" in config.models
+
+
 def test_remote_fallback_candidates_stay_in_policy_order():
     manager = _manager_with(ProviderType.NVIDIA, ProviderType.OPENROUTER, ProviderType.HF)
     # Use a tool-requiring task that does not require long context, so HF is

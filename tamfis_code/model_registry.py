@@ -77,10 +77,47 @@ MODELS: dict[str, ModelRecord] = {
         ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
         "frontier", "medium",
     ),
-    "Qwen/Qwen2.5-7B-Instruct": ModelRecord(
-        "Qwen/Qwen2.5-7B-Instruct", "hf",
-        ModelCapabilities(long_context=False), 32768,
-        ("single_file_explanation", "repository_search"), "balanced", "low",
+    "deepseek-ai/deepseek-v4-pro": ModelRecord(
+        "deepseek-ai/deepseek-v4-pro", "nvidia",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1000000,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "high",
+    ),
+    "deepseek-ai/deepseek-v4-flash": ModelRecord(
+        "deepseek-ai/deepseek-v4-flash", "nvidia",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1000000,
+        ("repository_search", "multi_file_edit", "debugging", "tool_heavy_execution"),
+        "frontier", "medium",
+    ),
+    "Qwen/Qwen3.6-35B-A3B": ModelRecord(
+        "Qwen/Qwen3.6-35B-A3B", "hf",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 262144,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "medium",
+    ),
+    "Qwen/Qwen3.6-27B": ModelRecord(
+        "Qwen/Qwen3.6-27B", "hf",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 262144,
+        ("repository_search", "multi_file_edit", "debugging", "planning"),
+        "frontier", "medium",
+    ),
+    "Qwen/Qwen3-Coder-480B-A35B-Instruct": ModelRecord(
+        "Qwen/Qwen3-Coder-480B-A35B-Instruct", "hf",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 262144,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "high",
+    ),
+    "deepseek-ai/DeepSeek-V4-Pro": ModelRecord(
+        "deepseek-ai/DeepSeek-V4-Pro", "hf",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1048576,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "high",
+    ),
+    "deepseek-ai/DeepSeek-V4-Flash": ModelRecord(
+        "deepseek-ai/DeepSeek-V4-Flash", "hf",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 262144,
+        ("repository_search", "multi_file_edit", "debugging", "tool_heavy_execution"),
+        "frontier", "medium",
     ),
 }
 
