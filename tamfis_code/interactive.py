@@ -6,6 +6,7 @@ management.
 
 from __future__ import annotations
 
+import asyncio
 import re
 from pathlib import Path
 from typing import Optional
@@ -43,7 +44,13 @@ from .custom_commands import (
 from .doctor import run_doctor
 from .live_input import LiveInputListener
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
-from .runner import resolve_approval_decision_async, retry_task_and_stream, run_ai_task_and_stream, run_shell_command
+from .runner import (
+    TaskOutcome,
+    resolve_approval_decision_async,
+    retry_task_and_stream,
+    run_ai_task_and_stream,
+    run_shell_command,
+)
 from .runner_local import run_local_agent_turn, run_local_shell_command
 from .pty import LocalPtyBroker
 from .safety import revert_mutation as local_revert_mutation
@@ -60,6 +67,48 @@ from .workspace import (
 # paste of a few lines stays visible and directly editable, matching how
 # those tools only collapse genuinely large pastes.
 PASTE_COLLAPSE_LINE_THRESHOLD = 3
+
+async def _run_cancellable_local_turn(
+    *,
+    session_id: int,
+    renderer: StreamRenderer,
+    config: Config,
+    turn_coro,
+) -> TaskOutcome:
+    """Run one standalone agent turn with immediate terminal cancellation."""
+
+    agent_task = asyncio.create_task(turn_coro)
+
+    def _interrupt(_classification: str) -> None:
+        if not agent_task.done():
+            agent_task.cancel()
+
+    live_input = LiveInputListener(
+        session_id=session_id,
+        renderer=renderer,
+        cli_config=config,
+        interrupt_callback=_interrupt,
+    )
+    live_input.start()
+
+    try:
+        return await agent_task
+    except asyncio.CancelledError:
+        classification = live_input.interrupt_classification or "cancel"
+
+        if classification == "exit":
+            return TaskOutcome(
+                status="exited",
+                error="Exit requested by user",
+            )
+
+        return TaskOutcome(
+            status="cancelled",
+            error="Task cancelled by user.",
+        )
+    finally:
+        live_input.stop()
+
 
 HELP_TEXT = """\
 Natural-language text submits a full coding-agent task (mode: coding).
@@ -469,19 +518,19 @@ async def run_interactive(
         model_state = local_state.get_session_state(workspace.session_id)
         plan_objective = local_state.plan_execution_objective(plan)
         if standalone:
-            live_input = LiveInputListener(session_id=workspace.session_id, renderer=renderer, cli_config=config)
-            live_input.start()
-            try:
-                outcome = await run_local_agent_turn(
+            outcome = await _run_cancellable_local_turn(
+                session_id=workspace.session_id,
+                renderer=renderer,
+                config=config,
+                turn_coro=run_local_agent_turn(
                     provider_manager, provider_type, model,
                     [*conversation_history, {"role": "user", "content": plan_objective}],
                     console, renderer,
                     workspace_root=workspace.workspace_root, session_id=workspace.session_id,
                     approval_policy=config.approval_policy, interactive=True, cli_config=config,
                     allow_swarm_tool=True,
-                )
-            finally:
-                live_input.stop()
+                ),
+            )
             _append_turn_to_history(
                 conversation_history, objective=plan_objective,
                 answer=outcome.summary if outcome.status == "completed" else None,
@@ -1294,10 +1343,11 @@ async def run_interactive(
                     print_error(console, "Existing uncommitted changes detected; retry is blocked to preserve user edits.")
                     continue
                 renderer = StreamRenderer(console, mode_label=mode_label_for_policy(config.approval_policy))
-                live_input = LiveInputListener(session_id=workspace.session_id, renderer=renderer, cli_config=config)
-                live_input.start()
-                try:
-                    outcome = await run_local_agent_turn(
+                outcome = await _run_cancellable_local_turn(
+                    session_id=workspace.session_id,
+                    renderer=renderer,
+                    config=config,
+                    turn_coro=run_local_agent_turn(
                         provider_manager, provider_type, model,
                         [*conversation_history, {"role": "user", "content": objective}],
                         console, renderer,
@@ -1305,9 +1355,8 @@ async def run_interactive(
                         approval_policy=config.approval_policy, interactive=True,
                         read_only=mode in {"chat", "audit", "plan"}, cli_config=config,
                         allow_swarm_tool=True,
-                    )
-                finally:
-                    live_input.stop()
+                    ),
+                )
                 renderer.finish()
                 _append_turn_to_history(
                     conversation_history, objective=objective,
@@ -1404,10 +1453,11 @@ async def run_interactive(
                     "payload": {"content": submitted_text},
                 })
                 if standalone:
-                    live_input = LiveInputListener(session_id=workspace.session_id, renderer=renderer, cli_config=config)
-                    live_input.start()
-                    try:
-                        outcome = await run_local_agent_turn(
+                    outcome = await _run_cancellable_local_turn(
+                        session_id=workspace.session_id,
+                        renderer=renderer,
+                        config=config,
+                        turn_coro=run_local_agent_turn(
                             provider_manager, provider_type, model,
                             [*conversation_history, {"role": "user", "content": intent.objective}],
                             console, renderer,
@@ -1415,15 +1465,18 @@ async def run_interactive(
                             approval_policy=config.approval_policy, interactive=True,
                             read_only=intent.mode in {"chat", "audit", "plan"}, cli_config=config,
                             allow_swarm_tool=True,
-                        )
-                    finally:
-                        live_input.stop()
+                        ),
+                    )
                     renderer.finish()
                     _append_turn_to_history(
                         conversation_history, objective=intent.objective,
                         answer=outcome.summary if outcome.status == "completed" else None,
                     )
                     last_turn = (intent.objective, intent.mode)
+                    if outcome.status == "exited":
+                        if local_pty is not None:
+                            local_pty.close()
+                        break
                     if intent.mode == "plan" and outcome.status == "completed" and outcome.summary:
                         saved = local_state.save_plan(workspace.session_id, objective=intent.objective, content=outcome.summary)
                         console.print(f"[green]Plan saved[/green] · {saved.id}")

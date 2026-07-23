@@ -306,13 +306,141 @@ def _detect_workspace_scope(workspace_root: str, objective: str) -> list[Path]:
     root = Path(workspace_root).expanduser().resolve()
     lowered = (objective or "").lower()
 
-    # CWD is the default boundary, but an explicitly named existing absolute
-    # project path is an intentional request to inspect that project. Resolve
-    # package/manifests to their containing project directory and keep the
-    # expansion bounded to the project marker -- never treat an arbitrary
-    # absolute path or filesystem parent as a workspace.
+    # A clear restrictive directive takes precedence over illustrative,
+    # historical or reproduction paths elsewhere in the objective.
+    restrictive_patterns = (
+        r"(?i)\boperate\s+only\s+(?:inside|within|on)\s+"
+        r"(?P<path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)",
+        r"(?i)\buse\s+only\s+"
+        r"(?P<path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)",
+        r"(?i)\bactive\s+(?:repository|root|workspace)\s*(?:is|:)\s*"
+        r"(?P<path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)",
+    )
+
+    restrictive_roots: list[Path] = []
+    restrictive_seen: set[str] = set()
+
+    # First collect paths appearing directly in restrictive phrases.
+    for pattern in restrictive_patterns:
+        for match in re.finditer(pattern, objective or ""):
+            candidate = Path(match.group("path").rstrip(".,;:)]}"))
+            try:
+                candidate = candidate.resolve()
+                if candidate.is_file():
+                    candidate = candidate.parent
+                if candidate.is_dir() and _is_project_root(candidate):
+                    key = str(candidate)
+                    if key not in restrictive_seen:
+                        restrictive_seen.add(key)
+                        restrictive_roots.append(candidate)
+            except OSError:
+                continue
+
+    # Support list-form directives such as:
+    #
+    # Operate only inside:
+    # - /repo/backend
+    # - /repo/frontend
+    #
+    # Once a restrictive heading is found, collect consecutive absolute-path
+    # list entries until ordinary prose resumes. This allows intentional
+    # multi-repository tasks without treating later reproduction/example
+    # paths as authorised roots.
+    lines = (objective or "").splitlines()
+    collecting_restrictive_list = False
+
+    for raw_line in lines:
+        stripped = raw_line.strip()
+
+        if re.search(
+            r"(?i)\b(?:operate|work|act|make changes)\s+only\s+"
+            r"(?:inside|within|on)\s*:?\s*$",
+            stripped,
+        ):
+            collecting_restrictive_list = True
+            continue
+
+        if not collecting_restrictive_list:
+            continue
+
+        match = re.match(
+            r"^(?:[-*+]\s+|\d+[.)]\s+)?"
+            r"(?P<path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)"
+            r"\s*[,;.]?\s*$",
+            stripped,
+        )
+
+        if match:
+            candidate = Path(match.group("path")).expanduser()
+            try:
+                candidate = candidate.resolve()
+                if candidate.is_file():
+                    candidate = candidate.parent
+                if candidate.is_dir() and _is_project_root(candidate):
+                    key = str(candidate)
+                    if key not in restrictive_seen:
+                        restrictive_seen.add(key)
+                        restrictive_roots.append(candidate)
+            except OSError:
+                continue
+            continue
+
+        # Blank lines are allowed within a list. Any other prose ends the
+        # restrictive-list section so later examples do not expand scope.
+        if stripped:
+            collecting_restrictive_list = False
+
+    # Also support multiple project roots written on one line:
+    #
+    #   Operate only inside /repo/backend and /repo/frontend.
+    #
+    # The narrow phrase regex above intentionally captures one path. Once a
+    # restrictive directive is established, collect every existing absolute
+    # project path from that same sentence only. Later example/reproduction
+    # paths in other sentences must not expand the authorised scope.
+    restrictive_trigger = re.compile(
+        r"(?i)\b(?:"
+        r"operate\s+only\s+(?:inside|within|on)|"
+        r"work\s+only\s+(?:inside|within|on)|"
+        r"act\s+only\s+(?:inside|within|on)|"
+        r"make\s+changes\s+only\s+(?:inside|within|on)|"
+        r"use\s+only"
+        r")\b"
+    )
+    absolute_project_path = re.compile(
+        r"(?<![\w.-])/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+"
+    )
+
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", objective or ""):
+        if not restrictive_trigger.search(sentence):
+            continue
+
+        for raw_path in absolute_project_path.findall(sentence):
+            candidate = Path(raw_path.rstrip(".,;:)]}")).expanduser()
+            try:
+                candidate = candidate.resolve()
+                if candidate.is_file():
+                    candidate = candidate.parent
+                if candidate.is_dir() and _is_project_root(candidate):
+                    key = str(candidate)
+                    if key not in restrictive_seen:
+                        restrictive_seen.add(key)
+                        restrictive_roots.append(candidate)
+            except OSError:
+                continue
+
+    if restrictive_roots:
+        return restrictive_roots
+
+    # An explicitly named existing absolute project path can intentionally
+    # expand task scope. The existing workspace-approval layer remains
+    # responsible for authorising access outside the launch workspace.
     explicit_roots: list[Path] = []
-    for raw_path in re.findall(r"(?<![\w.-])/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+", objective or ""):
+
+    for raw_path in re.findall(
+        r"(?<![\w.-])/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+",
+        objective or "",
+    ):
         candidate = Path(raw_path.rstrip(".,;:)]}"))
         try:
             candidate = candidate.resolve()
@@ -322,14 +450,17 @@ def _detect_workspace_scope(workspace_root: str, objective: str) -> list[Path]:
                 explicit_roots.append(candidate)
         except OSError:
             continue
+
     if explicit_roots:
         deduped: list[Path] = []
         seen_explicit: set[str] = set()
+
         for candidate in explicit_roots:
             key = str(candidate)
             if key not in seen_explicit:
                 seen_explicit.add(key)
                 deduped.append(candidate)
+
         return deduped
 
     try:
@@ -454,6 +585,23 @@ def _detect_workspace_scope(workspace_root: str, objective: str) -> list[Path]:
     return child_projects or [root]
 
 
+def _apply_mcp_task_scope(
+    mcp_server: MCPServer,
+    scope_roots: list[Path],
+) -> None:
+    """Make MCP's filesystem boundary match this turn's resolved scope.
+
+    MCPServer is created before task-specific scope is derived because it is
+    also used during repository preparation. Once the user's objective has
+    been resolved, replace—not extend—the launch-workspace approval set with
+    the exact authoritative project roots for this turn.
+    """
+    mcp_server.allowed_workspace_roots = {
+        Path(root).expanduser().resolve()
+        for root in scope_roots
+    }
+
+
 def _scope_instruction(workspace_root: str, scope_roots: list[Path]) -> str:
     roots = "\n".join(f"- {path}" for path in scope_roots)
     return (
@@ -464,7 +612,11 @@ def _scope_instruction(workspace_root: str, scope_roots: list[Path]) -> str:
         "another path. Do not recursively search the workspace parent. For a "
         "multi-project stack, inspect each listed root separately and use focused "
         "queries, bounded result counts, and project markers before reading files. "
-        "Do not run repository-wide find/grep/rg from the parent directory."
+        "Do not run repository-wide find/grep/rg from the parent directory. "
+        "Every plan step must reference only the target project roots listed above. "
+        "Do not mention, inspect or propose files from excluded or unselected sibling "
+        "directories. If a planned path falls outside the target roots, discard and "
+        "regenerate that plan step before displaying it."
     )
 
 
@@ -544,38 +696,145 @@ def _scope_tool_arguments(
 
     if tool_name == "execute_command":
         cwd = _resolve_argument_path(scoped.get("cwd"), workspace_root) or workspace
-        command = str(scoped.get("command") or "")
-        broad_scan = bool(re.search(r"(?:^|[;&|]\s*)(?:find|rg|grep)\b", command))
-        if len(scope_roots) == 1 and cwd == workspace and workspace != scope_roots[0]:
-            scoped["cwd"] = str(scope_roots[0])
-            cwd = scope_roots[0]
-        if broad_scan and cwd == workspace and any(root != workspace for root in scope_roots):
-            return scoped, (
-                "Broad parent-directory scan blocked. Run the command separately in one "
-                "of these project roots: " + ", ".join(str(root) for root in scope_roots)
-            )
-        if not any(_is_within(cwd, root) for root in scope_roots):
-            return scoped, (
-                f"Command cwd is outside the resolved task scope: {cwd}. Allowed roots: "
-                + ", ".join(str(root) for root in scope_roots)
-            )
-        # cwd scoping alone is insufficient for read commands: `find
-        # /unrelated/path` can escape without changing cwd. Reject explicit
-        # absolute operands (including --flag=/path) outside resolved roots.
+        command = str(scoped.get("command") or "").strip()
+
+        # Models commonly emit:
+        #
+        #   cd /authorised/project && git status
+        #
+        # even when the tool's cwd remains the shared workspace parent.
+        # Recognise one literal leading cd, validate it deterministically,
+        # normalise cwd to that authorised root, and remove the redundant cd
+        # before ordinary command-path validation.
+        leading_cd = re.match(
+            r"""^\s*cd\s+
+                (?P<target>"[^"]+"|'[^']+'|[^\s;&|]+)
+                \s*(?P<separator>&&|;)\s*
+                (?P<remainder>.+)$
+            """,
+            command,
+            flags=re.VERBOSE | re.DOTALL,
+        )
+
+        if leading_cd is not None:
+            raw_target = leading_cd.group("target")
+
+            try:
+                parsed_target = shlex.split(raw_target)
+            except ValueError:
+                parsed_target = []
+
+            if len(parsed_target) != 1:
+                return scoped, "Invalid leading cd target in command."
+
+            cd_target = _resolve_argument_path(parsed_target[0], str(cwd))
+
+            if cd_target is None or not any(
+                _is_within(cd_target, root)
+                for root in scope_roots
+            ):
+                return scoped, (
+                    f"Command cd target is outside the resolved task scope: "
+                    f"{cd_target or parsed_target[0]}. Allowed roots: "
+                    + ", ".join(str(root) for root in scope_roots)
+                )
+
+            cwd = cd_target
+            command = leading_cd.group("remainder").strip()
+            scoped["cwd"] = str(cwd)
+            scoped["command"] = command
+
+        broad_scan = bool(
+            re.search(r"(?:^|[;&|]\s*)(?:find|rg|grep)\b", command)
+        )
+
         try:
             command_tokens = shlex.split(command)
         except ValueError:
             command_tokens = []
+
+        absolute_operands: list[Path] = []
+        operand_roots: set[Path] = set()
+
         for token in command_tokens[1:]:
             candidate_text = token.split("=", 1)[-1] if "=" in token else token
-            if not candidate_text.startswith("/") or candidate_text == "/dev/null":
+
+            if (
+                not candidate_text.startswith("/")
+                or candidate_text == "/dev/null"
+            ):
                 continue
+
             candidate = Path(candidate_text).expanduser().resolve()
-            if not any(_is_within(candidate, root) for root in scope_roots):
+            absolute_operands.append(candidate)
+
+            matched_root = next(
+                (
+                    root
+                    for root in scope_roots
+                    if _is_within(candidate, root)
+                ),
+                None,
+            )
+
+            if matched_root is not None:
+                operand_roots.add(matched_root)
+
+        if (
+            len(scope_roots) == 1
+            and cwd == workspace
+            and workspace != scope_roots[0]
+        ):
+            scoped["cwd"] = str(scope_roots[0])
+            cwd = scope_roots[0]
+
+        if (
+            broad_scan
+            and cwd == workspace
+            and workspace not in scope_roots
+        ):
+            all_operands_authorised = (
+                bool(absolute_operands)
+                and all(
+                    any(
+                        _is_within(candidate, root)
+                        for root in scope_roots
+                    )
+                    for candidate in absolute_operands
+                )
+            )
+
+            if all_operands_authorised and len(operand_roots) == 1:
+                target_root = next(iter(operand_roots))
+                scoped["cwd"] = str(target_root)
+                cwd = target_root
+            else:
                 return scoped, (
-                    f"Command path is outside the resolved task scope: {candidate}. Allowed roots: "
+                    "Broad parent-directory scan blocked. Run the command "
+                    "separately in one of these project roots: "
                     + ", ".join(str(root) for root in scope_roots)
                 )
+
+        if not any(_is_within(cwd, root) for root in scope_roots):
+            return scoped, (
+                f"Command cwd is outside the resolved task scope: {cwd}. "
+                "Allowed roots: "
+                + ", ".join(str(root) for root in scope_roots)
+            )
+
+        for candidate in absolute_operands:
+            if not any(
+                _is_within(candidate, root)
+                for root in scope_roots
+            ):
+                return scoped, (
+                    f"Command path is outside the resolved task scope: "
+                    f"{candidate}. Allowed roots: "
+                    + ", ".join(str(root) for root in scope_roots)
+                )
+
+        scoped["cwd"] = str(cwd)
+        scoped["command"] = command
         return scoped, None
 
     if path_key is None:
@@ -593,10 +852,18 @@ def _scope_tool_arguments(
             )
         return scoped, None
 
-    # A request aimed at the common parent is redirected only when there is a
-    # single target.  For a stack, reject it so the model must inspect each
-    # project deliberately instead of returning thousands of unrelated items.
-    if requested == workspace and any(root != workspace for root in scope_roots):
+    # An exact active project root is always a valid target. This must be
+    # checked before the common-parent restriction; otherwise a standalone
+    # repository such as the Tamfis-Code source checkout is incorrectly
+    # rejected merely because unrelated roots also appeared in scope.
+    if requested in scope_roots:
+        scoped[path_key] = str(requested)
+        return scoped, None
+
+    # A request aimed at a genuine common parent is redirected only when
+    # there is one narrower target. For a multi-project stack, reject it so
+    # every repository is inspected deliberately.
+    if requested == workspace and workspace not in scope_roots:
         if len(scope_roots) == 1:
             scoped[path_key] = str(scope_roots[0])
             return scoped, None
@@ -2669,6 +2936,122 @@ def _plan_message_content(plan: Any, *, heading: str) -> str:
     return "\n".join(lines)
 
 
+
+def _validate_reasoning_plan_scope(
+    plan: Any,
+    *,
+    scope_roots: list[Path],
+    objective: str,
+) -> tuple[Optional[Any], list[str]]:
+    """Remove plan steps that reference unauthorised or non-canonical roots.
+
+    Provider-generated plans are untrusted model output. The scope prompt is
+    advisory, so every generated step must also pass deterministic validation
+    before it is persisted or displayed.
+
+    Steps without filesystem paths remain eligible. Steps containing absolute
+    paths outside ``scope_roots`` are removed. Hidden Claude worktrees are
+    excluded from ordinary canonical-repository audits unless the objective
+    explicitly requests a worktree.
+    """
+    if plan is None or not getattr(plan, "steps", None):
+        return None, []
+
+    resolved_roots = [
+        Path(root).expanduser().resolve()
+        for root in scope_roots
+    ]
+    lowered_objective = (objective or "").lower()
+    removed: list[str] = []
+    retained: list[Any] = []
+
+    # When all targets are immediate children of one parent, identify sibling
+    # project names so relative references such as "llama.cpp/pyproject.toml"
+    # cannot bypass the absolute-path check.
+    sibling_projects: dict[str, Path] = {}
+    parent_candidates = {root.parent for root in resolved_roots}
+
+    if len(parent_candidates) == 1:
+        common_parent = next(iter(parent_candidates))
+        try:
+            for child in common_parent.iterdir():
+                if not child.is_dir():
+                    continue
+                resolved_child = child.resolve()
+                if _is_project_root(resolved_child):
+                    sibling_projects[child.name.lower()] = resolved_child
+        except OSError:
+            sibling_projects = {}
+
+    allowed_names = {root.name.lower() for root in resolved_roots}
+
+    for step in list(plan.steps):
+        name = str(getattr(step, "name", "") or "").strip()
+        if not name:
+            removed.append("<empty plan step>")
+            continue
+
+        reject = False
+
+        # Validate every absolute path appearing in the step.
+        for raw_path in re.findall(
+            r"(?<![\w.-])/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+",
+            name,
+        ):
+            candidate = Path(raw_path.rstrip(".,;:)]}")).expanduser().resolve()
+
+            if not any(_is_within(candidate, root) for root in resolved_roots):
+                reject = True
+                break
+
+            normalised = candidate.as_posix().lower()
+            if (
+                "/.claude/worktrees/" in normalised
+                and "worktree" not in lowered_objective
+                and str(candidate).lower() not in lowered_objective
+            ):
+                reject = True
+                break
+
+        if reject:
+            removed.append(name)
+            continue
+
+        # Reject relative references beginning with an unselected sibling
+        # project name, for example "llama.cpp/requirements.txt".
+        lowered_name = name.lower()
+
+        for sibling_name in sibling_projects:
+            if sibling_name in allowed_names:
+                continue
+
+            if re.search(
+                rf"(?<![A-Za-z0-9._-]){re.escape(sibling_name)}(?:/|\\)",
+                lowered_name,
+            ):
+                reject = True
+                break
+
+        if reject:
+            removed.append(name)
+            continue
+
+        retained.append(step)
+
+    if not retained:
+        return None, removed
+
+    # Reindex after filtering so the rendered and persisted plan remains
+    # internally consistent.
+    for index, step in enumerate(retained, start=1):
+        step.index = index
+        if step.status not in {"pending", "in_progress", "completed", "failed"}:
+            step.status = "pending"
+
+    plan.steps = retained
+    return plan, removed
+
+
 # Classifications that should reach an already-running standalone turn
 # (mirrors cli.py's `queue` command choices) vs ones that only ever meant
 # "wait for the next turn" even before this existed (e.g. "reprioritise"
@@ -2897,6 +3280,7 @@ async def _attempt_reasoning_plan(
     renderer: StreamRenderer, reconnaissance_summary: Optional[str] = None,
     evidence_summary: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
+    scope_roots: Optional[list[Path]] = None,
 ) -> Optional[Any]:
     """Ask the resolved provider for a plan grounded in the real objective
     and real workspace facts (and, for a revision, real evidence gathered
@@ -2936,7 +3320,13 @@ async def _attempt_reasoning_plan(
             },
         })
         return None
-    plan = parse_reasoning_plan(content, objective=objective)
+    plan = parse_reasoning_plan(
+        content,
+        objective=objective,
+        reconnaissance_summary=reconnaissance_summary,
+        workspace_summary=repository_context,
+        scope_roots=scope_roots,
+    )
     if plan is None:
         renderer.handle_event({
             "event_type": "diagnostics",
@@ -3161,6 +3551,7 @@ async def run_local_agent_turn(
     # are not additional active audit targets. Keep the current --cwd as the
     # task scope so unrelated approved projects are never mixed into it.
     scope_roots = _detect_workspace_scope(workspace_root, objective)
+    _apply_mcp_task_scope(mcp_server, scope_roots)
     scope_message = {
         "role": "system",
         "content": _scope_instruction(workspace_root, scope_roots),
@@ -3312,6 +3703,7 @@ async def run_local_agent_turn(
             session_id=session_id, renderer=renderer,
             reconnaissance_summary=planning_reconnaissance,
             reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
+            scope_roots=scope_roots,
         )
         if reasoning_plan is not None and orchestrator.run is not None:
             orchestrator.replace_plan(reasoning_plan)
@@ -4614,8 +5006,10 @@ async def run_local_agent_turn(
             revised_plan = await _attempt_reasoning_plan(
                 client, model=resolved_model, objective=objective, task_profile=task_profile,
                 session_id=session_id, renderer=renderer,
+                reconnaissance_summary=planning_reconnaissance,
                 evidence_summary=_summarise_progress_for_rollover(session_id),
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
+                scope_roots=scope_roots,
             )
             if revised_plan is not None:
                 orchestrator.replace_plan(revised_plan)

@@ -566,14 +566,24 @@ class StreamRenderer:
             self.live_input_listener.pause()
 
     def resume_live(self) -> None:
-        """Restore the live status line after suspend_live(); a no-op on
-        non-TTY output or if a live line is already active. Does not
-        restart the assistant Live -- the next assistant_delta lazily
-        recreates it from the still-intact buffer if a block was open."""
+        """Restore the active terminal status owner after suspension.
+
+        A running LiveInputListener owns the terminal footer through
+        prompt-toolkit's bottom toolbar. Rich Live must not also be started,
+        otherwise both systems repaint the same terminal rows and the footer,
+        input prompt and spinner overwrite one another.
+        """
         if self.live_input_listener is not None:
             self.live_input_listener.resume()
+            return
+
         if self._is_tty and self._live is None and not self._assistant_open:
-            self._live = Live(self._build_status(), console=self.console, refresh_per_second=8, transient=True)
+            self._live = Live(
+                self._build_status(),
+                console=self.console,
+                refresh_per_second=8,
+                transient=True,
+            )
             self._live.start()
 
     def _record_tokens(self, content: str) -> None:

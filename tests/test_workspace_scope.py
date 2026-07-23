@@ -196,6 +196,302 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             self.assertIsNotNone(error)
             self.assertIn("Parent-directory operation blocked", error)
 
+    def test_restrictive_directive_beats_reproduction_paths(self):
+        with tempfile.TemporaryDirectory() as primary_parent, tempfile.TemporaryDirectory() as other_parent:
+            primary = Path(primary_parent) / "tamfiscode"
+            primary.mkdir()
+            (primary / "pyproject.toml").write_text(
+                '[project]\\nname = "tamfis-code"\\n',
+                encoding="utf-8",
+            )
+
+            other = Path(other_parent) / "tamgpt6"
+            other.mkdir()
+            (other / "pyproject.toml").write_text(
+                '[project]\\nname = "tamgpt6"\\n',
+                encoding="utf-8",
+            )
+
+            scope = _detect_workspace_scope(
+                str(primary),
+                (
+                    f"Operate only inside {primary}. "
+                    f"Reproduction previously involved {other}."
+                ),
+            )
+
+            self.assertEqual(scope, [primary.resolve()])
+
+    def test_exact_active_workspace_root_is_not_parent_blocked(self):
+        with tempfile.TemporaryDirectory() as root_dir, tempfile.TemporaryDirectory() as other_dir:
+            root = Path(root_dir).resolve()
+            other = Path(other_dir).resolve()
+
+            scoped, error = _scope_tool_arguments(
+                "search_code",
+                {"path": str(root), "query": "workspace"},
+                workspace_root=str(root),
+                scope_roots=[root, other],
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(scoped["path"], str(root))
+
+    def test_restrictive_multiroot_list_selects_every_listed_project(self):
+        with tempfile.TemporaryDirectory() as parent:
+            parent_path = Path(parent)
+            backend = parent_path / "tamgpt6"
+            frontend = parent_path / "tamfis-frontend"
+            unrelated = parent_path / "llama.cpp"
+
+            backend.mkdir()
+            frontend.mkdir()
+            unrelated.mkdir()
+
+            (backend / "pyproject.toml").write_text(
+                '[project]\nname = "tamgpt6"\n',
+                encoding="utf-8",
+            )
+            (frontend / "package.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (unrelated / "CMakeLists.txt").write_text(
+                "project(llama)",
+                encoding="utf-8",
+            )
+
+            objective = f"""Audit the TamfisGPT full stack.
+
+Operate only inside:
+- {backend}
+- {frontend}
+
+Do not inspect {unrelated}.
+"""
+
+            scope = _detect_workspace_scope(str(parent_path), objective)
+
+            self.assertEqual(
+                scope,
+                [backend.resolve(), frontend.resolve()],
+            )
+            self.assertNotIn(unrelated.resolve(), scope)
+
+    def test_generated_plan_removes_out_of_scope_and_hidden_worktree_steps(self):
+        from tamfis_code.orchestrator.planner import (
+            ExecutionPlan,
+            PlanStep,
+        )
+        from tamfis_code.runner_local import _validate_reasoning_plan_scope
+
+        with tempfile.TemporaryDirectory() as parent:
+            parent_path = Path(parent)
+            backend = parent_path / "tamgpt6"
+            frontend = parent_path / "tamfis-frontend"
+            unrelated = parent_path / "llama.cpp"
+
+            backend.mkdir()
+            frontend.mkdir()
+            unrelated.mkdir()
+
+            (backend / "pyproject.toml").write_text(
+                '[project]\nname = "tamgpt6"\n',
+                encoding="utf-8",
+            )
+            (frontend / "package.json").write_text(
+                "{}",
+                encoding="utf-8",
+            )
+            (unrelated / "CMakeLists.txt").write_text(
+                "project(llama)",
+                encoding="utf-8",
+            )
+
+            plan = ExecutionPlan(
+                objective="Audit the selected stack",
+                assumptions=[],
+                components=[],
+                steps=[
+                    PlanStep(
+                        1,
+                        f"Read {frontend / 'package.json'}",
+                    ),
+                    PlanStep(
+                        2,
+                        f"Read {unrelated / 'pyproject.toml'}",
+                    ),
+                    PlanStep(
+                        3,
+                        (
+                            "Read "
+                            + str(
+                                backend
+                                / ".claude"
+                                / "worktrees"
+                                / "session-audit"
+                                / "alembic"
+                                / "versions"
+                                / "example.py"
+                            )
+                        ),
+                    ),
+                    PlanStep(
+                        4,
+                        f"Inspect {backend / 'benchmark.py'}",
+                    ),
+                ],
+                validation_criteria=[],
+                risks=[],
+            )
+
+            validated, removed = _validate_reasoning_plan_scope(
+                plan,
+                scope_roots=[backend.resolve(), frontend.resolve()],
+                objective="Audit only the selected canonical repositories.",
+            )
+
+            self.assertIsNotNone(validated)
+            self.assertEqual(
+                [step.name for step in validated.steps],
+                [
+                    f"Read {frontend / 'package.json'}",
+                    f"Inspect {backend / 'benchmark.py'}",
+                ],
+            )
+            self.assertEqual(
+                [step.index for step in validated.steps],
+                [1, 2],
+            )
+            self.assertEqual(len(removed), 2)
+
+    def test_broad_scan_of_one_authorised_root_is_normalised_and_allowed(self):
+        from tamfis_code.runner_local import _scope_tool_arguments
+
+        with tempfile.TemporaryDirectory() as parent:
+            parent_path = Path(parent).resolve()
+            backend = parent_path / "tamgpt6"
+            frontend = parent_path / "tamfis-frontend"
+            backend.mkdir()
+            frontend.mkdir()
+
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {
+                    "cwd": str(parent_path),
+                    "command": f"find {frontend} -type f -name '*.ts'",
+                },
+                workspace_root=str(parent_path),
+                scope_roots=[backend.resolve(), frontend.resolve()],
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(frontend.resolve()))
+
+    def test_leading_cd_into_authorised_root_is_normalised(self):
+        with tempfile.TemporaryDirectory() as parent:
+            parent_path = Path(parent).resolve()
+            backend = parent_path / "tamgpt6"
+            frontend = parent_path / "tamfis-frontend"
+            backend.mkdir()
+            frontend.mkdir()
+
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {
+                    "cwd": str(parent_path),
+                    "command": f"cd {frontend} && git status",
+                },
+                workspace_root=str(parent_path),
+                scope_roots=[backend.resolve(), frontend.resolve()],
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(frontend.resolve()))
+            self.assertEqual(scoped["command"], "git status")
+
+    def test_leading_cd_outside_scope_is_blocked(self):
+        with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as outside:
+            parent_path = Path(parent).resolve()
+            backend = parent_path / "tamgpt6"
+            frontend = parent_path / "tamfis-frontend"
+            backend.mkdir()
+            frontend.mkdir()
+
+            _, error = _scope_tool_arguments(
+                "execute_command",
+                {
+                    "cwd": str(parent_path),
+                    "command": f"cd {Path(outside).resolve()} && git status",
+                },
+                workspace_root=str(parent_path),
+                scope_roots=[backend.resolve(), frontend.resolve()],
+            )
+
+            self.assertIsNotNone(error)
+            self.assertIn("cd target is outside", error)
+
+    def test_one_line_restrictive_directive_selects_both_project_roots(self):
+        from tamfis_code.runner_local import _detect_workspace_scope
+
+        with tempfile.TemporaryDirectory() as launch, tempfile.TemporaryDirectory() as parent:
+            launch_root = Path(launch).resolve()
+            parent_root = Path(parent).resolve()
+            backend = _make_project(parent_root, "tamgpt6")
+            frontend = _make_project(
+                parent_root,
+                "tamfis-frontend",
+                marker="package.json",
+            )
+
+            objective = (
+                f"Audit the full stack. Operate only inside {backend} and "
+                f"{frontend}. Do not inspect other sibling directories."
+            )
+
+            roots = _detect_workspace_scope(str(launch_root), objective)
+
+            self.assertEqual(
+                roots,
+                [backend.resolve(), frontend.resolve()],
+            )
+
+    def test_mcp_boundary_is_replaced_with_resolved_task_roots(self):
+        from tamfis_code.mcp import MCPServer
+        from tamfis_code.runner_local import _apply_mcp_task_scope
+
+        with tempfile.TemporaryDirectory() as launch, tempfile.TemporaryDirectory() as parent:
+            launch_root = Path(launch).resolve()
+            parent_root = Path(parent).resolve()
+            backend = _make_project(parent_root, "tamgpt6")
+            frontend = _make_project(
+                parent_root,
+                "tamfis-frontend",
+                marker="package.json",
+            )
+
+            server = MCPServer(workspace_root=str(launch_root))
+            _apply_mcp_task_scope(
+                server,
+                [backend.resolve(), frontend.resolve()],
+            )
+
+            self.assertEqual(
+                server.allowed_workspace_roots,
+                {backend.resolve(), frontend.resolve()},
+            )
+            self.assertEqual(
+                server._resolve_in_workspace(str(backend)),
+                backend.resolve(),
+            )
+            self.assertEqual(
+                server._resolve_in_workspace(str(frontend)),
+                frontend.resolve(),
+            )
+
+            with self.assertRaises(PermissionError):
+                server._resolve_in_workspace(str(launch_root))
+
 
 if __name__ == "__main__":
     unittest.main()

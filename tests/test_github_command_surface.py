@@ -9,7 +9,10 @@ def test_requested_github_command_surface_is_registered():
     assert not missing, f"Missing GitHub-compatible commands: {missing}"
 
 
-def test_version_is_pinned_to_0613():
+def test_cli_version_matches_package_version():
+    from tamfis_code import __version__
+
     result = CliRunner().invoke(cli, ["--version"])
+
     assert result.exit_code == 0
-    assert "0.6.13" in result.output
+    assert __version__ in result.output

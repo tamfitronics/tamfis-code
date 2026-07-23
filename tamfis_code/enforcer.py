@@ -20,6 +20,8 @@ except ImportError:
 
 
 class TestEnforcer:
+    # Application component, not a pytest test container.
+    __test__ = False
     """Detects and runs the current workspace's own test/build commands."""
 
     def __init__(self, workspace_root: Optional[Path] = None):

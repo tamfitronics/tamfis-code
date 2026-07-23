@@ -12,7 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
-from typing import Optional
+from typing import Callable, Optional
 
 from prompt_toolkit.formatted_text import HTML
 
@@ -30,10 +30,19 @@ _CTRL_Y = b"\x19"
 class LiveInputListener:
     """Run a persistent, asynchronous follow-up editor during a task."""
 
-    def __init__(self, *, session_id: int, renderer: StreamRenderer, cli_config: Config) -> None:
+    def __init__(
+        self,
+        *,
+        session_id: int,
+        renderer: StreamRenderer,
+        cli_config: Config,
+        interrupt_callback: Optional[Callable[[str], None]] = None,
+    ) -> None:
         self.session_id = session_id
         self.renderer = renderer
         self.cli_config = cli_config
+        self._interrupt_callback = interrupt_callback
+        self._interrupt_classification: Optional[str] = None
         self._is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
         self._input_task: Optional[asyncio.Task] = None
         self._interject_task: Optional[asyncio.Task] = None
@@ -136,11 +145,15 @@ class LiveInputListener:
 
         @bindings.add("escape")
         def _cancel_running_turn(event) -> None:
-            # Match the interrupt affordance offered by other terminal agents:
-            # Escape cancels the active turn, while the prompt remains usable
-            # for subsequent work once the runner reaches a safe boundary.
-            self._enqueue_control("cancel")
-            event.app.exit(result="")
+            # Escape cancels the active turn immediately and returns control
+            # to the ordinary REPL without terminating Tamfis-Code.
+            if self._paused or not self._active:
+                return
+
+            self._request_interrupt("cancel")
+
+            if not event.app.is_done:
+                event.app.exit(result="")
 
         session = PromptSession(key_bindings=bindings)
         self._prompt_session = session
@@ -163,8 +176,43 @@ class LiveInputListener:
                 return
             except EOFError:
                 return
+
+            # Escape sets _paused before exiting the prompt, so its empty
+            # result must not be queued or cause another editor to start.
+            if self._paused:
+                break
+
+            # A genuine line already returned by prompt_async remains valid
+            # even when the listener was deactivated during that prompt.
+            # Queue it first, then let the loop terminate cleanly.
             self._enqueue(text)
+
+            if not self._active:
+                break
+
         self._prompt_session = None
+
+    @property
+    def interrupt_classification(self) -> Optional[str]:
+        return self._interrupt_classification
+
+    def _request_interrupt(self, classification: str) -> None:
+        """Record and immediately propagate one terminal interrupt.
+
+        The durable queue item remains useful for history and recovery, but
+        immediate cancellation is delivered through interrupt_callback so a
+        blocked provider request or long-running tool does not need to reach
+        another orchestration boundary first.
+        """
+        if self._interrupt_classification is not None:
+            return
+
+        self._interrupt_classification = classification
+        self._paused = True
+        self._enqueue_control(classification)
+
+        if self._interrupt_callback is not None:
+            self._interrupt_callback(classification)
 
     def _enqueue_control(self, classification: str) -> None:
         item = local_state.enqueue_instruction(

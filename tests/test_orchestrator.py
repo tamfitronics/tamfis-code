@@ -126,8 +126,13 @@ class OrchestratorTests(unittest.TestCase):
             envelope2.finish(result={"success": True, "result": "ok"}, success=True)
             engine.record_tool(envelope2)
 
-            self.assertEqual(run.plan.steps[0].status, "completed")
-            self.assertEqual(run.plan.steps[1].status, "in_progress")
+            # Tool count is not proof that any particular plan step completed.
+            # Until validation establishes completion, the first step remains
+            # in progress and later steps remain pending.
+            self.assertEqual(run.plan.steps[0].status, "in_progress")
+            self.assertTrue(
+                all(step.status == "pending" for step in run.plan.steps[1:])
+            )
             # The final (report) step must never be auto-advanced into --
             # only complete()/fail() may resolve it.
             self.assertEqual(run.plan.steps[-1].status, "pending")

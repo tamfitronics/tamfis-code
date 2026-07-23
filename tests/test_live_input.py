@@ -222,6 +222,82 @@ class RendererSuspendResumeTouchesListenerTests(unittest.TestCase):
         renderer.resume_live()
         self.assertEqual(calls, ["pause", "resume"])
 
+    def test_resume_does_not_start_rich_live_while_listener_owns_footer(self):
+        renderer = StreamRenderer(_console())
+        renderer._stop_live()
+
+        calls = []
+        renderer.live_input_listener = SimpleNamespaceListener(calls)
+
+        with patch("tamfis_code.render.Live") as live_cls:
+            renderer.resume_live()
+
+        self.assertEqual(calls, ["resume"])
+        live_cls.assert_not_called()
+
+
+class EscapeCancellationLifecycleTests(unittest.TestCase):
+    def test_blank_result_is_not_rescheduled_while_listener_is_paused(self):
+        renderer = StreamRenderer(_console())
+        cfg = _config("ask")
+        listener = LiveInputListener(
+            session_id=999,
+            renderer=renderer,
+            cli_config=cfg,
+        )
+
+        listener._active = True
+        listener._paused = True
+        listener._input_task = None
+
+        listener._enqueue("")
+
+        self.assertIsNone(listener._input_task)
+
+
+class DirectInterruptCallbackTests(_StatePatchMixin, unittest.TestCase):
+    def test_cancel_callback_is_invoked_once(self):
+        renderer = StreamRenderer(_console())
+        cfg = _config("ask")
+        calls = []
+
+        listener = LiveInputListener(
+            session_id=501,
+            renderer=renderer,
+            cli_config=cfg,
+            interrupt_callback=calls.append,
+        )
+        listener._active = True
+
+        listener._request_interrupt("cancel")
+        listener._request_interrupt("cancel")
+
+        self.assertEqual(calls, ["cancel"])
+        self.assertEqual(listener.interrupt_classification, "cancel")
+        self.assertTrue(listener._paused)
+
+        queued = state_module.get_session_state(501).queued_user_instructions
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["classification"], "cancel")
+
+    def test_exit_callback_records_exit_classification(self):
+        renderer = StreamRenderer(_console())
+        cfg = _config("ask")
+        calls = []
+
+        listener = LiveInputListener(
+            session_id=502,
+            renderer=renderer,
+            cli_config=cfg,
+            interrupt_callback=calls.append,
+        )
+        listener._active = True
+
+        listener._request_interrupt("exit")
+
+        self.assertEqual(calls, ["exit"])
+        self.assertEqual(listener.interrupt_classification, "exit")
+
 
 class SimpleNamespaceListener:
     def __init__(self, calls):
@@ -232,6 +308,46 @@ class SimpleNamespaceListener:
 
     def resume(self):
         self._calls.append("resume")
+
+
+def test_renderer_resume_does_not_start_rich_live_while_listener_owns_footer():
+    from unittest.mock import Mock, patch
+    from rich.console import Console
+
+    from tamfis_code.render import StreamRenderer
+
+    console = Console(force_terminal=True)
+    renderer = StreamRenderer(console)
+    renderer._stop_live()
+
+    listener = Mock()
+    renderer.live_input_listener = listener
+
+    with patch("tamfis_code.render.Live") as live_cls:
+        renderer.resume_live()
+
+    listener.resume.assert_called_once_with()
+    live_cls.assert_not_called()
+
+
+def test_empty_prompt_result_is_not_requeued_after_escape_pause():
+    from unittest.mock import Mock
+
+    cfg = Mock()
+    cfg.approval_policy = "ask"
+
+    renderer = Mock()
+    listener = LiveInputListener(
+        session_id=999,
+        renderer=renderer,
+        cli_config=cfg,
+    )
+    listener._active = True
+    listener._paused = True
+
+    listener._enqueue("")
+
+    assert listener._input_task is None
 
 
 if __name__ == "__main__":

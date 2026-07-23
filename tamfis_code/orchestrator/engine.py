@@ -135,22 +135,27 @@ class AgentOrchestrator:
         self._advance_plan_step()
 
     def _advance_plan_step(self) -> None:
-        """Best-effort plan-step progress: each observed tool result is real,
-        concrete evidence that execution has moved forward, so use the
-        running tool-call count to advance a cursor through the plan's
-        steps -- reserving the final step (report/validate) so it is never
-        marked done before completion actually happens. This does not claim
-        precise step-to-action correspondence (see _sync_plan_progress)."""
+        """Expose execution progress without fabricating completion.
+
+        A tool result proves only that a tool call occurred. It does not prove
+        that a particular plan step completed, that a file changed, or that a
+        validation command passed. Therefore this method may mark one pending
+        step as in progress, but it must never mark a step completed.
+
+        Final completion is assigned only by complete() after validation.
+        """
         assert self.run is not None
         if self.run.plan is None or not self.run.plan.steps:
             return
-        steps = self.run.plan.steps
-        cursor = min(len(self.run.tool_records) - 1, max(len(steps) - 2, 0))
-        for step in steps[:cursor]:
-            if step.status not in {"completed", "failed"}:
-                step.status = "completed"
-        if steps[cursor].status not in {"completed", "failed"}:
-            steps[cursor].status = "in_progress"
+
+        # Keep at most one step active. Additional tool calls are evidence
+        # that work continues, not that later plan steps have started.
+        if not any(step.status == "in_progress" for step in self.run.plan.steps):
+            for step in self.run.plan.steps:
+                if step.status == "pending":
+                    step.status = "in_progress"
+                    break
+
         self._sync_plan_progress()
 
     def mark_repair(self, reason: str) -> None:

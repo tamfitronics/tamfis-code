@@ -128,6 +128,8 @@ class CodeAnalyzer(SubAgent):
         return issues
 
 class TestGenerator(SubAgent):
+    # Application component, not a pytest test container.
+    __test__ = False
     """Generates tests for code"""
     
     def __init__(self):
