@@ -1,7 +1,7 @@
 """Configuration and credential storage for TamfisGPT Code.
 
 Precedence (highest wins): CLI flag > environment variable > project-local
-.tamfis/config.toml > user ~/.config/tamfis-code/config.toml > built-in
+.tamfis/config.toml > platform-native per-user config.toml > built-in
 default. Only fields the CLI actually gives distinct behaviour to are
 supported here -- see docs/REMOTE_AGENT_MASTER_SPEC.md Phase 21's full
 configuration wishlist for what is intentionally deferred.
@@ -11,12 +11,18 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
+# NOTE: "never" means "never approve" (deny every action outright) --
+# it is NOT the opposite-sounding-but-actually-similar "never prompt" that
+# "auto"/"full-auto" already mean. Easy to reach for by name alone and get
+# the exact opposite of what you wanted; see /mode's own help text and
+# --approval's CLI help for the same disambiguation surfaced to the user.
 APPROVAL_MODES = (
     "ask", "safe", "auto", "read-only", "plan-only",
     "suggest", "workspace", "full-auto", "never",
@@ -35,7 +41,74 @@ MODE_ALIASES = {
     "auto": "auto",
 }
 
-CONFIG_DIR = Path(os.environ.get("TAMFIS_CODE_CONFIG_HOME", "") or (Path.home() / ".config" / "tamfis-code"))
+# Reverse of MODE_ALIASES -- unambiguous since every value above is
+# distinct. Used to render the raw approval_policy back into its
+# short, user-facing name (e.g. for a persistent mode indicator).
+_POLICY_TO_MODE_LABEL = {policy: label for label, policy in MODE_ALIASES.items()}
+
+# Shift+Tab cycling order for the interactive REPL's mode indicator --
+# mirrors Claude Code's own manual -> accept-edits -> auto cadence, with
+# plan (read-only) as the fourth stop rather than folded into the cycle by
+# default surprise, since switching INTO a read-only mode by accident via a
+# stray keypress is worse than switching between two mutating modes.
+MODE_CYCLE = ("manual", "accept-edits", "auto", "plan")
+
+
+def mode_label_for_policy(policy: str) -> str:
+    """The short /mode name for a raw approval_policy value, falling back
+    to the raw value itself for policies with no short alias (e.g. the
+    --approval-only values like "safe"/"workspace"/"never"/"suggest")."""
+    return _POLICY_TO_MODE_LABEL.get(policy, policy)
+
+
+def next_mode_in_cycle(policy: str) -> str:
+    """The next MODE_CYCLE policy after `policy`'s label position. A
+    current policy outside the named cycle (e.g. set via --approval to a
+    raw value like "safe") starts the cycle fresh from the beginning,
+    rather than raising or being a no-op."""
+    current_label = mode_label_for_policy(policy)
+    try:
+        index = MODE_CYCLE.index(current_label)
+    except ValueError:
+        index = -1
+    next_label = MODE_CYCLE[(index + 1) % len(MODE_CYCLE)]
+    return MODE_ALIASES[next_label]
+
+def resolve_config_dir(
+    *, environment: Optional[Mapping[str, str]] = None,
+    platform: Optional[str] = None,
+    home: Optional[Path] = None,
+) -> Path:
+    """Resolve portable per-user storage for an installed Tamfis Code.
+
+    Runtime data never belongs to the source checkout or site-packages:
+    either can be read-only and package upgrades replace the latter. The
+    explicit override supports portable/container installs; otherwise this
+    follows the operating system convention of the user running the CLI.
+    """
+    env = os.environ if environment is None else environment
+    override = str(env.get("TAMFIS_CODE_CONFIG_HOME") or "").strip()
+    if override:
+        return Path(override).expanduser()
+
+    current_platform = sys.platform if platform is None else platform
+    user_home = Path.home() if home is None else Path(home)
+    if current_platform.startswith("win"):
+        app_data = str(env.get("APPDATA") or env.get("LOCALAPPDATA") or "").strip()
+        return (
+            Path(app_data) / "tamfis-code"
+            if app_data else user_home / "AppData" / "Roaming" / "tamfis-code"
+        )
+
+    xdg_config = str(env.get("XDG_CONFIG_HOME") or "").strip()
+    if xdg_config:
+        return Path(xdg_config).expanduser() / "tamfis-code"
+    if current_platform == "darwin":
+        return user_home / "Library" / "Application Support" / "tamfis-code"
+    return user_home / ".config" / "tamfis-code"
+
+
+CONFIG_DIR = resolve_config_dir()
 CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 USER_CONFIG_PATH = CONFIG_DIR / "config.toml"
 PROJECT_CONFIG_RELATIVE = Path(".tamfis") / "config.toml"
@@ -73,6 +146,11 @@ class Config:
     # TamfisGPT tenant who wants that be the default, the same way Claude
     # Code/Codex/kimi-code default to their respective hosted accounts.
     default_backend: str = "standalone"
+    # Additional local roots that may be used by this installation. The
+    # launch directory is always included separately; these roots make a
+    # multi-project service practical without granting access to the whole
+    # filesystem.
+    workspace_roots: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)  # field -> where it came from, for `doctor`/`config`
 
     def as_dict(self) -> dict[str, Any]:
@@ -85,6 +163,7 @@ class Config:
             "debug": self.debug,
             "enable_subagent_delegation": self.enable_subagent_delegation,
             "default_backend": self.default_backend,
+            "workspace_roots": self.workspace_roots,
         }
 
 
@@ -120,6 +199,14 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if data.get("default_backend") in ("standalone", "remote"):
             cfg.default_backend = str(data["default_backend"])
             cfg.sources["default_backend"] = source_name
+        configured_roots = data.get("workspace_roots")
+        if isinstance(configured_roots, list):
+            cfg.workspace_roots = [
+                str(Path(item).expanduser().resolve())
+                for item in configured_roots
+                if isinstance(item, str) and item.strip()
+            ]
+            cfg.sources["workspace_roots"] = source_name
 
     env_api_base = os.environ.get("TAMFIS_CODE_API_BASE")
     if env_api_base:
@@ -140,6 +227,15 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_backend in ("standalone", "remote"):
         cfg.default_backend = env_backend
         cfg.sources["default_backend"] = "env TAMFIS_CODE_DEFAULT_BACKEND"
+
+    env_roots = os.environ.get("TAMFIS_CODE_WORKSPACE_ROOTS")
+    if env_roots:
+        cfg.workspace_roots = [
+            str(Path(item.strip()).expanduser().resolve())
+            for item in env_roots.split(os.pathsep)
+            if item.strip()
+        ]
+        cfg.sources["workspace_roots"] = "env TAMFIS_CODE_WORKSPACE_ROOTS"
 
     return cfg
 

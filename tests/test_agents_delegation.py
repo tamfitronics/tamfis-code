@@ -14,7 +14,7 @@ class ExecuteTasksConcurrencyTests(unittest.TestCase):
             await asyncio.sleep(0.2)
             return {"status": "completed", "summary": f"done:{task.description}"}
 
-        with patch("tamfis_code.workspace.resolve_local_workspace", return_value=fake_workspace), \
+        with patch("tamfis_code.workspace.resolve_swarm_subtask_workspace", return_value=fake_workspace), \
                 patch("tamfis_code.agents.DelegatedCodingAgent.execute", new=fake_execute):
             manager = AgentManager()
             started = time.monotonic()
@@ -38,7 +38,7 @@ class ExecuteTasksConcurrencyTests(unittest.TestCase):
             await asyncio.sleep(0.15)
             return {"status": "completed", "summary": "done"}
 
-        with patch("tamfis_code.workspace.resolve_local_workspace", return_value=fake_workspace), \
+        with patch("tamfis_code.workspace.resolve_swarm_subtask_workspace", return_value=fake_workspace), \
                 patch("tamfis_code.agents.DelegatedCodingAgent.execute", new=fake_execute):
             manager = AgentManager()
             started = time.monotonic()
@@ -58,7 +58,7 @@ class ExecuteTasksConcurrencyTests(unittest.TestCase):
         async def fake_execute(self, task):
             raise RuntimeError("boom")
 
-        with patch("tamfis_code.workspace.resolve_local_workspace", return_value=fake_workspace), \
+        with patch("tamfis_code.workspace.resolve_swarm_subtask_workspace", return_value=fake_workspace), \
                 patch("tamfis_code.agents.DelegatedCodingAgent.execute", new=fake_execute):
             manager = AgentManager()
             results = asyncio.run(manager.execute_tasks(

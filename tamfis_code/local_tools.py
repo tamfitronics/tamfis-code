@@ -1,7 +1,7 @@
 """Read-only local filesystem tools for tamfis-code's offline/local chat mode.
 
 Local mode has no server-side approval gate, safety classifier, or mutation-
-ledger/audit trail (that infrastructure lives in tamgpt6's Remote Workspace
+ledger/audit trail (that infrastructure lives in the Remote Workspace backend
 backend for good reason). Without it, offering anything that mutates state --
 writing files, running shell commands -- would be a real safety regression,
 not a feature. This module therefore wraps only the read-only subset of
@@ -11,7 +11,8 @@ intentionally never exposed here.
 """
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Optional
 
 from .mcp import MCPServer
 
@@ -79,8 +80,16 @@ class LocalReadOnlyTools:
     point for local mode's read-only boundary, not just documentation of it.
     """
 
-    def __init__(self) -> None:
-        self._server = MCPServer()
+    def __init__(self, workspace_root: Optional[str] = None) -> None:
+        # Without a workspace_root, MCPServer falls back to its legacy
+        # unrestricted behaviour (see mcp.py's _resolve_in_workspace) --
+        # confirmed live, that let the model read_file/search_code/
+        # list_directory/get_git_info anywhere on disk (e.g. ~/.ssh,
+        # /etc/shadow) despite this class's docstring describing a
+        # read-only *boundary*. Read-only isn't a safety boundary if it
+        # isn't also workspace-confined, so default to cwd here the same
+        # way the standalone agent loop confines its own tool surface.
+        self._server = MCPServer(workspace_root=workspace_root or str(Path.cwd()))
 
     async def call(self, name: str, arguments: Dict[str, Any]) -> Any:
         if name not in _READ_ONLY_NAMES:

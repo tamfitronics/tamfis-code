@@ -1,7 +1,7 @@
 """TamfisGPT Code -- a standalone terminal coding agent.
 
-By default, this package calls an LLM provider directly (Hugging Face,
-NVIDIA NIM, OpenRouter, or Ollama -- see providers.py/runner_local.py) and
+By default, this package calls an LLM provider directly (NVIDIA NIM,
+OpenRouter, or Hugging Face -- see providers.py/runner_local.py) and
 runs its own agent loop, tool execution (mcp.py), and local risk
 classification/approval/mutation ledger (safety.py) -- no separate backend
 process required. Every `ask`/`chat`/`audit`/`plan`/`agent`/`exec` command,
@@ -17,7 +17,7 @@ See docs/REMOTE_AGENT_MASTER_SPEC.md, Phase 21, for the original --remote
 architecture's spec.
 """
 
-__version__ = "0.2.3"
+__version__ = "0.6.13"
 
 # Bumped whenever a CLI release requires a minimum backend Remote API
 # contract version. Only meaningful for --remote; the standalone path has no
@@ -31,7 +31,6 @@ MIN_COMPATIBLE_API_VERSION = "remote-ai-v2"
 # New exports
 from .completion import ShellCompleter
 from .metrics import MetricsTracker, StreamMetrics
-from .sessions import SessionManager, Session, Message
 from .agents import AgentManager, SubAgent, CodeAnalyzer, TestGenerator, DocGenerator
 from .mcp import MCPServer, ToolDefinition, call_tool
 from .indexer import CodeIndexer, CodeSymbol, CodeFile
@@ -41,9 +40,6 @@ __all__ = [
     'ShellCompleter',
     'MetricsTracker',
     'StreamMetrics',
-    'SessionManager',
-    'Session',
-    'Message',
     'AgentManager',
     'SubAgent',
     'CodeAnalyzer',

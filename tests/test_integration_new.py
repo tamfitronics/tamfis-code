@@ -39,19 +39,6 @@ class TestNewModulesIntegration:
         assert 'references' in result
         assert len(result['references']['files']) >= 0
 
-    def test_sessions(self):
-        """Test session management"""
-        from tamfis_code.sessions import SessionManager
-        
-        manager = SessionManager(self.workspace / 'sessions.db')
-        session = manager.create_session('Integration Test')
-        session.add_message('user', 'Hello')
-        manager.save(session)
-        
-        loaded = manager.load(session.id)
-        assert loaded is not None
-        assert len(loaded.messages) == 1
-
     def test_metrics(self):
         """Test metrics tracking"""
         from tamfis_code.metrics import MetricsTracker

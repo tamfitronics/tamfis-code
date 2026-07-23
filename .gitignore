@@ -1,8 +1,11 @@
-__pycache__/
-*.pyc
 .pytest_cache/
+__pycache__/
+*.py[cod]
 *.egg-info/
-.env
-.coverage
-dist/
 build/
+dist/
+screenshots/
+*.log
+.env
+.env.*
+.tamfis/
