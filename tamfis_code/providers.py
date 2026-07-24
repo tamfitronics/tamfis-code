@@ -1,7 +1,25 @@
 """Provider integrations for Tamfis-Code.
 
-Supports the TamfisGPT subscription API, Hugging Face, NVIDIA NIM, and
-OpenRouter through a canonical OpenAI-compatible client interface.
+Supports Ollama Cloud, NVIDIA NIM, Hugging Face, OpenRouter, the TamfisGPT
+subscription API, and the internal Tier IV orchestration service through a
+canonical OpenAI-compatible client interface.
+
+Automatic standalone routing:
+    1. Ollama Cloud
+       - Current/default: gemma4:cloud
+       - Premium coding: kimi-k2.7-code:cloud
+       - Premium agent: minimax-m2.7:cloud
+    2. NVIDIA NIM
+    3. Hugging Face
+    4. OpenRouter
+
+Ollama Cloud is accessed through the signed-in local Ollama daemon at
+``http://127.0.0.1:11434/v1``. The daemon forwards ``:cloud`` models to
+Ollama Cloud while preserving the OpenAI-compatible tools/streaming contract
+already used throughout Tamfis-Code.
+
+Canonical project environment file:
+    /home/tamfiscode/.env
 """
 
 from __future__ import annotations
@@ -9,9 +27,64 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Any, AsyncIterator, Dict, List, Optional, TYPE_CHECKING
 
 from openai import AsyncOpenAI
+
+
+def _load_project_env() -> None:
+    """Load Tamfis-Code's root .env without requiring python-dotenv.
+
+    Existing process environment variables always win. The canonical file is
+    ``/home/tamfiscode/.env`` unless ``TAMFIS_CODE_ENV_FILE`` overrides it.
+    """
+
+    default_root = Path(
+        os.environ.get("TAMFIS_CODE_ROOT", "/home/tamfiscode")
+    ).expanduser()
+    env_path = Path(
+        os.environ.get(
+            "TAMFIS_CODE_ENV_FILE",
+            str(default_root / ".env"),
+        )
+    ).expanduser()
+
+    if not env_path.is_file():
+        return
+
+    try:
+        for raw_line in env_path.read_text(encoding="utf-8").splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[7:].strip()
+            if "=" not in line:
+                continue
+
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+
+            if not key or not key.replace("_", "").isalnum():
+                continue
+
+            if (
+                len(value) >= 2
+                and value[0] == value[-1]
+                and value[0] in {"'", '"'}
+            ):
+                value = value[1:-1]
+
+            os.environ.setdefault(key, value)
+    except OSError:
+        # Environment loading must never make the CLI unstartable.
+        return
+
+
+_load_project_env()
+
 
 if TYPE_CHECKING:
     from .routing import TaskProfile
@@ -22,6 +95,7 @@ class ProviderType(str, Enum):
 
     TIER_IV = "tier_iv"
     TAMFIS = "tamfis"
+    OLLAMA_CLOUD = "ollama_cloud"
     HF = "hf"
     NVIDIA = "nvidia"
     OPENROUTER = "openrouter"
@@ -150,14 +224,45 @@ class ProviderManager:
     """Initialise, inspect, rank, and access configured AI providers."""
 
     PRIORITY_ORDER: tuple[ProviderType, ...] = (
-        ProviderType.TIER_IV,
-        ProviderType.TAMFIS,
-        ProviderType.HF,
+        ProviderType.OLLAMA_CLOUD,
         ProviderType.NVIDIA,
+        ProviderType.HF,
         ProviderType.OPENROUTER,
+        ProviderType.TAMFIS,
+        ProviderType.TIER_IV,
     )
 
     PROVIDERS: Dict[ProviderType, ProviderConfig] = {
+        ProviderType.OLLAMA_CLOUD: ProviderConfig(
+            name="Ollama Cloud",
+            # The signed-in local daemon forwards :cloud models to Ollama.
+            # This preserves Tamfis-Code's existing OpenAI SDK, streaming,
+            # structured-output, and function-tool calling implementation.
+            base_url=os.environ.get(
+                "OLLAMA_BASE_URL",
+                "http://127.0.0.1:11434/v1",
+            ).rstrip("/"),
+            api_key_env="OLLAMA_API_KEY",
+            default_model=os.environ.get(
+                "TAMFIS_CODE_OLLAMA_GENERAL_MODEL",
+                "gemma4:cloud",
+            ),
+            models=[
+                "gemma4:cloud",
+                "kimi-k2.7-code:cloud",
+                "minimax-m2.7:cloud",
+            ],
+            priority=0,
+            weight=10,
+            reasoning_supported=True,
+            vision_supported=True,
+            context_window=262144,
+            coding_quality=5,
+            tool_calling=True,
+            structured_output=True,
+            long_context=True,
+            local_only=False,
+        ),
         # Public subscription API. Unlike TIER_IV this endpoint is intended
         # for portable installs and authenticates with a user-owned key.
         # Tool calls are returned to the CLI so local workspace tools remain
@@ -171,7 +276,7 @@ class ProviderManager:
             api_key_env="TAMFIS_API_KEY",
             default_model="tamfis-gpt-auto",
             models=["tamfis-gpt-auto"],
-            priority=0,
+            priority=4,
             weight=6,
             context_window=128000,
             coding_quality=5,
@@ -194,7 +299,7 @@ class ProviderManager:
             api_key_env="TAMFIS_ACCESS_TOKEN",
             default_model="",  # empty -- let Tier IV's own orchestrator pick, same as tamgpt6's own callers do when no model is pinned.
             models=[],
-            priority=0,
+            priority=5,
             weight=5,
             reasoning_supported=True,
             vision_supported=False,
@@ -297,7 +402,7 @@ class ProviderManager:
                 # have to mean losing access to this model entirely.
                 "moonshotai/Kimi-K2.6",
             ],
-            priority=0,
+            priority=2,
             weight=3,
             reasoning_supported=False,
             vision_supported=True,
@@ -398,8 +503,16 @@ class ProviderManager:
         return os.environ.get("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false").strip().lower() == "true"
 
     def _fallback_provider_allowed(self, provider: ProviderType) -> bool:
-        if provider == ProviderType.NVIDIA:
+        # These are the agreed automatic recovery providers. OpenRouter is
+        # permitted automatically only where a free route exists, unless paid
+        # fallback is explicitly enabled.
+        if provider in {
+            ProviderType.OLLAMA_CLOUD,
+            ProviderType.NVIDIA,
+            ProviderType.HF,
+        }:
             return True
+
         config = self.PROVIDERS.get(provider)
         return bool(config and config.free_model) or self.paid_fallback_enabled()
 
@@ -431,6 +544,13 @@ class ProviderManager:
             # SDK still needs a non-empty api_key string to construct.
             return os.environ.get(config.api_key_env, "").strip() or "tier-iv-local"
 
+        if provider_type == ProviderType.OLLAMA_CLOUD:
+            # Authentication to cloud models is owned by the signed-in local
+            # Ollama daemon. The OpenAI SDK still requires a non-empty value,
+            # but the local Ollama endpoint ignores it. Preserve the real key
+            # in the environment for direct native API use elsewhere.
+            return os.environ.get(config.api_key_env, "").strip() or "ollama"
+
         key = os.environ.get(config.api_key_env, "").strip()
         return key or None
 
@@ -442,6 +562,9 @@ class ProviderManager:
 
         if provider_type == ProviderType.TIER_IV:
             return self._check_tier_iv_available()
+
+        if provider_type == ProviderType.OLLAMA_CLOUD:
+            return self._check_ollama_available()
 
         config = self.PROVIDERS.get(provider_type)
         if config is None:
@@ -461,6 +584,35 @@ class ProviderManager:
             "DUMMY",
         )
         return not any(marker in upper_key for marker in placeholder_markers)
+
+    def _check_ollama_available(self) -> bool:
+        """Return True when the local Ollama daemon is reachable.
+
+        A successful daemon health check does not guarantee that every cloud
+        model is included in the current account plan. A model-specific 403 is
+        therefore handled as a retryable provider error and AUTO falls back to
+        NVIDIA, Hugging Face, then OpenRouter.
+        """
+
+        explicit = os.environ.get("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED")
+        if explicit is not None and explicit.strip().lower() != "true":
+            return False
+
+        config = self.PROVIDERS.get(ProviderType.OLLAMA_CLOUD)
+        if config is None:
+            return False
+
+        import httpx
+
+        base = config.base_url
+        if base.endswith("/v1"):
+            base = base[:-3]
+
+        try:
+            response = httpx.get(f"{base}/api/tags", timeout=3.0)
+            return response.status_code == 200
+        except httpx.HTTPError:
+            return False
 
     def _check_tier_iv_available(self) -> bool:
         """Return True when Tier IV is reachable, unless explicitly disabled.
@@ -541,6 +693,36 @@ class ProviderManager:
         _task_needs_paid_tier) escalate to the paid `default_model`, so
         ordinary chat/inspection turns don't spend credits at all.
         """
+        if config.name == "Ollama Cloud":
+            premium_enabled = os.environ.get(
+                "TAMFIS_CODE_OLLAMA_PREMIUM",
+                "false",
+            ).strip().lower() in {"1", "true", "yes", "on"}
+
+            if premium_enabled:
+                task_type = getattr(task_profile, "task_type", None)
+                task_value = (
+                    getattr(task_type, "value", None)
+                    or str(task_type or "")
+                )
+
+                if task_value in {"audit", "debug", "edit", "test"}:
+                    return os.environ.get(
+                        "TAMFIS_CODE_OLLAMA_CODING_MODEL",
+                        "kimi-k2.7-code:cloud",
+                    )
+
+                if _task_needs_paid_tier(task_profile):
+                    return os.environ.get(
+                        "TAMFIS_CODE_OLLAMA_AGENT_MODEL",
+                        "minimax-m2.7:cloud",
+                    )
+
+            return os.environ.get(
+                "TAMFIS_CODE_OLLAMA_GENERAL_MODEL",
+                config.default_model,
+            )
+
         if config.free_model and not _task_needs_paid_tier(task_profile):
             return config.free_model
         return config.default_model
@@ -639,14 +821,15 @@ class ProviderManager:
                 ),
             )
 
-        # Quality mode favours capability while preserving the stated policy
-        # as the tie-breaker.
-        return max(
+        # Capability filtering has already happened above. Honour the
+        # explicitly agreed provider order instead of allowing equal quality
+        # scores or context-window size to override priority 1.
+        return min(
             eligible,
             key=lambda provider: (
-                self.PROVIDERS[provider].coding_quality,
-                self.PROVIDERS[provider].context_window,
-                -self.PROVIDERS[provider].priority,
+                self.PROVIDERS[provider].priority,
+                -self.PROVIDERS[provider].coding_quality,
+                -self.PROVIDERS[provider].context_window,
             ),
         )
 
@@ -848,9 +1031,13 @@ class ProviderManager:
             raise ValueError(f"Provider {resolved.value} is not available")
 
         selected_model = model or (
-            config.free_model
-            if config.free_model and not self.paid_fallback_enabled()
-            else self.select_model(config, task_profile)
+            self.select_model(config, task_profile)
+            if resolved == ProviderType.OLLAMA_CLOUD
+            else (
+                config.free_model
+                if config.free_model and not self.paid_fallback_enabled()
+                else self.select_model(config, task_profile)
+            )
         )
 
         request_kwargs: Dict[str, Any] = {
@@ -967,6 +1154,19 @@ class ProviderManager:
         ):
             chunks.append(chunk)
         return "".join(chunks)
+
+
+async def chat_with_ollama_cloud(
+    messages: List[Dict[str, Any]],
+    **kwargs: Any,
+) -> AsyncIterator[str]:
+    manager = ProviderManager()
+    async for chunk in manager.chat_completion(
+        ProviderType.OLLAMA_CLOUD,
+        messages,
+        **kwargs,
+    ):
+        yield chunk
 
 
 async def chat_with_hf(
