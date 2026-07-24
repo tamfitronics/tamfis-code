@@ -1,0 +1,5 @@
+[console_scripts]
+tamfis = tamfis_code.cli:main
+tamfis-code = tamfis_code.cli:main
+tamfis-code-server = tamfis_code.openhands.agent_server:main
+tamgpt-code = tamfis_code.cli:main

@@ -10,6 +10,7 @@ from .context import ContextBundle, build_context_bundle
 from .planner import ExecutionPlan, create_plan
 from .protocols import AgentPhase, ToolEnvelope
 from .validator import ValidationReport, validate_completion
+from ..runtime import ExecutionController, GuardDecision, ObservationDecision
 
 
 @dataclass
@@ -26,6 +27,7 @@ class OrchestrationRun:
     route: dict[str, Any] = field(default_factory=dict)
     repair_attempts: int = 0
     reasoning_plan: bool = False
+    runtime: ExecutionController = field(default_factory=ExecutionController)
 
 
 class AgentOrchestrator:
@@ -60,6 +62,7 @@ class AgentOrchestrator:
         if profile.requires_repository_context:
             self.transition(AgentPhase.INSPECT, action="Load or refresh repository context")
         self.run.plan = create_plan(objective, profile)
+        self.run.runtime.start_planning()
         plan_dict = self.run.plan.to_dict() if self.run.plan else None
         self.run.context = build_context_bundle(
             session_id=self.session_id, workspace_root=self.workspace_root,
@@ -85,6 +88,9 @@ class AgentOrchestrator:
         for the "here is the new plan" banner; this only handles state.
         """
         assert self.run is not None
+        if not self.run.runtime.record_plan_revision():
+            self.fail(self.run.runtime.snapshot.failure_reason)
+            return
         saved = local_state.save_plan(
             self.session_id, objective=self.run.objective,
             content="\n".join(f"{s.index}. {s.name}" for s in plan.steps),
@@ -120,51 +126,79 @@ class AgentOrchestrator:
         local_state.save_session_state(self.session_id, selected_provider=provider, selected_model=model)
 
     def start_execution(self) -> None:
+        assert self.run is not None
+        self.run.runtime.start_execution()
         self.transition(AgentPhase.EXECUTE, action="Execute the model/tool loop")
+
+    def guard_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> GuardDecision:
+        assert self.run is not None
+        decision = self.run.runtime.guard_action(tool_name, arguments)
+        if not decision.allowed:
+            self.emit({"event_type": "diagnostics", "payload": {"content": decision.reason}})
+        return decision
 
     def waiting_for_approval(self, purpose: str) -> None:
         self.transition(AgentPhase.WAITING_FOR_APPROVAL, action=purpose)
 
-    def record_tool(self, envelope: ToolEnvelope) -> None:
+    def record_tool(self, envelope: ToolEnvelope) -> ObservationDecision:
         assert self.run is not None
         self.run.tool_records.append(envelope)
         self.transition(AgentPhase.OBSERVE, action=f"Observe {envelope.tool_name} result")
+        result = {
+            "success": bool(envelope.success),
+            "result": {
+                "stdout": envelope.stdout,
+                "stderr": envelope.stderr,
+                "exit_code": envelope.exit_code,
+                "files_changed": list(envelope.files_changed),
+                "path": envelope.arguments.get("path") or envelope.arguments.get("destination"),
+            },
+        }
+        decision = self.run.runtime.observe(envelope.tool_name, envelope.arguments, result)
         state = local_state.get_session_state(self.session_id)
         records = state.completed_actions + [{"type": "tool", **envelope.to_dict()}]
-        local_state.save_session_state(self.session_id, completed_actions=records[-250:])
-        self._advance_plan_step()
+        local_state.save_session_state(
+            self.session_id, completed_actions=records[-250:],
+            running_action={
+                "purpose": decision.reason or f"Observed {envelope.tool_name}",
+                "phase": self.run.runtime.snapshot.phase.value,
+                "runtime": self.run.runtime.snapshot.to_dict(),
+            },
+        )
+        self._advance_plan_step(decision)
+        if decision.terminal:
+            self.fail(decision.reason)
+        return decision
 
-    def _advance_plan_step(self) -> None:
-        """Expose execution progress without fabricating completion.
-
-        A tool result proves only that a tool call occurred. It does not prove
-        that a particular plan step completed, that a file changed, or that a
-        validation command passed. Therefore this method may mark one pending
-        step as in progress, but it must never mark a step completed.
-
-        Final completion is assigned only by complete() after validation.
-        """
+    def _advance_plan_step(self, decision: ObservationDecision) -> None:
+        """Advance only when a successful observation gained useful evidence."""
         assert self.run is not None
         if self.run.plan is None or not self.run.plan.steps:
             return
-
-        # Keep at most one step active. Additional tool calls are evidence
-        # that work continues, not that later plan steps have started.
-        if not any(step.status == "in_progress" for step in self.run.plan.steps):
-            for step in self.run.plan.steps:
-                if step.status == "pending":
-                    step.status = "in_progress"
-                    break
-
+        active = next((step for step in self.run.plan.steps if step.status == "in_progress"), None)
+        if active is None:
+            active = next((step for step in self.run.plan.steps if step.status == "pending"), None)
+            if active is not None:
+                active.status = "in_progress"
+        if active is not None and decision.useful:
+            active.status = "completed"
+            active.evidence.extend(item for item in decision.evidence if item not in active.evidence)
+            nxt = next((step for step in self.run.plan.steps if step.status == "pending"), None)
+            if nxt is not None:
+                nxt.status = "in_progress"
         self._sync_plan_progress()
 
     def mark_repair(self, reason: str) -> None:
         assert self.run is not None
         self.run.repair_attempts += 1
+        if not self.run.runtime.record_repair():
+            self.fail(self.run.runtime.snapshot.failure_reason)
+            return
         self.transition(AgentPhase.REPAIR, action=reason)
 
     def validate(self, *, final_text: str, any_mutation: bool) -> ValidationReport:
         assert self.run is not None
+        self.run.runtime.begin_validation()
         self.transition(AgentPhase.VALIDATE, action="Validate evidence and completion claims")
         report = validate_completion(
             profile=self.run.profile,
@@ -205,12 +239,17 @@ class AgentOrchestrator:
                 )
             self._sync_plan_progress()
         self.transition(AgentPhase.REPORT, action="Report only evidence-supported outcomes")
+        if report.severity == "error":
+            self.run.runtime.fail("Completion validation failed.")
+        else:
+            self.run.runtime.complete()
         self.transition(AgentPhase.FAILED if report.severity == "error" else AgentPhase.COMPLETED)
         local_state.checkpoint(self.session_id, reason="orchestrator_complete", summary=final_text[-1000:])
         return report
 
     def fail(self, error: str) -> None:
         if self.run is not None:
+            self.run.runtime.fail(error)
             if self.run.plan is not None:
                 for step in self.run.plan.steps:
                     if step.status == "in_progress":

@@ -63,7 +63,7 @@ from .workspace import classify_root
 # legitimately needs many more tool calls (read several files, make several
 # edits, run tests, iterate). This exists only to guarantee termination if
 # something is genuinely stuck in a loop, not to cap normal work.
-MAX_AGENT_ROUNDS = 200
+MAX_AGENT_ROUNDS = 40
 
 # High reasoning is valuable for deliberate architecture work but makes the
 # interactive terminal feel stalled on ordinary audits/edits. Medium is the
@@ -4762,6 +4762,29 @@ async def run_local_agent_turn(
             except json.JSONDecodeError:
                 arguments = {}
 
+            guard = orchestrator.guard_tool_call(tc.name, arguments)
+            if not guard.allowed:
+                result = {
+                    "success": False,
+                    "error": guard.reason,
+                    "runtime_blocked": True,
+                }
+                working_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.call_id,
+                    "content": json.dumps(result),
+                })
+                renderer.handle_event({
+                    "event_type": "tool_output",
+                    "payload": {"tool": tc.name, "result": result},
+                })
+                if guard.terminal:
+                    _persist_turn_checkpoint(status="failed", last_error=guard.reason)
+                    orchestrator.fail(guard.reason)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": guard.reason}})
+                    return TaskOutcome(status="failed", error=guard.reason)
+                continue
+
             if tc.name == "retrieve_evidence":
                 # A pure local lookup by id -- read-only, no workspace scope
                 # or approval gate applies (it isn't a filesystem/shell tool
@@ -4949,7 +4972,16 @@ async def run_local_agent_turn(
             result = await mcp_server.call_tool(tc.name, arguments)
             result = _normalise_tool_result(tc.name, arguments, result, workspace_root)
             envelope.finish(result=result, success=bool(result.get("success")))
-            orchestrator.record_tool(envelope)
+            observation = orchestrator.record_tool(envelope)
+            if observation.terminal:
+                working_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.call_id,
+                    "content": json.dumps(result, default=str),
+                })
+                _persist_turn_checkpoint(status="failed", last_error=observation.reason)
+                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": observation.reason}})
+                return TaskOutcome(status="failed", error=observation.reason)
             renderer.handle_event({
                 "event_type": "tool_output",
                 "payload": {"tool": tc.name, "result": _tool_output_for_render(result)},

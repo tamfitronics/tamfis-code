@@ -1,54 +1,49 @@
-"""TamfisGPT Code -- a standalone terminal coding agent.
+"""Tamfis-Code, a standalone terminal coding agent.
 
-By default, this package calls an LLM provider directly (NVIDIA NIM,
-OpenRouter, or Hugging Face -- see providers.py/runner_local.py) and
-runs its own agent loop, tool execution (mcp.py), and local risk
-classification/approval/mutation ledger (safety.py) -- no separate backend
-process required. Every `ask`/`chat`/`audit`/`plan`/`agent`/`exec` command,
-and the interactive REPL, work this way unless `--remote` is passed.
-
-`--remote` still supports the original architecture this package started
-as: a thin client to the TamfisGPT Remote Workspace backend (same sessions/
-tasks/tools/approvals/events -- see tier_ii_gateway/api/remote.py), which
-does the equivalent work server-side. That path is kept for continuity but
-is not the primary, developed-going-forward one.
-
-See docs/REMOTE_AGENT_MASTER_SPEC.md, Phase 21, for the original --remote
-architecture's spec.
+The package keeps import-time side effects deliberately minimal. Public
+components are loaded lazily so a missing optional module cannot prevent the
+CLI or deterministic runtime from starting.
 """
+from __future__ import annotations
 
-__version__ = "0.6.14"
+from importlib import import_module
+from typing import Any
 
-# Bumped whenever a CLI release requires a minimum backend Remote API
-# contract version. Only meaningful for --remote; the standalone path has no
-# server to negotiate a contract version with. There is no server-side
-# version negotiation yet (`tamfis-code doctor --remote` just checks
-# reachability) -- this constant exists so that check has something concrete
-# to compare against once one is added, rather than silently assuming
-# compatibility forever.
+__version__ = "0.7.0"
 MIN_COMPATIBLE_API_VERSION = "remote-ai-v2"
 
-# New exports
-from .completion import ShellCompleter
-from .metrics import MetricsTracker, StreamMetrics
-from .agents import AgentManager, SubAgent, CodeAnalyzer, TestGenerator, DocGenerator
-from .mcp import MCPServer, ToolDefinition, call_tool
-from .indexer import CodeIndexer, CodeSymbol, CodeFile
+_LAZY_EXPORTS: dict[str, tuple[str, str]] = {
+    "ShellCompleter": (".completion", "ShellCompleter"),
+    "MetricsTracker": (".metrics", "MetricsTracker"),
+    "StreamMetrics": (".metrics", "StreamMetrics"),
+    "AgentManager": (".agents", "AgentManager"),
+    "SubAgent": (".agents", "SubAgent"),
+    "CodeAnalyzer": (".agents", "CodeAnalyzer"),
+    "TestGenerator": (".agents", "TestGenerator"),
+    "DocGenerator": (".agents", "DocGenerator"),
+    "MCPServer": (".mcp", "MCPServer"),
+    "ToolDefinition": (".mcp", "ToolDefinition"),
+    "call_tool": (".mcp", "call_tool"),
+    "CodeIndexer": (".indexer", "CodeIndexer"),
+    "CodeSymbol": (".indexer", "CodeSymbol"),
+    "CodeFile": (".indexer", "CodeFile"),
+}
 
-__all__ = [
-    # Existing...
-    'ShellCompleter',
-    'MetricsTracker',
-    'StreamMetrics',
-    'AgentManager',
-    'SubAgent',
-    'CodeAnalyzer',
-    'TestGenerator',
-    'DocGenerator',
-    'MCPServer',
-    'ToolDefinition',
-    'call_tool',
-    'CodeIndexer',
-    'CodeSymbol',
-    'CodeFile',
-]
+__all__ = ["__version__", "MIN_COMPATIBLE_API_VERSION", *_LAZY_EXPORTS]
+
+
+def __getattr__(name: str) -> Any:
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(name)
+    module_name, attribute = target
+    try:
+        module = import_module(module_name, __name__)
+    except ModuleNotFoundError as exc:
+        raise AttributeError(
+            f"Optional Tamfis-Code component {name!r} is unavailable because "
+            f"module {module_name!r} is not installed."
+        ) from exc
+    value = getattr(module, attribute)
+    globals()[name] = value
+    return value
