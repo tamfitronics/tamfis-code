@@ -55,6 +55,7 @@ from .orchestrator import (
     parse_reasoning_plan,
     should_plan,
 )
+from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
@@ -3535,8 +3536,13 @@ async def _run_local_agent_turn_impl(
             if recovered_objective else incoming_objective
         )
     )
+    _turn_budget_config = cli_config or Config()
     orchestrator = AgentOrchestrator(
-        session_id=session_id, workspace_root=workspace_root, emit=renderer.handle_event
+        session_id=session_id, workspace_root=workspace_root, emit=renderer.handle_event,
+        budgets=RuntimeBudgets(
+            max_runtime_seconds=int(_turn_budget_config.turn_runtime_seconds),
+            max_runtime_extensions=_turn_budget_config.max_runtime_extensions,
+        ),
     )
     orchestration = orchestrator.begin(objective=objective, messages=messages, read_only=read_only)
     task_profile = orchestration.profile

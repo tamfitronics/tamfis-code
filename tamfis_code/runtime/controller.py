@@ -16,6 +16,12 @@ class GuardDecision:
     terminal: bool = False
     reason: str = ""
     fingerprint: str = ""
+    # True only when `terminal` was caused by the wall-clock budget running
+    # out -- the one failure mode a caller may recover from by granting a
+    # fresh turn (extend_runtime) instead of ending the task. Every other
+    # terminal reason (repeated actions, stalls, tool-call ceiling) reflects
+    # the agent making no real progress and must stay a hard failure.
+    time_budget_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -39,6 +45,29 @@ class ExecutionController:
             self.snapshot.failure_reason = reason
             self.snapshot.transition(RuntimePhase.FAILED)
 
+    def extend_runtime(self) -> bool:
+        """Grant one more turn's worth of wall-clock budget instead of
+        ending the task, when the only reason execution stopped is time.
+
+        Returns False once the extension allowance itself is exhausted --
+        at that point the caller must treat the timeout as final. A
+        successful extension clears a FAILED phase that was set purely by
+        `_check_time()` so execution can resume; it bypasses the normal
+        transition table on purpose, since FAILED has no legal outgoing
+        transitions and this is the one case where that's meant to be
+        reversible.
+        """
+        if self.snapshot.runtime_extensions >= self.budgets.max_runtime_extensions:
+            return False
+        self.snapshot.runtime_extensions += 1
+        self.started_at = time.monotonic()
+        if self.snapshot.phase == RuntimePhase.FAILED and self.snapshot.failure_reason.startswith(
+            "Runtime budget exhausted"
+        ):
+            self.snapshot.phase = RuntimePhase.EXECUTE
+            self.snapshot.failure_reason = ""
+        return True
+
     def _check_time(self) -> str:
         elapsed = time.monotonic() - self.started_at
         if elapsed >= self.budgets.max_runtime_seconds:
@@ -57,7 +86,7 @@ class ExecutionController:
         timeout = self._check_time()
         if timeout:
             self._fail(timeout)
-            return GuardDecision(False, True, timeout)
+            return GuardDecision(False, True, timeout, time_budget_exhausted=True)
         if self.snapshot.terminal:
             return GuardDecision(False, True, self.snapshot.failure_reason or "Runtime is terminal.")
         if self.snapshot.tool_calls >= self.budgets.max_tool_calls:

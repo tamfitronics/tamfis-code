@@ -133,6 +133,17 @@ class Config:
     colour: bool = True
     output_mode: str = "text"
     timeout_seconds: float = 120.0
+    # Wall-clock budget for one agent "turn" against the runtime controller
+    # (runtime/budgets.py). Previously hardcoded at 900s with no way to
+    # raise it for slow cloud models; hitting it mid-generation discarded
+    # the whole task instead of just ending the turn.
+    turn_runtime_seconds: float = 900.0
+    # How many times a turn may auto-renew its runtime budget and continue
+    # (rather than the task failing outright) when it runs out of time
+    # mid-execution. Purely a safety cap on the continuation loop --
+    # unrelated budgets (tool-call count, repeated actions, stalls) are
+    # untouched by an extension and still fail the task normally.
+    max_runtime_extensions: int = 3
     debug: bool = False
     # Real (LLM-backed) subagent delegation is opt-in: concurrent sessions
     # against the Remote backend have open questions (rate limiting, approval
@@ -160,6 +171,8 @@ class Config:
             "colour": self.colour,
             "output_mode": self.output_mode,
             "timeout_seconds": self.timeout_seconds,
+            "turn_runtime_seconds": self.turn_runtime_seconds,
+            "max_runtime_extensions": self.max_runtime_extensions,
             "debug": self.debug,
             "enable_subagent_delegation": self.enable_subagent_delegation,
             "default_backend": self.default_backend,
@@ -193,6 +206,12 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "timeout_seconds" in data:
             cfg.timeout_seconds = float(data["timeout_seconds"])
             cfg.sources["timeout_seconds"] = source_name
+        if "turn_runtime_seconds" in data:
+            cfg.turn_runtime_seconds = float(data["turn_runtime_seconds"])
+            cfg.sources["turn_runtime_seconds"] = source_name
+        if "max_runtime_extensions" in data:
+            cfg.max_runtime_extensions = int(data["max_runtime_extensions"])
+            cfg.sources["max_runtime_extensions"] = source_name
         if "enable_subagent_delegation" in data:
             cfg.enable_subagent_delegation = bool(data["enable_subagent_delegation"])
             cfg.sources["enable_subagent_delegation"] = source_name
@@ -227,6 +246,16 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_backend in ("standalone", "remote"):
         cfg.default_backend = env_backend
         cfg.sources["default_backend"] = "env TAMFIS_CODE_DEFAULT_BACKEND"
+
+    env_turn_runtime = os.environ.get("TAMFIS_CODE_TURN_RUNTIME_SECONDS")
+    if env_turn_runtime:
+        cfg.turn_runtime_seconds = float(env_turn_runtime)
+        cfg.sources["turn_runtime_seconds"] = "env TAMFIS_CODE_TURN_RUNTIME_SECONDS"
+
+    env_runtime_extensions = os.environ.get("TAMFIS_CODE_MAX_RUNTIME_EXTENSIONS")
+    if env_runtime_extensions:
+        cfg.max_runtime_extensions = int(env_runtime_extensions)
+        cfg.sources["max_runtime_extensions"] = "env TAMFIS_CODE_MAX_RUNTIME_EXTENSIONS"
 
     env_roots = os.environ.get("TAMFIS_CODE_WORKSPACE_ROOTS")
     if env_roots:

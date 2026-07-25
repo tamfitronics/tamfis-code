@@ -26,6 +26,47 @@ _SHIFT_TAB = b"\x1b[Z"
 _CTRL_T = b"\x14"
 _CTRL_Y = b"\x19"
 
+# Claude Code's own bottom-toolbar phrasing for the three MODE_CYCLE stops
+# that actually change what gets auto-approved -- "manual" (/mode's "ask")
+# is the quiet default and gets no banner, matching how Claude Code only
+# announces the modes that suppress a prompt.
+_MODE_ON_LABEL = {
+    "accept-edits": "auto-accept edits on",
+    "auto": "auto mode on",
+    "plan-only": "plan mode on",
+}
+
+
+def _active_agent_count(exclude_session_id: int) -> int:
+    """Count other known sessions currently mid-task (e.g. swarm children
+    delegated via /delegate), for the "N agents" toolbar suffix."""
+    count = 0
+    for sid in local_state.all_known_session_ids():
+        if sid == exclude_session_id:
+            continue
+        if local_state.get_session_state(sid).execution_status == "running":
+            count += 1
+    return count
+
+
+def _mode_and_agents_html(cli_config: Config, session_id: int) -> str:
+    mode = mode_label_for_policy(cli_config.approval_policy)
+    mode_on = _MODE_ON_LABEL.get(mode)
+    mode_line = (
+        f"<ansiyellow>⏵⏵ {mode_on} (shift+tab to cycle)</ansiyellow>"
+        if mode_on else "<ansigray>shift+tab to cycle mode</ansigray>"
+    )
+    agents = _active_agent_count(session_id)
+    agents_suffix = f" <ansigray>· ← {agents} agent{'s' if agents != 1 else ''}</ansigray>" if agents else ""
+    return f"{mode_line}{agents_suffix}"
+
+
+def idle_bottom_toolbar(cli_config: Config, session_id: int) -> HTML:
+    """Bottom-toolbar content for the plain REPL prompt (no task running) --
+    same mode/agents banner as the live in-task footer below, so the bar
+    doesn't disappear the moment a turn finishes."""
+    return HTML(_mode_and_agents_html(cli_config, session_id))
+
 
 class LiveInputListener:
     """Run a persistent, asynchronous follow-up editor during a task."""
@@ -141,10 +182,9 @@ class LiveInputListener:
 
     def _bottom_toolbar(self):
         status = self.renderer.live_input_status()
-        mode = mode_label_for_policy(self.cli_config.approval_policy)
         return HTML(
             f"<b><ansicyan>◆</ansicyan></b> <b>{status}</b>  "
-            f"<ansigray>│ {mode} │ esc interrupt │ shift+tab mode</ansigray>"
+            f"<ansigray>│ esc interrupt │</ansigray> {_mode_and_agents_html(self.cli_config, self.session_id)}"
         )
 
     async def _input_loop(self) -> None:

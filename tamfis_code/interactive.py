@@ -42,7 +42,7 @@ from .custom_commands import (
     load_custom_commands,
 )
 from .doctor import run_doctor
-from .live_input import LiveInputListener
+from .live_input import LiveInputListener, idle_bottom_toolbar
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
 from .runner import (
     TaskOutcome,
@@ -495,6 +495,7 @@ async def run_interactive(
     session: PromptSession = PromptSession(
         history=FileHistory(str(history_path)), multiline=True, key_bindings=bindings,
         completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
+        bottom_toolbar=lambda: idle_bottom_toolbar(config, workspace.session_id),
     )
 
     async def _run_saved_plan(plan_id_arg: Optional[str]) -> bool:

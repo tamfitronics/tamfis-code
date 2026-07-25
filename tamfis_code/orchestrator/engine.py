@@ -11,6 +11,7 @@ from .planner import ExecutionPlan, create_plan
 from .protocols import AgentPhase, ToolEnvelope
 from .validator import ValidationReport, validate_completion
 from ..runtime import ExecutionController, GuardDecision, ObservationDecision
+from ..runtime.budgets import RuntimeBudgets
 
 
 @dataclass
@@ -31,10 +32,18 @@ class OrchestrationRun:
 
 
 class AgentOrchestrator:
-    def __init__(self, *, session_id: int, workspace_root: str, emit: Callable[[dict[str, Any]], None]):
+    def __init__(
+        self,
+        *,
+        session_id: int,
+        workspace_root: str,
+        emit: Callable[[dict[str, Any]], None],
+        budgets: RuntimeBudgets | None = None,
+    ):
         self.session_id = session_id
         self.workspace_root = workspace_root
         self.emit = emit
+        self.budgets = budgets or RuntimeBudgets()
         self.run: OrchestrationRun | None = None
 
     def transition(self, phase: AgentPhase, *, action: str = "") -> None:
@@ -52,7 +61,7 @@ class AgentOrchestrator:
 
     def begin(self, *, objective: str, messages: list[dict[str, Any]], read_only: bool) -> OrchestrationRun:
         profile = classify_task(objective, read_only=read_only)
-        self.run = OrchestrationRun(self.session_id, objective, profile)
+        self.run = OrchestrationRun(self.session_id, objective, profile, runtime=ExecutionController(self.budgets))
         local_state.save_session_state(
             self.session_id,
             active_task={"objective": objective, "task_type": profile.task_type.value, "complexity": profile.complexity},
@@ -148,6 +157,26 @@ class AgentOrchestrator:
     def guard_tool_call(self, tool_name: str, arguments: dict[str, Any]) -> GuardDecision:
         assert self.run is not None
         decision = self.run.runtime.guard_action(tool_name, arguments)
+        if not decision.allowed and decision.time_budget_exhausted:
+            # Running out of wall-clock time mid-task isn't the same kind of
+            # failure as a stalled or looping agent -- it just means the
+            # turn needs to keep going. Grant a fresh budget and re-check
+            # (which still applies every other guard -- tool-call ceiling,
+            # repeated-action detection -- against the unmodified state) up
+            # to max_runtime_extensions before treating it as final.
+            if self.run.runtime.extend_runtime():
+                extensions = self.run.runtime.snapshot.runtime_extensions
+                limit = self.run.runtime.budgets.max_runtime_extensions
+                self.emit({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Turn budget reached -- starting turn {extensions + 1} "
+                            f"(extension {extensions}/{limit}) instead of ending the task."
+                        ),
+                    },
+                })
+                decision = self.run.runtime.guard_action(tool_name, arguments)
         if not decision.allowed:
             self.emit({"event_type": "diagnostics", "payload": {"content": decision.reason}})
         return decision

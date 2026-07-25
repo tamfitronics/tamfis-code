@@ -40,6 +40,7 @@ class RuntimeSnapshot:
     repair_rounds: int = 0
     evidence_items: int = 0
     repeated_actions: int = 0
+    runtime_extensions: int = 0
     failure_reason: str = ""
     action_counts: dict[str, int] = field(default_factory=dict)
     observation_counts: dict[str, int] = field(default_factory=dict)

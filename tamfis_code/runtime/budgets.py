@@ -11,6 +11,12 @@ class RuntimeBudgets:
     max_plan_revisions: int = 4
     max_repair_rounds: int = 3
     max_runtime_seconds: int = 900
+    # How many times a turn may reset its wall-clock budget and keep going
+    # instead of the task failing outright when it runs out of time. This
+    # is a continuation, not a bigger single budget: every other guard
+    # (tool-call count, repeated actions, stall detection) still applies
+    # across the whole task and is untouched by an extension.
+    max_runtime_extensions: int = 3
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():
