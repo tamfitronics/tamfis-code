@@ -36,6 +36,8 @@ from .api_client import (
 )
 from .config import APPROVAL_MODES, CONFIG_DIR, Config, Credentials, load_config
 from .doctor import run_doctor
+from .runtime.memory import MemoryRecord, MemoryType, get_memory_store
+from .runtime.worktree import WorktreeError, create_worktree, list_worktrees, remove_worktree
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
 from .runner import (
     ACTIVE_TASK_STATUSES,
@@ -341,6 +343,125 @@ def workspace_remove(ctx: click.Context, path: Path):
         session_id, allowed_workspaces=[item for item in state.allowed_workspaces if item != target],
     )
     console.print(f"[green]Workspace removed:[/green] {target}")
+
+
+@cli.group(name="memory")
+def memory_group():
+    """Manage durable, cross-session memory records."""
+
+
+@memory_group.command(name="list")
+@click.option("--type", "memory_type", type=click.Choice([t.value for t in MemoryType]), default=None)
+def memory_list(memory_type: Optional[str]):
+    console = Console()
+    store = get_memory_store()
+    records = store.list(MemoryType(memory_type) if memory_type else None)
+    if not records:
+        console.print("[dim]No memory records.[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("name")
+    table.add_column("type")
+    table.add_column("description")
+    for record in records:
+        table.add_row(record.name, record.type.value, record.description)
+    console.print(table)
+
+
+@memory_group.command(name="show")
+@click.argument("name")
+def memory_show(name: str):
+    console = Console()
+    record = get_memory_store().load(name)
+    if record is None:
+        print_error(console, f"No memory record named {name!r}.")
+        raise SystemExit(EXIT_TASK_FAILED)
+    console.print(f"[bold]{record.name}[/bold] ({record.type.value})")
+    console.print(record.description)
+    console.print()
+    console.print(record.content)
+
+
+@memory_group.command(name="add")
+@click.argument("name")
+@click.option("--type", "memory_type", type=click.Choice([t.value for t in MemoryType]), required=True)
+@click.option("--description", required=True)
+@click.option("--content", required=True)
+def memory_add(name: str, memory_type: str, description: str, content: str):
+    console = Console()
+    record = get_memory_store().save(
+        MemoryRecord(name=name, type=MemoryType(memory_type), description=description, content=content)
+    )
+    console.print(f"[green]Saved memory record:[/green] {record.name}")
+
+
+@memory_group.command(name="forget")
+@click.argument("name")
+def memory_forget(name: str):
+    console = Console()
+    if get_memory_store().delete(name):
+        console.print(f"[green]Forgot memory record:[/green] {name}")
+    else:
+        print_error(console, f"No memory record named {name!r}.")
+        raise SystemExit(EXIT_TASK_FAILED)
+
+
+@cli.group(name="worktree")
+def worktree_group():
+    """Manage isolated git worktrees for background/parallel execution."""
+
+
+@worktree_group.command(name="list")
+@click.pass_context
+def worktree_list_cmd(ctx: click.Context):
+    console = Console(no_color=not ctx.obj["config"].colour)
+    try:
+        handles = list_worktrees(ctx.obj["workspace_root"])
+    except WorktreeError as exc:
+        print_error(console, str(exc))
+        raise SystemExit(EXIT_TASK_FAILED)
+    if not handles:
+        console.print("[dim]No worktrees.[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("branch")
+    table.add_column("path")
+    for handle in handles:
+        table.add_row(handle.branch, str(handle.path))
+    console.print(table)
+
+
+@worktree_group.command(name="create")
+@click.argument("branch")
+@click.option("--base", default="HEAD", help="Ref the new worktree branch is created from.")
+@click.pass_context
+def worktree_create_cmd(ctx: click.Context, branch: str, base: str):
+    console = Console(no_color=not ctx.obj["config"].colour)
+    try:
+        handle = create_worktree(ctx.obj["workspace_root"], branch=branch, base=base)
+    except WorktreeError as exc:
+        print_error(console, str(exc))
+        raise SystemExit(EXIT_TASK_FAILED)
+    console.print(f"[green]Worktree created:[/green] {handle.path} (branch {handle.branch})")
+
+
+@worktree_group.command(name="remove")
+@click.argument("branch")
+@click.option("--force", is_flag=True, default=False, help="Remove even if the worktree has uncommitted changes.")
+@click.pass_context
+def worktree_remove_cmd(ctx: click.Context, branch: str, force: bool):
+    console = Console(no_color=not ctx.obj["config"].colour)
+    try:
+        handles = {h.branch: h for h in list_worktrees(ctx.obj["workspace_root"])}
+        handle = handles.get(branch)
+        if handle is None:
+            print_error(console, f"No worktree found for branch {branch!r}.")
+            raise SystemExit(EXIT_TASK_FAILED)
+        remove_worktree(handle, force=force)
+    except WorktreeError as exc:
+        print_error(console, str(exc))
+        raise SystemExit(EXIT_TASK_FAILED)
+    console.print(f"[green]Worktree removed:[/green] {branch}")
 
 
 @cli.command(name="cwd")

@@ -233,9 +233,31 @@ def run_release_verification(root: Path, artifacts: Iterable[Path] = ()) -> Veri
     workspace_ok = all(marker in workspace_authority_text for marker in workspace_markers) and "resolve_workspace_targets(" in runner_text
     report.add("Workspace authority", workspace_ok, "fail-closed launch-root grants, explicit target resolution, and no sibling inference" if workspace_ok else "workspace authority markers missing", "orchestration")
 
-    phase_tests = [root / "tests" / f"test_phase{number}_{name}.py" for number, name in ((1, "reliability"), (2, "unified_runtime"), (3, "claude_behaviour"), (4, "release_verification"), (5, "cognitive_orchestration"), (6, "workspace_authority"))]
+    memory_text = _read(root / "tamfis_code" / "runtime" / "memory.py")
+    memory_markers = ("class MemoryStore", 'USER = "user"', 'FEEDBACK = "feedback"', 'PROJECT = "project"', 'REFERENCE = "reference"', "_atomic_write_json")
+    memory_ok = all(marker in memory_text for marker in memory_markers) and "relevant_memories(request.objective)" in unified_text
+    report.add("Durable cross-session memory", memory_ok, "typed, atomically-written memory store wired into task-contract derivation" if memory_ok else "memory store markers missing", "memory")
+
+    worktree_text = _read(root / "tamfis_code" / "runtime" / "worktree.py")
+    worktree_markers = ("def create_worktree", "def remove_worktree", "is_worktree_clean(handle)", "refusing to remove without force")
+    worktree_ok = all(marker in worktree_text for marker in worktree_markers) and 'request.isolation == "worktree"' in unified_text
+    report.add("Worktree isolation", worktree_ok, "fail-closed worktree creation, dirty-state removal guard, and unified-runtime isolation wiring present" if worktree_ok else "worktree isolation markers missing", "worktree")
+
+    approvals_text = _read(root / "tamfis_code" / "orchestrator" / "approvals.py")
+    approvals_markers = ("class ApprovalBatch", "def describe_batch", "risky_actions")
+    decision_ok = all(marker in approvals_text for marker in approvals_markers) and "_turn_batch = ApprovalBatch()" in runner_text and "_batch_denied_ids" in runner_text
+    report.add("Risk-tiered decision gating", decision_ok, "same-turn risky actions are batched into one approval decision instead of prompting per call" if decision_ok else "decision/approval batching markers missing", "decision")
+
+    phase_tests = [
+        root / "tests" / f"test_phase{number}_{name}.py"
+        for number, name in (
+            (1, "reliability"), (2, "unified_runtime"), (3, "claude_behaviour"),
+            (4, "release_verification"), (5, "cognitive_orchestration"), (6, "workspace_authority"),
+            (7, "memory"), (8, "worktree"), (9, "decision_logic"),
+        )
+    ]
     missing_tests = [path.name for path in phase_tests if not path.is_file()]
-    report.add("Phase regression suites", not missing_tests, "Phase 1-6 test modules present" if not missing_tests else f"missing: {', '.join(missing_tests)}", "tests")
+    report.add("Phase regression suites", not missing_tests, "Phase 1-9 test modules present" if not missing_tests else f"missing: {', '.join(missing_tests)}", "tests")
 
     for artifact in artifacts:
         artifact = Path(artifact)

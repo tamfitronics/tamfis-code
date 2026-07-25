@@ -47,8 +47,11 @@ from .render import StreamRenderer, resume_live_if_active, suspend_live_if_activ
 from .routing import classify_task
 from .orchestrator import (
     AgentOrchestrator,
+    ApprovalAction,
+    ApprovalBatch,
     ToolEnvelope,
     build_reasoning_plan_prompt,
+    describe_batch,
     parse_reasoning_plan,
     should_plan,
 )
@@ -4776,6 +4779,64 @@ async def _run_local_agent_turn_impl(
                 return outcome
             continue  # nudged -- give the model one more round to self-correct
 
+        # When one model turn requests several non-read-only actions, ask once
+        # for the whole batch instead of prompting per call -- mirrors how a
+        # multi-action turn is confirmed as one unit rather than N separate
+        # interruptions. A single risky action in the turn still falls through
+        # to the existing per-call prompt below unchanged.
+        _turn_batch = ApprovalBatch()
+        _turn_batch_args: dict[str, dict[str, Any]] = {}
+        for _tc in tool_calls:
+            try:
+                _tc_args = json.loads(_tc.arguments or "{}")
+            except json.JSONDecodeError:
+                _tc_args = {}
+            _turn_batch_args[_tc.call_id] = _tc_args
+            _tc_risk = classify_tool_call_risk(_tc.name, _tc_args, workspace_root=workspace_root)
+            _turn_batch.add(ApprovalAction(
+                _tc.name, _tc_args, purpose=f"Execute {_tc.name}", risk=_tc_risk,
+                cwd=str(_tc_args.get("cwd") or workspace_root),
+            ))
+        _batch_approved_once_ids: set[str] = set()
+        _batch_denied_ids: set[str] = set()
+        _risky_batch_actions = _turn_batch.risky_actions
+        if (
+            len(_risky_batch_actions) > 1
+            and not read_only
+            and _turn_batch.highest_risk not in session_approved_risks
+        ):
+            combined_text = describe_batch(_turn_batch)
+            suspend_live_if_active(renderer)
+            orchestrator.waiting_for_approval(f"Approve {len(_risky_batch_actions)} actions")
+            renderer.handle_event({
+                "event_type": "approval_required",
+                "payload": {
+                    "command": combined_text, "risk_level": _turn_batch.highest_risk,
+                    "working_directory": workspace_root,
+                    "reason": f"The agent requested {len(_risky_batch_actions)} actions in this turn.",
+                    "diff": None,
+                },
+            })
+            try:
+                _batch_decision = await resolve_approval_decision_async(
+                    console, combined_text, _turn_batch.highest_risk, turn_approval_policy, interactive,
+                    display_preview=False, config=cli_config,
+                )
+            finally:
+                resume_live_if_active(renderer)
+            _risky_ids = {
+                _tc.call_id for _tc in tool_calls
+                if classify_tool_call_risk(_tc.name, _turn_batch_args[_tc.call_id], workspace_root=workspace_root) != "read_only"
+            }
+            if _batch_decision == "approve_session":
+                for _action in _risky_batch_actions:
+                    session_approved_risks.add(_action.risk)
+                _batch_approved_once_ids |= _risky_ids
+            elif _batch_decision == "deny":
+                _batch_denied_ids |= _risky_ids
+            else:
+                _batch_approved_once_ids |= _risky_ids
+
         for tc in tool_calls:
             try:
                 arguments = json.loads(tc.arguments or "{}")
@@ -4900,7 +4961,16 @@ async def _run_local_agent_turn_impl(
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                 continue
 
-            if risk != "read_only" and risk not in session_approved_risks:
+            if risk != "read_only" and tc.call_id in _batch_denied_ids:
+                result = {"error": "Denied by approval policy -- try a different, less risky approach.", "success": False}
+                working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
+                renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                continue
+
+            if (
+                risk != "read_only" and risk not in session_approved_risks
+                and tc.call_id not in _batch_approved_once_ids
+            ):
                 # The live status line redraws on its own timer (independent
                 # of anything else writing to the console) -- confirmed live
                 # via a pty capture: suspending it *after* the panel below

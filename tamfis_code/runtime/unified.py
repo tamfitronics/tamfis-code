@@ -18,7 +18,9 @@ from .controller import ExecutionController
 from .journal import RuntimeEvent, append_event
 from .checkpoint import ExecutionCheckpoint, save_checkpoint
 from .cognitive import EvidenceGraph, EvidenceNode, TaskContract
+from .memory import relevant_memories
 from .reviewer import IndependentReviewer
+from .worktree import create_worktree
 
 
 class ExecutionMode(str, Enum):
@@ -37,6 +39,7 @@ class ExecutionRequest:
     interactive: bool = True
     approval_policy: str = "ask"
     read_only: bool = False
+    isolation: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
@@ -84,6 +87,12 @@ class UnifiedAgentRuntime:
                 raise RuntimeError("an agent execution is already active in this runtime")
             self.controller = ExecutionController()
             self._active_request = request
+            memories = relevant_memories(request.objective)
+            if memories:
+                request.metadata["relevant_memory"] = [
+                    {"name": m.name, "type": m.type.value, "description": m.description}
+                    for m in memories
+                ]
             self.task_contract = TaskContract.derive(
                 request.objective,
                 read_only=request.read_only,
@@ -93,6 +102,14 @@ class UnifiedAgentRuntime:
             self.evidence_graph = EvidenceGraph()
             self.last_review = None
             execution_id = uuid.uuid4().hex
+            if request.isolation == "worktree":
+                handle = create_worktree(request.workspace_root, branch=f"tamfis/{execution_id[:12]}")
+                request.metadata["worktree_path"] = str(handle.path)
+                request.metadata["worktree_branch"] = handle.branch
+                # The operation runs against the isolated checkout, not the launch
+                # workspace -- this is the one place isolation actually changes
+                # where execution happens.
+                request.workspace_root = str(handle.path)
             started = time.monotonic()
             append_event(RuntimeEvent(
                 event="execution_started", execution_id=execution_id, mode=request.mode.value,
