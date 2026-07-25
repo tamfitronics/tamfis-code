@@ -133,10 +133,16 @@ _TIP_ROTATE_EVERY_SECONDS = 8.0
 _ASSISTANT_REFRESH_INTERVAL_SECONDS = 0.08
 _ASSISTANT_REFRESH_MIN_CHARS = 96
 # Virtualize the live terminal viewport. The complete response remains in
-# the runner/checkpoint; Rich only reparses a bounded recent window so a very
-# long answer cannot turn every refresh into an ever-larger Markdown parse.
-_ASSISTANT_LIVE_MAX_CHARS = 12_000
-_ASSISTANT_LIVE_WINDOW_CHARS = 8_000
+# the runner/checkpoint; Rich only ever redraws a bounded recent tail in
+# place, and everything before that tail is committed to real terminal
+# scrollback (via Live.console.print) as soon as it's stable. A Live region
+# redraws by moving the cursor up N lines and repainting every refresh --
+# once N exceeds the terminal height that cursor math breaks (most
+# terminals can't scroll-and-reposition mid-redraw), which read as the UI
+# freezing and refusing to scroll on long answers. Keeping the live region
+# itself short-and-bounded, with older text pushed into normal scrollback,
+# is what lets the terminal auto-scroll the way Claude Code/Codex do.
+_ASSISTANT_LIVE_TAIL_CHARS = 2_000
 _ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|```\s*$)")
 _USER_MESSAGE_MAX_DISPLAY_CHARS = 20_000
 
@@ -384,6 +390,11 @@ class StreamRenderer:
         self._assistant_rendered_length = 0
         self._assistant_last_refresh = 0.0
         self._assistant_live: Optional[Live] = None
+        # How much of _assistant_buffer has already been committed to real
+        # scrollback (printed through the Live's own console, which pauses
+        # the live redraw, prints a permanent line, then resumes). The Live
+        # region itself only ever shows the remainder -- see _flush_assistant.
+        self._assistant_scrolled_length = 0
         # Set by live_input.py's LiveInputListener.start() for the duration
         # of one interactive turn; None for every other caller (one-shot
         # CLI commands, tests, the --remote path) -- suspend_live/resume_live
@@ -618,22 +629,32 @@ class StreamRenderer:
         self._assistant_pending = ""
         self._assistant_last_refresh = now
         if self._is_tty and self.live_input_listener is None:
-            render_buffer = self._assistant_buffer
-            if len(render_buffer) > _ASSISTANT_LIVE_MAX_CHARS:
-                render_buffer = (
-                    "[Earlier response content virtualized; full text is retained.]\n\n"
-                    + render_buffer[-_ASSISTANT_LIVE_WINDOW_CHARS:]
-                )
+            if self._assistant_live is None:
+                self._assistant_live = Live(Text(""), console=self.console, refresh_per_second=12)
+                self._assistant_live.start()
+            unscrolled = self._assistant_buffer[self._assistant_scrolled_length:]
+            while len(unscrolled) > _ASSISTANT_LIVE_TAIL_CHARS:
+                # Commit everything but a bounded tail to real scrollback.
+                # Looped (not a single trim) so one large burst -- force=True
+                # flushing a big pending chunk in one go, not just steady
+                # per-delta growth -- still converges to a bounded tail
+                # instead of leaving a live region taller than the terminal.
+                # The newline search only looks in a small window right
+                # before the target cut point: searching further back (like
+                # the previous "any earlier newline" version did) could
+                # under-cut by however far away that newline was, which is
+                # exactly how this overshot before.
+                target_cut = len(unscrolled) - _ASSISTANT_LIVE_TAIL_CHARS
+                nl_idx = unscrolled.rfind("\n", max(0, target_cut - 500), target_cut)
+                cut = nl_idx + 1 if nl_idx != -1 else target_cut
+                self._assistant_live.console.print(Text(unscrolled[:cut]), end="")
+                self._assistant_scrolled_length += cut
+                unscrolled = unscrolled[cut:]
             # During streaming, plain Text avoids reparsing the complete
             # Markdown document on every update. This is deliberately a
             # terminal viewport optimization; the canonical response text
             # and checkpoint remain unchanged.
-            document = Text(render_buffer)
-            if self._assistant_live is None:
-                self._assistant_live = Live(document, console=self.console, refresh_per_second=12)
-                self._assistant_live.start()
-            else:
-                self._assistant_live.update(document, refresh=True)
+            self._assistant_live.update(Text(unscrolled), refresh=True)
         else:
             delta = self._assistant_buffer[self._assistant_rendered_length:]
             if delta:
@@ -652,6 +673,7 @@ class StreamRenderer:
             self._assistant_pending = ""
             self._assistant_rendered_length = 0
             self._assistant_last_refresh = 0.0
+            self._assistant_scrolled_length = 0
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("event_type") or event.get("event") or event.get("type")
