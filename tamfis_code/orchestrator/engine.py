@@ -119,6 +119,21 @@ class AgentOrchestrator:
         # that -- no banner reprint, no spinner phase change, every round.
         self.emit({"event_type": "plan_step_progress", "payload": {"items": items}})
 
+    def edit_plan_step(self, index: int, *, name: str | None = None, status: str | None = None) -> None:
+        assert self.run is not None and self.run.plan is not None
+        self.run.plan.edit_step(index, name=name, status=status)
+        self._sync_plan_progress()
+
+    def add_plan_step(self, name: str, *, after: int | None = None) -> None:
+        assert self.run is not None and self.run.plan is not None
+        self.run.plan.add_step(name, after=after)
+        self._sync_plan_progress()
+
+    def remove_plan_step(self, index: int) -> None:
+        assert self.run is not None and self.run.plan is not None
+        self.run.plan.remove_step(index)
+        self._sync_plan_progress()
+
     def record_route(self, *, provider: str, model: str, reason: str, fallback_chain: list[str] | None = None) -> None:
         assert self.run is not None
         self.transition(AgentPhase.ROUTE, action="Select a capability-matched provider and model")
