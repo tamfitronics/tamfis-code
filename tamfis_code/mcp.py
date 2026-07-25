@@ -9,6 +9,8 @@ import re
 import subprocess
 import fnmatch
 import asyncio
+import os
+import tempfile
 import sys
 import shutil
 import tarfile
@@ -680,13 +682,31 @@ class MCPServer:
                 )
         return resolved
 
-    async def _write_file(self, path: str, content: str) -> str:
+    def _atomic_write_text(self, target: Path, content: str) -> None:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+                handle.write(content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temp_name, target)
+        except BaseException:
+            with contextlib.suppress(OSError):
+                os.unlink(temp_name)
+            raise
+
+    async def _write_file(self, path: str, content: str | None = None, **aliases: Any) -> str:
+        content = content if content is not None else aliases.pop("text", None)
+        content = content if content is not None else aliases.pop("new_content", None)
+        content = content if content is not None else aliases.pop("file_content", None)
+        if content is None:
+            return "❌ Error: write_file requires content"
         p = self._resolve_in_workspace(path)
         original_content = p.read_text(encoding="utf-8", errors="ignore") if p.is_file() else None
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(content, encoding='utf-8')
-        if not p.exists():
-            return f"❌ Failed to write to '{path}'"
+        self._atomic_write_text(p, content)
+        if p.read_text(encoding="utf-8", errors="strict") != content:
+            return f"❌ Failed to verify write to '{path}'"
         if self.session_id is not None:
             from .safety import record_mutation
             record_mutation(
@@ -696,7 +716,18 @@ class MCPServer:
             )
         return f"✅ Successfully wrote {len(content)} bytes to '{path}'"
 
-    async def _edit_file(self, path: str, old_string: str, new_string: str) -> str:
+    async def _edit_file(
+        self, path: str, old_string: str | None = None, new_string: str | None = None, **aliases: Any
+    ) -> str:
+        old_string = old_string if old_string is not None else aliases.pop("old_text", None)
+        new_string = new_string if new_string is not None else aliases.pop("new_text", None)
+        new_string = new_string if new_string is not None else aliases.pop("replacement", None)
+        full_content = aliases.pop("content", None)
+        full_content = full_content if full_content is not None else aliases.pop("new_content", None)
+        if full_content is not None and old_string is None:
+            return await self._write_file(path, content=full_content)
+        if old_string is None or new_string is None:
+            return "❌ Error: edit_file requires old_string and new_string, or content for full replacement"
         p = self._resolve_in_workspace(path)
         if not p.is_file():
             return f"❌ Error: File '{path}' not found"
@@ -710,7 +741,9 @@ class MCPServer:
                 "Include more surrounding context to disambiguate."
             )
         new_content = original_content.replace(old_string, new_string, 1)
-        p.write_text(new_content, encoding="utf-8")
+        self._atomic_write_text(p, new_content)
+        if p.read_text(encoding="utf-8", errors="strict") != new_content:
+            return f"❌ Failed to verify edit to '{path}'"
         if self.session_id is not None:
             from .safety import record_mutation
             record_mutation(

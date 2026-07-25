@@ -356,7 +356,7 @@ async def _print_command_budget_if_notable(client: RemoteAPIClient, console: Con
         console.print(f"[{style}]Commands used: {count}/{budget} for this task.[/{style}]")
 
 
-async def run_ai_task_and_stream(
+async def _run_ai_task_and_stream_impl(
     client: RemoteAPIClient,
     renderer: StreamRenderer,
     console: Console,
@@ -838,3 +838,28 @@ async def follow_session_logs(
         interrupt_task.cancel()
         uninstall_sigint()
         renderer.finish()
+
+
+async def run_ai_task_and_stream(
+    client: RemoteAPIClient,
+    renderer: StreamRenderer,
+    console: Console,
+    *,
+    session_id: int,
+    objective: str,
+    mode: str,
+    approval_policy: str,
+    interactive: bool,
+    model: str = "auto",
+    provider: Optional[str] = None,
+    attachments: Optional[list[dict[str, Any]]] = None,
+    config: Optional[Config] = None,
+) -> TaskOutcome:
+    """Public remote adapter routed through the unified Phase 2 runtime."""
+    from .runtime.unified import get_unified_runtime
+    return await get_unified_runtime().execute_remote(
+        client=client, renderer=renderer, console=console, session_id=session_id,
+        objective=objective, mode=mode, approval_policy=approval_policy,
+        interactive=interactive, model=model, provider=provider,
+        attachments=attachments, config=config,
+    )

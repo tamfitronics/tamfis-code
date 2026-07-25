@@ -57,6 +57,7 @@ from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
 from .workspace import classify_root
+from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
 # was appropriate for a read-only Q&A loop; a real coding-agent task
@@ -3272,6 +3273,9 @@ def _build_planning_reconnaissance(
 
     lines.append("PLANNING RULE: do not propose a command unless it appears above as manifest-backed.")
     lines.append("PLANNING RULE: first inspect the named objective-matching paths and manifests; do not guess services or migrations.")
+    lines.append("EVIDENCE RULE: current source, manifests, live service state, and current tests outrank reports and status documents.")
+    lines.append("EVIDENCE RULE: files marked SUPERSEDED or PARTIALLY SUPERSEDED may guide inspection only; they cannot support a current-state conclusion without re-verification.")
+    lines.append("COMPLETION RULE: do not present a final audit conclusion while any required plan step is pending, in progress, or failed without an explicit limitation.")
     return "\n".join(lines)
 
 
@@ -3397,7 +3401,7 @@ def _perform_context_rollover(
     return [leading_system, scope_message, continuation, latest_user]
 
 
-async def run_local_agent_turn(
+async def _run_local_agent_turn_impl(
     manager: ProviderManager,
     provider: ProviderType,
     model: Optional[str],
@@ -3547,10 +3551,26 @@ async def run_local_agent_turn(
             tools = [*tools, SWARM_TOOL_SCHEMA]
 
     working_messages = list(orchestration.context.messages if orchestration.context else messages)
-    # Approved roots grant access to explicitly named external paths; they
-    # are not additional active audit targets. Keep the current --cwd as the
-    # task scope so unrelated approved projects are never mixed into it.
-    scope_roots = _detect_workspace_scope(workspace_root, objective)
+    # Resolve workspace authority before planning or repository inspection.
+    # Product names and sibling directory names never expand scope. External
+    # roots require both an explicit absolute path in the objective and a
+    # durable session grant.
+    try:
+        workspace_resolution = resolve_workspace_targets(
+            launch_root=workspace_root,
+            objective=objective,
+            allowed_roots=prior_state.allowed_workspaces or [workspace_root],
+        )
+    except WorkspaceAuthorityError as exc:
+        message = str(exc)
+        orchestrator.fail(message)
+        renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+        local_state.save_turn_checkpoint(
+            session_id, objective=objective, mode=("read_only" if read_only else "execute"),
+            messages=messages, status="failed", last_error=message,
+        )
+        return TaskOutcome(status="failed", error=message)
+    scope_roots = list(workspace_resolution.roots)
     _apply_mcp_task_scope(mcp_server, scope_roots)
     scope_message = {
         "role": "system",
@@ -5110,3 +5130,34 @@ async def run_local_shell_command(
     local_state.finish_action(session_id, action.id, status=outcome.status, summary=f"exit={exit_code}")
     local_state.checkpoint(session_id, reason=f"command_{outcome.status}", summary=f"exit={exit_code}")
     return outcome
+
+
+async def run_local_agent_turn(
+    manager: ProviderManager,
+    provider: ProviderType,
+    model: Optional[str],
+    messages: list[dict[str, Any]],
+    console: Console,
+    renderer: StreamRenderer,
+    *,
+    workspace_root: str,
+    session_id: int,
+    approval_policy: str = "ask",
+    interactive: bool = True,
+    max_rounds: int = MAX_AGENT_ROUNDS,
+    read_only: bool = False,
+    cli_config: Optional[Config] = None,
+    allow_swarm_tool: bool = False,
+    attachment_paths: tuple[str, ...] = (),
+    image_content_blocks: Optional[list[dict[str, Any]]] = None,
+) -> TaskOutcome:
+    """Public local adapter routed through the unified Phase 2 runtime."""
+    from .runtime.unified import get_unified_runtime
+    return await get_unified_runtime().execute_local(
+        manager=manager, provider=provider, model=model, messages=messages,
+        console=console, renderer=renderer, workspace_root=workspace_root,
+        session_id=session_id, approval_policy=approval_policy,
+        interactive=interactive, max_rounds=max_rounds, read_only=read_only,
+        cli_config=cli_config, allow_swarm_tool=allow_swarm_tool,
+        attachment_paths=attachment_paths, image_content_blocks=image_content_blocks,
+    )

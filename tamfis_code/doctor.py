@@ -21,6 +21,7 @@ from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .config import Config, load_credentials
 from .providers import get_provider_status
 from .workspace import resolve_local_workspace
+from .runtime.journal import JOURNAL_PATH, recent_failures
 
 
 @dataclass
@@ -189,6 +190,20 @@ def _diagnose_local_session(workspace_root: Path) -> list[CheckResult]:
             by_status[step.get("status", "pending")] = by_status.get(step.get("status", "pending"), 0) + 1
         summary = ", ".join(f"{count} {name}" for name, count in sorted(by_status.items())) or "no steps"
         results.append(CheckResult("Active plan step progress", "PASS", summary))
+
+    failures = recent_failures(5)
+    if failures:
+        latest = failures[0]
+        detail = (
+            f"{len(failures)} recent failed/cancelled execution(s); latest "
+            f"{latest.get('mode', 'unknown')} at {latest.get('timestamp', 'unknown')}: "
+            f"{latest.get('error') or latest.get('status') or 'unknown failure'}"
+        )
+        results.append(CheckResult("Unified runtime recent failures", "WARNING", detail))
+    elif JOURNAL_PATH.exists():
+        results.append(CheckResult("Unified runtime recent failures", "PASS", "none in the recent execution journal"))
+    else:
+        results.append(CheckResult("Unified runtime execution journal", "WARNING", "no unified runtime executions recorded yet"))
 
     return results
 

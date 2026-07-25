@@ -1014,7 +1014,7 @@ def print_banner(console: Console, *, host: str, workspace_root: str, mode: str,
     console.print(f"[dim]Workspace:[/dim] {workspace_root}")
     if host.startswith("local:"):
         route = host.split(":", 1)[1] or "auto"
-        route_label = "auto (nvidia, openrouter, hf, in capability-ranked order)" if route == "auto" else route
+        route_label = "auto (ollama_cloud, nvidia, hf, openrouter, in authoritative priority order)" if route == "auto" else route
         console.print(
             f"[dim]Mode:[/dim] {mode}   [dim]Approval:[/dim] {approval_policy}   "
             f"[dim]Runtime:[/dim] standalone   [dim]Provider:[/dim] {route_label}"

@@ -38,7 +38,7 @@ def resolve_provider_type(name: Optional[str]) -> ProviderType:
     return _PROVIDER_ALIASES[key]
 
 
-async def run_local_turn(
+async def _run_local_turn_impl(
     manager: ProviderManager,
     provider: ProviderType,
     messages: List[Dict[str, Any]],
@@ -108,7 +108,7 @@ async def run_local_turn(
     return "(Stopped after exhausting the local tool-call round limit -- try a narrower question.)"
 
 
-async def stream_local_turn(
+async def _stream_local_turn_impl(
     manager: ProviderManager,
     provider: ProviderType,
     messages: List[Dict[str, Any]],
@@ -118,4 +118,35 @@ async def stream_local_turn(
     turn needs no repo inspection (kept separate from run_local_turn so the
     common single-shot/no-tools case still gets real token streaming)."""
     async for chunk in manager.chat_completion(provider, messages, model=model, stream=True):
+        yield chunk
+
+
+async def run_local_turn(
+    manager: ProviderManager,
+    provider: ProviderType,
+    messages: List[Dict[str, Any]],
+    model: Optional[str],
+    console: Console,
+    *,
+    use_tools: bool = True,
+) -> str:
+    """Compatibility adapter routed through the unified runtime."""
+    from .runtime.unified import get_unified_runtime
+    return await get_unified_runtime().execute_local_chat(
+        manager=manager, provider=provider, messages=messages, model=model,
+        console=console, use_tools=use_tools,
+    )
+
+
+async def stream_local_turn(
+    manager: ProviderManager,
+    provider: ProviderType,
+    messages: List[Dict[str, Any]],
+    model: Optional[str],
+) -> AsyncIterator[str]:
+    """Compatibility streaming adapter routed through the unified runtime."""
+    from .runtime.unified import get_unified_runtime
+    async for chunk in get_unified_runtime().stream_local_chat(
+        manager=manager, provider=provider, messages=messages, model=model,
+    ):
         yield chunk

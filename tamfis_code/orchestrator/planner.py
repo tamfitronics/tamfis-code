@@ -94,6 +94,47 @@ class ExecutionPlan:
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
 
+    def _reindex(self) -> None:
+        for index, step in enumerate(self.steps, start=1):
+            step.index = index
+
+    def add_step(self, name: str, *, after: int | None = None, evidence: list[str] | None = None) -> PlanStep:
+        step = PlanStep(0, name.strip(), evidence=list(evidence or []))
+        if not step.name:
+            raise ValueError("plan step name cannot be empty")
+        if after is None:
+            self.steps.append(step)
+        else:
+            position = max(0, min(int(after), len(self.steps)))
+            self.steps.insert(position, step)
+        self._reindex()
+        return step
+
+    def edit_step(self, index: int, *, name: str | None = None, status: str | None = None) -> PlanStep:
+        if index < 1 or index > len(self.steps):
+            raise IndexError("plan step index out of range")
+        step = self.steps[index - 1]
+        if name is not None:
+            cleaned = name.strip()
+            if not cleaned:
+                raise ValueError("plan step name cannot be empty")
+            step.name = cleaned
+        if status is not None:
+            if status not in {"pending", "in_progress", "completed", "blocked", "skipped"}:
+                raise ValueError("invalid plan step status")
+            step.status = status
+        return step
+
+    def remove_step(self, index: int) -> PlanStep:
+        if index < 1 or index > len(self.steps):
+            raise IndexError("plan step index out of range")
+        removed = self.steps.pop(index - 1)
+        self._reindex()
+        return removed
+
+    def next_pending(self) -> PlanStep | None:
+        return next((step for step in self.steps if step.status == "pending"), None)
+
 
 @dataclass
 class PlannerEvidence:

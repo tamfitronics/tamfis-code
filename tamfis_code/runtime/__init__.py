@@ -2,6 +2,7 @@
 from .budgets import RuntimeBudgets
 from .controller import ExecutionController, GuardDecision, ObservationDecision
 from .state import RuntimePhase, RuntimeSnapshot
+from .unified import ExecutionMode, ExecutionRecord, ExecutionRequest, UnifiedAgentRuntime, get_unified_runtime
 
 __all__ = [
     "ExecutionController",
@@ -10,4 +11,9 @@ __all__ = [
     "RuntimeBudgets",
     "RuntimePhase",
     "RuntimeSnapshot",
+    "ExecutionMode",
+    "ExecutionRecord",
+    "ExecutionRequest",
+    "UnifiedAgentRuntime",
+    "get_unified_runtime",
 ]

@@ -53,7 +53,7 @@ from .local_chat import _PROVIDER_ALIASES
 # validation and then failed with "Unknown local provider" inside
 # resolve_provider_type every time.
 _PROVIDER_CHOICES = sorted(_PROVIDER_ALIASES.keys())
-_PROVIDER_HELP = "tamfis/tamfisgpt (subscription API), hf, nvidia, openrouter, or auto (default)."
+_PROVIDER_HELP = "tamfis/tamfisgpt (subscription API), ollama_cloud, nvidia, hf, openrouter, or auto (default)."
 
 EXIT_OK = 0
 EXIT_TASK_FAILED = 1
@@ -100,7 +100,7 @@ def async_command(fn):
 @click.option("--approval", "approval_policy", type=click.Choice(APPROVAL_MODES), default=None, help="Override the configured approval policy for this invocation. Note: 'never' means deny everything outright -- the opposite of 'auto'/'full-auto' (which mean never PROMPT, i.e. auto-approve). It is not a synonym for auto-approve.")
 @click.option("--api-base", "api_base", default=None, help="Override the configured Remote API base URL.")
 @click.option("--cwd", "cwd_override", type=click.Path(exists=True, file_okay=False), default=None, help="Treat this directory as the workspace instead of the current directory.")
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default) -- which provider the bare (no-subcommand) interactive REPL calls directly.")
+@click.option("--provider", default="auto", help="ollama_cloud, nvidia, hf, openrouter, or auto (default) -- which provider the bare (no-subcommand) interactive REPL calls directly.")
 @click.option("--model", default=None, help="Provider-specific model id for the bare interactive REPL; defaults to that provider's default model.")
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend for the bare interactive REPL instead of calling a provider directly.")
 @click.version_option(__version__, prog_name="tamfis-code")
@@ -422,7 +422,7 @@ async def init(ctx: click.Context, remote: bool):
 
 
 @cli.command()
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default).")
+@click.option("--provider", default="auto", help="ollama_cloud, nvidia, hf, openrouter, or auto (default).")
 @click.option("--remote", is_flag=True, default=False, help="Check the legacy TamfisGPT Remote Workspace backend instead of local provider connectivity.")
 @click.pass_context
 @async_command
@@ -1359,7 +1359,7 @@ async def run(ctx: click.Context, command: str, background: bool, remote: bool):
 
 @cli.command()
 @click.argument("session_id", type=int, required=False, default=None)
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default).")
+@click.option("--provider", default="auto", help="ollama_cloud, nvidia, hf, openrouter, or auto (default).")
 @click.option("--model", default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.option("--remote", is_flag=True, default=False, help="Resume a session on the legacy TamfisGPT Remote Workspace backend instead of a local one.")
 @click.pass_context
@@ -1426,7 +1426,7 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
 
 @cli.command()
 @click.argument("task_id", required=False, default=None)
-@click.option("--provider", default="auto", help="hf, nvidia, openrouter, or auto (default).")
+@click.option("--provider", default="auto", help="ollama_cloud, nvidia, hf, openrouter, or auto (default).")
 @click.option("--model", default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.option("--remote", is_flag=True, default=False, help="Retry a task on the legacy TamfisGPT Remote Workspace backend instead of resending locally.")
 @click.pass_context
@@ -1948,7 +1948,7 @@ def completion_cmd(shell: str):
 @click.option('--task', '-t', 'tasks', multiple=True, help='Task description (repeatable for delegate)')
 @click.option('--file', '-f', help='File to operate on')
 @click.option('--max-concurrency', default=1, show_default=True, help='Max concurrent delegated sub-tasks')
-@click.option('--provider', default="auto", help="hf, nvidia, openrouter, or auto (default).")
+@click.option('--provider', default="auto", help="ollama_cloud, nvidia, hf, openrouter, or auto (default).")
 @click.option('--model', default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.pass_context
 def agent_cmd(ctx: click.Context, action: str, tasks: tuple[str, ...], file: str, max_concurrency: int, provider: str, model: Optional[str]):
@@ -2189,7 +2189,7 @@ def providers_command(ctx: click.Context):
 
 @cli.command('local')
 @click.argument('objective', required=False)
-@click.option('--provider', default="auto", help="hf, nvidia, openrouter, or auto (default).")
+@click.option('--provider', default="auto", help="ollama_cloud, nvidia, hf, openrouter, or auto (default).")
 @click.option('--model', default=None, help="Provider-specific model id; defaults to that provider's default model.")
 @click.option('--no-tools', 'no_tools', is_flag=True, default=False, help="Disable read-only repo tools (read_file/list_directory/search_code/get_git_info) for this turn.")
 @click.option('--agent', 'full_agent', is_flag=True, default=False, help="Full read/write/execute tool access (write_file/edit_file/execute_command) via the local risk/approval/mutation-ledger layer, instead of read-only Q&A. Standalone -- no TamfisGPT backend involved.")
@@ -2381,6 +2381,34 @@ from .enforcer import TestEnforcer, run_enforcer, add_enforcer_command
 # flags wired to _run_shell_checks/_run_type_checks, neither of which exist on
 # TestEnforcer -- using those flags raised AttributeError at runtime.
 add_enforcer_command(cli)
+
+@cli.command("verify-release")
+@click.option("--artifact", "artifacts", multiple=True, type=click.Path(exists=True, dir_okay=False, path_type=Path), help="Built wheel, source archive, checksum, or manifest to verify.")
+@click.option("--output-dir", type=click.Path(file_okay=False, path_type=Path), default=None, help="Directory for JSON and Markdown verification reports.")
+@click.pass_context
+def verify_release_command(ctx: click.Context, artifacts: tuple[Path, ...], output_dir: Optional[Path]):
+    """Run the Phase 4 release gate without contacting any AI provider."""
+    from .release_verification import run_release_verification
+
+    root: Path = ctx.obj["workspace_root"]
+    report = run_release_verification(root, artifacts)
+    console = Console(no_color=not ctx.obj["config"].colour)
+    table = Table(show_header=True, header_style="bold")
+    table.add_column("Category")
+    table.add_column("Check")
+    table.add_column("Result")
+    table.add_column("Detail")
+    for check in report.checks:
+        table.add_row(check.category, check.name, "PASS" if check.passed else "FAIL", check.detail)
+    console.print(table)
+
+    destination = output_dir or (root / "dist")
+    json_path = report.write_json(destination / f"tamfis_code-{report.version}-verification-report.json")
+    md_path = report.write_markdown(destination / f"tamfis_code-{report.version}-verification-report.md")
+    console.print(f"Verification reports: {json_path}  {md_path}")
+    if not report.passed:
+        raise SystemExit(EXIT_TASK_FAILED)
+
 
 # Familiar GitHub CLI command surface, delegated to the installed `gh` binary.
 from .github_commands import register_github_commands

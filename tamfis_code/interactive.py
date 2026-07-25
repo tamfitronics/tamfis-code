@@ -107,7 +107,7 @@ async def _run_cancellable_local_turn(
             error="Task cancelled by user.",
         )
     finally:
-        live_input.stop()
+        await live_input.stop()
 
 
 HELP_TEXT = """\
@@ -589,8 +589,41 @@ async def run_interactive(
                 break
             except EOFError:
                 break
+            resolved_paste_count = 0
+            resolved_paste_chars = 0
+            resolved_paste_lines = 0
+
             for placeholder, real_text in pending_pastes.items():
+                if placeholder not in text:
+                    continue
+
                 text = text.replace(placeholder, real_text)
+                resolved_paste_count += 1
+                resolved_paste_chars += len(real_text)
+                resolved_paste_lines += real_text.count("\n") + (
+                    0 if real_text.endswith("\n") else 1
+                )
+
+            unresolved_pastes = re.findall(
+                r"\[Pasted text #\d+ \+\d+ lines\]",
+                text,
+            )
+            if unresolved_pastes:
+                print_error(
+                    console,
+                    "Pasted-text resolution failed. The underlying paste was "
+                    "not available, so no task was submitted. Unresolved: "
+                    + ", ".join(unresolved_pastes),
+                )
+                continue
+
+            if resolved_paste_count:
+                console.print(
+                    "[dim]diagnostics: Resolved "
+                    f"{resolved_paste_count} pasted-text block(s), "
+                    f"{resolved_paste_lines:,} line(s), "
+                    f"{resolved_paste_chars:,} character(s).[/dim]"
+                )
 
         text = text.strip()
         if not text:

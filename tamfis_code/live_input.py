@@ -61,21 +61,29 @@ class LiveInputListener:
         self._active = True
         self._schedule_prompt()
 
-    def stop(self) -> None:
+    async def stop(self) -> None:
+        """Stop input ownership and wait until prompt-toolkit releases stdin."""
         self._active = False
-        self._cancel_prompt()
+        await self._shutdown_prompt()
         if self.renderer.live_input_listener is self:
             self.renderer.live_input_listener = None
-            self.renderer.resume_live()
+        self.renderer.resume_live()
 
     def pause(self) -> None:
+        """Synchronously request prompt shutdown before another UI reads stdin."""
         self._paused = True
+        self._request_prompt_exit()
         self._cancel_prompt()
 
     def resume(self) -> None:
         self._paused = False
-        if self._active:
-            self._schedule_prompt()
+        if not self._active:
+            return
+        task = self._input_task
+        if task is not None and not task.done():
+            task.add_done_callback(lambda _task: self._schedule_prompt() if self._active and not self._paused else None)
+            return
+        self._schedule_prompt()
 
     def _dispatch(self) -> None:
         """Compatibility hook for older embedders; start() no longer uses it."""
@@ -102,11 +110,28 @@ class LiveInputListener:
         if self._input_task is None or self._input_task.done():
             self._input_task = asyncio.create_task(self._input_loop())
 
+    def _request_prompt_exit(self) -> None:
+        session = self._prompt_session
+        app = getattr(session, "app", None)
+        if app is not None and not getattr(app, "is_done", False):
+            with contextlib.suppress(Exception):
+                app.exit(result="")
+
     def _cancel_prompt(self) -> None:
+        task = self._input_task
+        if task is not None and not task.done():
+            task.cancel()
+
+    async def _shutdown_prompt(self) -> None:
+        self._request_prompt_exit()
         task = self._input_task
         self._input_task = None
         if task is not None and not task.done():
             task.cancel()
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
+        self._prompt_session = None
 
     def invalidate(self) -> None:
         """Refresh the prompt footer after a streamed phase/status update."""
@@ -157,40 +182,32 @@ class LiveInputListener:
 
         session = PromptSession(key_bindings=bindings)
         self._prompt_session = session
-        while self._active and not self._paused:
-            try:
-                # patch_stdout keeps concurrent tool/assistant output above
-                # the current line and redraws the line beneath it.
-                with patch_stdout(raw=True):
-                    text = await session.prompt_async(
-                        "message> ", bottom_toolbar=self._bottom_toolbar,
-                    )
-            except asyncio.CancelledError:
-                return
-            except KeyboardInterrupt:
-                # Ctrl+C is the process/REPL exit affordance. The active
-                # runner's signal path remains reserved for true process
-                # interrupts; queue an explicit exit so the local runner
-                # can finish its current safe boundary and the REPL exits.
-                self._enqueue_control("exit")
-                return
-            except EOFError:
-                return
+        try:
+            while self._active and not self._paused:
+                try:
+                    with patch_stdout(raw=True):
+                        text = await session.prompt_async(
+                            "message> ", bottom_toolbar=self._bottom_toolbar,
+                        )
+                except asyncio.CancelledError:
+                    raise
+                except KeyboardInterrupt:
+                    self._request_interrupt("cancel")
+                    return
+                except EOFError:
+                    return
 
-            # Escape sets _paused before exiting the prompt, so its empty
-            # result must not be queued or cause another editor to start.
-            if self._paused:
-                break
-
-            # A genuine line already returned by prompt_async remains valid
-            # even when the listener was deactivated during that prompt.
-            # Queue it first, then let the loop terminate cleanly.
-            self._enqueue(text)
-
-            if not self._active:
-                break
-
-        self._prompt_session = None
+                if self._paused:
+                    break
+                self._enqueue(text)
+                if not self._active:
+                    break
+        finally:
+            if self._prompt_session is session:
+                self._prompt_session = None
+            current = asyncio.current_task()
+            if self._input_task is current:
+                self._input_task = None
 
     @property
     def interrupt_classification(self) -> Optional[str]:

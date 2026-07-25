@@ -61,7 +61,7 @@ class TamfisAgent:
     ) -> AgentRunResult:
         from rich.console import Console
         from tamfis_code.providers import ProviderManager, ProviderType
-        from tamfis_code.runner_local import run_local_agent_turn
+        from tamfis_code.runtime.unified import get_unified_runtime
 
         if self.conversation.state == ConversationState.RUNNING:
             raise RuntimeError("conversation is already running")
@@ -74,7 +74,7 @@ class TamfisAgent:
         except ValueError as exc:
             raise ValueError(f"unsupported provider: {provider}") from exc
         try:
-            outcome = await run_local_agent_turn(
+            outcome = await get_unified_runtime().execute_local(
                 manager,
                 selected,
                 model,
