@@ -18,6 +18,7 @@ from typing import Any, Optional
 
 from rich.console import Console, Group
 from rich.live import Live
+from rich.markup import escape
 from rich.panel import Panel
 from rich.table import Table
 from rich.spinner import Spinner
@@ -28,6 +29,20 @@ from .metrics import MetricsTracker
 from .safety import redact_secrets
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
+
+# Single source of truth for plan-step glyph/colour, shared by the transient
+# live spinner (_build_status) and the durable scrollback snapshot
+# (_print_plan_snapshot) -- these used to disagree (the live view showed
+# ◉ for in_progress, the permanent snapshot showed ▶), and only the live
+# view was coloured, so the same step looked like two different UIs
+# depending on which one happened to be drawing it.
+# (marker, marker_style, step-text style)
+_PLAN_MARKER_BY_STATUS: dict[str, tuple[str, str, str]] = {
+    "completed": ("✓", "green", "dim strike"),
+    "failed": ("✗", "bold red", "red"),
+    "in_progress": ("◉", "bold yellow", "bold"),
+    "pending": ("○", "dim", "dim"),
+}
 
 # Mirrors runner.py's own `phase_by_event` mapping (used there to persist
 # SessionState.current_phase) purely for this renderer's live display -- kept
@@ -284,7 +299,17 @@ def _render_result_block(console: Console, *, ok: bool, label: str, content: str
     routine reads/greps/pip-freezes. Approval prompts still get a Panel
     (see approval_required below) since those genuinely need to interrupt."""
     glyph, style = ("✓", "green") if ok else ("✗", "red")
-    console.print(f"[{style}]{glyph}[/{style}] {label}")
+    # `label` embeds raw tool arguments (grep patterns, paths, commands) --
+    # e.g. a pattern like "[0-9]+" -- and `content` is raw tool/command
+    # output. Both are untrusted-for-markup: printed through an f-string
+    # console.print (which parses Rich markup/highlights by default) they
+    # get silently mangled (bracket runs read as style tags, ReprHighlighter
+    # recolours "words" inside them and can drop text). Building explicit
+    # Text objects and disabling the console's syntax highlighter for them
+    # keeps arbitrary tool output showing exactly what it is.
+    header = Text(f"{glyph} ", style=style)
+    header.append(label)
+    console.print(header, highlight=False)
     body = content.strip("\n")
     if not body:
         return
@@ -293,7 +318,7 @@ def _render_result_block(console: Console, *, ok: bool, label: str, content: str
         omitted = len(lines) - _RESULT_BLOCK_MAX_LINES
         lines = lines[:_RESULT_BLOCK_MAX_LINES] + [f"… {omitted} more line{'s' if omitted != 1 else ''} …"]
     for line in lines:
-        console.print(f"  [dim]{line}[/dim]")
+        console.print(Text(f"  {line}", style="dim"), highlight=False)
 
 
 def _format_diagnostics_line(payload: dict[str, Any]) -> str:
@@ -502,17 +527,23 @@ class StreamRenderer:
         if tip:
             lines.append(Text.from_markup(f"  [dim]{tip}[/dim]"))
         for step in self._plan_steps:
-            status = step.get("status")
-            marker = "[green]✓[/green]" if status == "completed" else (
-                "[yellow]◉[/yellow]" if status == "in_progress" else "[dim]○[/dim]"
-            )
+            status = str(step.get("status") or "pending")
+            marker, marker_style, text_style = _PLAN_MARKER_BY_STATUS.get(status, _PLAN_MARKER_BY_STATUS["pending"])
+            # Built with Text.append (styled spans), not Text.from_markup --
+            # step text comes from the model's own plan and from_markup
+            # would parse any literal "[...]" inside it as a (possibly
+            # unintended, possibly broken) style tag instead of visible text.
+            line = Text("  ")
+            line.append(marker, style=marker_style)
+            line.append(" ")
             # No per-step completion event exists yet (see state.py's
             # update_plan_steps docstring) -- statuses beyond the initial
             # plan_created payload are a best-effort approximation, so this
             # is labelled "~" rather than presented as precise.
-            lines.append(Text.from_markup(
-                f"  {marker} {'~ ' if status == 'in_progress' else ''}{step.get('step') or ''}"
-            ))
+            if status == "in_progress":
+                line.append("~ ", style=marker_style)
+            line.append(str(step.get("step") or ""), style=text_style)
+            lines.append(line)
         return Group(self._spinner, *lines)
 
     def _refresh_live(self) -> None:
@@ -530,20 +561,22 @@ class StreamRenderer:
         creation and every status transition gets a durable snapshot here.
         """
         table = Table.grid(padding=(0, 1))
-        table.add_column(width=4, justify="right", style="cyan")
+        table.add_column(width=4, justify="right")
         table.add_column(ratio=1)
         for index, item in enumerate(items, start=1):
             status = str(item.get("status") or "pending")
-            marker = "✓" if status == "completed" else (
-                "✗" if status == "failed" else ("▶" if status == "in_progress" else "○")
+            marker, marker_style, text_style = _PLAN_MARKER_BY_STATUS.get(status, _PLAN_MARKER_BY_STATUS["pending"])
+            step_text = str(item.get("step") or "")
+            table.add_row(
+                Text(f"{index}. {marker}", style=marker_style),
+                Text(step_text, style=text_style),
             )
-            table.add_row(f"{index}. {marker}", f"{item.get('step') or ''} · {status}")
         body: list[Any] = [table]
         if assumptions:
             body.extend([Text("Assumptions", style="bold"), Text(" • " + "\n • ".join(map(str, assumptions)))])
         if risks:
             body.extend([Text("Risks", style="bold yellow"), Text(" • " + "\n • ".join(map(str, risks)))])
-        self.console.print(Panel(Group(*body), title=title, border_style="cyan", expand=False))
+        self.console.print(Panel(Group(*body), title=Text(title), border_style="cyan", expand=False))
 
     def _stop_live(self) -> None:
         """End the progress display before ordinary streamed output begins."""
@@ -684,7 +717,7 @@ class StreamRenderer:
         denied = [str(item) for item in payload.get("denied_targets") or []]
         allowed = [str(item) for item in payload.get("allowed_roots") or []]
         if not denied and not allowed:
-            self.console.print(f"[bold red]Task failed:[/bold red] {error}")
+            self.console.print(f"[bold red]Task failed:[/bold red] {escape(error)}")
             return
         # The denied/allowed paths are rendered as real bullet lists below,
         # so the headline is deliberately just the sentence explaining what
@@ -744,7 +777,7 @@ class StreamRenderer:
                 self._reasoning_last = now
                 self._refresh_live()
                 if self.debug:
-                    self.console.print(f"[dim italic]{content}[/dim italic]", end="")
+                    self.console.print(f"[dim italic]{escape(content)}[/dim italic]", end="")
             return
 
         if event_type == "assistant_delta":
@@ -819,14 +852,14 @@ class StreamRenderer:
                 # contradictory provider claim in progress output.
                 if self._selected_provider and content.lower().startswith("executing with "):
                     content = f"Executing with {self._selected_provider}..."
-                self.console.print(f"[dim]· {content}[/dim]")
+                self.console.print(f"[dim]· {escape(content)}[/dim]")
             return
 
         if event_type == "tool_call_requested":
             self._close_assistant()
             name = str(payload.get("name") or payload.get("tool") or "tool")
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
-            self.console.print(f"[bold yellow]→ {_tool_action_label(name, args)}[/bold yellow]")
+            self.console.print(f"[bold yellow]→ {escape(_tool_action_label(name, args))}[/bold yellow]")
             return
 
         if event_type == "tool_output":
@@ -870,9 +903,9 @@ class StreamRenderer:
                 payload.get("download_url") or payload.get("file_url")
                 or payload.get("image_url") or payload.get("video_url") or payload.get("url")
             )
-            body = f"{filename}{size_text}"
+            body = f"{escape(str(filename))}{size_text}"
             if url:
-                body += f"\n{url}"
+                body += f"\n{escape(str(url))}"
             validated = payload.get("validated")
             kind_title = {
                 "image_generated": "Image generated",
@@ -895,12 +928,12 @@ class StreamRenderer:
 
         if event_type == "file_mutation_reverted":
             self._close_assistant()
-            self.console.print(f"[green]↺ Reverted {payload.get('path', '?')}[/green]")
+            self.console.print(f"[green]↺ Reverted {escape(str(payload.get('path', '?')))}[/green]")
             return
 
         if event_type == "command_started":
             self._close_assistant()
-            self.console.print(f"[bold]$[/bold] {payload.get('command', '')}")
+            self.console.print(f"[bold]$[/bold] {escape(str(payload.get('command', '')))}")
             return
 
         if event_type in ("command_completed", "command_failed"):
@@ -926,11 +959,18 @@ class StreamRenderer:
             cwd = str(payload.get('cwd') or payload.get('working_directory') or '?')
             reason = str(payload.get('reason') or 'The agent requested this command.')
             command_text = _bounded_preview(str(text or ''))
+            # This is the one screen where display accuracy is a safety
+            # property, not just cosmetics: a human approves/rejects based
+            # on what's shown here. Panel's body/title are markup-parsed by
+            # default, so a real shell command containing brackets --
+            # `grep -E '[a-z]+' file`, `echo ${arr[0]}` -- could previously
+            # render mangled or truncated, meaning the text the user
+            # approved was NOT what actually ran. escape() keeps it literal.
             body = (
-                f"Command:\n{command_text}\n\n"
-                f"Working directory:\n{cwd}\n\n"
-                f"Reason:\n{reason}\n\n"
-                f"Risk:\n{risk}"
+                f"Command:\n{escape(command_text)}\n\n"
+                f"Working directory:\n{escape(cwd)}\n\n"
+                f"Reason:\n{escape(reason)}\n\n"
+                f"Risk:\n{escape(str(risk))}"
             )
             # This event fires identically whether a human is actively
             # attached to answer it (attach's own interactive prompt handles
@@ -945,7 +985,7 @@ class StreamRenderer:
             self.console.print(
                 Panel(
                     body,
-                    title=f"Approval required — risk: {risk}" + (f" (id {command_id})" if command_id is not None else ""),
+                    title=f"Approval required — risk: {escape(str(risk))}" + (f" (id {command_id})" if command_id is not None else ""),
                     border_style="magenta",
                     expand=False,
                 )
@@ -976,7 +1016,7 @@ class StreamRenderer:
             # to turn them off.
             self._close_assistant()
             if self.debug:
-                self.console.print(f"[dim]· {payload.get('content', '')}[/dim]")
+                self.console.print(f"[dim]· {escape(str(payload.get('content', '')))}[/dim]")
             return
 
         if event_type in ("context_reused", "context_rescanned"):
@@ -986,12 +1026,12 @@ class StreamRenderer:
                 if event_type == "context_reused":
                     self.console.print("[dim]· Reusing workspace context — repository unchanged since last turn[/dim]")
                 else:
-                    self.console.print(f"[dim]· Workspace rescanned (reason: {reason})[/dim]")
+                    self.console.print(f"[dim]· Workspace rescanned (reason: {escape(str(reason))})[/dim]")
             return
 
         if event_type == "task_diagnostics":
             self._close_assistant()
-            self.console.print(f"[dim]· {_format_diagnostics_line(payload)}[/dim]")
+            self.console.print(f"[dim]· {escape(_format_diagnostics_line(payload))}[/dim]")
             return
 
         if event_type == "model_selected":
@@ -1006,14 +1046,14 @@ class StreamRenderer:
             model = payload.get("model") or "(provider default)"
             reason = payload.get("selection_reason") or "explicit selection or orchestration routing"
             if self.debug:
-                self.console.print(f"[dim]· Provider: {provider} · Model: {model} · {reason}[/dim]")
+                self.console.print(f"[dim]· Provider: {escape(str(provider))} · Model: {escape(str(model))} · {escape(str(reason))}[/dim]")
             else:
                 # Persist the authoritative route in the scrollback. The
                 # previous debug-only display made "local:auto" in the
                 # banner look like local Ollama even when AUTO had selected
                 # NVIDIA/OpenRouter/HF; users could not tell which provider
                 # was actually responsible for a slow or bad response.
-                self.console.print(f"[dim]· Using {provider} · {model}[/dim]")
+                self.console.print(f"[dim]· Using {escape(str(provider))} · {escape(str(model))}[/dim]")
             return
 
         if event_type == "ai_task_failed":
@@ -1027,9 +1067,9 @@ class StreamRenderer:
         # Unrecognised event type: show it plainly rather than silently
         # dropping it -- a gap in this renderer should be visible, not hidden.
         self._close_assistant()
-        content = payload.get("content") or payload.get("status") or ""
+        content = str(payload.get("content") or payload.get("status") or "")
         if content:
-            self.console.print(f"[dim]· {event_type}: {content}[/dim]")
+            self.console.print(f"[dim]· {escape(str(event_type))}: {escape(content)}[/dim]")
         if self.debug:
             self.console.print(json.dumps(event, indent=2, default=str, ensure_ascii=False))
 
@@ -1062,7 +1102,7 @@ def resume_live_if_active(renderer: Any) -> None:
 def print_banner(console: Console, *, host: str, workspace_root: str, mode: str, approval_policy: str) -> None:
     console.print(Text(f"TamfisGPT Code v{__version__}", style="bold cyan"))
     console.print(Text("by Tamfis Nig. Ltd", style="dim"))
-    console.print(f"[dim]Workspace:[/dim] {workspace_root}")
+    console.print(f"[dim]Workspace:[/dim] {escape(workspace_root)}")
     if host.startswith("local:"):
         route = host.split(":", 1)[1] or "auto"
         route_label = "auto (ollama_cloud, nvidia, hf, openrouter, in authoritative priority order)" if route == "auto" else route
@@ -1071,11 +1111,11 @@ def print_banner(console: Console, *, host: str, workspace_root: str, mode: str,
             f"[dim]Runtime:[/dim] standalone   [dim]Provider:[/dim] {route_label}"
         )
     else:
-        console.print(f"[dim]Mode:[/dim] {mode}   [dim]Approval:[/dim] {approval_policy}   [dim]Host:[/dim] {host}")
+        console.print(f"[dim]Mode:[/dim] {escape(mode)}   [dim]Approval:[/dim] {escape(approval_policy)}   [dim]Host:[/dim] {escape(host)}")
 
 
 def print_error(console: Console, message: str) -> None:
-    console.print(f"[bold red]Error:[/bold red] {message}")
+    console.print(f"[bold red]Error:[/bold red] {escape(message)}")
 
 
 def print_recent_thread(console: Console, messages: list[dict[str, Any]], limit: int = 6) -> None:
@@ -1105,31 +1145,42 @@ def print_recent_thread(console: Console, messages: list[dict[str, Any]], limit:
     for key in shown:
         turn = turns[key]
         if turn["objective"]:
-            console.print(f"[dim]›[/dim] {turn['objective']}")
+            console.print(f"[dim]›[/dim] {escape(str(turn['objective']))}")
         if turn["answer"]:
-            console.print(f"  {turn['answer']}")
+            console.print(f"  {escape(str(turn['answer']))}")
         console.print()
 
 
 def print_unified_diff(console: Console, diff_text: str, *, title: str = "Changes") -> None:
-    """Render a unified diff semantically; Console owns colour fallback."""
+    """Render a unified diff as a bordered card (file path as the panel
+    title, +/-/@@ lines coloured), matching how plan/approval/failure
+    output is already boxed elsewhere in this renderer -- a diff printed
+    as bare scrolling lines with no border was the one card type in this
+    file that didn't visually read as "a card" the way Claude Code's own
+    file-edit diffs do."""
     no_color = bool(getattr(console, "no_color", False))
-    console.print(title if no_color else f"[bold]{title}[/bold]")
     if not diff_text.strip():
-        console.print("(empty diff)" if no_color else "[dim](empty diff)[/dim]")
-        return
-    for line in diff_text.splitlines():
-        if line.startswith("+++") or line.startswith("---"):
-            style = "bold"
-        elif line.startswith("+"):
-            style = "green"
-        elif line.startswith("-"):
-            style = "red"
-        elif line.startswith("@@"):
-            style = "cyan"
-        else:
-            style = "dim"
-        console.print(Text(line, style=None if no_color else style), soft_wrap=True)
+        body: Any = Text("(empty diff)", style=None if no_color else "dim")
+    else:
+        lines: list[Text] = []
+        for line in diff_text.splitlines():
+            if line.startswith("+++") or line.startswith("---"):
+                style = "bold"
+            elif line.startswith("+"):
+                style = "green"
+            elif line.startswith("-"):
+                style = "red"
+            elif line.startswith("@@"):
+                style = "cyan"
+            else:
+                style = "dim"
+            lines.append(Text(line, style=None if no_color else style))
+        body = Group(*lines)
+    # Text(title), not the raw string -- Panel's title is markup-parsed by
+    # default, and a bracketed filename (Next.js-style "[id].tsx" routes are
+    # common in exactly the kind of repo this diffs) would otherwise be
+    # misread as a style tag instead of shown literally.
+    console.print(Panel(body, title=Text(title), border_style="blue", expand=False))
 
 
 def print_resume_plan_status(console: Console, state: Any) -> None:
@@ -1154,7 +1205,7 @@ def print_resume_plan_status(console: Console, state: Any) -> None:
     if not steps or all(step.get("status") == "completed" for step in steps):
         return
     no_color = bool(getattr(console, "no_color", False))
-    objective = plan.get("objective") or "no objective recorded"
+    objective = escape(str(plan.get("objective") or "no objective recorded"))
     console.print(f"Plan in progress ({objective}):" if no_color else f"[bold cyan]Plan in progress[/bold cyan] ({objective}):")
     markers = {"completed": "✓", "in_progress": "◉", "failed": "✗"}
     colors = {"completed": "green", "in_progress": "yellow", "failed": "red"}
@@ -1163,4 +1214,4 @@ def print_resume_plan_status(console: Console, state: Any) -> None:
         glyph = markers.get(status, "○")
         color = colors.get(status)
         marker = glyph if no_color or color is None else f"[{color}]{glyph}[/{color}]"
-        console.print(f"  {marker} {step.get('step') or ''}")
+        console.print(f"  {marker} {escape(str(step.get('step') or ''))}")

@@ -434,8 +434,13 @@ class StreamRendererTests(unittest.TestCase):
             renderer.finish()
         output = console.file.getvalue()
         self.assertIn("Plan progress", output)
-        self.assertIn("Inspect · completed", output)
-        self.assertIn("Fix · in_progress", output)
+        # Status is now conveyed by the coloured marker (✓/◉/○) rather than
+        # a redundant "· completed"/"· in_progress" suffix repeating what
+        # the marker already says -- see _PLAN_MARKER_BY_STATUS.
+        self.assertIn("✓", output)
+        self.assertIn("Inspect", output)
+        self.assertIn("◉", output)
+        self.assertIn("Fix", output)
 
     def test_approval_gate_suspends_and_resumes_the_live_status_line(self):
         # Regression guard: Rich's Live redraws on its own timer, independent
