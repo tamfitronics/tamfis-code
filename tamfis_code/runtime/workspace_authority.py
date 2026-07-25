@@ -15,10 +15,29 @@ from typing import Iterable
 _ABSOLUTE_PATH_RE = re.compile(
     r"(?<![\w.-])/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+"
 )
+# Strips any "scheme://host/path" span before the absolute-path scan runs.
+# Without this, a URL like "https://www.tamfitronics.com/robots.txt" in the
+# objective (e.g. quoted from a prior tool result, or the user pasting a
+# link) has its "//www.tamfitronics.com/robots.txt" portion matched by
+# _ABSOLUTE_PATH_RE as if "/www.tamfitronics.com/robots.txt" were a real
+# filesystem path -- which then fails closed as "outside the workspace
+# grant" even though nothing filesystem-related was ever requested.
+_URL_RE = re.compile(r"\b\w[\w+.-]*://\S+")
 
 
 class WorkspaceAuthorityError(PermissionError):
-    """Raised when the requested target is outside the active workspace grant."""
+    """Raised when the requested target is outside the active workspace grant.
+
+    Carries the denied/allowed paths as structured fields (in addition to
+    the fully-rendered message str() already used by str(exc)/tests) so a
+    caller like render.py can lay them out as a real list instead of one
+    long comma-joined sentence.
+    """
+
+    def __init__(self, message: str, *, denied: tuple[Path, ...] = (), allowed: tuple[Path, ...] = ()) -> None:
+        super().__init__(message)
+        self.denied_targets = denied
+        self.allowed_roots = allowed
 
 
 @dataclass(frozen=True)
@@ -56,7 +75,8 @@ def _project_root(path: Path) -> Path:
 def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
     targets: list[Path] = []
     seen: set[str] = set()
-    for raw in _ABSOLUTE_PATH_RE.findall(objective or ""):
+    scrubbed = _URL_RE.sub(" ", objective or "")
+    for raw in _ABSOLUTE_PATH_RE.findall(scrubbed):
         candidate = Path(raw.rstrip(".,;:)]}")).expanduser()
         try:
             candidate = _project_root(candidate)
@@ -110,7 +130,8 @@ def resolve_workspace_targets(
         allowed = ", ".join(str(path) for path in grant.allowed_roots)
         raise WorkspaceAuthorityError(
             f"Requested target is outside the active workspace grant: {rendered}. "
-            f"Active roots: {allowed}. Restart Tamfis-Code from the target directory or run `tamfis-code workspace add PATH` before retrying."
+            f"Active roots: {allowed}. Restart Tamfis-Code from the target directory or run `tamfis-code workspace add PATH` before retrying.",
+            denied=denied, allowed=grant.allowed_roots,
         )
 
     selected: list[Path] = []
@@ -125,7 +146,8 @@ def resolve_workspace_targets(
             raise WorkspaceAuthorityError(
                 f"The request appears to target {rendered}, which is outside the current workspace "
                 f"{grant.launch_root}. No external files were inspected. Restart Tamfis-Code from that "
-                "project, or run `tamfis-code workspace add PATH` and retry with the explicit absolute path."
+                "project, or run `tamfis-code workspace add PATH` and retry with the explicit absolute path.",
+                denied=named_external, allowed=grant.allowed_roots,
             )
         selected = [grant.launch_root]
 

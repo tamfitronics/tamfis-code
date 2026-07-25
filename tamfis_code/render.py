@@ -675,6 +675,35 @@ class StreamRenderer:
             self._assistant_last_refresh = 0.0
             self._assistant_scrolled_length = 0
 
+    def _print_task_failure(self, payload: dict[str, Any]) -> None:
+        """Render ai_task_failed as a structured card instead of one long
+        wrapped red line -- a comma-joined path list (e.g. workspace-grant
+        denials) reads as noise packed into a sentence at terminal width,
+        not a message a user can act on at a glance."""
+        error = str(payload.get("error") or "unknown error")
+        denied = [str(item) for item in payload.get("denied_targets") or []]
+        allowed = [str(item) for item in payload.get("allowed_roots") or []]
+        if not denied and not allowed:
+            self.console.print(f"[bold red]Task failed:[/bold red] {error}")
+            return
+        # The denied/allowed paths are rendered as real bullet lists below,
+        # so the headline is deliberately just the sentence explaining what
+        # happened -- repeating the paths inline here too would duplicate
+        # exactly what the bullets already say.
+        headline = "Requested target is outside the active workspace grant." if denied and allowed else error.split(". ", 1)[0]
+        body: list[Any] = [Text(headline)]
+        if denied:
+            body.append(Text(""))
+            body.append(Text("Requested targets (outside the grant):"))
+            body.extend(Text(f"  · {path}") for path in denied)
+        if allowed:
+            body.append(Text(""))
+            body.append(Text("Active workspace roots:"))
+            body.extend(Text(f"  · {path}") for path in allowed)
+        body.append(Text(""))
+        body.append(Text("Restart from the target directory, or run `tamfis-code workspace add PATH`.", style="dim"))
+        self.console.print(Panel(Group(*body), title="Task failed", border_style="red", expand=False))
+
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("event_type") or event.get("event") or event.get("type")
         payload = event.get("payload") or {}
@@ -989,7 +1018,7 @@ class StreamRenderer:
 
         if event_type == "ai_task_failed":
             self._close_assistant()
-            self.console.print(f"[bold red]Task failed:[/bold red] {payload.get('error', 'unknown error')}")
+            self._print_task_failure(payload)
             return
 
         if event_type in ("ai_task_completed", "assistant_message", "task_cancelled", "heartbeat", "stream_closed"):

@@ -3573,7 +3573,14 @@ async def _run_local_agent_turn_impl(
     except WorkspaceAuthorityError as exc:
         message = str(exc)
         orchestrator.fail(message)
-        renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+        renderer.handle_event({
+            "event_type": "ai_task_failed",
+            "payload": {
+                "error": message,
+                "denied_targets": [str(p) for p in exc.denied_targets],
+                "allowed_roots": [str(p) for p in exc.allowed_roots],
+            },
+        })
         local_state.save_turn_checkpoint(
             session_id, objective=objective, mode=("read_only" if read_only else "execute"),
             messages=messages, status="failed", last_error=message,
