@@ -152,6 +152,21 @@ FABRICATED_RESULT_CORRECTION = (
     "and report only what it actually returns."
 )
 
+# Same one-chance-then-fallback shape as narrated tool intent, capitulation,
+# and fabricated results, for the distinct failure of writing out a fake
+# tool invocation (paren-call, JSON object, CLI-flag syntax, or malformed
+# `<tool_call>` XML) as plain text instead of issuing a real, registered
+# tool call.
+MAX_FAKE_TOOL_CALL_RETRIES_PER_PROVIDER = 1
+FAKE_TOOL_CALL_CORRECTION = (
+    "Your previous response wrote out what looks like a tool invocation in plain text or "
+    "markup (a function-call-style line, a JSON object naming a tool, CLI-style flags, or "
+    "`<tool_call>` markup), but no registered tool call was actually issued this turn -- "
+    "writing the call as text does not run it. Use the real tool-calling mechanism this "
+    "turn instead of describing or formatting one yourself, then continue based on its "
+    "actual result."
+)
+
 RESUME_EXECUTION_INSTRUCTION = (
     "You are resuming an unfinished engineering task from durable state. The user's "
     "continuation directive is authoritative: do not declare that there is no clear next "
@@ -2338,9 +2353,32 @@ _FAKE_TOOL_CALL_JSON_RE = re.compile(
     r'search_code|execute_command|get_git_info|browser|web_search)"'
 )
 
+# Confirmed live, a third shape: instead of a paren-call or a JSON object, a
+# weak model can narrate a CLI-flag-style pseudo-invocation --
+# `execute_command --command="..."` -- with no opening paren and no JSON,
+# so neither pattern above matches. Also seen: a `<tool_call>` block that
+# the streaming text-tool parser (_parse_text_tool_block) rejected because
+# it used a raw JSON body instead of `<parameter=...>` tags -- the rejected
+# block's XML-ish markup (`<function=`, `<parameter`, `</tool_call>`) is
+# preserved verbatim as trailing assistant text by _TextToolStreamFilter.
+# finish() and never gets any other guard's attention.
+_FAKE_TOOL_CALL_FLAG_RE = re.compile(
+    r"\b(?:read_file|write_file|edit_file|extract_archive|repackage_archive|list_directory|"
+    r"search_code|execute_command|get_git_info|browser|web_search)\s+--[A-Za-z_][\w-]*\s*="
+)
+_FAKE_TOOL_CALL_XML_RE = re.compile(
+    r"</tool_call\s*>|<tool_call[\s>]|<function(?:\s*=|\s+name\s*=)|<parameter(?:\s*=|\s+name\s*=)",
+    re.IGNORECASE,
+)
+
 
 def _looks_like_fake_tool_call(text: str) -> bool:
-    return bool(_FAKE_TOOL_CALL_RE.search(text) or _FAKE_TOOL_CALL_JSON_RE.search(text))
+    return bool(
+        _FAKE_TOOL_CALL_RE.search(text)
+        or _FAKE_TOOL_CALL_JSON_RE.search(text)
+        or _FAKE_TOOL_CALL_FLAG_RE.search(text)
+        or _FAKE_TOOL_CALL_XML_RE.search(text)
+    )
 
 
 _NARRATED_TOOL_INTENT_RE = re.compile(
@@ -3774,6 +3812,8 @@ async def _run_local_agent_turn_impl(
     capitulation_failed_providers: set[ProviderType] = set()
     fabricated_result_retries: dict[ProviderType, int] = {}
     fabricated_result_failed_providers: set[ProviderType] = set()
+    fake_tool_call_retries: dict[ProviderType, int] = {}
+    fake_tool_call_failed_providers: set[ProviderType] = set()
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
@@ -4549,6 +4589,76 @@ async def _run_local_agent_turn_impl(
                     "The available model repeatedly described repository actions without issuing a registered "
                     "tool call. The exact turn was checkpointed; type `continue` after enabling another "
                     "tool-capable provider, or select one explicitly."
+                )
+                _persist_turn_checkpoint(status="interrupted", last_error=error)
+                orchestrator.fail(error)
+                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+                return TaskOutcome(status="failed", error=error)
+
+            if tools and _looks_like_fake_tool_call(content):
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({"role": "system", "content": FAKE_TOOL_CALL_CORRECTION})
+                attempts = fake_tool_call_retries.get(resolved_provider, 0)
+                if attempts < MAX_FAKE_TOOL_CALL_RETRIES_PER_PROVIDER:
+                    fake_tool_call_retries[resolved_provider] = attempts + 1
+                    orchestrator.mark_repair(
+                        f"Converting a text-written fake tool call into a real tool call on {resolved_provider.value}"
+                    )
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {
+                            "content": (
+                                "The model wrote out a tool call as text/markup instead of issuing a real "
+                                "one; requesting the registered tool call now."
+                            )
+                        },
+                    })
+                    _persist_turn_checkpoint()
+                    continue
+
+                fake_tool_call_failed_providers.add(resolved_provider)
+                switched = False
+                if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
+                    for candidate in manager.fallback_candidates(resolved_provider, task_profile):
+                        if candidate in fake_tool_call_failed_providers:
+                            continue
+                        candidate_client = manager.get_client(candidate)
+                        candidate_config = manager.PROVIDERS.get(candidate)
+                        if candidate_client is None or candidate_config is None:
+                            continue
+                        old_provider = resolved_provider
+                        resolved_provider = candidate
+                        config = candidate_config
+                        client = candidate_client
+                        resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
+                        orchestrator.mark_repair(
+                            f"Falling back from {old_provider.value}: model repeatedly wrote fake tool calls as text"
+                        )
+                        orchestrator.record_route(
+                            provider=resolved_provider.value,
+                            model=resolved_model,
+                            reason="automatic fallback after unexecuted text-written tool call",
+                            fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    f"{old_provider.value} repeatedly wrote tool calls as text without executing "
+                                    f"them; falling back to {resolved_provider.value} / {resolved_model}."
+                                )
+                            },
+                        })
+                        switched = True
+                        break
+                if switched:
+                    _persist_turn_checkpoint()
+                    continue
+
+                error = (
+                    "The available model repeatedly wrote out tool calls as text/markup instead of issuing "
+                    "registered tool calls. The exact turn was checkpointed; type `continue` after enabling "
+                    "another tool-capable provider, or select one explicitly."
                 )
                 _persist_turn_checkpoint(status="interrupted", last_error=error)
                 orchestrator.fail(error)
