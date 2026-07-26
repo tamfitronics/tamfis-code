@@ -9,7 +9,7 @@ from __future__ import annotations
 from importlib import import_module
 from typing import Any
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 MIN_COMPATIBLE_API_VERSION = "remote-ai-v2"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {

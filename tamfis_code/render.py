@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import textwrap
 import time
 from typing import Any, Optional
 
@@ -159,6 +160,11 @@ _ASSISTANT_REFRESH_MIN_CHARS = 96
 # is what lets the terminal auto-scroll the way Claude Code/Codex do.
 _ASSISTANT_LIVE_TAIL_CHARS = 2_000
 _ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|```\s*$)")
+# Enclosing box width for the non-Live rendering path (see
+# _print_box_top/_print_box_line): capped well below typical wide terminals
+# so a long reply still reads as one message card, not a border stretched
+# edge-to-edge.
+_ASSISTANT_BOX_MAX_WIDTH = 100
 _USER_MESSAGE_MAX_DISPLAY_CHARS = 20_000
 
 
@@ -375,6 +381,11 @@ class StreamRenderer:
         # turn with two tool rounds read as two separate answers instead of
         # one continuous response with tool calls woven through it.
         self._assistant_header_shown = False
+        # Enclosing box state for the manual (non-Rich-Live) rendering path:
+        # a real TTY with live_input_listener active, where Rich Live can't
+        # be used (see _flush_assistant) so box lines are printed directly.
+        self._box_open = False
+        self._assistant_line_buffer = ""
         self._tool_names_by_call_id: dict[str, str] = {}
         self._selected_provider: Optional[str] = None
         # Model displayed in the persistent PTY/TTY footer. It must be
@@ -630,6 +641,41 @@ class StreamRenderer:
             )
             self._live.start()
 
+    def _box_content_width(self) -> int:
+        try:
+            width = int(self.console.width)
+        except Exception:
+            width = 80
+        return max(20, min(width, _ASSISTANT_BOX_MAX_WIDTH))
+
+    def _print_box_top(self, *, title: Optional[str] = None) -> None:
+        width = self._box_content_width()
+        line = Text()
+        if title:
+            label = f" {title} "
+            right = max(1, width - 3 - len(label))
+            line.append("╭─", style="cyan")
+            line.append(label, style="bold cyan")
+            line.append("─" * right + "╮", style="cyan")
+        else:
+            line.append("╭" + "─" * (width - 2) + "╮", style="cyan")
+        self.console.print(line)
+
+    def _print_box_bottom(self) -> None:
+        width = self._box_content_width()
+        self.console.print(Text("╰" + "─" * (width - 2) + "╯", style="cyan"))
+
+    def _print_box_line(self, line: str) -> None:
+        width = self._box_content_width()
+        inner = width - 4
+        pieces = textwrap.wrap(line, inner, break_long_words=True, break_on_hyphens=False) if line.strip() else [""]
+        for piece in pieces:
+            row = Text()
+            row.append("│ ", style="cyan")
+            row.append(piece.ljust(inner))
+            row.append(" │", style="cyan")
+            self.console.print(row)
+
     def _record_tokens(self, content: str) -> None:
         if not content:
             return
@@ -688,15 +734,40 @@ class StreamRenderer:
             # terminal viewport optimization; the canonical response text
             # and checkpoint remain unchanged.
             self._assistant_live.update(Text(unscrolled), refresh=True)
-        else:
+        elif self._is_tty:
+            # A real terminal with live_input_listener active (the ordinary
+            # interactive path -- see the class docstring on
+            # live_input_listener): Rich Live can't be used here (it would
+            # fight the listener's prompt-toolkit bottom toolbar for the
+            # same rows), so the enclosing box is drawn as plain completed
+            # lines instead of one live-redrawn region. A trailing partial
+            # line is held back so a boxed line's right border is never
+            # printed before the line is actually finished.
             delta = self._assistant_buffer[self._assistant_rendered_length:]
             if delta:
-                self.console.print(delta, end="")
+                self._assistant_rendered_length = len(self._assistant_buffer)
+                self._assistant_line_buffer += delta
+                *complete_lines, self._assistant_line_buffer = self._assistant_line_buffer.split("\n")
+                for line in complete_lines:
+                    self._print_box_line(line)
+        else:
+            # Redirected/non-terminal output: keep the original unboxed
+            # plain-text stream -- box-drawing characters are noise in a
+            # log file or piped output, and there is no terminal to enclose.
+            delta = self._assistant_buffer[self._assistant_rendered_length:]
+            if delta:
+                self.console.print(Text(delta), end="")
                 self._assistant_rendered_length = len(self._assistant_buffer)
 
     def _close_assistant(self) -> None:
         if self._assistant_open:
             self._flush_assistant(force=True)
+            if self._box_open:
+                if self._assistant_line_buffer:
+                    self._print_box_line(self._assistant_line_buffer)
+                    self._assistant_line_buffer = ""
+                self._print_box_bottom()
+                self._box_open = False
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None
@@ -786,9 +857,11 @@ class StreamRenderer:
                 self._thought_seconds = (self._reasoning_last or self._reasoning_start) - self._reasoning_start
             if not self._assistant_open:
                 self._stop_live()
-                if not self._assistant_header_shown:
-                    self.console.print("[bold cyan]Assistant[/bold cyan]")
-                    self._assistant_header_shown = True
+                use_box = self._is_tty and self.live_input_listener is not None
+                if use_box:
+                    self._print_box_top(title="Assistant" if not self._assistant_header_shown else None)
+                    self._box_open = True
+                self._assistant_header_shown = True
                 self._assistant_open = True
             # Whitespace/reasoning-only provider frames are not a visible
             # final answer. Marking them as displayed suppresses cli.py's
