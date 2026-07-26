@@ -3542,6 +3542,7 @@ async def _run_local_agent_turn_impl(
         budgets=RuntimeBudgets(
             max_runtime_seconds=int(_turn_budget_config.turn_runtime_seconds),
             max_runtime_extensions=_turn_budget_config.max_runtime_extensions,
+            max_repair_extensions=_turn_budget_config.max_repair_extensions,
         ),
     )
     orchestration = orchestrator.begin(objective=objective, messages=messages, read_only=read_only)

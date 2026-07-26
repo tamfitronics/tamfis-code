@@ -236,8 +236,29 @@ class AgentOrchestrator:
         assert self.run is not None
         self.run.repair_attempts += 1
         if not self.run.runtime.record_repair():
-            self.fail(self.run.runtime.snapshot.failure_reason)
-            return
+            # The shared repair counter ran out -- not necessarily because
+            # THIS repair is unproductive, possibly because unrelated infra
+            # recovery earlier in the turn (provider fallback, empty-
+            # continuation recovery, ...) already spent most of it. Grant a
+            # fresh window instead of failing the whole task on that
+            # accounting artifact, bounded by max_repair_extensions.
+            if self.run.runtime.extend_repair_budget():
+                extensions = self.run.runtime.snapshot.repair_extensions
+                limit = self.run.runtime.budgets.max_repair_extensions
+                self.emit({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Repair budget reached -- granting another "
+                            f"{self.run.runtime.budgets.max_repair_rounds} attempts "
+                            f"(extension {extensions}/{limit}) instead of ending the task."
+                        ),
+                    },
+                })
+                self.run.runtime.record_repair()
+            else:
+                self.fail(self.run.runtime.snapshot.failure_reason)
+                return
         self.transition(AgentPhase.REPAIR, action=reason)
 
     def validate(self, *, final_text: str, any_mutation: bool) -> ValidationReport:

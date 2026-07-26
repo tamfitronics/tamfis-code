@@ -144,6 +144,11 @@ class Config:
     # unrelated budgets (tool-call count, repeated actions, stalls) are
     # untouched by an extension and still fail the task normally.
     max_runtime_extensions: int = 3
+    # How many times the shared repair-attempt counter (runtime/budgets.py's
+    # max_repair_rounds -- covers provider fallback, empty-continuation
+    # recovery, and genuine fix-the-actual-failure repairs alike) may renew
+    # instead of failing the task the moment it runs out.
+    max_repair_extensions: int = 2
     debug: bool = False
     # Real (LLM-backed) subagent delegation is opt-in: concurrent sessions
     # against the Remote backend have open questions (rate limiting, approval
@@ -173,6 +178,7 @@ class Config:
             "timeout_seconds": self.timeout_seconds,
             "turn_runtime_seconds": self.turn_runtime_seconds,
             "max_runtime_extensions": self.max_runtime_extensions,
+            "max_repair_extensions": self.max_repair_extensions,
             "debug": self.debug,
             "enable_subagent_delegation": self.enable_subagent_delegation,
             "default_backend": self.default_backend,
@@ -212,6 +218,9 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "max_runtime_extensions" in data:
             cfg.max_runtime_extensions = int(data["max_runtime_extensions"])
             cfg.sources["max_runtime_extensions"] = source_name
+        if "max_repair_extensions" in data:
+            cfg.max_repair_extensions = int(data["max_repair_extensions"])
+            cfg.sources["max_repair_extensions"] = source_name
         if "enable_subagent_delegation" in data:
             cfg.enable_subagent_delegation = bool(data["enable_subagent_delegation"])
             cfg.sources["enable_subagent_delegation"] = source_name
@@ -256,6 +265,11 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_runtime_extensions:
         cfg.max_runtime_extensions = int(env_runtime_extensions)
         cfg.sources["max_runtime_extensions"] = "env TAMFIS_CODE_MAX_RUNTIME_EXTENSIONS"
+
+    env_repair_extensions = os.environ.get("TAMFIS_CODE_MAX_REPAIR_EXTENSIONS")
+    if env_repair_extensions:
+        cfg.max_repair_extensions = int(env_repair_extensions)
+        cfg.sources["max_repair_extensions"] = "env TAMFIS_CODE_MAX_REPAIR_EXTENSIONS"
 
     env_roots = os.environ.get("TAMFIS_CODE_WORKSPACE_ROOTS")
     if env_roots:

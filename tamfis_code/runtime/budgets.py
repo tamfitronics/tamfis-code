@@ -17,6 +17,17 @@ class RuntimeBudgets:
     # (tool-call count, repeated actions, stall detection) still applies
     # across the whole task and is untouched by an extension.
     max_runtime_extensions: int = 3
+    # record_repair() is shared across ~10 unrelated recovery classes --
+    # provider fallback, empty-continuation recovery, fabricated-tool-result
+    # correction, capitulation redirection, AND genuine "the model tried to
+    # fix a real failure (e.g. a broken build)" repairs -- see the many
+    # orchestrator.mark_repair(...) call sites in runner_local.py. A single
+    # small shared counter means 3 unrelated infra hiccups earlier in a turn
+    # can exhaust the budget before the model gets a real shot at the
+    # actual failing step. Extensions grant a fresh max_repair_rounds
+    # window (bounded by this count) instead of failing the whole task the
+    # first time the shared counter runs out.
+    max_repair_extensions: int = 2
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():

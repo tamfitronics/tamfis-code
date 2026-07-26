@@ -160,6 +160,25 @@ class ExecutionController:
             self.snapshot.transition(RuntimePhase.REPAIR)
         return True
 
+    def extend_repair_budget(self) -> bool:
+        """Grant a fresh max_repair_rounds window instead of ending the
+        task, when record_repair() just ran out. Bounded by
+        max_repair_extensions -- see budgets.py for why record_repair's
+        counter is shared across unrelated recovery classes and can run out
+        on infra noise before the model gets a real shot at the actual
+        failure. Like extend_runtime(), reverses a FAILED phase that was
+        set purely by this exhaustion so execution can resume."""
+        if self.snapshot.repair_extensions >= self.budgets.max_repair_extensions:
+            return False
+        self.snapshot.repair_extensions += 1
+        self.snapshot.repair_rounds = 0
+        if self.snapshot.phase == RuntimePhase.FAILED and self.snapshot.failure_reason.startswith(
+            "Repair budget exhausted"
+        ):
+            self.snapshot.phase = RuntimePhase.EXECUTE
+            self.snapshot.failure_reason = ""
+        return True
+
     def record_plan_revision(self) -> bool:
         self.snapshot.plan_revisions += 1
         if self.snapshot.plan_revisions > self.budgets.max_plan_revisions:
