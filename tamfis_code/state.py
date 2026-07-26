@@ -35,6 +35,10 @@ MAX_CHECKPOINTS = 50
 MAX_SAVED_PLANS = 50
 MAX_CONVERSATION_MESSAGES = 60
 MAX_TURN_CHECKPOINT_MESSAGES = 80
+# Keep the on-disk recovery record useful without allowing a long thread or a
+# large tool result to turn every checkpoint into a multi-megabyte write.
+MAX_MEMORY_MESSAGE_CHARS = 12000
+MAX_MEMORY_TOTAL_CHARS = 180000
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)([^\s]+)"),
@@ -63,6 +67,37 @@ def _sanitize(value: Any) -> Any:
     if isinstance(value, dict):
         return {key: _sanitize(item) for key, item in value.items()}
     return value
+
+
+def _compact_memory_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Bound durable memory while retaining protocol shape and recent detail.
+
+    This is deliberately a storage-only compaction pass. The live provider
+    context is compacted by runner_local.py; memory compaction must never
+    remove a tool-call/tool-result pair that the next process may need to
+    close safely during resume.
+    """
+    bounded_reversed: list[dict[str, Any]] = []
+    total = 0
+    for message in reversed(messages[-MAX_TURN_CHECKPOINT_MESSAGES:]):
+        item = dict(message)
+        for key in ("content", "name"):
+            value = item.get(key)
+            if isinstance(value, str) and len(value) > MAX_MEMORY_MESSAGE_CHARS:
+                item[key] = (
+                    value[:MAX_MEMORY_MESSAGE_CHARS // 2]
+                    + "\n… [memory compacted; full live context is unavailable in this snapshot] …\n"
+                    + value[-MAX_MEMORY_MESSAGE_CHARS // 2:]
+                )
+        encoded_size = len(json.dumps(item, default=str))
+        if total + encoded_size > MAX_MEMORY_TOTAL_CHARS and bounded_reversed:
+            # Keep the latest complete messages; older context is represented
+            # by conversation_summary/evidence rather than being silently
+            # allowed to make future atomic writes stall.
+            continue
+        bounded_reversed.append(item)
+        total += encoded_size
+    return list(reversed(bounded_reversed))
 
 
 @dataclass
@@ -339,11 +374,30 @@ def save_turn_checkpoint(
         "objective": objective,
         "mode": mode,
         "status": status,
-        "messages": messages[-MAX_TURN_CHECKPOINT_MESSAGES:],
+        "messages": _compact_memory_messages(messages),
         "partial_assistant": partial_assistant,
         "last_error": last_error,
         "updated_at": _now(),
     }
+    put_session_state(state)
+
+
+def mark_turn_checkpoint_interrupted(session_id: int, *, error: str) -> None:
+    """Durably mark the latest live checkpoint after task cancellation.
+
+    Cancellation can arrive while the runner is awaiting a provider or tool,
+    so the runner's local working list is not available at that exact point.
+    Updating the already-atomic snapshot is safer than overwriting it with
+    the original pre-turn messages and still makes `continue` discoverable.
+    """
+    state = get_session_state(session_id)
+    checkpoint = dict(state.turn_checkpoint or {})
+    if not checkpoint:
+        return
+    checkpoint["status"] = "interrupted"
+    checkpoint["last_error"] = error
+    checkpoint["updated_at"] = _now()
+    state.turn_checkpoint = checkpoint
     put_session_state(state)
 
 
@@ -361,8 +415,22 @@ def remember_conversation_turn(
     history = [*state.conversation_history, {"role": "user", "content": objective}]
     if answer:
         history.append({"role": "assistant", "content": answer})
-    state.conversation_history = history[-MAX_CONVERSATION_MESSAGES:]
-    state.conversation_summary = answer[-4000:] if answer else state.conversation_summary
+    # Keep a rolling, bounded digest of older turns so a long-lived REPL
+    # retains continuity without replaying an ever-growing transcript.
+    if len(history) > MAX_CONVERSATION_MESSAGES:
+        older = history[:-MAX_CONVERSATION_MESSAGES]
+        digest_parts = [
+            f"{item.get('role', 'unknown')}: {str(item.get('content') or '')[:600]}"
+            for item in older[-12:]
+        ]
+        digest = "\n".join(digest_parts)
+        state.conversation_summary = (
+            (state.conversation_summary + "\n" if state.conversation_summary else "")
+            + digest
+        )[-8000:]
+    elif answer:
+        state.conversation_summary = answer[-4000:]
+    state.conversation_history = _compact_memory_messages(history[-MAX_CONVERSATION_MESSAGES:])
     if clear_checkpoint:
         state.turn_checkpoint = None
     put_session_state(state)

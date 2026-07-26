@@ -21,6 +21,7 @@ from .cognitive import EvidenceGraph, EvidenceNode, TaskContract
 from .memory import relevant_memories
 from .reviewer import IndependentReviewer
 from .worktree import create_worktree
+from .. import state as local_state
 
 
 class ExecutionMode(str, Enum):
@@ -126,6 +127,10 @@ class UnifiedAgentRuntime:
                 result = await self._active_task
             except asyncio.CancelledError:
                 self.controller.fail("Execution cancelled by user.")
+                if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
+                    local_state.mark_turn_checkpoint_interrupted(
+                        request.session_id, error="Execution cancelled by user.",
+                    )
                 duration_ms = int((time.monotonic() - started) * 1000)
                 self.history.append(ExecutionRecord(request.mode, "cancelled", request.session_id, error="cancelled", execution_id=execution_id, duration_ms=duration_ms))
                 append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="cancelled", objective=request.objective, workspace_root=request.workspace_root, error="cancelled", duration_ms=duration_ms))
@@ -134,6 +139,13 @@ class UnifiedAgentRuntime:
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
                 self.controller.fail(message)
+                if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
+                    # Preserve the last atomically written local turn instead
+                    # of allowing a provider disconnect or unexpected worker
+                    # failure to look like an unstarted turn on resume.
+                    local_state.mark_turn_checkpoint_interrupted(
+                        request.session_id, error=message,
+                    )
                 duration_ms = int((time.monotonic() - started) * 1000)
                 self.history.append(ExecutionRecord(request.mode, "failed", request.session_id, error=message, execution_id=execution_id, duration_ms=duration_ms))
                 append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="failed", objective=request.objective, workspace_root=request.workspace_root, error=message, duration_ms=duration_ms))

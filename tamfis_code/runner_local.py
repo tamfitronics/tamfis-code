@@ -3708,10 +3708,10 @@ async def _run_local_agent_turn_impl(
         nonlocal last_checkpoint_at
         checkpoint_partial_parts.append(delta)
         now = time.monotonic()
-        # Four atomic snapshots per second is effectively realtime for a
-        # terminal stream without fsyncing once per token (which can be
-        # hundreds of writes per second on fast local models).
-        if now - last_checkpoint_at >= 0.25:
+        # One atomic snapshot per second is close enough to realtime for
+        # recovery while keeping fsync work out of the hot token path. A
+        # completed provider chunk and every tool boundary are flushed below.
+        if now - last_checkpoint_at >= 1.0:
             _persist_turn_checkpoint(partial_assistant="".join(checkpoint_partial_parts))
             last_checkpoint_at = now
 
@@ -4277,6 +4277,13 @@ async def _run_local_agent_turn_impl(
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
                 progress_callback=_remember_stream_delta,
             )
+            # Do not wait for the next tool round/final answer: if the process
+            # is interrupted immediately after a provider stream completes,
+            # its latest assistant text is already durable.
+            _persist_turn_checkpoint(
+                partial_assistant=content,
+                status="running",
+            )
         except Exception as exc:
             # Automatic routing must treat provider/account failures as route
             # failures, not task failures. In particular, OpenRouter HTTP 402
@@ -4348,6 +4355,10 @@ async def _run_local_agent_turn_impl(
                             reasoning_effort=_reasoning_effort(candidate, candidate_model),
                             progress_callback=_remember_stream_delta,
                             initial_partial=interrupted_partial,
+                        )
+                        _persist_turn_checkpoint(
+                            partial_assistant=content,
+                            status="running",
                         )
                     except Exception as candidate_exc:
                         last_error = (
@@ -5305,6 +5316,10 @@ async def _run_local_agent_turn_impl(
                 "tool_call_id": tc.call_id,
                 "content": json.dumps(result, default=str),
             })
+            # A batch may contain several tools. Flush after each completed
+            # result so a kill/network loss between tools cannot make resume
+            # treat an already-applied mutation as still in flight.
+            _persist_turn_checkpoint()
 
             if configured_hooks:
                 post_hook_results = await run_tool_hooks(

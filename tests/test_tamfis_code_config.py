@@ -224,6 +224,26 @@ class DurableSessionStateTests(unittest.TestCase):
         self.assertEqual(loaded.completed_actions[-1]["id"], action.id)
         self.assertEqual(loaded.context_checkpoints[-1]["reason"], "validation_complete")
 
+    def test_live_checkpoint_is_bounded_and_cancellation_is_durable(self):
+        state_module.save_turn_checkpoint(
+            12,
+            objective="recover this turn",
+            mode="execute",
+            messages=[
+                {"role": "user", "content": "x" * 200_000},
+                {"role": "assistant", "content": "partial answer"},
+            ],
+        )
+        state_module.mark_turn_checkpoint_interrupted(
+            12, error="Execution cancelled by user.",
+        )
+        loaded = state_module.get_session_state(12)
+        self.assertEqual(loaded.turn_checkpoint["status"], "interrupted")
+        self.assertEqual(loaded.turn_checkpoint["last_error"], "Execution cancelled by user.")
+        self.assertLess(len(state_module.STATE_PATH.read_text()), 220_000)
+        memory = Path(state_module.CONFIG_DIR) / ".memory" / "session-12.json"
+        self.assertTrue(memory.is_file())
+
     def test_persisted_queue_and_actions_redact_likely_secrets(self):
         state_module.enqueue_instruction(10, "retry with access_token=super-secret-token")
         state_module.start_action(10, action_type="shell_command", purpose="login", detail="password=hunter2")
