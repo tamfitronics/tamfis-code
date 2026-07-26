@@ -70,6 +70,24 @@ from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_worksp
 # something is genuinely stuck in a loop, not to cap normal work.
 MAX_AGENT_ROUNDS = 40
 
+# Live-reported: a genuinely large, multi-feature objective ("implement AI
+# content generation, competitor cloning, mass submission, audit reports --
+# all in one turn, actually wire it") ran 40 rounds of real, varied tool
+# calls -- never tripping MAX_CONSECUTIVE_IDENTICAL_ROUNDS or any of the
+# narrated-intent/capitulation/fabricated-result guards, all of which exist
+# specifically to catch a genuinely stuck model -- and then hard-failed
+# anyway, discarding real completed work, exactly like the wall-clock
+# runtime budget used to before extend_runtime() (orchestrator/engine.py's
+# guard_tool_call). Reaching MAX_AGENT_ROUNDS *without* any stall guard
+# tripping is evidence of an oversized task, not a stuck one, so it gets
+# the same bounded-extension treatment: grant one more full round window at
+# a time, up to this many extensions, instead of failing outright. Kept
+# separate from RuntimeBudgets/ExecutionController's own max_tool_calls
+# extension (that one is scoped to time-only exhaustion) since this guards
+# a different, coarser dimension (rounds, not raw tool calls) in the plain
+# loop below, not the orchestrator's internal budget.
+MAX_AGENT_ROUND_EXTENSIONS = 2
+
 # High reasoning is valuable for deliberate architecture work but makes the
 # interactive terminal feel stalled on ordinary audits/edits. Medium is the
 # responsive default; set TAMFIS_CODE_REASONING_EFFORT=high when depth matters
@@ -4055,7 +4073,33 @@ async def _run_local_agent_turn_impl(
                 vision_message_index = _idx
                 break
 
-    for _round in range(max_rounds):
+    _round = -1
+    _round_extensions_used = 0
+    _round_window_size = max_rounds
+    while True:
+        _round += 1
+        if _round >= max_rounds:
+            if _round_extensions_used >= MAX_AGENT_ROUND_EXTENSIONS:
+                break
+            _round_extensions_used += 1
+            max_rounds += _round_window_size
+            orchestrator.mark_repair(
+                f"Extending the tool-call round budget (extension {_round_extensions_used}/"
+                f"{MAX_AGENT_ROUND_EXTENSIONS}) -- {_round} rounds of real tool work with no "
+                "stall detected, task is larger than one round window rather than stuck"
+            )
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"Round budget reached after {_round} rounds of real, varied tool work "
+                        f"(no stall detected) -- granting {_round_window_size} more rounds "
+                        f"(extension {_round_extensions_used}/{MAX_AGENT_ROUND_EXTENSIONS}) instead "
+                        "of ending the task."
+                    ),
+                },
+            })
+            _persist_turn_checkpoint()
         # User-requested: reach a standalone task that's already running from
         # a SECOND terminal (`tamfis-code queue "..."` against the same
         # session) -- a single terminal can't do this mid-turn since the
@@ -5274,7 +5318,15 @@ async def _run_local_agent_turn_impl(
                     "payload": _plan_created_payload(revised_plan, title="Plan (revised)"),
                 })
 
-    message = f"(Stopped after {max_rounds} tool-call rounds without a final answer -- this usually means the task needs to be narrowed.)"
+    extension_note = (
+        f" (including {_round_extensions_used} round-budget extension"
+        f"{'s' if _round_extensions_used != 1 else ''} already granted)"
+        if _round_extensions_used else ""
+    )
+    message = (
+        f"(Stopped after {max_rounds} tool-call rounds{extension_note} without a final answer -- "
+        "this usually means the task needs to be narrowed.)"
+    )
     _persist_turn_checkpoint(status="interrupted", last_error=message)
     orchestrator.fail(message)
     renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
