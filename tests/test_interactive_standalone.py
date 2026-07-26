@@ -19,7 +19,7 @@ from prompt_toolkit.document import Document
 
 from tamfis_code import state as state_module
 from tamfis_code.config import Config
-from tamfis_code.interactive import PASTE_COLLAPSE_LINE_THRESHOLD, SLASH_COMMANDS, _SlashCommandCompleter, paste_placeholder
+from tamfis_code.interactive import PASTE_COLLAPSE_CHAR_THRESHOLD, PASTE_COLLAPSE_LINE_THRESHOLD, SLASH_COMMANDS, _SlashCommandCompleter, paste_placeholder
 from tamfis_code.runner import TaskOutcome
 from tamfis_code.workspace import WorkspaceContext
 
@@ -57,6 +57,12 @@ class PastePlaceholderTests(unittest.TestCase):
 
     def test_single_line_paste_with_no_trailing_newline_is_not_collapsed(self):
         self.assertIsNone(paste_placeholder("just one long line, no newline at all", 1))
+
+    def test_large_single_line_paste_collapses_at_character_threshold(self):
+        text = "x" * PASTE_COLLAPSE_CHAR_THRESHOLD
+        placeholder, normalized = paste_placeholder(text, 1)
+        self.assertEqual(placeholder, f"[Pasted text #1 +{PASTE_COLLAPSE_CHAR_THRESHOLD} chars]")
+        self.assertEqual(normalized, text)
 
     def test_empty_paste_returns_none(self):
         self.assertIsNone(paste_placeholder("", 1))

@@ -75,6 +75,40 @@ class ToolActionLabelSecretRedactionTests(unittest.TestCase):
 
 
 class StreamRendererTests(unittest.TestCase):
+    def test_read_tools_show_only_a_compact_progress_line(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_call_requested",
+            "payload": {"name": "read_file", "arguments": {"path": "src/app.ts"}},
+        })
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {"tool": "read_file", "arguments": {"path": "src/app.ts"}, "content": "secret implementation\n"},
+        })
+        output = console.file.getvalue()
+        self.assertIn("Read src/app.ts", output)
+        self.assertNotIn("secret implementation", output)
+        self.assertNotIn("→", output)
+
+    def test_mutation_tool_announcement_is_live_only_on_a_tty(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_call_requested",
+            "payload": {"name": "edit_file", "arguments": {"path": "src/app.ts"}},
+        })
+        renderer.handle_event({
+            "event_type": "file_mutation",
+            "payload": {"path": "src/app.ts", "lines_added": 2, "lines_removed": 1, "mutation_id": "m1"},
+        })
+        output = console.file.getvalue()
+        self.assertNotIn("→ Editing", output)
+        self.assertIn("src/app.ts", output)
+        self.assertIn("2", output)
+        self.assertIn("-1", output)
+        renderer.finish()
+
     def test_assistant_delta_streams_and_sets_streamed_final_text(self):
         console = _console()
         renderer = StreamRenderer(console)

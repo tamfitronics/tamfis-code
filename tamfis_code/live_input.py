@@ -37,6 +37,15 @@ _MODE_ON_LABEL = {
 }
 
 
+class _CompletedAwaitable:
+    """A no-op awaitable that is also safe to ignore for non-TTY callers."""
+
+    def __await__(self):
+        if False:
+            yield None
+        return None
+
+
 def _active_agent_count(exclude_session_id: int) -> int:
     """Count other known sessions currently mid-task (e.g. swarm children
     delegated via /delegate), for the "N agents" toolbar suffix."""
@@ -102,7 +111,20 @@ class LiveInputListener:
         self._active = True
         self._schedule_prompt()
 
-    async def stop(self) -> None:
+    def stop(self):
+        """Stop input ownership, returning an awaitable only when needed.
+
+        Non-TTY callers commonly use the listener as a capability probe and
+        call lifecycle methods synchronously. Returning immediately in that
+        case avoids an un-awaited coroutine warning while preserving the
+        awaited shutdown path for a real prompt-toolkit session.
+        """
+        if not self._is_tty and not self._active and self._input_task is None:
+            self._active = False
+            return _CompletedAwaitable()
+        return self._stop_async()
+
+    async def _stop_async(self) -> None:
         """Stop input ownership and wait until prompt-toolkit releases stdin."""
         self._active = False
         await self._shutdown_prompt()

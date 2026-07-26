@@ -240,7 +240,13 @@ MAX_TOKENS_PER_REQUEST = 4096
 # Leave headroom below the provider's stated context_window: it's a
 # conservative estimate already (see providers.py), and this estimate's own
 # char/token ratio is approximate too.
-_CONTEXT_SAFETY_MARGIN = 0.9
+# The estimator is intentionally provider-independent (four characters per
+# token), while code, JSON, paths, and tool schemas tokenize more densely than
+# ordinary prose.  0.90 let a displayed "~97k" context still overflow a
+# nominal 128k endpoint in real turns.  Keep a larger reserve so compaction
+# leaves room for provider-side tokenization variance and the next response,
+# allowing the same task to continue instead of being cut off at the request.
+_CONTEXT_SAFETY_MARGIN = 0.75
 
 
 # Workspace scoping keeps broad requests such as "audit the full stack" from

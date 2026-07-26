@@ -442,6 +442,17 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn(str(Path(tmp).resolve()), result.output)
 
+    def test_agents_lists_local_sessions_without_nested_event_loop(self):
+        """The standalone agents alias must not invoke the async Click
+        wrapper for ``sessions`` from inside its own event loop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = str(Path(tmp).resolve())
+            state_module.save_session_state(5, workspace_root=root)
+            result = self.runner.invoke(cli, ["--cwd", tmp, "agents"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Standalone sessions", result.output)
+        self.assertIn(root, result.output)
+
     def test_sessions_hides_swarm_child_sessions_unless_all(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = str(Path(tmp).resolve())

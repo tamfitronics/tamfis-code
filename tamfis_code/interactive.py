@@ -7,6 +7,7 @@ management.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from pathlib import Path
 from typing import Optional
@@ -67,6 +68,10 @@ from .workspace import (
 # paste of a few lines stays visible and directly editable, matching how
 # those tools only collapse genuinely large pastes.
 PASTE_COLLAPSE_LINE_THRESHOLD = 3
+# A single-line paste can still be a large log, JSON blob, or source file.
+# Collapse it at the same practical size users expect from the terminal UI;
+# line count alone incorrectly left 896-character pastes fully visible.
+PASTE_COLLAPSE_CHAR_THRESHOLD = 896
 
 async def _run_cancellable_local_turn(
     *,
@@ -107,7 +112,9 @@ async def _run_cancellable_local_turn(
             error="Task cancelled by user.",
         )
     finally:
-        await live_input.stop()
+        stop_result = live_input.stop()
+        if inspect.isawaitable(stop_result):
+            await stop_result
 
 
 HELP_TEXT = """\
@@ -304,9 +311,15 @@ def paste_placeholder(data: str, count: int) -> Optional[tuple[str, str]]:
     if not normalized:
         return None
     line_count = normalized.count("\n") + (0 if normalized.endswith("\n") else 1)
-    if line_count <= PASTE_COLLAPSE_LINE_THRESHOLD:
+    if (
+        line_count <= PASTE_COLLAPSE_LINE_THRESHOLD
+        and len(normalized) < PASTE_COLLAPSE_CHAR_THRESHOLD
+    ):
         return None
-    placeholder = f"[Pasted text #{count} +{line_count} lines]"
+    if line_count > PASTE_COLLAPSE_LINE_THRESHOLD:
+        placeholder = f"[Pasted text #{count} +{line_count} lines]"
+    else:
+        placeholder = f"[Pasted text #{count} +{len(normalized)} chars]"
     return placeholder, normalized
 
 
@@ -606,7 +619,7 @@ async def run_interactive(
                 )
 
             unresolved_pastes = re.findall(
-                r"\[Pasted text #\d+ \+\d+ lines\]",
+                r"\[Pasted text #\d+ \+\d+ (?:lines|chars)\]",
                 text,
             )
             if unresolved_pastes:

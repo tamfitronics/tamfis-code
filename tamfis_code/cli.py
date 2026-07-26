@@ -97,6 +97,27 @@ def async_command(fn):
     return wrapper
 
 
+def _print_local_sessions(console: Console, *, show_all: bool) -> None:
+    """Render local sessions without invoking another Click command.
+
+    ``agents`` is itself an ``@async_command`` callback. Calling the
+    decorated ``sessions`` command from inside it used to nest
+    ``asyncio.run()`` and crash every standalone ``tamfis-code agents``
+    invocation. Keeping this small presentation helper synchronous makes the
+    two command surfaces share output without crossing Click/asyncio
+    boundaries.
+    """
+    table = Table(show_header=True, header_style="bold")
+    for col in ("ID", "Workspace Root"):
+        table.add_column(col)
+    for sid in local_state.all_known_session_ids():
+        sess_state = local_state.get_session_state(sid)
+        if sess_state.is_swarm_child and not show_all:
+            continue
+        table.add_row(str(sid), sess_state.workspace_root or sess_state.primary_workspace)
+    console.print(table)
+
+
 @click.group(invoke_without_command=True)
 @click.option("--debug", is_flag=True, default=False, help="Show structured event and tool diagnostics.")
 @click.option("--approval", "approval_policy", type=click.Choice(APPROVAL_MODES), default=None, help="Override the configured approval policy for this invocation. Note: 'never' means deny everything outright -- the opposite of 'auto'/'full-auto' (which mean never PROMPT, i.e. auto-approve). It is not a synonym for auto-approve.")
@@ -651,15 +672,7 @@ async def sessions(ctx: click.Context, remote: bool, show_all: bool):
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
-        table = Table(show_header=True, header_style="bold")
-        for col in ("ID", "Workspace Root"):
-            table.add_column(col)
-        for sid in local_state.all_known_session_ids():
-            sess_state = local_state.get_session_state(sid)
-            if sess_state.is_swarm_child and not show_all:
-                continue
-            table.add_row(str(sid), sess_state.workspace_root or sess_state.primary_workspace)
-        console.print(table)
+        _print_local_sessions(console, show_all=show_all)
         return
 
     creds = load_credentials()
@@ -1804,7 +1817,7 @@ async def agents(ctx: click.Context, remote: bool):
 
     if not _use_remote(config, remote):
         console.print("[dim]Standalone sessions have no background/approval-pending concept (each run is synchronous). Showing known local sessions -- see `tamfis-code sessions`.[/dim]")
-        ctx.invoke(sessions)
+        _print_local_sessions(console, show_all=False)
         return
 
     creds = load_credentials()

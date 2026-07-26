@@ -222,6 +222,32 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
     return label
 
 
+_READ_ONLY_TOOLS = {
+    "read_file", "glob_files", "search_files", "grep_files", "list_directory",
+}
+_MUTATION_TOOLS = {"write_file", "edit_file", "file_edit", "create_file", "update_file"}
+
+
+def _normalized_tool_name(name: str) -> str:
+    return (name or "tool").strip().lower().replace("-", "_").rsplit("/", 1)[-1]
+
+
+def _is_read_only_tool(name: str) -> bool:
+    return _normalized_tool_name(name) in _READ_ONLY_TOOLS
+
+
+def _is_mutation_tool(name: str) -> bool:
+    return _normalized_tool_name(name) in _MUTATION_TOOLS
+
+
+def _read_target(arguments: Optional[dict[str, Any]]) -> str:
+    arguments = arguments or {}
+    return str(
+        arguments.get("path") or arguments.get("file_path")
+        or arguments.get("pattern") or arguments.get("query") or "workspace"
+    ).strip()
+
+
 def _tool_result_message(payload: dict[str, Any]) -> tuple[str, bool]:
     """Render structured tool results without asking the model to infer status.
 
@@ -912,6 +938,9 @@ class StreamRenderer:
                 if call_id:
                     self._tool_names_by_call_id[str(call_id)] = tool
                 args = payload.get("arguments") or {}
+                if _is_read_only_tool(tool):
+                    self.console.print(f"[dim]Read {escape(_read_target(args))}[/dim]")
+                    return
                 arg_text = ", ".join(f"{k}={v}" for k, v in args.items() if v not in (None, "")) if isinstance(args, dict) else ""
                 label = f"[bold yellow]→ {_tool_action_label(tool, args)}[/bold yellow]"
                 if self.debug and arg_text:
@@ -932,6 +961,15 @@ class StreamRenderer:
             self._close_assistant()
             name = str(payload.get("name") or payload.get("tool") or "tool")
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+            if _is_read_only_tool(name):
+                self.console.print(f"[dim]Read {escape(_read_target(args))}[/dim]")
+                return
+            # On an interactive terminal the persistent live status line is
+            # the progress indicator.  Printing a second arrow line for an
+            # edit/write leaves duplicate history behind; the durable
+            # file_mutation event below is the single completed summary.
+            if _is_mutation_tool(name) and self._is_tty:
+                return
             self.console.print(f"[bold yellow]→ {escape(_tool_action_label(name, args))}[/bold yellow]")
             return
 
@@ -939,6 +977,12 @@ class StreamRenderer:
             self._close_assistant()
             tool = str(payload.get("tool", "tool"))
             result_envelope = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+            if _is_read_only_tool(tool):
+                success = result_envelope.get("success")
+                if success is False or result_envelope.get("status") in {"failed", "error"}:
+                    args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else result_envelope
+                    self.console.print(f"[red]Read failed {escape(_read_target(args))}[/red]")
+                return
             # Command/file events already carry the useful result. Some
             # canonical tool-completion envelopes contain only a tool name
             # and success flag; rendering those produced the misleading,
