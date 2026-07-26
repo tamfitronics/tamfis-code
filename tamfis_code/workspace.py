@@ -9,6 +9,7 @@ repeated runs from the same directory.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
 from dataclasses import dataclass
@@ -782,6 +783,53 @@ def _discover_project_type(workspace_root: Path) -> dict[str, Any]:
         pass
 
     return result("unknown", package_manager=None)
+
+
+# Preference order for a real type/build verification script in package.json.
+# "build" is deliberately last and weakest: bundlers like esbuild/vite catch
+# syntax errors (a genuinely truncated file) but not type errors -- a project
+# with a real truncated function body can still report a clean `npm run
+# build` while `npm run check`/`typecheck` (a real `tsc` invocation) fails on
+# the same code. Confirmed live: TamfisSEO Pro's package.json has "check":
+# "tsc -b" (not the generically-named "typecheck" enforcer.py's own script
+# list already looked for), so both this and that list needed the same fix.
+_JS_VERIFY_SCRIPT_PRIORITY = ("check", "typecheck", "type-check", "verify", "build")
+
+
+def detect_verify_command(workspace_root: Path) -> Optional[tuple[str, str]]:
+    """Best available "did this actually compile/typecheck" command for a
+    JS/TS project, as (script_name, full_shell_command), or None if this
+    isn't a JS/TS project or none of the known script names are present.
+
+    Deliberately narrow (JS/TS only, for now) rather than reusing the
+    broader test_commands detection in _project_metadata -- that list is
+    about running the test *suite*, not verifying the code actually builds,
+    and mixing the two would silently satisfy this check with `npm test`
+    passing while the project still fails to type-check or bundle.
+    """
+    root = Path(workspace_root).expanduser().resolve()
+    project_type = _discover_project_type(root)
+    if project_type.get("language") not in {"JavaScript", "TypeScript", "JavaScript/TypeScript"}:
+        return None
+
+    package_json = root / "package.json"
+    if not package_json.is_file():
+        return None
+
+    try:
+        pkg = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+    scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
+    if not isinstance(scripts, dict):
+        return None
+
+    for name in _JS_VERIFY_SCRIPT_PRIORITY:
+        if name in scripts:
+            return name, f"npm run {name}"
+
+    return None
 
 
 def discover_local_repository(session_id: int, workspace_root: Path, *, force: bool = False) -> dict[str, Any]:

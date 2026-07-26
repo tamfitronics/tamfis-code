@@ -60,7 +60,7 @@ from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
-from .workspace import classify_root
+from .workspace import classify_root, detect_verify_command
 from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
@@ -183,6 +183,26 @@ FAKE_TOOL_CALL_CORRECTION = (
     "writing the call as text does not run it. Use the real tool-calling mechanism this "
     "turn instead of describing or formatting one yourself, then continue based on its "
     "actual result."
+)
+
+# Live-reported ("So why can't tamfis-code be efficient at least?"): a
+# coding task could edit files and report success while the project didn't
+# actually compile -- npm run build (bundling) passed while the real
+# type-check (npm run check / tsc -b, a differently-named script) was never
+# run, because nothing in the completion path required it. `npm run build`
+# alone is not sufficient evidence either: bundlers catch syntax errors but
+# not type errors, so a real truncated function can still "build" cleanly
+# -- see workspace.py's detect_verify_command for why "build" is the
+# weakest, last-resort entry in that priority list. This is a *system*
+# gap, not a model one: even a fully capable model only verifies what the
+# harness actually requires before letting it finish.
+MAX_VERIFY_COMMAND_RETRIES = 2
+VERIFY_COMMAND_CORRECTION = (
+    "You changed files in this project, but never successfully ran `{command}` (this "
+    "project's real build/type-check command) since the last change. `npm run build` alone "
+    "does not prove the code is correct -- it bundles without type-checking. Run `{command}` "
+    "now via execute_command, and if it reports any errors, fix them and re-run it until it "
+    "passes cleanly before finishing."
 )
 
 RESUME_EXECUTION_INSTRUCTION = (
@@ -3835,6 +3855,9 @@ async def _run_local_agent_turn_impl(
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
+    verify_command = None if read_only else detect_verify_command(Path(workspace_root))
+    verify_command_confirmed = False
+    verify_command_retries = 0
 
     async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
         """Turn accumulated completion output into the turn's final
@@ -4894,6 +4917,33 @@ async def _run_local_agent_turn_impl(
                 _persist_turn_checkpoint()
                 continue
 
+            if (
+                tools and any_mutation and verify_command is not None
+                and not verify_command_confirmed
+                and verify_command_retries < MAX_VERIFY_COMMAND_RETRIES
+            ):
+                verify_command_retries += 1
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({
+                    "role": "system",
+                    "content": VERIFY_COMMAND_CORRECTION.format(command=verify_command[1]),
+                })
+                orchestrator.mark_repair(
+                    f"Requiring a real `{verify_command[1]}` run before completion "
+                    f"(attempt {verify_command_retries}/{MAX_VERIFY_COMMAND_RETRIES})"
+                )
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Files changed but `{verify_command[1]}` hasn't been confirmed clean since; "
+                            "requesting it before finishing."
+                        )
+                    },
+                })
+                _persist_turn_checkpoint()
+                continue
+
             return await _finalize_completed_answer(content, finish_reason)
 
         signature = _tool_calls_signature(tool_calls)
@@ -5267,6 +5317,10 @@ async def _run_local_agent_turn_impl(
 
             if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive"} and result.get("success"):
                 any_mutation = True
+                # A further edit after a clean verify run invalidates that
+                # result -- require re-verifying against the latest code,
+                # not whatever was true before this change.
+                verify_command_confirmed = False
                 state = local_state.get_session_state(session_id)
                 if state.modified_files:
                     mutation = state.modified_files[-1]
@@ -5274,6 +5328,14 @@ async def _run_local_agent_turn_impl(
                         "path": mutation["path"], "lines_added": mutation["lines_added"],
                         "lines_removed": mutation["lines_removed"], "mutation_id": mutation["mutation_id"],
                     }})
+
+            if (
+                verify_command is not None
+                and tc.name == "execute_command"
+                and result.get("success")
+                and verify_command[1] in str(arguments.get("command") or "")
+            ):
+                verify_command_confirmed = True
 
         # The assistant tool-call message and every matching tool result are
         # now protocol-complete.  Save immediately before any optional

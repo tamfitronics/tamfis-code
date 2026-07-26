@@ -214,7 +214,13 @@ class TestEnforcer:
                 self.results["frontend_tests"]["status"] = "install_failed"
                 return
 
-        test_scripts = ["test", "test:unit", "test:integration", "build", "typecheck"]
+        # Live-reported: TamfisSEO Pro's package.json has a "check": "tsc -b"
+        # script -- the real type-check -- but this list only ever looked
+        # for the literal name "typecheck", so it silently ran `build`
+        # (which bundles without type-checking) and never caught type
+        # errors a truncated/broken file would trigger. Widened to the same
+        # common naming conventions, "check" included.
+        test_scripts = ["test", "test:unit", "test:integration", "check", "typecheck", "type-check", "build"]
         available = [s for s in test_scripts if s in scripts]
 
         if not available:
