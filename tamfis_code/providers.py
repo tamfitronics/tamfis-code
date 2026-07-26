@@ -126,15 +126,19 @@ def reasoning_effort_capable(provider: ProviderType, model: str) -> bool:
     instruct models NVIDIA also hosts -- meta/llama-3.1-*, moonshotai/
     kimi-k2.6, mistralai/mistral-large-2-123b, google/gemma-2-27b-it,
     microsoft/phi-3-medium-128k-instruct -- HANG indefinitely when given
-    it: a real streaming call to meta/llama-3.1-70b-instruct (NVIDIA's own
-    current default_model, below) with reasoning_effort="high" produced
-    zero chunks in 40+ seconds, while the identical call without it
-    returned in well under a second. REASONING_EFFORT_CAPABLE_PROVIDERS
-    alone silently broke the moment NVIDIA's default_model moved off
-    nemotron (the v0.4.39 kimi-k2.6-404 fix) -- nobody had re-verified
-    reasoning_effort against the new default, since the original "confirmed
-    live" note only ever tested nemotron. OpenRouter/Tier IV are left as
-    provider-level (unverified per-model here; no live evidence either way).
+    it: a real streaming call to meta/llama-3.1-70b-instruct (NVIDIA's
+    default_model at the time, briefly, per the v0.4.39 kimi-k2.6-404 fix)
+    with reasoning_effort="high" produced zero chunks in 40+ seconds, while
+    the identical call without it returned in well under a second.
+    REASONING_EFFORT_CAPABLE_PROVIDERS alone silently broke the moment
+    NVIDIA's default_model moved off nemotron that time -- nobody had
+    re-verified reasoning_effort against the new default, since the
+    original "confirmed live" note only ever tested nemotron. This
+    model-name substring check is why later default_model changes within
+    the nemotron family (2026-07-26: nemotron-3-ultra-550b-a55b) stay
+    correctly gated without needing another update here. OpenRouter/Tier IV
+    are left as provider-level (unverified per-model here; no live evidence
+    either way).
     """
     if provider not in REASONING_EFFORT_CAPABLE_PROVIDERS:
         return False
@@ -331,25 +335,54 @@ class ProviderManager:
             name="NVIDIA NIM",
             base_url="https://integrate.api.nvidia.com/v1",
             api_key_env="NVIDIA_API_KEY",
-            # The plain Llama instruct route can answer fluently but has
-            # repeatedly narrated/fabricated local tool results in this CLI.
-            # This NVIDIA reasoning model was verified to return genuine
-            # tool_calls and to accept reasoning parameters without the
-            # indefinite stream stall seen on the plain instruct models.
-            # Keep the older models selectable for accounts where this route
-            # is not enabled, but do not make them the automatic coding path.
-            default_model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            # 2026-07-26: re-prioritized after nemotron-3-nano-omni-30b-a3b-
+            # reasoning (the prior default) was caught live wrapping a fake
+            # tool call in CLI-flag/XML-ish text under real agentic use (see
+            # runner_local.py's _FAKE_TOOL_CALL_FLAG_RE/_FAKE_TOOL_CALL_XML_RE
+            # fix) -- a failure mode a plain single-call smoke test doesn't
+            # surface, since that model also returns clean real tool_calls
+            # on simple prompts. Re-verified all candidates below live
+            # against this account immediately before reordering (real
+            # chat-completions calls with tools attached, real tool_calls
+            # returned, not guessed from NVIDIA's public catalog page):
+            # nemotron-3-ultra-550b-a55b (1.8s), nemotron-3-super-120b-a12b
+            # (6.1s), nemotron-3-nano-30b-a3b, llama-3.3-nemotron-super-49b-
+            # v1.5, llama-3.3-nemotron-super-49b-v1, minimaxai/minimax-m3
+            # all returned genuine tool_calls. ultra-550b-a55b is NVIDIA's
+            # largest/most capable hybrid Mamba-Transformer MoE for agentic
+            # reasoning, coding, planning, and tool calling and was fast in
+            # the live check, so it is now the default; super-120b-a12b
+            # (already separately confirmed to handle reasoning_effort
+            # without hanging) is the next fallback. The nano-omni-reasoning
+            # route stays selectable -- do not remove it entirely, since an
+            # account without ultra/super entitlement still needs a working
+            # route -- but it is no longer the automatic coding path.
+            default_model="nvidia/nemotron-3-ultra-550b-a55b",
             models=[
-                "nvidia/nemotron-3-super-120b-a12b",
                 "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3-nano-30b-a3b",
+                # NVIDIA-hosted, live-verified real tool_calls on this
+                # account; high accuracy on reasoning/tool-calling per
+                # NVIDIA's own catalog, kept as mid-tier fallbacks below the
+                # newer nemotron-3 family.
+                "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+                "nvidia/llama-3.3-nemotron-super-49b-v1",
+                # Third-party (MiniMax AI) multimodal MoE hosted on NVIDIA
+                # NIM, live-verified real tool_calls on this account.
+                # Marketplace models have previously turned out to be a
+                # per-account entitlement gap disguised as a working route
+                # (see the kimi-k2.6 404 fix) -- kept selectable, not
+                # promoted to default, until it has more real-world use.
+                "minimaxai/minimax-m3",
                 # Confirmed live: real tool_calls response (not narrated
                 # text), reasoning_effort and reasoning_budget both work
-                # without hanging (unlike the plain instruct models below).
+                # without hanging. Demoted from default after the fake-
+                # tool-call-as-text incident above; still selectable.
                 "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-                "nvidia/nemotron-3-nano-30b-a3b",
                 # NVIDIA currently exposes these DeepSeek V4 hosted routes
                 # as mature coding/agent models. They remain selectable
-                # fallbacks; the verified Nemotron route stays the default
+                # fallbacks; the verified Nemotron routes stay the default
                 # until an account-specific smoke test proves otherwise.
                 "deepseek-ai/deepseek-v4-pro",
                 "deepseek-ai/deepseek-v4-flash",

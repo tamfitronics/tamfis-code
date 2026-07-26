@@ -38,9 +38,20 @@ class ReasoningEffortCapabilityTests(unittest.TestCase):
             "mistralai/mistral-large-2-123b",
             "google/gemma-2-27b-it",
             "microsoft/phi-3-medium-128k-instruct",
+            # Third-party (MiniMax AI) model added 2026-07-26 -- no
+            # "nemotron" in the name, so it correctly falls through to the
+            # same not-capable path as the other non-nemotron NVIDIA routes.
+            "minimaxai/minimax-m3",
         ):
             with self.subTest(model=model):
                 self.assertFalse(reasoning_effort_capable(ProviderType.NVIDIA, model))
+
+    def test_llama_nemotron_super_variants_on_nvidia_are_capable(self):
+        # "nemotron" appears in these ids too (llama-3.3-nemotron-super-*),
+        # so the existing substring gate covers them without needing a
+        # separate allowlist entry.
+        self.assertTrue(reasoning_effort_capable(ProviderType.NVIDIA, "nvidia/llama-3.3-nemotron-super-49b-v1.5"))
+        self.assertTrue(reasoning_effort_capable(ProviderType.NVIDIA, "nvidia/llama-3.3-nemotron-super-49b-v1"))
 
     def test_case_insensitive_nemotron_match(self):
         self.assertTrue(reasoning_effort_capable(ProviderType.NVIDIA, "NVIDIA/Nemotron-3-Super"))

@@ -107,11 +107,16 @@ def test_openrouter_default_is_not_openai_family():
 
 def test_nvidia_default_model_is_tool_capable_and_not_unentitled_kimi():
     # The plain Llama route is fluent but has been observed fabricating local
-    # tool results. Use the verified NVIDIA reasoning/tool route instead;
+    # tool results. Use a verified NVIDIA nemotron tool-calling route instead;
     # never use the account-unentitled Kimi route as the default.
+    # 2026-07-26: re-prioritized off nemotron-3-nano-omni-30b-a3b-reasoning
+    # after it was caught live wrapping a fake tool call in CLI-flag/XML-ish
+    # text (see runner_local.py's fake-tool-call detection fix) -- a failure
+    # mode a single simple tool-calling smoke test doesn't surface, since
+    # that model also returns clean real tool_calls on simple prompts.
     default_model = ProviderManager.PROVIDERS[ProviderType.NVIDIA].default_model
     assert default_model != "moonshotai/kimi-k2.6"
-    assert default_model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    assert default_model == "nvidia/nemotron-3-ultra-550b-a55b"
 
 
 def test_kimi_k2_6_is_still_selectable_on_openrouter_and_hf():
@@ -150,9 +155,27 @@ def test_hf_prefers_official_qwen36_coding_route_and_keeps_deepseek_fallbacks():
 
 def test_nvidia_exposes_deepseek_v4_routes_without_replacing_verified_default():
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
-    assert config.default_model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    assert config.default_model == "nvidia/nemotron-3-ultra-550b-a55b"
     assert "deepseek-ai/deepseek-v4-pro" in config.models
     assert "deepseek-ai/deepseek-v4-flash" in config.models
+
+
+def test_nvidia_exposes_newly_added_coding_and_tool_calling_models():
+    # 2026-07-26: added per a live NVIDIA NIM catalog re-check for models
+    # described as strong at coding/tool-calling. All were live-verified
+    # against this account (real chat-completions calls with tools
+    # attached, real tool_calls returned) before being added here.
+    config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
+    assert "nvidia/nemotron-3-ultra-550b-a55b" in config.models
+    assert "nvidia/nemotron-3-super-120b-a12b" in config.models
+    assert "nvidia/nemotron-3-nano-30b-a3b" in config.models
+    assert "nvidia/llama-3.3-nemotron-super-49b-v1.5" in config.models
+    assert "nvidia/llama-3.3-nemotron-super-49b-v1" in config.models
+    assert "minimaxai/minimax-m3" in config.models
+    # The nano-omni-reasoning route stays selectable (not removed), just no
+    # longer the default -- see test_nvidia_default_model_is_tool_capable_
+    # and_not_unentitled_kimi.
+    assert "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" in config.models
 
 
 def test_remote_fallback_candidates_stay_in_policy_order():
