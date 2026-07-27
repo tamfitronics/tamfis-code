@@ -73,11 +73,37 @@ def validate_completion(
             "execute_command", "get_git_info", "read_file", "search_code", "list_directory",
         }
         validated = any(item.get("tool_name") in validation_tools and item.get("success") for item in tool_records)
-        # A successful recorded mutation is proportionate validation for a
-        # trivial single-file creation/edit. Complex audit/debug/test turns
-        # still require an independent inspection or command result.
-        if profile.task_type == TaskType.EDIT and any_mutation:
-            validated = True
+
+        # Verification is ordered evidence.  A later failed check/build must
+        # invalidate an earlier successful command; otherwise a model can run
+        # `build`, fail `check`, and still be allowed to report "all checks
+        # passed".  The runner may ask the model to repair and retry, but it
+        # must never call the turn complete while the latest verification is
+        # red.
+        commands = [item for item in tool_records if item.get("tool_name") == "execute_command"]
+        latest_command = commands[-1] if commands else None
+        latest_command_failed = bool(
+            latest_command
+            and (
+                latest_command.get("success") is not True
+                or latest_command.get("exit_code") not in (None, 0)
+            )
+        )
+        checks.append({
+            "name": "latest_command_clean",
+            "passed": not latest_command_failed,
+        })
+        if latest_command_failed:
+            command = latest_command.get("arguments", {}).get("command", "verification command")
+            unresolved.append(
+                f"The latest verification command failed: {str(command)[:160]}. "
+                "The task cannot be reported complete until it is repaired and rerun successfully."
+            )
+            validated = False
+
+        # A successful mutation alone is not validation for code edits.  A
+        # read/inspection or command result is required, and failed latest
+        # verification always wins over earlier evidence.
         checks.append({"name": "validation_evidence", "passed": validated})
         if not validated:
             unresolved.append("No successful validation or inspection tool result was recorded.")
@@ -88,6 +114,11 @@ def validate_completion(
     severity = "pass"
     if not passed:
         severity = "warning"
+        if profile.requires_validation and any(
+            check["name"] == "latest_command_clean" and not check["passed"]
+            for check in checks
+        ):
+            severity = "error"
         if profile.requires_tools and not successful_tools and _claims_completed_inspection(final_text):
             severity = "error"
             unresolved.append(

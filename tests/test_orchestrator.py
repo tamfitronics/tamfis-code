@@ -327,3 +327,33 @@ class OrchestratorTests(unittest.TestCase):
         report = validate_completion(profile=profile, tool_records=[], any_mutation=False, final_text="answer")
         self.assertFalse(report.passed)
         self.assertTrue(report.unresolved)
+
+    def test_latest_failed_verification_overrides_earlier_success(self):
+        """A green build followed by a red check cannot be reported green."""
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        profile = classify_task("fix the broken TypeScript router")
+        report = validate_completion(
+            profile=profile,
+            tool_records=[
+                {"tool_name": "write_file", "success": True},
+                {
+                    "tool_name": "execute_command",
+                    "success": True,
+                    "exit_code": 0,
+                    "arguments": {"command": "npm run build"},
+                },
+                {
+                    "tool_name": "execute_command",
+                    "success": False,
+                    "exit_code": 2,
+                    "arguments": {"command": "npm run check"},
+                },
+            ],
+            any_mutation=True,
+            final_text="The build and type check passed successfully.",
+        )
+        self.assertFalse(report.passed)
+        self.assertEqual(report.severity, "error")
+        self.assertTrue(any("latest verification command failed" in item for item in report.unresolved))
