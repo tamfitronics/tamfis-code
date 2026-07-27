@@ -54,6 +54,39 @@ async def test_runtime_cancel_cancels_active_operation():
     assert not runtime.active
 
 
+@pytest.mark.asyncio
+async def test_runtime_does_not_turn_unavailable_telemetry_into_task_failure(monkeypatch):
+    import tamfis_code.runtime.unified as unified
+
+    def unavailable(*args, **kwargs):
+        raise OSError("read-only runtime storage")
+
+    monkeypatch.setattr(unified, "append_event", unavailable)
+    monkeypatch.setattr(unified, "save_checkpoint", unavailable)
+    runtime = UnifiedAgentRuntime()
+    result = await runtime._run_exclusive(
+        ExecutionRequest(ExecutionMode.LOCAL_AGENT, objective="answer"),
+        lambda: asyncio.sleep(0, result=Outcome()),
+    )
+    assert result.status == "completed"
+    assert any("journal unavailable" in warning for warning in runtime.persistence_warnings)
+    assert any("checkpoint unavailable" in warning for warning in runtime.persistence_warnings)
+
+
+def test_session_state_falls_back_to_volatile_process_storage(monkeypatch):
+    import tamfis_code.state as state
+
+    original = dict(state._VOLATILE_STATE)
+    state._VOLATILE_STATE.clear()
+    monkeypatch.setattr(state, "_save_raw", lambda data: (_ for _ in ()).throw(OSError("read-only")))
+    try:
+        state.save_session_state(404, active_task={"objective": "continue"})
+        assert state.get_session_state(404).active_task == {"objective": "continue"}
+    finally:
+        state._VOLATILE_STATE.clear()
+        state._VOLATILE_STATE.update(original)
+
+
 def test_execution_request_modes_are_explicit():
     assert {mode.value for mode in ExecutionMode} == {
         "local_agent", "remote_agent", "local_chat", "local_stream"

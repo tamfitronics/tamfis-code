@@ -63,6 +63,11 @@ class TaskOutcome:
     error: Optional[str] = None
     plan_id: Optional[str] = None
     plan_items: list[dict[str, Any]] = field(default_factory=list)
+    # Shared runtime evidence.  Local and remote stream adapters historically
+    # returned only status/summary, which made the unified reviewer believe a
+    # successful mutation had no changed files or validation evidence.
+    changed_files: list[str] = field(default_factory=list)
+    validations: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _decision_for_policy(policy: str, risk: str, interactive: bool) -> Optional[str]:

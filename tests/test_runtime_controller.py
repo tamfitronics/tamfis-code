@@ -44,6 +44,18 @@ def test_identical_action_is_blocked_after_two_attempts():
     assert "repeated action" in third.reason.casefold()
 
 
+def test_novel_evidence_allows_a_reasonable_follow_up_check():
+    controller = ExecutionController(RuntimeBudgets(max_identical_actions=2, max_runtime_seconds=60))
+    args = {"path": "/tmp/app.py"}
+    for content in ("before", "after"):
+        assert controller.guard_action("read_file", args).allowed
+        observation = controller.observe("read_file", args, _result(content))
+        assert observation.useful
+    # The same check is now valid again because the file's observed state
+    # changed; it must not inherit the pre-edit repetition count forever.
+    assert controller.guard_action("read_file", args).allowed
+
+
 def test_tool_budget_is_hard():
     controller = ExecutionController(RuntimeBudgets(max_tool_calls=2, max_runtime_seconds=60))
     for index in range(2):

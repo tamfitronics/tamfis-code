@@ -66,8 +66,13 @@ class UnifiedAgentRuntime:
     def __init__(self) -> None:
         self.controller = ExecutionController()
         self._active_task: asyncio.Task[Any] | None = None
+        # Reservation task used during synchronous lifecycle setup.  Without
+        # this, a second invocation (or cancellation) could observe an idle
+        # runtime while journaling/checkpoint creation was still in progress.
+        self._runner_task: asyncio.Task[Any] | None = None
         self._active_request: ExecutionRequest | None = None
         self.history: list[ExecutionRecord] = []
+        self.persistence_warnings: list[str] = []
         self._lock = asyncio.Lock()
         self.task_contract: TaskContract | None = None
         self.evidence_graph = EvidenceGraph()
@@ -75,7 +80,27 @@ class UnifiedAgentRuntime:
 
     @property
     def active(self) -> bool:
-        return self._active_task is not None and not self._active_task.done()
+        return any(
+            task is not None and not task.done()
+            for task in (self._runner_task, self._active_task)
+        )
+
+    def _append_event(self, event: RuntimeEvent) -> None:
+        """Persist telemetry without making telemetry a task dependency."""
+        try:
+            append_event(event)
+        except Exception as exc:
+            self.persistence_warnings.append(f"journal unavailable: {exc}")
+
+    def _save_checkpoint(self, checkpoint: ExecutionCheckpoint) -> None:
+        """Persist recovery state without turning a read-only config home
+        into an execution failure. The runner's live state remains the source
+        of truth while this process is running; the warning is retained for
+        diagnostics and the next invocation can repair storage."""
+        try:
+            save_checkpoint(checkpoint)
+        except Exception as exc:
+            self.persistence_warnings.append(f"checkpoint unavailable: {exc}")
 
     async def _run_exclusive(self, request: ExecutionRequest, operation: Callable[[], Awaitable[Any]]) -> Any:
         # Fail fast instead of queueing a second agent behind the first. A queued
@@ -86,6 +111,8 @@ class UnifiedAgentRuntime:
         async with self._lock:
             if self.active:
                 raise RuntimeError("an agent execution is already active in this runtime")
+            self._runner_task = asyncio.current_task()
+            self.persistence_warnings = []
             self.controller = ExecutionController()
             self._active_request = request
             memories = relevant_memories(request.objective)
@@ -102,6 +129,21 @@ class UnifiedAgentRuntime:
             )
             self.evidence_graph = EvidenceGraph()
             self.last_review = None
+            baseline_mutation_ids: set[str] = set()
+            baseline_validation_count = 0
+            if request.session_id:
+                try:
+                    baseline_state = local_state.get_session_state(request.session_id)
+                    baseline_mutation_ids = {
+                        str(item.get("mutation_id"))
+                        for item in baseline_state.modified_files
+                        if item.get("mutation_id")
+                    }
+                    baseline_validation_count = len(baseline_state.validation_results)
+                except OSError:
+                    # Evidence enrichment is best-effort; the actual runner
+                    # still owns execution and reports its own result.
+                    pass
             execution_id = uuid.uuid4().hex
             if request.isolation == "worktree":
                 handle = create_worktree(request.workspace_root, branch=f"tamfis/{execution_id[:12]}")
@@ -112,12 +154,12 @@ class UnifiedAgentRuntime:
                 # where execution happens.
                 request.workspace_root = str(handle.path)
             started = time.monotonic()
-            append_event(RuntimeEvent(
+            self._append_event(RuntimeEvent(
                 event="execution_started", execution_id=execution_id, mode=request.mode.value,
                 session_id=request.session_id, timestamp=_utc_now(), status="running",
                 objective=request.objective, workspace_root=request.workspace_root, metadata=request.metadata,
             ))
-            save_checkpoint(ExecutionCheckpoint(
+            self._save_checkpoint(ExecutionCheckpoint(
                 execution_id=execution_id, session_id=request.session_id, mode=request.mode.value,
                 objective=request.objective, workspace_root=request.workspace_root, status="running",
                 metadata={**request.metadata, "task_contract": self.task_contract.to_dict()},
@@ -133,8 +175,8 @@ class UnifiedAgentRuntime:
                     )
                 duration_ms = int((time.monotonic() - started) * 1000)
                 self.history.append(ExecutionRecord(request.mode, "cancelled", request.session_id, error="cancelled", execution_id=execution_id, duration_ms=duration_ms))
-                append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="cancelled", objective=request.objective, workspace_root=request.workspace_root, error="cancelled", duration_ms=duration_ms))
-                save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="cancelled", unresolved=["Execution cancelled by user."], metadata=request.metadata))
+                self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="cancelled", objective=request.objective, workspace_root=request.workspace_root, error="cancelled", duration_ms=duration_ms))
+                self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="cancelled", unresolved=["Execution cancelled by user."], metadata=request.metadata))
                 raise
             except Exception as exc:
                 message = f"{type(exc).__name__}: {exc}"
@@ -148,8 +190,8 @@ class UnifiedAgentRuntime:
                     )
                 duration_ms = int((time.monotonic() - started) * 1000)
                 self.history.append(ExecutionRecord(request.mode, "failed", request.session_id, error=message, execution_id=execution_id, duration_ms=duration_ms))
-                append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="failed", objective=request.objective, workspace_root=request.workspace_root, error=message, duration_ms=duration_ms))
-                save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="failed", unresolved=[message], metadata=request.metadata))
+                self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="failed", objective=request.objective, workspace_root=request.workspace_root, error=message, duration_ms=duration_ms))
+                self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="failed", unresolved=[message], metadata=request.metadata))
                 raise
             else:
                 status = str(getattr(result, "status", "completed"))
@@ -157,6 +199,26 @@ class UnifiedAgentRuntime:
                 error = getattr(result, "error", None)
                 changed_files = list(getattr(result, "changed_files", []) or [])
                 validations = list(getattr(result, "validations", []) or [])
+                # Adapters should provide these fields, but derive them from
+                # the canonical session ledger as a compatibility bridge for
+                # both the legacy remote stream and older local outcomes.
+                if request.session_id and (not changed_files or not validations):
+                    try:
+                        current_state = local_state.get_session_state(request.session_id)
+                        if not changed_files:
+                            changed_files = list(dict.fromkeys(
+                                str(item.get("path"))
+                                for item in current_state.modified_files
+                                if item.get("path") and str(item.get("mutation_id")) not in baseline_mutation_ids
+                            ))
+                        if not validations:
+                            validations = list(current_state.validation_results[baseline_validation_count:])
+                    except OSError:
+                        pass
+                if hasattr(result, "changed_files"):
+                    result.changed_files = changed_files
+                if hasattr(result, "validations"):
+                    result.validations = validations
                 self.evidence_graph.add(EvidenceNode(
                     "completion", "completion_summary", summary or status, "execution_result", ["objective"]
                 ))
@@ -185,15 +247,20 @@ class UnifiedAgentRuntime:
                     self.controller.fail(str(error or status))
                 duration_ms = int((time.monotonic() - started) * 1000)
                 self.history.append(ExecutionRecord(request.mode, status, request.session_id, summary, error, execution_id, duration_ms))
-                append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status=status, objective=request.objective, workspace_root=request.workspace_root, summary=summary, error=str(error or ""), duration_ms=duration_ms))
-                save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status=status, changed_files=changed_files, validations=validations, unresolved=[str(error)] if error else [], metadata={**request.metadata, "task_contract": self.task_contract.to_dict() if self.task_contract else None, "evidence_graph": self.evidence_graph.to_dict(), "independent_review": {"approved": self.last_review.approved, "missing_requirements": self.last_review.missing_requirements, "warnings": self.last_review.warnings} if self.last_review else None}))
+                self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status=status, objective=request.objective, workspace_root=request.workspace_root, summary=summary, error=str(error or ""), duration_ms=duration_ms))
+                self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status=status, changed_files=changed_files, validations=validations, unresolved=[str(error)] if error else [], metadata={**request.metadata, "task_contract": self.task_contract.to_dict() if self.task_contract else None, "evidence_graph": self.evidence_graph.to_dict(), "independent_review": {"approved": self.last_review.approved, "missing_requirements": self.last_review.missing_requirements, "warnings": self.last_review.warnings} if self.last_review else None}))
                 return result
             finally:
                 self._active_task = None
                 self._active_request = None
+                self._runner_task = None
 
     def cancel(self) -> bool:
-        task = self._active_task
+        task = (
+            self._active_task
+            if self._active_task is not None and not self._active_task.done()
+            else self._runner_task
+        )
         if task is None or task.done():
             return False
         task.cancel()

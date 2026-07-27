@@ -124,7 +124,8 @@ class ExecutionController:
 
         empty = is_empty_result(tool_name, result)
         fingerprint = observation_fingerprint(tool_name, result)
-        self.snapshot.observation_counts[fingerprint] = self.snapshot.observation_counts.get(fingerprint, 0) + 1
+        observation_count = self.snapshot.observation_counts.get(fingerprint, 0) + 1
+        self.snapshot.observation_counts[fingerprint] = observation_count
         self._last_observation = fingerprint
 
         if empty:
@@ -144,6 +145,18 @@ class ExecutionController:
         labels = tuple(evidence_labels(tool_name, arguments, result))
         self.snapshot.evidence_items += len(labels) or 1
         self.snapshot.consecutive_empty_observations = 0
+        # An action is only a loop when it repeats without changing the
+        # evidence state.  Keep the guard strict for identical observations,
+        # but forget an action's old count after genuinely novel evidence so a
+        # model can sensibly re-run a check after editing or discovering a new
+        # dependency.  The old implementation counted for the whole turn,
+        # which made valid "inspect -> change -> verify" sequences look like
+        # pathological repetition.
+        if observation_count == 1:
+            # New evidence can invalidate more than the immediately preceding
+            # action (for example, a file edit changes which search commands
+            # are meaningful), so reset the stale repetition window globally.
+            self.snapshot.action_counts.clear()
         self.snapshot.transition(RuntimePhase.EXECUTE)
         return ObservationDecision(True, False, evidence=labels)
 

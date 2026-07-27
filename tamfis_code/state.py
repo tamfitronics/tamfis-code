@@ -30,6 +30,11 @@ from typing import Any, Optional
 from .config import CONFIG_DIR
 
 STATE_PATH = CONFIG_DIR / "state.json"
+_VOLATILE_STATE: dict[tuple[str, int], "SessionState"] = {}
+
+
+def _volatile_key(session_id: int) -> tuple[str, int]:
+    return (str(STATE_PATH), int(session_id))
 MAX_ACTION_HISTORY = 250
 MAX_CHECKPOINTS = 50
 MAX_SAVED_PLANS = 50
@@ -298,6 +303,9 @@ def _save_memory_snapshot(state: SessionState) -> None:
 def get_session_state(session_id: int) -> SessionState:
     raw = _load_raw().get(str(session_id))
     if not raw:
+        volatile = _VOLATILE_STATE.get(_volatile_key(session_id))
+        if volatile is not None:
+            return volatile
         return SessionState(session_id=session_id)
     allowed = set(SessionState.__dataclass_fields__)
     values = {key: value for key, value in raw.items() if key in allowed and key != "session_id"}
@@ -326,8 +334,28 @@ def put_session_state(state: SessionState) -> None:
         )[-MAX_SAVED_PLANS:]
     state.updated_at = _now()
     data[str(state.session_id)] = asdict(state)
-    _save_raw(data)
-    _save_memory_snapshot(state)
+    # Keep the live session usable when a container, sandbox, or ownership
+    # mismatch makes the configured state directory unwritable. This is not a
+    # substitute for durable recovery: the warning makes that limitation
+    # explicit, while the in-process ledger still lets mutation evidence,
+    # approvals, and the current turn proceed consistently.
+    _VOLATILE_STATE[_volatile_key(state.session_id)] = state
+    try:
+        _save_raw(data)
+    except OSError as exc:
+        print(
+            f"⚠ Local session state is volatile ({CONFIG_DIR} is not writable: {exc}). "
+            "The current task can continue, but resume data will not survive this process.",
+            file=sys.stderr,
+        )
+        return
+    try:
+        _save_memory_snapshot(state)
+    except OSError as exc:
+        print(
+            f"⚠ Could not update the session memory mirror ({exc}); state.json remains available.",
+            file=sys.stderr,
+        )
 
 
 def save_session_state(
