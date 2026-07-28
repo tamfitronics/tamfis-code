@@ -253,6 +253,13 @@ class ProviderManager:
             ),
             models=[
                 "gemma4:cloud",
+                # Moonshot AI's newest Ollama Cloud model as of 2026-07-28:
+                # 2.81T-param native multimodal agentic MoE, 1M-token
+                # context, tools/thinking/vision confirmed on the model's
+                # own ollama.com/library/kimi-k3 page before wiring this in.
+                # Listed first / made the coding default below per an
+                # explicit request to prioritize it over kimi-k2.7-code.
+                "kimi-k3:cloud",
                 "kimi-k2.7-code:cloud",
                 "minimax-m2.7:cloud",
             ],
@@ -260,6 +267,12 @@ class ProviderManager:
             weight=10,
             reasoning_supported=True,
             vision_supported=True,
+            # NOTE: this budget is shared by the whole provider bucket
+            # (gemma4:cloud, minimax-m2.7:cloud too, not just kimi-k3), and
+            # gates real request-size/truncation logic in runner_local.py --
+            # left at the existing conservative value rather than raised to
+            # kimi-k3's real 1M window, since that would misrepresent the
+            # other two models' actual limits.
             context_window=262144,
             coding_quality=5,
             tool_calling=True,
@@ -535,6 +548,21 @@ class ProviderManager:
     def paid_fallback_enabled(self) -> bool:
         return os.environ.get("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false").strip().lower() == "true"
 
+    def ollama_cloud_is_premium_primary(self) -> bool:
+        """Whether premium Ollama Cloud is an explicit primary route.
+
+        Premium selection is a user/provider choice, not merely a quality
+        hint. When it is enabled, AUTO must not silently spend time or quota
+        on NVIDIA because the local Ollama daemon is temporarily unavailable.
+        The caller receives a concrete Ollama availability error instead.
+        """
+        return (
+            self.provider_allowed(ProviderType.OLLAMA_CLOUD)
+            and os.environ.get("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true").strip().lower() == "true"
+            and os.environ.get("TAMFIS_CODE_OLLAMA_PREMIUM", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
     def _fallback_provider_allowed(self, provider: ProviderType) -> bool:
         # These are the agreed automatic recovery providers. OpenRouter is
         # permitted automatically only where a free route exists, unless paid
@@ -740,9 +768,14 @@ class ProviderManager:
                 )
 
                 if task_value in {"audit", "debug", "edit", "test"}:
+                    # Promoted from kimi-k2.7-code:cloud: kimi-k3 is
+                    # Moonshot's newer, larger (2.81T-param), longer-context
+                    # (1M token) model with tools/thinking/vision confirmed
+                    # live on ollama.com/library/kimi-k3 -- made the
+                    # priority coding model per explicit request.
                     return os.environ.get(
                         "TAMFIS_CODE_OLLAMA_CODING_MODEL",
-                        "kimi-k2.7-code:cloud",
+                        "kimi-k3:cloud",
                     )
 
                 if _task_needs_paid_tier(task_profile):
@@ -750,6 +783,19 @@ class ProviderManager:
                         "TAMFIS_CODE_OLLAMA_AGENT_MODEL",
                         "minimax-m2.7:cloud",
                     )
+
+                # kimi-k3 is the priority model whenever premium credit is
+                # available, not just for the audit/debug/edit/test subset
+                # above -- this used to fall through to
+                # TAMFIS_CODE_OLLAMA_GENERAL_MODEL (gemma4:cloud, the free
+                # model) for every other task even with premium enabled,
+                # which is backwards: gemma4:cloud should only be used when
+                # there's no premium Ollama credit left at all, not as the
+                # everyday default while premium is active.
+                return os.environ.get(
+                    "TAMFIS_CODE_OLLAMA_CODING_MODEL",
+                    "kimi-k3:cloud",
+                )
 
             return os.environ.get(
                 "TAMFIS_CODE_OLLAMA_GENERAL_MODEL",
@@ -769,17 +815,26 @@ class ProviderManager:
     ) -> tuple[ProviderType, ProviderConfig]:
         """Resolve AUTO to a concrete provider and configuration."""
 
-        resolved = (
-            self._select_best_provider(
-                task_profile, quality_mode=quality_mode,
-                allowed_providers=(
-                    tuple(provider for provider in self.routing_order if self._fallback_provider_allowed(provider))
-                    if provider == ProviderType.AUTO else None
-                ),
+        if provider == ProviderType.AUTO and self.ollama_cloud_is_premium_primary():
+            resolved = ProviderType.OLLAMA_CLOUD
+            if resolved not in self.clients:
+                raise ValueError(
+                    "Ollama Cloud is enabled as the premium primary route, but its local daemon is unavailable "
+                    f"at {self.PROVIDERS[resolved].base_url}. Start/sign in to Ollama Cloud, or explicitly "
+                    "select another provider with --provider."
+                )
+        else:
+            resolved = (
+                self._select_best_provider(
+                    task_profile, quality_mode=quality_mode,
+                    allowed_providers=(
+                        tuple(provider for provider in self.routing_order if self._fallback_provider_allowed(provider))
+                        if provider == ProviderType.AUTO else None
+                    ),
+                )
+                if provider == ProviderType.AUTO
+                else provider
             )
-            if provider == ProviderType.AUTO
-            else provider
-        )
 
         if not self.provider_allowed(resolved):
             raise ValueError(
@@ -957,8 +1012,17 @@ class ProviderManager:
         self,
         current: ProviderType,
         task_profile: Optional["TaskProfile"] = None,
+        *,
+        allow_premium_primary: bool = False,
     ) -> List[ProviderType]:
         """Return usable alternatives in canonical policy order."""
+
+        if (
+            self.ollama_cloud_is_premium_primary()
+            and ProviderType.OLLAMA_CLOUD in self.clients
+            and not allow_premium_primary
+        ):
+            return []
 
         requires_tools = bool(
             getattr(task_profile, "requires_tools", False)

@@ -302,9 +302,73 @@ class LiveInputListener:
             "payload": {"content": f"◆ Queued {classification} for the running task ({item.id})."},
         })
 
+    def _handle_live_model_command(self, text: str) -> bool:
+        """Handle `/model ...` typed into the live in-task follow-up prompt.
+
+        Previously every line typed here -- including `/model kimi-k3:cloud`
+        -- was queued as an ordinary chat follow-up instruction, since only
+        the top-level REPL loop (interactive.py) special-cased `/model`.
+        That meant switching models required waiting for the running task
+        to finish and returning to the plain prompt, unlike Shift+Tab's
+        already-live approval-mode cycling. This mirrors interactive.py's
+        standalone-runtime /model handler so the switch takes effect
+        immediately (from the next turn/queued follow-up onward) without
+        leaving the running task. Returns True if `text` was a /model
+        command (handled or reported as a usage error either way), so the
+        caller must not also enqueue it as a chat message.
+        """
+        if not (text == "/model" or text.startswith("/model ")):
+            return False
+
+        def _report(message: str) -> None:
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": f"◆ {message}"},
+            })
+
+        arg = text[len("/model"):].strip()
+        state = local_state.get_session_state(self.session_id)
+        if not arg:
+            _report(f"model={state.selected_model}  provider={state.selected_provider or 'auto'}")
+            return True
+
+        parts = arg.split()
+        if parts[0].lower() == "auto":
+            local_state.save_session_state(self.session_id, selected_model="auto", selected_provider=None)
+            _report("Provider routing set to automatic -- takes effect on the next turn.")
+            return True
+
+        if parts[0].lower() == "list":
+            _report("Use the top-level `/model list` (outside a running task) to browse full model tables.")
+            return True
+
+        from .local_chat import resolve_provider_type as _resolve_provider_type
+
+        try:
+            provider_type = _resolve_provider_type(parts[0])
+        except ValueError as exc:
+            _report(f"{exc} Usage: /model auto | /model <tamfis|hf|nvidia|openrouter> [model-id]")
+            return True
+        del provider_type  # only validated here; resolve_route re-resolves it per call
+
+        if len(parts) > 2:
+            _report("Model ids cannot contain spaces.")
+            return True
+
+        model_id = parts[1] if len(parts) > 1 else "auto"
+        local_state.save_session_state(
+            self.session_id, selected_model=model_id, selected_provider=parts[0].lower(),
+        )
+        _report(f"Pinned {parts[0].lower()} route, model={model_id} -- takes effect on the next turn.")
+        return True
+
     def _enqueue(self, text: str) -> None:
         text = text.strip()
         if not text:
+            if self._active and not self._paused:
+                self._schedule_prompt()
+            return
+        if self._handle_live_model_command(text):
             if self._active and not self._paused:
                 self._schedule_prompt()
             return
