@@ -90,6 +90,33 @@ def test_auto_prefers_nvidia_over_hf_for_audit():
     assert manager._select_best_provider(classify_task("audit the whole repository")) == ProviderType.NVIDIA
 
 
+def test_premium_ollama_is_authoritative_for_auto(monkeypatch):
+    monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+    resolved, _ = manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    assert resolved == ProviderType.OLLAMA_CLOUD
+
+
+def test_premium_ollama_does_not_fallback_to_nvidia(monkeypatch):
+    monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+    assert manager.fallback_candidates(ProviderType.OLLAMA_CLOUD) == []
+
+
+def test_unavailable_premium_ollama_fails_explicitly_in_auto(monkeypatch):
+    monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    manager = _manager_with(ProviderType.NVIDIA)
+    try:
+        manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    except ValueError as exc:
+        assert "Ollama Cloud is enabled as the premium primary route" in str(exc)
+    else:
+        raise AssertionError("AUTO silently selected a non-Ollama provider")
+
+
 def test_auto_prefers_openrouter_for_edit_when_nvidia_unavailable():
     manager = _manager_with(ProviderType.OPENROUTER, ProviderType.HF)
     assert manager._select_best_provider(classify_task("fix and refactor the code")) == ProviderType.HF

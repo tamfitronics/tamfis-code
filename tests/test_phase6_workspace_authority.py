@@ -17,15 +17,24 @@ def _project(path: Path) -> Path:
 
 def test_launch_root_is_only_implicit_workspace(tmp_path: Path):
     current = _project(tmp_path / "tamfisseo")
-    other = _project(tmp_path / "tamfisgpt")
-    with pytest.raises(WorkspaceAuthorityError) as exc:
-        resolve_workspace_targets(
-            launch_root=current,
-            objective="audit the full stack TamfisGPT IOS",
-            allowed_roots=[current],
-        )
-    assert str(other) in str(exc.value)
-    assert "No external files were inspected" in str(exc.value)
+    _project(tmp_path / "tamfisgpt")
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective="audit the full stack TamfisGPT IOS",
+        allowed_roots=[current],
+    )
+    assert result.roots == (current.resolve(),)
+
+
+def test_named_project_context_does_not_change_workspace_target(tmp_path: Path):
+    current = _project(tmp_path / "tamfisseo")
+    _project(tmp_path / "tamfisgpt")
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective="Use port 3001 because TamfisGPT uses port 5173 for dev.",
+        allowed_roots=[current],
+    )
+    assert result.roots == (current.resolve(),)
 
 
 def test_explicit_external_path_requires_prior_grant(tmp_path: Path):

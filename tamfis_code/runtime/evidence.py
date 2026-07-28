@@ -64,6 +64,9 @@ def is_empty_result(tool_name: str, result: dict[str, Any]) -> bool:
 
 
 def evidence_labels(tool_name: str, arguments: dict[str, Any], result: dict[str, Any]) -> list[str]:
+    if not bool(result.get("success")):
+        error = normalise_text(result.get("error") or result.get("message") or "tool failure")
+        return [f"tool:{tool_name}", f"error:{error[:160]}"]
     if is_empty_result(tool_name, result):
         return []
     payload = result.get("result") if isinstance(result.get("result"), dict) else result

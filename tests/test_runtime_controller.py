@@ -33,6 +33,20 @@ def test_three_empty_observations_fail_terminally():
     assert "stalled" in controller.snapshot.failure_reason.casefold()
 
 
+def test_tool_failures_are_actionable_evidence_not_empty_stalls():
+    controller = ExecutionController(RuntimeBudgets(max_consecutive_empty_observations=3, max_runtime_seconds=60))
+    for index in range(3):
+        args = {"command": f"bad-{index}"}
+        assert controller.guard_action("execute_command", args).allowed
+        decision = controller.observe(
+            "execute_command", args,
+            {"success": False, "error": "Command path is outside the resolved task scope"},
+        )
+        assert decision.useful
+        assert not decision.terminal
+    assert controller.snapshot.consecutive_empty_observations == 0
+
+
 def test_identical_action_is_blocked_after_two_attempts():
     controller = ExecutionController(RuntimeBudgets(max_identical_actions=2, max_runtime_seconds=60))
     args = {"root": "/tmp", "query": "same"}

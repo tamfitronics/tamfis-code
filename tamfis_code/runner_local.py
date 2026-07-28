@@ -784,6 +784,30 @@ def _scope_tool_arguments(
         cwd = _resolve_argument_path(scoped.get("cwd"), workspace_root) or workspace
         command = str(scoped.get("command") or "").strip()
 
+        # Heredoc bodies are source text, not command operands. Inspecting the
+        # entire body with shlex makes literals such as `/` or URL fragments
+        # look like filesystem paths and can incorrectly resolve a target to
+        # the filesystem root. Keep the heredoc header and any suffix command
+        # for scope validation, while excluding the body itself.
+        heredoc_header = re.search(
+            r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_-]*)"
+            r"\1[^\n]*(?:\n|$)",
+            command,
+        )
+        if heredoc_header:
+            delimiter = heredoc_header.group("delimiter")
+            terminator = re.search(
+                rf"(?m)^[ \t]*{re.escape(delimiter)}[ \t]*(?:\r?\n|$)",
+                command[heredoc_header.end():],
+            )
+            if terminator:
+                body_end = heredoc_header.end() + terminator.end()
+                command_for_scope_validation = command[:heredoc_header.end()] + command[body_end:]
+            else:
+                command_for_scope_validation = command[:heredoc_header.end()]
+        else:
+            command_for_scope_validation = command
+
         # Models commonly emit:
         #
         #   cd /authorised/project && git status
@@ -835,7 +859,7 @@ def _scope_tool_arguments(
         )
 
         try:
-            command_tokens = shlex.split(command)
+            command_tokens = shlex.split(command_for_scope_validation)
         except ValueError:
             command_tokens = []
 
@@ -1251,6 +1275,99 @@ def _auto_provider_fallback_enabled(manager: Any) -> bool:
 def _paid_provider_fallback_enabled(manager: Any) -> bool:
     method = getattr(manager, "paid_fallback_enabled", None)
     return bool(method()) if callable(method) else True
+
+
+PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS = 30
+
+
+async def _ask_provider_fallback_approval(
+    console: Console,
+    *,
+    failed_provider: ProviderType,
+    interactive: bool,
+    choices: list[tuple[ProviderType, str]] = (),
+) -> str:
+    """Ask before leaving an explicitly configured premium primary route.
+
+    A provider outage is recoverable, so an unanswered interactive prompt
+    authorises the safe continuation after the bounded 30-second window. An
+    explicit negative answer still preserves the failure for the user to
+    inspect or resume later.
+    """
+    choice_text = ""
+    if choices:
+        choice_text = "\nAvailable routes:\n" + "\n".join(
+            f"  {index}. {provider.value} / {model}"
+            for index, (provider, model) in enumerate(choices, start=1)
+        ) + "\n"
+    prompt = (
+        f"Ollama Cloud failed while it was the premium primary route. Switch "
+        f"from {failed_provider.value} to the best available coding provider? "
+        "[Y/n] or enter a route number/provider/model "
+        f"(auto-switching in {PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS} seconds): "
+    )
+    if choice_text:
+        console.print(choice_text, end="")
+    console.print(
+        "[yellow]Ollama Cloud is unavailable for this turn.[/yellow] "
+        f"Provider fallback requires approval; no response after {PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS} seconds will continue automatically."
+    )
+    if not interactive:
+        return "timeout"
+    # Use prompt_toolkit's async input path. A background ``console.input``
+    # thread competes with the REPL's terminal application and can leave the
+    # live renderer apparently frozen after the provider failure.
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
+
+    session = PromptSession()
+    try:
+        answer = await asyncio.wait_for(
+            session.prompt_async(HTML(prompt)),
+            timeout=PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        console.print("[dim]No response after 30 seconds; selecting the best available coding provider.[/dim]")
+        return "timeout"
+    except (EOFError, KeyboardInterrupt):
+        return "deny"
+    normalized = answer.strip().lower()
+    return "deny" if normalized in {"n", "no"} else normalized or "approve"
+
+
+def _requested_fallback_choice(
+    answer: str,
+    choices: list[tuple[ProviderType, str]],
+) -> tuple[ProviderType, str] | None:
+    if answer in {"approve", "timeout", "", "y", "yes"}:
+        return choices[0] if choices else None
+    if answer.isdigit() and 1 <= int(answer) <= len(choices):
+        return choices[int(answer) - 1]
+    requested_provider, separator, requested_model = answer.partition("/")
+    for provider, model in choices:
+        if provider.value == requested_provider or (
+            separator and provider.value == requested_provider and model == requested_model
+        ):
+            return provider, requested_model if separator else model
+    return None
+
+
+def _fallback_candidates_for_turn(
+    manager: Any,
+    current: ProviderType,
+    task_profile: Any,
+    *,
+    allow_premium_primary: bool = False,
+) -> list[ProviderType]:
+    method = getattr(manager, "fallback_candidates", None)
+    if not callable(method):
+        return []
+    try:
+        return list(method(current, task_profile, allow_premium_primary=allow_premium_primary))
+    except TypeError:
+        # Compatibility with lightweight provider doubles used by older
+        # integrations and tests.
+        return list(method(current, task_profile))
 
 
 def _is_resume_request(text: str) -> bool:
@@ -3787,7 +3904,18 @@ async def _run_local_agent_turn_impl(
     # an execution endpoint, not a routing-decision one.
     renderer.handle_event({"event_type": "routing_started", "payload": {"requested_provider": provider.value, "task_type": task_profile.task_type.value}})
     if provider == ProviderType.AUTO and hasattr(manager, "resolve_route"):
-        resolved_provider, config = manager.resolve_route(provider, task_profile, quality_mode="quality")
+        try:
+            resolved_provider, config = manager.resolve_route(provider, task_profile, quality_mode="quality")
+        except ValueError:
+            # Keep the premium-primary route visible so the normal provider
+            # fallback approval can handle an unavailable Ollama daemon.
+            if (
+                getattr(manager, "ollama_cloud_is_premium_primary", lambda: False)()
+            ):
+                resolved_provider = ProviderType.OLLAMA_CLOUD
+                config = manager.PROVIDERS[resolved_provider]
+            else:
+                raise
     else:
         resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
         config = manager.PROVIDERS.get(resolved_provider)
@@ -3803,10 +3931,45 @@ async def _run_local_agent_turn_impl(
             },
         })
     if not client or config is None:
-        error = f"Provider {resolved_provider.value} is not available (no client / no valid credentials)."
-        orchestrator.fail(error)
-        renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
-        return TaskOutcome(status="failed", error=error)
+        if (
+            provider == ProviderType.AUTO
+            and resolved_provider == ProviderType.OLLAMA_CLOUD
+            and getattr(manager, "ollama_cloud_is_premium_primary", lambda: False)()
+        ):
+            candidates = _fallback_candidates_for_turn(
+                manager,
+                resolved_provider,
+                task_profile,
+                allow_premium_primary=True,
+            )
+            choices = [
+                (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                for candidate in candidates
+                if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
+            ]
+            decision = await _ask_provider_fallback_approval(
+                console,
+                failed_provider=resolved_provider,
+                interactive=interactive,
+                choices=choices,
+            )
+            if decision != "deny":
+                selected = _requested_fallback_choice(decision, choices)
+                for candidate, selected_model in ([selected] if selected else choices):
+                    candidate_client = manager.get_client(candidate)
+                    candidate_config = manager.PROVIDERS.get(candidate)
+                    if candidate_client is not None and candidate_config is not None:
+                        resolved_provider, client, config = candidate, candidate_client, candidate_config
+                        if selected_model:
+                            # Preserve an in-flight premium model choice for
+                            # the first fallback attempt.
+                            model = selected_model
+                        break
+        if not client or config is None:
+            error = f"Provider {resolved_provider.value} is not available (no client / no valid credentials)."
+            orchestrator.fail(error)
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+            return TaskOutcome(status="failed", error=error)
     selected_default_model = (
         _select_fallback_model(manager, config, task_profile)
         if provider == ProviderType.AUTO and not _paid_provider_fallback_enabled(manager)
@@ -4388,6 +4551,19 @@ async def _run_local_agent_turn_impl(
                 exc.partial if isinstance(exc, _InterruptedCompletion)
                 else "".join(checkpoint_partial_parts)
             )
+            # BUG FIX: `failed_provider` was previously first referenced below
+            # (in the premium-Ollama-fallback-approval check) before ever
+            # being assigned in this except block. The only earlier
+            # assignment in this function is inside the narrated-content
+            # repair retry (~line 4098), a separate and not-always-reached
+            # code path -- so the very first streaming call of a task failing
+            # (the most common failure shape: Ollama daemon down, a network
+            # blip, any retryable provider error on round 1) raised
+            # UnboundLocalError here instead of falling back gracefully. No
+            # existing test exercises this integration path (they cover
+            # providers.py's routing logic in isolation, not this function),
+            # which is how it went uncaught.
+            failed_provider = resolved_provider
             can_fallback = (
                 provider == ProviderType.AUTO
                 and _auto_provider_fallback_enabled(manager)
@@ -4395,16 +4571,73 @@ async def _run_local_agent_turn_impl(
                 and manager.is_retryable_provider_error(root_exc)
                 and hasattr(manager, "fallback_candidates")
             )
+            allow_premium_primary = False
+            # Same class of bug: only assigned inside the branch below, but
+            # read unconditionally further down (`candidate ==
+            # premium_choices[0][0] and premium_choices` -- indexed BEFORE
+            # the truthiness check even runs, so an empty/undefined list
+            # would raise UnboundLocalError or IndexError, not just skip the
+            # branch).
+            premium_choices: list[tuple[ProviderType, str]] = []
+            if (
+                can_fallback
+                and failed_provider == ProviderType.OLLAMA_CLOUD
+                and getattr(manager, "ollama_cloud_is_premium_primary", lambda: False)()
+            ):
+                premium_candidates = _fallback_candidates_for_turn(
+                    manager,
+                    failed_provider,
+                    task_profile,
+                    allow_premium_primary=True,
+                )
+                premium_choices = [
+                    (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                    for candidate in premium_candidates
+                    if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
+                ]
+                decision = await _ask_provider_fallback_approval(
+                    console,
+                    failed_provider=failed_provider,
+                    interactive=interactive,
+                    choices=premium_choices,
+                )
+                selected_choice = _requested_fallback_choice(decision, premium_choices)
+                allow_premium_primary = decision != "deny"
+                if selected_choice:
+                    # Put the requested route first; the normal loop still
+                    # tries other dynamically available routes if it fails.
+                    chosen_provider, chosen_model = selected_choice
+                    premium_candidates = [
+                        chosen_provider,
+                        *[candidate for candidate in premium_candidates if candidate != chosen_provider],
+                    ]
+                    premium_choices = [(chosen_provider, chosen_model), *[
+                        choice for choice in premium_choices if choice[0] != chosen_provider
+                    ]]
+                else:
+                    can_fallback = False
             fallback_succeeded = False
             last_error: Exception = root_exc
             failed_provider = resolved_provider
             if can_fallback:
-                for candidate in manager.fallback_candidates(failed_provider, task_profile):
+                candidates = _fallback_candidates_for_turn(
+                    manager,
+                    failed_provider,
+                    task_profile,
+                    allow_premium_primary=allow_premium_primary,
+                )
+                for candidate in candidates:
                     candidate_client = manager.get_client(candidate)
                     candidate_config = manager.PROVIDERS.get(candidate)
                     if candidate_client is None or candidate_config is None:
                         continue
-                    candidate_model = _select_fallback_model(manager, candidate_config, task_profile)
+                    candidate_model = _select_model(manager, candidate_config, task_profile)
+                    if (
+                        failed_provider == ProviderType.OLLAMA_CLOUD
+                        and premium_choices
+                        and candidate == premium_choices[0][0]
+                    ):
+                        candidate_model = premium_choices[0][1]
                     status = manager.provider_error_status(last_error) if hasattr(manager, "provider_error_status") else None
                     reason = f"HTTP {status}" if status is not None else str(last_error)
                     # A real repair attempt, tracked at the point it's actually
@@ -4474,7 +4707,7 @@ async def _run_local_agent_turn_impl(
                         provider=resolved_provider.value,
                         model=resolved_model,
                         reason="automatic provider fallback",
-                        fallback_chain=["nvidia", "hf", "openrouter"],
+                        fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
                     )
                     fallback_succeeded = True
                     break

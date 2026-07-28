@@ -133,6 +133,21 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             self.assertIsNotNone(error)
             self.assertIn("Command path is outside", error)
 
+    def test_heredoc_source_is_not_parsed_as_command_paths(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "tamfisseo")
+            command = "cat > /tmp-placeholder/api.ts << 'EOF'\nimport { readFile } from 'node:fs/promises';\nconst route = '/';\nEOF"
+            command = command.replace("/tmp-placeholder", str(project))
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {"command": command, "cwd": str(root)},
+                workspace_root=str(root),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(project.resolve()))
+
     def test_do_not_touch_excludes_the_launch_directory_and_routes_to_siblings(self):
         """Confirmed live: launching tamfis-code from inside its own repo
         with the objective "audit the TamfisGPT iOS full stack. Identify it

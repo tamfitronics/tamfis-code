@@ -122,7 +122,11 @@ class ExecutionController:
         if self.snapshot.phase == RuntimePhase.EXECUTE:
             self.snapshot.transition(RuntimePhase.OBSERVE)
 
-        empty = is_empty_result(tool_name, result)
+        # A structured tool failure is useful evidence: it tells the model
+        # what operation was rejected and why. It must not be collapsed into
+        # an "empty reconnaissance" streak, otherwise three actionable
+        # errors terminate the task before the model can correct its call.
+        empty = bool(result.get("success")) and is_empty_result(tool_name, result)
         fingerprint = observation_fingerprint(tool_name, result)
         observation_count = self.snapshot.observation_counts.get(fingerprint, 0) + 1
         self.snapshot.observation_counts[fingerprint] = observation_count

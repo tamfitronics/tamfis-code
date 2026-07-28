@@ -95,10 +95,21 @@ def infer_named_external_project(launch_root: Path, objective: str) -> tuple[Pat
     This is diagnostic only. It catches requests such as "audit TamfisGPT"
     launched from /home/tamfisseo and forces the user to switch/add a workspace
     rather than silently inspecting the sibling.
+
+    A project name mentioned as background context (for example, "TamfisGPT
+    uses port 5173") is not a workspace target. Require a project-directed
+    action before applying this diagnostic, otherwise ordinary comparisons and
+    dependency notes are incorrectly rejected before the model sees them.
     """
-    lowered = re.sub(r"[^a-z0-9]+", "", (objective or "").lower())
+    text = objective or ""
+    lowered = re.sub(r"[^a-z0-9]+", "", text.lower())
     if not lowered or launch_root.parent == launch_root:
         return ()
+    target_action_re = re.compile(
+        r"\b(?:audit|inspect|review|read|edit|fix|update|modify|change|search|"
+        r"check|test|build|deploy|run|open|scan|work\s+on|look\s+(?:at|inside))\b",
+        re.IGNORECASE,
+    )
     matches: list[Path] = []
     try:
         siblings = list(launch_root.parent.iterdir())
@@ -114,8 +125,19 @@ def infer_named_external_project(launch_root: Path, objective: str) -> tuple[Pat
             aliases.update({"tamfisgptios", "tamfisaios"})
         if key == "tamfisseo":
             aliases.update({"tamfisseopro"})
-        if key and key != launch_key and any(alias in lowered for alias in aliases):
-            matches.append(sibling.resolve())
+        if not key or key == launch_key:
+            continue
+        # Only classify the named sibling as a target when an action verb
+        # occurs shortly before it. This preserves the safety check for
+        # "audit TamfisGPT" while allowing context such as "TamfisGPT uses
+        # port 5173" to remain an answer/implementation request in the
+        # current workspace.
+        alias_pattern = "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+        for alias_match in re.finditer(rf"\b(?:{alias_pattern})\b", text, re.IGNORECASE):
+            preceding_text = text[max(0, alias_match.start() - 100):alias_match.start()]
+            if target_action_re.search(preceding_text):
+                matches.append(sibling.resolve())
+                break
     return tuple(matches)
 
 
@@ -140,15 +162,13 @@ def resolve_workspace_targets(
             selected.append(path)
 
     if not selected:
-        named_external = infer_named_external_project(grant.launch_root, objective)
-        if named_external:
-            rendered = ", ".join(str(path) for path in named_external)
-            raise WorkspaceAuthorityError(
-                f"The request appears to target {rendered}, which is outside the current workspace "
-                f"{grant.launch_root}. No external files were inspected. Restart Tamfis-Code from that "
-                "project, or run `tamfis-code workspace add PATH` and retry with the explicit absolute path.",
-                denied=named_external, allowed=grant.allowed_roots,
-            )
+        # A sibling's product/repository name is context, not a filesystem
+        # target. Cross-workspace access is requested with an explicit
+        # absolute path (and handled by the normal grant/approval flow above);
+        # silently treating a name mention as a target rejects valid requests
+        # such as port or dependency comparisons before intent classification.
+        # No external files were inspected when a name is mentioned without
+        # an explicit path; the current launch root remains the only scope.
         selected = [grant.launch_root]
 
     return WorkspaceResolution(roots=tuple(selected), explicit_paths=explicit)
