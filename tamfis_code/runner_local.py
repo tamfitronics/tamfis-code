@@ -60,7 +60,7 @@ from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
-from .workspace import classify_root, detect_verify_command
+from .workspace import classify_root, detect_validation_commands
 from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
@@ -199,11 +199,33 @@ FAKE_TOOL_CALL_CORRECTION = (
 MAX_VERIFY_COMMAND_RETRIES = 2
 VERIFY_COMMAND_CORRECTION = (
     "You changed files in this project, but never successfully ran `{command}` (this "
-    "project's real build/type-check command) since the last change. `npm run build` alone "
-    "does not prove the code is correct -- it bundles without type-checking. Run `{command}` "
-    "now via execute_command, and if it reports any errors, fix them and re-run it until it "
-    "passes cleanly before finishing."
+    "project's real validation command) since the last change. Run `{command}` now via "
+    "execute_command, inspect the real output, fix any errors, and re-run it until it passes "
+    "cleanly before finishing. If the failure says a project dependency or validator is "
+    "missing, install it using the project's declared package manager, then retry. Prefer "
+    "the project's virtual environment; only when no venv exists may Python use `python -m "
+    "pip install --break-system-packages`. Do not claim validation from a command you only "
+    "described."
 )
+
+
+def _validation_dependency_hint(command: str, error: str = "") -> str:
+    """Give the model a safe, project-appropriate install recovery path."""
+    missing = any(marker in (error or "").lower() for marker in (
+        "command not found", "no module named", "cannot find module", "not recognized",
+        "no such file or directory",
+    ))
+    if not missing:
+        return ""
+    if command.startswith("npm "):
+        return "The Node dependency tree appears missing; run `npm ci` when package-lock.json exists, otherwise `npm install`, then retry."
+    if command.startswith(("pytest", "ruff", "python ")):
+        return "The Python validator appears missing; prefer `.venv/bin/python -m pip install -e '.[dev]'` when the project declares dev extras, otherwise install the named validator with `python -m pip install --break-system-packages`."
+    if command.startswith("composer") or command.startswith("find .") and "php -l" in command:
+        return "The PHP dependencies or runtime appear missing; run `composer install` for project dependencies and report an unavailable system PHP runtime instead of using an unsafe workaround."
+    if command.startswith(("go ", "cargo ", "dotnet ", "mvn", "./mvnw", "gradle", "./gradlew", "cmake", "make")):
+        return "The project toolchain appears missing; install it through the project's documented toolchain or package manager, then retry the validation command."
+    return "Install the missing project validator through the project's declared package manager, then retry."
 
 RESUME_EXECUTION_INSTRUCTION = (
     "You are resuming an unfinished engineering task from durable state. The user's "
@@ -1771,6 +1793,14 @@ def _normalise_tool_result(
     else:
         normalised["success"] = bool(normalised.get("success", True))
     return normalised
+
+
+def _is_old_string_not_found(tool_name: str, result: dict[str, Any]) -> bool:
+    """Identify the edit failure that requires a fresh source read."""
+    if tool_name != "edit_file" or result.get("success") is not False:
+        return False
+    error = str(result.get("error") or result.get("message") or "").lower()
+    return "old_string not found" in error
 
 
 _AUDIT_PLAN_PATH_RE = re.compile(r"(?<![\w])/(?:[^\s,;()\[\]{}<>]+)")
@@ -3861,9 +3891,11 @@ async def _run_local_agent_turn_impl(
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
-    verify_command = None if read_only else detect_verify_command(Path(workspace_root))
-    verify_command_confirmed = False
-    verify_command_retries = 0
+    validation_commands = [] if read_only else detect_validation_commands(Path(workspace_root))
+    validation_confirmed: set[str] = set()
+    validation_retries: dict[str, int] = {}
+    validation_errors: dict[str, str] = {}
+    unresolved_edit_paths: set[str] = set()
 
     async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
         """Turn accumulated completion output into the turn's final
@@ -3970,6 +4002,15 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
+        if unresolved_edit_paths:
+            message = (
+                "Edit failed: the requested old_string was not found after a fresh read of "
+                + ", ".join(sorted(unresolved_edit_paths))
+                + ". The task is not complete; use the refreshed file contents before editing again."
+            )
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
+            return TaskOutcome(status="failed", error=message, summary=content)
         validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
         if validation.severity == "error":
             message = "Validation failed: " + "; ".join(validation.unresolved)
@@ -3988,6 +4029,49 @@ async def _run_local_agent_turn_impl(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
         )
         return TaskOutcome(status="completed", summary=content)
+
+    def _synthesize_stuck_recovery_summary(messages: list[dict]) -> str:
+        """Last resort when the model won't produce any text even with
+        tools disabled: rebuild a plain-text summary directly from the
+        tool calls/results already recorded on `working_messages` this
+        turn, so real work the model actually did (e.g. four completed
+        database cleanups) isn't thrown away just because the model
+        itself never narrated it. Returns "" if nothing usable was found."""
+        call_info: dict[str, tuple[str, Any]] = {}
+        lines: list[str] = []
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for call in msg["tool_calls"]:
+                    fn = call.get("function") or {}
+                    call_info[call.get("id")] = (fn.get("name") or "tool", fn.get("arguments"))
+            elif msg.get("role") == "tool":
+                name, arguments = call_info.get(msg.get("tool_call_id"), ("tool", None))
+                try:
+                    result = json.loads(msg.get("content") or "{}")
+                except (TypeError, ValueError):
+                    result = {}
+                if not isinstance(result, dict):
+                    continue
+                if str(result.get("error", "")).startswith("Refused: this round was detected as stuck"):
+                    continue
+                success = result.get("success")
+                label = "done" if success else ("failed" if success is False else "ran")
+                detail = result.get("error") or result.get("message") or result.get("result")
+                arg_hint = ""
+                if isinstance(arguments, str):
+                    arg_hint = arguments[:120]
+                elif arguments is not None:
+                    arg_hint = json.dumps(arguments, default=str)[:120]
+                line = f"- {name}({arg_hint}) -> {label}"
+                if detail:
+                    line += f": {str(detail)[:200]}"
+                lines.append(line)
+        if not lines:
+            return ""
+        return (
+            "⚠ The model could not produce a text summary even with tools disabled, so this is "
+            "reconstructed directly from the actions it actually took this turn:\n\n" + "\n".join(lines)
+        )
 
     async def _handle_stuck_loop(
         stuck_reason: str, tool_calls: list["_StreamedToolCall"],
@@ -4082,6 +4166,16 @@ async def _run_local_agent_turn_impl(
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
             return TaskOutcome(status="failed", error=message)
         if not recovery_content.strip():
+            fallback_summary = _synthesize_stuck_recovery_summary(working_messages)
+            if fallback_summary:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": "Tools-disabled recovery answer was empty too -- reconstructing a "
+                                   "summary from actions actually taken this turn instead of failing."
+                    },
+                })
+                return await _finalize_completed_answer(fallback_summary, None)
             message = (f"Detected {stuck_reason}, and the tools-disabled recovery answer was empty too. ""Try narrowing the objective to a specific repository, component, file, or concern.")
             orchestrator.fail(message)
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
@@ -4934,27 +5028,44 @@ async def _run_local_agent_turn_impl(
                 _persist_turn_checkpoint()
                 continue
 
-            if (
-                tools and any_mutation and verify_command is not None
-                and not verify_command_confirmed
-                and verify_command_retries < MAX_VERIFY_COMMAND_RETRIES
-            ):
-                verify_command_retries += 1
+            next_validation = next(
+                (item for item in validation_commands if item[1] not in validation_confirmed),
+                None,
+            )
+            if tools and any_mutation and next_validation is not None:
+                validation_label, validation_command = next_validation
+                retries = validation_retries.get(validation_command, 0)
+                if retries >= MAX_VERIFY_COMMAND_RETRIES:
+                    message = (
+                        f"Validation incomplete: `{validation_command}` did not produce a "
+                        "confirmed successful result after the allowed attempts."
+                    )
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    _persist_turn_checkpoint(status="failed", last_error=message)
+                    return TaskOutcome(status="failed", error=message)
+                validation_retries[validation_command] = retries + 1
                 working_messages.append({"role": "assistant", "content": content})
                 working_messages.append({
                     "role": "system",
-                    "content": VERIFY_COMMAND_CORRECTION.format(command=verify_command[1]),
+                    "content": (
+                        VERIFY_COMMAND_CORRECTION.format(command=validation_command)
+                        + "\n\n"
+                        + _validation_dependency_hint(
+                            validation_command, validation_errors.get(validation_command, "")
+                        )
+                    ),
                 })
                 orchestrator.mark_repair(
-                    f"Requiring a real `{verify_command[1]}` run before completion "
-                    f"(attempt {verify_command_retries}/{MAX_VERIFY_COMMAND_RETRIES})"
+                    f"Requiring a real `{validation_command}` run before completion "
+                    f"(attempt {validation_retries[validation_command]}/{MAX_VERIFY_COMMAND_RETRIES})"
                 )
                 renderer.handle_event({
                     "event_type": "diagnostics",
                     "payload": {
                         "content": (
-                            f"Files changed but `{verify_command[1]}` hasn't been confirmed clean since; "
-                            "requesting it before finishing."
+                            f"Files changed but `{validation_command}` hasn't been confirmed clean since; "
+                            f"requesting validation ({validation_label}) before finishing."
                         )
                     },
                 })
@@ -5316,6 +5427,39 @@ async def _run_local_agent_turn_impl(
                 "tool_call_id": tc.call_id,
                 "content": json.dumps(result, default=str),
             })
+            if _is_old_string_not_found(tc.name, result):
+                refresh_path = str(arguments.get("path") or "")
+                if refresh_path:
+                    unresolved_edit_paths.add(refresh_path)
+                    refresh_call_id = f"fresh_read_{_round}_{len(working_messages)}"
+                    renderer.handle_event({"event_type": "tool_call_requested", "payload": {
+                        "name": "read_file", "arguments": {"path": refresh_path},
+                    }})
+                    fresh_read = await mcp_server.call_tool("read_file", {"path": refresh_path})
+                    fresh_read = _normalise_tool_result(
+                        "read_file", {"path": refresh_path}, fresh_read, workspace_root,
+                    )
+                    working_messages.append({
+                        "role": "assistant", "tool_calls": [{
+                            "id": refresh_call_id, "type": "function",
+                            "function": {"name": "read_file", "arguments": json.dumps({"path": refresh_path})},
+                        }],
+                    })
+                    working_messages.append({
+                        "role": "tool", "tool_call_id": refresh_call_id,
+                        "content": json.dumps(fresh_read, default=str),
+                    })
+                    working_messages.append({
+                        "role": "system",
+                        "content": (
+                            f"Fresh read_file completed for {refresh_path!r} after edit_file failed. "
+                            "Do not retry the same old_string/edit arguments; use the refreshed content "
+                            "or report Edit failed."
+                        ),
+                    })
+                    renderer.handle_event({"event_type": "tool_output", "payload": {
+                        "tool": "read_file", "result": _tool_output_for_render(fresh_read),
+                    }})
             # A batch may contain several tools. Flush after each completed
             # result so a kill/network loss between tools cannot make resume
             # treat an already-applied mutation as still in flight.
@@ -5341,7 +5485,7 @@ async def _run_local_agent_turn_impl(
                 # A further edit after a clean verify run invalidates that
                 # result -- require re-verifying against the latest code,
                 # not whatever was true before this change.
-                verify_command_confirmed = False
+                validation_confirmed.clear()
                 state = local_state.get_session_state(session_id)
                 if state.modified_files:
                     mutation = state.modified_files[-1]
@@ -5350,13 +5494,18 @@ async def _run_local_agent_turn_impl(
                         "lines_removed": mutation["lines_removed"], "mutation_id": mutation["mutation_id"],
                     }})
 
-            if (
-                verify_command is not None
-                and tc.name == "execute_command"
-                and result.get("success")
-                and verify_command[1] in str(arguments.get("command") or "")
-            ):
-                verify_command_confirmed = True
+            if tc.name == "execute_command" and result.get("success"):
+                executed_command = str(arguments.get("command") or "")
+                for _, validation_command in validation_commands:
+                    if validation_command in executed_command:
+                        validation_confirmed.add(validation_command)
+            elif tc.name == "execute_command":
+                executed_command = str(arguments.get("command") or "")
+                for _, validation_command in validation_commands:
+                    if validation_command in executed_command:
+                        validation_errors[validation_command] = str(
+                            result.get("error") or result.get("result") or result.get("message") or "validation failed"
+                        )
 
         # The assistant tool-call message and every matching tool result are
         # now protocol-complete.  Save immediately before any optional

@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from tamfis_code.workspace import detect_verify_command
+from tamfis_code.workspace import detect_validation_commands, detect_verify_command
 
 
 def _write_package_json(root: Path, scripts: dict) -> None:
@@ -24,6 +24,34 @@ def _write_package_json(root: Path, scripts: dict) -> None:
 
 
 class DetectVerifyCommandTests(unittest.TestCase):
+    def test_detects_typecheck_build_and_tests_together(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / ".git").mkdir()
+            _write_package_json(root, {"check": "tsc -b", "build": "vite build", "test": "vitest"})
+            commands = dict(detect_validation_commands(root))
+        self.assertIn("npm run check", commands.values())
+        self.assertIn("npm run build", commands.values())
+        self.assertIn("npm test", commands.values())
+        self.assertIn("git diff --check", commands.values())
+
+    def test_detects_python_checks(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pyproject.toml").write_text("[tool.ruff]\n")
+            (root / "tests").mkdir()
+            commands = dict(detect_validation_commands(root))
+        self.assertIn("python -m compileall -q .", commands.values())
+        self.assertIn("ruff check .", commands.values())
+        self.assertIn("pytest -q", commands.values())
+
+    def test_detects_cmake_build(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "CMakeLists.txt").write_text("cmake_minimum_required(VERSION 3.20)\n")
+            commands = dict(detect_validation_commands(root))
+        self.assertIn("cmake -S . -B build && cmake --build build", commands.values())
+
     def test_prefers_check_script_over_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

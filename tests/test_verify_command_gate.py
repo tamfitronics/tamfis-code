@@ -48,12 +48,10 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
         )
         return root
 
-    def test_mutation_without_verification_is_nudged_then_completes_after_retries_exhausted(self):
+    def test_mutation_without_verification_fails_after_retries_exhausted(self):
         """The model edits a file but never runs the check command, even
-        after being asked -- this must NOT hard-fail the whole task (unlike
-        a fabricated/narrated-intent guard) and must NOT loop forever; it
-        completes once the bounded retry budget is spent, with diagnostics
-        proving the nudge actually fired."""
+        after being asked -- this must fail rather than claim completion,
+        while remaining bounded and reporting the required validation command."""
         with tempfile.TemporaryDirectory() as tmp:
             ws = self._js_workspace(tmp)
             write_args = json.dumps({"path": str(ws / "app.ts"), "content": "export const x = 1;\n"})
@@ -82,7 +80,7 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
                 workspace_root=str(ws), session_id=1, approval_policy="auto", interactive=False,
             ))
 
-            self.assertEqual(outcome.status, "completed")
+            self.assertEqual(outcome.status, "failed")
             diagnostics = [
                 str(e["payload"].get("content"))
                 for e in renderer.events

@@ -832,6 +832,115 @@ def detect_verify_command(workspace_root: Path) -> Optional[tuple[str, str]]:
     return None
 
 
+def detect_validation_commands(workspace_root: Path) -> list[tuple[str, str]]:
+    """Return declared, language-aware checks required after an edit."""
+    root = Path(workspace_root).expanduser().resolve()
+    commands: list[tuple[str, str]] = []
+
+    def add(label: str, command: str) -> None:
+        if not any(existing == command for _, existing in commands):
+            commands.append((label, command))
+
+    if (root / ".git").exists():
+        add("git diff --check", "git diff --check")
+
+    project_type = _discover_project_type(root)
+    language = project_type.get("language")
+
+    if language in {"JavaScript", "TypeScript", "JavaScript/TypeScript"}:
+        try:
+            package = json.loads((root / "package.json").read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            package = {}
+        scripts = package.get("scripts") if isinstance(package, dict) else {}
+        if isinstance(scripts, dict):
+            for name in _JS_VERIFY_SCRIPT_PRIORITY:
+                if name in scripts:
+                    add(f"npm run {name}", f"npm run {name}")
+            if "test" in scripts:
+                add("npm test", "npm test")
+
+    elif language == "Python":
+        add("Python syntax check", "python -m compileall -q .")
+        manifest_text = ""
+        for manifest in (root / "pyproject.toml", root / "setup.cfg"):
+            if manifest.is_file():
+                try:
+                    manifest_text += manifest.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+        if (root / "ruff.toml").is_file() or "[tool.ruff" in manifest_text:
+            add("ruff check", "ruff check .")
+        if ((root / "pytest.ini").is_file() or (root / "tox.ini").is_file()
+                or "pytest" in manifest_text or (root / "tests").is_dir()):
+            add("pytest", "pytest -q")
+
+    elif language == "PHP":
+        add("PHP syntax check", "find . -type f -name '*.php' -not -path './vendor/*' -not -path './node_modules/*' -print0 | xargs -0 -r -n1 php -l")
+        if (root / "composer.json").is_file():
+            try:
+                composer = json.loads((root / "composer.json").read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                composer = {}
+            scripts = composer.get("scripts") if isinstance(composer, dict) else {}
+            if isinstance(scripts, dict):
+                for name in ("lint", "stan", "analyse", "test"):
+                    if name in scripts:
+                        add(f"composer {name}", f"composer run {name}")
+
+    elif language == "Go":
+        add("go vet", "go vet ./...")
+        add("go test", "go test ./...")
+        add("go build", "go build ./...")
+    elif language == "Rust":
+        add("cargo fmt", "cargo fmt --check")
+        add("cargo check", "cargo check")
+        add("cargo test", "cargo test")
+    elif language in {"C#", "F#"}:
+        add("dotnet build", "dotnet build")
+        if (root / "tests").is_dir() or any(root.glob("*.sln")):
+            add("dotnet test", "dotnet test")
+    elif language in {"Java", "Java/Kotlin", "Kotlin"}:
+        if (root / "mvnw").is_file():
+            add("Maven test", "./mvnw test")
+            add("Maven package", "./mvnw package -DskipTests")
+        elif (root / "pom.xml").is_file():
+            add("Maven test", "mvn test")
+            add("Maven package", "mvn package -DskipTests")
+        elif (root / "gradlew").is_file():
+            add("Gradle test", "./gradlew test")
+            add("Gradle build", "./gradlew build")
+    elif language == "Ruby":
+        if (root / "Rakefile").is_file():
+            add("Ruby tests", "bundle exec rake test")
+        else:
+            add("Ruby syntax check", "find . -type f -name '*.rb' -not -path './vendor/*' -print0 | xargs -0 -r -n1 ruby -c")
+    elif language == "Dart":
+        add("Dart analyze", "dart analyze")
+        add("Dart test", "dart test")
+    elif language == "Elixir":
+        add("Mix compile", "mix compile --warnings-as-errors")
+        add("Mix test", "mix test")
+    elif language in {"Haskell", "Scala", "Clojure", "Perl", "Swift"}:
+        commands_by_language = {
+            "Haskell": ("stack test", "stack build"), "Scala": ("sbt test", "sbt compile"),
+            "Clojure": ("clojure -M:test", "clojure -M:compile"), "Perl": ("prove -r t",),
+            "Swift": ("swift test", "swift build"),
+        }
+        for command in commands_by_language.get(language, ()):
+            add(command, command)
+
+    # Manifest-light native projects.
+    if (root / "CMakeLists.txt").is_file():
+        add("CMake build", "cmake -S . -B build && cmake --build build")
+    elif (root / "Makefile").is_file() or (root / "makefile").is_file():
+        add("Make build", "make")
+    if any(root.glob("*.sh")):
+        add("shell syntax check", "find . -type f -name '*.sh' -not -path './node_modules/*' -not -path './vendor/*' -print0 | xargs -0 -r -n1 bash -n")
+
+    return commands
+
+
 def discover_local_repository(session_id: int, workspace_root: Path, *, force: bool = False) -> dict[str, Any]:
     """Cache local CLI context until Git HEAD or dirty-file count changes.
 
@@ -967,6 +1076,12 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
     # only None when that git call failed (see its `"no-head"` sentinel).
     if context.get("head"):
         lines.append(f"Git repository root: {context['repository_root']}  branch: {context.get('branch') or '(detached HEAD)'}")
+        lines.append(
+            "For Git publishing requests, inspect status, diff, remotes, and the current branch first. "
+            "Stage only files belonging to this task, commit with a concise message, and push the current "
+            "branch only after the normal approval gate. Never force-push or rewrite history unless the user "
+            "explicitly requests it."
+        )
         if context.get("dirty"):
             lines.append(
                 f"The working tree already has {len(context.get('dirty_files') or [])} uncommitted change(s) -- "

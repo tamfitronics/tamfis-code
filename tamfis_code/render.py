@@ -1005,6 +1005,8 @@ class StreamRenderer:
                     "command": result.get("command"),
                 }
             label = _tool_action_label(tool, args, completed=True)
+            if failed and tool == "edit_file":
+                label = "Edit failed"
             _render_result_block(self.console, ok=not failed, label=label, content=content)
             return
 
