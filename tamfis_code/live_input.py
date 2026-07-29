@@ -13,8 +13,9 @@ import asyncio
 import contextlib
 import sys
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
+from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import HTML
 
 from . import state as local_state
@@ -54,7 +55,12 @@ def _active_agent_count(exclude_session_id: int) -> int:
     for sid in local_state.all_known_session_ids():
         if sid == exclude_session_id:
             continue
-        if local_state.get_session_state(sid).execution_status == "running":
+        state = local_state.get_session_state(sid)
+        # Ordinary sessions can remain marked "running" after a killed SSH
+        # process. Only real delegated swarm children belong in the agent
+        # counter; counting every stale top-level session produced nonsense
+        # footers such as "← 16 agents" on a fresh prompt.
+        if state.is_swarm_child and state.execution_status == "running":
             count += 1
     return count
 
@@ -63,23 +69,50 @@ def _mode_and_agents_html(cli_config: Config, session_id: int) -> str:
     mode = mode_label_for_policy(cli_config.approval_policy)
     mode_on = _MODE_ON_LABEL.get(mode)
     mode_line = (
-        f"<ansiyellow>⏵⏵ {mode_on} (shift+tab to cycle)</ansiyellow>"
+        f"<ansiyellow>⏵⏵ {mode_on.replace(' mode on', '').replace(' on', '')} · shift+tab</ansiyellow>"
         if mode_on
-        else f"<ansigray>⏵⏵ {mode} mode · shift+tab to cycle</ansigray>"
+        else f"<ansigray>⏵⏵ {mode} · shift+tab</ansigray>"
     )
     agents = _active_agent_count(session_id)
     agents_suffix = f" <ansigray>· ← {agents} agent{'s' if agents != 1 else ''}</ansigray>" if agents else ""
     return f"{mode_line}{agents_suffix}"
 
 
-def idle_bottom_toolbar(cli_config: Config, session_id: int) -> HTML:
+def idle_bottom_toolbar(
+    cli_config: Config,
+    session_id: int,
+    *,
+    provider: str = "auto",
+    model: Optional[str] = None,
+) -> HTML:
     """Bottom-toolbar content for the plain REPL prompt (no task running) --
     same mode/agents banner as the live in-task footer below, so the bar
     doesn't disappear the moment a turn finishes."""
     return HTML(
         "<b><ansicyan>◆</ansicyan></b> <b>Ready</b>  "
-        f"<ansigray>│</ansigray> {_mode_and_agents_html(cli_config, session_id)}"
+        f"<ansigray>│ provider {provider} · model {model or 'auto'} │</ansigray> "
+        f"{_mode_and_agents_html(cli_config, session_id)}"
     )
+
+
+def force_bottom_toolbar_visible(session: Any) -> None:
+    """Render status on terminals where prompt-toolkit disables CPR.
+
+    PromptSession normally hides its bottom toolbar until the terminal
+    confirms cursor-position-report support. Several SSH/web terminals never
+    answer that query, leaving Tamfis-Code's mode/model/status permanently
+    absent. The toolbar is essential UI here, so remove only that capability
+    gate while retaining prompt-toolkit's own toolbar window.
+    """
+    root = getattr(getattr(session, "layout", None), "container", None)
+    children = getattr(root, "children", None)
+    if not children:
+        return
+    toolbar = children[-1]
+    if hasattr(toolbar, "filter"):
+        toolbar.filter = Condition(
+            lambda: getattr(session, "bottom_toolbar", None) is not None
+        )
 
 
 class LiveInputListener:
@@ -257,14 +290,24 @@ class LiveInputListener:
             if not event.app.is_done:
                 event.app.exit(result="")
 
-        session = PromptSession(key_bindings=bindings)
+        # Keep the same boxed composer while a task is running. Replacing the
+        # idle editor with a bare "message>" line made the interface jump
+        # between two unrelated layouts and hid the footer hierarchy.
+        session = PromptSession(
+            key_bindings=bindings,
+            show_frame=True,
+            reserve_space_for_menu=0,
+        )
+        force_bottom_toolbar_visible(session)
         self._prompt_session = session
         try:
             while self._active and not self._paused:
                 try:
                     with patch_stdout(raw=True):
                         text = await session.prompt_async(
-                            "message> ", bottom_toolbar=self._bottom_toolbar,
+                            "message› ",
+                            bottom_toolbar=self._bottom_toolbar,
+                            show_frame=True,
                         )
                 except asyncio.CancelledError:
                     raise

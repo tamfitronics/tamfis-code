@@ -188,6 +188,22 @@ class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
         self.assertEqual(rendered, "message› ")
         self.assertNotIn("manual", rendered)
 
+    def test_interactive_prompt_uses_a_real_composer_frame(self):
+        with patch("tamfis_code.interactive.Console", return_value=Console(file=io.StringIO())), \
+                patch("tamfis_code.interactive.PromptSession") as session_cls, \
+                patch("tamfis_code.interactive.print_banner"):
+            session_cls.return_value.prompt_async = AsyncMock(side_effect=[EOFError()])
+            asyncio.run(run_interactive_import(
+                client=None,
+                config=Config(),
+                workspace=WorkspaceContext(session_id=99, workspace_root="/tmp/fake-workspace"),
+            ))
+
+        self.assertTrue(session_cls.call_args.kwargs["show_frame"])
+        self.assertTrue(
+            session_cls.return_value.prompt_async.await_args.kwargs["show_frame"]
+        )
+
     def test_status_shows_standalone_not_server_id(self):
         output = _run(["/status", EOFError()])
         self.assertIn("standalone, local session", output)

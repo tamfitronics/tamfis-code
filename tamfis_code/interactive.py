@@ -44,7 +44,11 @@ from .custom_commands import (
     load_custom_commands,
 )
 from .doctor import run_doctor
-from .live_input import LiveInputListener, idle_bottom_toolbar
+from .live_input import (
+    LiveInputListener,
+    force_bottom_toolbar_visible,
+    idle_bottom_toolbar,
+)
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
 from .runner import (
     TaskOutcome,
@@ -552,8 +556,20 @@ async def run_interactive(
     session: PromptSession = PromptSession(
         history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
         completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
-        bottom_toolbar=lambda: idle_bottom_toolbar(config, workspace.session_id),
+        bottom_toolbar=lambda: idle_bottom_toolbar(
+            config,
+            workspace.session_id,
+            provider=provider,
+            model=model,
+        ),
+        reserve_space_for_menu=0,
+        # prompt-toolkit supplies a real dynamic Frame around the entire
+        # multiline editor. This is the composer box the previous prompt-only
+        # change failed to provide; the status/mode toolbar remains directly
+        # below the frame, matching Codex/Claude Code's visual hierarchy.
+        show_frame=True,
     )
+    force_bottom_toolbar_visible(session)
 
     async def _run_saved_plan(plan_id_arg: Optional[str]) -> bool:
         """Execute a saved plan by id (or the most recent if plan_id_arg is
@@ -634,7 +650,10 @@ async def run_interactive(
             pending_pastes.clear()
             paste_counter = 0
             try:
-                text = await session.prompt_async(_prompt_message)
+                text = await session.prompt_async(
+                    _prompt_message,
+                    show_frame=True,
+                )
             except KeyboardInterrupt:
             # NOTE: this used to just `continue`, silently redrawing the
             # prompt -- Ctrl+C appeared to do nothing at all, with no

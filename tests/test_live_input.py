@@ -13,6 +13,8 @@ from tamfis_code.live_input import (
     _CTRL_T,
     _CTRL_Y,
     _SHIFT_TAB,
+    _active_agent_count,
+    force_bottom_toolbar_visible,
     idle_bottom_toolbar,
 )
 from tamfis_code.render import StreamRenderer
@@ -43,12 +45,27 @@ def _config(approval_policy: str = "ask") -> Config:
 
 class ShiftTabCyclesModeTests(unittest.TestCase):
     def test_idle_toolbar_keeps_ready_status_and_current_mode_below_input(self):
-        fragments = idle_bottom_toolbar(_config("ask"), 1).__pt_formatted_text__()
+        fragments = idle_bottom_toolbar(
+            _config("ask"), 1, provider="ollama_cloud", model="kimi",
+        ).__pt_formatted_text__()
         rendered = "".join(text for _style, text in fragments)
 
         self.assertIn("Ready", rendered)
-        self.assertIn("manual mode", rendered)
-        self.assertIn("shift+tab to cycle", rendered)
+        self.assertIn("provider ollama_cloud", rendered)
+        self.assertIn("model kimi", rendered)
+        self.assertIn("⏵⏵ manual", rendered)
+        self.assertIn("shift+tab", rendered)
+
+    def test_toolbar_is_not_suppressed_when_terminal_cpr_is_unknown(self):
+        from prompt_toolkit import PromptSession
+
+        session = PromptSession(bottom_toolbar="status", show_frame=True)
+        before = repr(session.layout.container.children[-1].filter)
+        force_bottom_toolbar_visible(session)
+        after = repr(session.layout.container.children[-1].filter)
+
+        self.assertIn("renderer_height_is_known", before)
+        self.assertNotIn("renderer_height_is_known", after)
 
     def test_dispatch_cycles_approval_policy_and_emits_diagnostic(self):
         renderer = StreamRenderer(_console())
@@ -93,6 +110,17 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
 
 
 class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCase):
+    def test_agent_count_ignores_stale_top_level_sessions(self):
+        stale = state_module.get_session_state(41)
+        stale.execution_status = "running"
+        state_module.put_session_state(stale)
+        child = state_module.get_session_state(42)
+        child.execution_status = "running"
+        child.is_swarm_child = True
+        state_module.put_session_state(child)
+
+        self.assertEqual(_active_agent_count(exclude_session_id=1), 1)
+
     @patch("prompt_toolkit.PromptSession.prompt_async", new_callable=AsyncMock, return_value="also check the login page")
     async def test_interject_enqueues_a_follow_up_instruction(self, _mock_prompt_async):
         renderer = StreamRenderer(_console())
