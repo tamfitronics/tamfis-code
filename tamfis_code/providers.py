@@ -7,8 +7,8 @@ canonical OpenAI-compatible client interface.
 Automatic standalone routing:
     1. Ollama Cloud
        - Current/default: gemma4:cloud
-       - Premium coding: kimi-k2.7-code:cloud
-       - Premium agent: minimax-m2.7:cloud
+       - Priority coding/agent: kimi-k2.7-code:cloud
+       - Extra-usage heavy jobs (explicit opt-in): kimi-k3:cloud
     2. NVIDIA NIM
     3. Hugging Face
     4. OpenRouter
@@ -257,8 +257,9 @@ class ProviderManager:
                 # 2.81T-param native multimodal agentic MoE, 1M-token
                 # context, tools/thinking/vision confirmed on the model's
                 # own ollama.com/library/kimi-k3 page before wiring this in.
-                # Listed first / made the coding default below per an
-                # explicit request to prioritize it over kimi-k2.7-code.
+                # It remains available for explicit operator-approved heavy
+                # jobs, but is not an automatic/default route because it can
+                # consume Ollama extra usage.
                 "kimi-k3:cloud",
                 "kimi-k2.7-code:cloud",
                 "minimax-m2.7:cloud",
@@ -761,40 +762,28 @@ class ProviderManager:
             ).strip().lower() in {"1", "true", "yes", "on"}
 
             if premium_enabled:
-                task_type = getattr(task_profile, "task_type", None)
-                task_value = (
-                    getattr(task_type, "value", None)
-                    or str(task_type or "")
-                )
-
-                if task_value in {"audit", "debug", "edit", "test"}:
-                    # Promoted from kimi-k2.7-code:cloud: kimi-k3 is
-                    # Moonshot's newer, larger (2.81T-param), longer-context
-                    # (1M token) model with tools/thinking/vision confirmed
-                    # live on ollama.com/library/kimi-k3 -- made the
-                    # priority coding model per explicit request.
+                # Kimi K3 consumes Ollama "extra usage" on accounts where it
+                # is not included in plan usage. Never select it merely
+                # because Ollama Cloud is the primary provider. A machine
+                # administrator must explicitly enable extra usage, and the
+                # task must independently qualify as heavy.
+                extra_usage_enabled = os.environ.get(
+                    "TAMFIS_CODE_OLLAMA_EXTRA_USAGE",
+                    "false",
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if extra_usage_enabled and _task_needs_paid_tier(task_profile):
                     return os.environ.get(
-                        "TAMFIS_CODE_OLLAMA_CODING_MODEL",
+                        "TAMFIS_CODE_OLLAMA_HEAVY_MODEL",
                         "kimi-k3:cloud",
                     )
 
-                if _task_needs_paid_tier(task_profile):
-                    return os.environ.get(
-                        "TAMFIS_CODE_OLLAMA_AGENT_MODEL",
-                        "minimax-m2.7:cloud",
-                    )
-
-                # kimi-k3 is the priority model whenever premium credit is
-                # available, not just for the audit/debug/edit/test subset
-                # above -- this used to fall through to
-                # TAMFIS_CODE_OLLAMA_GENERAL_MODEL (gemma4:cloud, the free
-                # model) for every other task even with premium enabled,
-                # which is backwards: gemma4:cloud should only be used when
-                # there's no premium Ollama credit left at all, not as the
-                # everyday default while premium is active.
+                # The included-plan Kimi coding route is the all-round
+                # priority whenever Ollama Cloud is intentionally enabled as
+                # primary. It handles routine and heavy coding without
+                # silently escalating to an extra-usage-only model.
                 return os.environ.get(
                     "TAMFIS_CODE_OLLAMA_CODING_MODEL",
-                    "kimi-k3:cloud",
+                    "kimi-k2.7-code:cloud",
                 )
 
             return os.environ.get(

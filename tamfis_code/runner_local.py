@@ -867,7 +867,13 @@ def _scope_tool_arguments(
         operand_roots: set[Path] = set()
 
         for token in command_tokens[1:]:
-            candidate_text = token.split("=", 1)[-1] if "=" in token else token
+            # Shell environment assignments are not command path operands.
+            # Treating `SMTP_PASSWORD=...` as a path caused the checker to
+            # report misleading errors such as `/SMTP_PASSWORD=` and made
+            # reasoning models retry the same invalid call repeatedly.
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                continue
+            candidate_text = token
 
             if (
                 not candidate_text.startswith("/")
@@ -1001,6 +1007,56 @@ EMPTY_CONTINUATION_INSTRUCTION = (
     "If the task is complete, provide a concrete evidence-backed final answer. "
     "Do not return an empty response."
 )
+
+
+def _empty_continuation_messages(
+    messages: list[dict[str, Any]], attempt: int,
+) -> list[dict[str, Any]]:
+    """Build a fresh, provider-visible continuation request.
+
+    Appending a late ``system`` message after a tool result is legal in some
+    OpenAI-compatible APIs but is ignored or handled inconsistently by
+    others. More importantly, retrying that identical transcript can produce
+    the same cached/deterministic empty completion forever. A user-role nudge
+    is universally visible and the attempt marker makes every bounded retry
+    a genuinely new request.
+    """
+    retry_detail = (
+        ""
+        if attempt <= 1
+        else (
+            f" Continuation recovery attempt {attempt}: the previous recovery "
+            "also returned no assistant text or tool call, so choose a concrete "
+            "next action now."
+        )
+    )
+    return [
+        *messages,
+        {
+            "role": "user",
+            "content": EMPTY_CONTINUATION_INSTRUCTION + retry_detail,
+        },
+    ]
+
+
+def _same_provider_recovery_models(config: Any, current_model: str) -> list[str]:
+    """Return safe alternate models without leaving the selected provider."""
+    candidates = [
+        str(getattr(config, "default_model", "") or ""),
+        *[str(item or "") for item in (getattr(config, "models", None) or [])],
+    ]
+    extra_usage_enabled = os.environ.get(
+        "TAMFIS_CODE_OLLAMA_EXTRA_USAGE", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    result: list[str] = []
+    for candidate in candidates:
+        if not candidate or candidate == current_model or candidate in result:
+            continue
+        if candidate == "kimi-k3:cloud" and not extra_usage_enabled:
+            continue
+        result.append(candidate)
+    return result
+
 
 # A long, reasoning-heavy final answer (e.g. a full-stack audit report) can
 # hit MAX_TOKENS_PER_REQUEST mid-sentence -- confirmed live: a nemotron
@@ -1852,6 +1908,12 @@ def _semantic_tool_failure(tool_name: str, arguments: dict[str, Any], result: di
     if isinstance(inner, str):
         stripped = inner.strip()
         lowered = stripped.lower()
+        # Built-in MCP mutation tools return human-readable status strings
+        # prefixed with glyphs (for example "❌ Error: old_string not
+        # found"). Strip presentation glyphs before classifying semantics;
+        # transport success only means the Python handler returned, not that
+        # the requested edit happened.
+        semantic_text = re.sub(r"^[^\w]+", "", lowered)
         failure_prefixes = (
             "error:",
             "file not found:",
@@ -1860,7 +1922,7 @@ def _semantic_tool_failure(tool_name: str, arguments: dict[str, Any], result: di
             "fatal:",
             "failed:",
         )
-        if lowered.startswith(failure_prefixes):
+        if semantic_text.startswith(failure_prefixes):
             return stripped
 
     if tool_name == "read_file":
@@ -2057,12 +2119,11 @@ async def _recover_empty_continuation(
     task_profile: Any,
 ) -> tuple[str, list[_StreamedToolCall], ProviderType, Any, Any, str]:
     """Recover an empty post-tool continuation without abandoning the task."""
-    retry_messages = list(messages) + [
-        {"role": "system", "content": EMPTY_CONTINUATION_INSTRUCTION}
-    ]
+    retry_messages = _empty_continuation_messages(messages, 1)
     last_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_EMPTY_CONTINUATION_RETRIES + 1):
+        retry_messages = _empty_continuation_messages(messages, attempt)
         renderer.handle_event({
             "event_type": "diagnostics",
             "payload": {
@@ -2098,6 +2159,46 @@ async def _recover_empty_continuation(
         except Exception as exc:  # provider-specific failures are handled below
             last_error = exc
             break
+
+    # A user who explicitly selected ollama_cloud selected the provider, not
+    # a promise that one particular model may terminate the entire task. Try
+    # a bounded alternate model on the same endpoint before considering any
+    # cross-provider fallback. This also covers AUTO when its primary model
+    # alone has a broken post-tool continuation.
+    for recovery_model in _same_provider_recovery_models(config, model):
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {
+                "content": (
+                    f"{resolved_provider.value} / {model} produced no continuation; "
+                    f"retrying on the same provider with {recovery_model}."
+                )
+            },
+        })
+        try:
+            alternate_messages = _empty_continuation_messages(
+                messages, MAX_EMPTY_CONTINUATION_RETRIES + 1,
+            )
+            content, calls, _finish_reason = await _stream_one_completion(
+                client,
+                model=recovery_model,
+                messages=alternate_messages,
+                tools=tools,
+                renderer=renderer,
+            )
+            if not content.strip() and not calls:
+                continue
+            return (
+                content,
+                calls,
+                resolved_provider,
+                config,
+                client,
+                recovery_model,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
 
     if requested_provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
         failed_provider = resolved_provider
@@ -4051,6 +4152,7 @@ async def _run_local_agent_turn_impl(
     fabricated_result_failed_providers: set[ProviderType] = set()
     fake_tool_call_retries: dict[ProviderType, int] = {}
     fake_tool_call_failed_providers: set[ProviderType] = set()
+    consecutive_scope_errors = 0
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
@@ -5513,6 +5615,7 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
             if scope_error:
+                consecutive_scope_errors += 1
                 result = {
                     "error": scope_error,
                     "success": False,
@@ -5527,7 +5630,17 @@ async def _run_local_agent_turn_impl(
                     "event_type": "tool_output",
                     "payload": {"tool": tc.name, "result": result},
                 })
+                if consecutive_scope_errors >= 3:
+                    message = (
+                        "Stopped after three invalid commands were rejected by the workspace scope guard. "
+                        "The task is not complete; use a command rooted under the allowed project directory."
+                    )
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    return TaskOutcome(status="failed", error=message)
                 continue
+
+            consecutive_scope_errors = 0
 
             risk = classify_tool_call_risk(tc.name, arguments, workspace_root=workspace_root)
 

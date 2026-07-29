@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import sys
+import time
 from typing import Callable, Optional
 
 from prompt_toolkit.formatted_text import HTML
@@ -63,7 +64,8 @@ def _mode_and_agents_html(cli_config: Config, session_id: int) -> str:
     mode_on = _MODE_ON_LABEL.get(mode)
     mode_line = (
         f"<ansiyellow>⏵⏵ {mode_on} (shift+tab to cycle)</ansiyellow>"
-        if mode_on else "<ansigray>shift+tab to cycle mode</ansigray>"
+        if mode_on
+        else f"<ansigray>⏵⏵ {mode} mode · shift+tab to cycle</ansigray>"
     )
     agents = _active_agent_count(session_id)
     agents_suffix = f" <ansigray>· ← {agents} agent{'s' if agents != 1 else ''}</ansigray>" if agents else ""
@@ -74,7 +76,10 @@ def idle_bottom_toolbar(cli_config: Config, session_id: int) -> HTML:
     """Bottom-toolbar content for the plain REPL prompt (no task running) --
     same mode/agents banner as the live in-task footer below, so the bar
     doesn't disappear the moment a turn finishes."""
-    return HTML(_mode_and_agents_html(cli_config, session_id))
+    return HTML(
+        "<b><ansicyan>◆</ansicyan></b> <b>Ready</b>  "
+        f"<ansigray>│</ansigray> {_mode_and_agents_html(cli_config, session_id)}"
+    )
 
 
 class LiveInputListener:
@@ -99,6 +104,7 @@ class LiveInputListener:
         self._prompt_session = None
         self._paused = False
         self._active = False
+        self._last_invalidate = 0.0
 
     def start(self) -> None:
         if not self._is_tty:
@@ -200,6 +206,15 @@ class LiveInputListener:
         """Refresh the prompt footer after a streamed phase/status update."""
         app = getattr(self._prompt_session, "app", None)
         if app is not None:
+            # Reasoning models can emit dozens of tiny deltas per second.
+            # Invalidating prompt-toolkit for every delta makes the input UI
+            # compete with Rich and makes the whole terminal feel sluggish.
+            # The footer is status-only, so a bounded 10 Hz refresh is enough
+            # while keeping phase/model/elapsed-time changes responsive.
+            now = time.monotonic()
+            if now - self._last_invalidate < 0.1:
+                return
+            self._last_invalidate = now
             app.invalidate()
 
     def _bottom_toolbar(self):

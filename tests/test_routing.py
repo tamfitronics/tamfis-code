@@ -98,6 +98,32 @@ def test_premium_ollama_is_authoritative_for_auto(monkeypatch):
     assert resolved == ProviderType.OLLAMA_CLOUD
 
 
+def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", raising=False)
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_CODING_MODEL", raising=False)
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD)
+
+    for prompt in ("hello", "fix the API", "audit the entire repository"):
+        profile = classify_task(prompt)
+        assert manager.select_model(
+            manager.PROVIDERS[ProviderType.OLLAMA_CLOUD], profile
+        ) == "kimi-k2.7-code:cloud"
+
+
+def test_ollama_extra_usage_requires_operator_opt_in_and_heavy_task(monkeypatch):
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", "true")
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_HEAVY_MODEL", raising=False)
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD)
+    config = manager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
+
+    assert manager.select_model(config, classify_task("hello")) == "kimi-k2.7-code:cloud"
+    assert manager.select_model(
+        config, classify_task("audit the entire repository")
+    ) == "kimi-k3:cloud"
+
+
 def test_premium_ollama_does_not_fallback_to_nvidia(monkeypatch):
     monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")

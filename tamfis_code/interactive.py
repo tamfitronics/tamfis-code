@@ -15,10 +15,11 @@ from typing import Optional
 from prompt_toolkit import PromptSession
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from rich.console import Console
+from rich.markup import escape
 from rich.markdown import Markdown
 from rich.table import Table
 
@@ -279,6 +280,34 @@ class Intent:
 MAX_STANDALONE_HISTORY_TURNS = 30
 
 
+def message_prompt() -> HTML:
+    """The uncluttered editable-line label used by the interactive REPL."""
+    return HTML("<b>message</b><ansicyan>›</ansicyan> ")
+
+
+def _prompt_history(history_path: Path, console: Console):
+    """Return durable prompt history when possible, otherwise stay usable.
+
+    ``FileHistory`` defers opening the file until the first submitted line.
+    In read-only containers, locked-down SSH homes, and some CI shells that
+    turns a normal Enter press into an unhandled prompt-toolkit exception.
+    Probe the path up front and fall back to process-local history; the REPL
+    should lose persistence, not the user's session.
+    """
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        with history_path.open("ab"):
+            pass
+    except (OSError, PermissionError) as exc:
+        console.print(
+            "[dim]Prompt history is session-only ("
+            f"{escape(str(exc))}"
+            "); your REPL is still usable.[/dim]"
+        )
+        return InMemoryHistory()
+    return FileHistory(str(history_path))
+
+
 def _append_turn_to_history(
     history: list[dict[str, str]], *, objective: str, answer: Optional[str],
 ) -> None:
@@ -452,6 +481,18 @@ async def run_interactive(
     def _submit(event) -> None:
         event.current_buffer.validate_and_handle()
 
+    # Some SSH/terminal clients report focus changes as CSI sequences
+    # (ESC [ I / ESC [ O). Consume them explicitly so the escape byte is
+    # not treated as a bare cancel and the trailing I/O characters are not
+    # inserted into the prompt when entering or leaving tamfis-code.
+    @bindings.add("escape", "[", "I")
+    def _ignore_focus_in(event) -> None:
+        return
+
+    @bindings.add("escape", "[", "O")
+    def _ignore_focus_out(event) -> None:
+        return
+
     @bindings.add("escape", "enter")
     def _newline(event) -> None:
         event.current_buffer.insert_text("\n")
@@ -495,7 +536,10 @@ async def run_interactive(
         event.current_buffer.insert_text(placeholder)
 
     def _prompt_message() -> HTML:
-        return HTML(f"tamfis-code <ansicyan>[{mode_label_for_policy(config.approval_policy)}]</ansicyan>> ")
+        # Keep the editable line clean, like Codex/Claude Code: mode and
+        # status live in prompt-toolkit's persistent toolbar *below* the
+        # message box instead of consuming space before every message.
+        return message_prompt()
 
     # multiline=True is essential for bracketed terminal paste: embedded
     # newlines remain part of one objective instead of submitting the first
@@ -506,7 +550,7 @@ async def run_interactive(
     # command files without needing to be rebuilt.
     custom_commands: dict[str, CustomCommand] = load_custom_commands(workspace.workspace_root)
     session: PromptSession = PromptSession(
-        history=FileHistory(str(history_path)), multiline=True, key_bindings=bindings,
+        history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
         completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
         bottom_toolbar=lambda: idle_bottom_toolbar(config, workspace.session_id),
     )

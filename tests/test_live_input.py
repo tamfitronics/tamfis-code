@@ -8,7 +8,13 @@ from rich.console import Console
 
 from tamfis_code import state as state_module
 from tamfis_code.config import Config, next_mode_in_cycle
-from tamfis_code.live_input import LiveInputListener, _CTRL_T, _CTRL_Y, _SHIFT_TAB
+from tamfis_code.live_input import (
+    LiveInputListener,
+    _CTRL_T,
+    _CTRL_Y,
+    _SHIFT_TAB,
+    idle_bottom_toolbar,
+)
 from tamfis_code.render import StreamRenderer
 
 
@@ -36,6 +42,14 @@ def _config(approval_policy: str = "ask") -> Config:
 
 
 class ShiftTabCyclesModeTests(unittest.TestCase):
+    def test_idle_toolbar_keeps_ready_status_and_current_mode_below_input(self):
+        fragments = idle_bottom_toolbar(_config("ask"), 1).__pt_formatted_text__()
+        rendered = "".join(text for _style, text in fragments)
+
+        self.assertIn("Ready", rendered)
+        self.assertIn("manual mode", rendered)
+        self.assertIn("shift+tab to cycle", rendered)
+
     def test_dispatch_cycles_approval_policy_and_emits_diagnostic(self):
         renderer = StreamRenderer(_console())
         cfg = _config("ask")

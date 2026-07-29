@@ -23,6 +23,9 @@ from .providers import ProviderManager, ProviderType
 MAX_TOOL_ROUNDS = 5
 
 _PROVIDER_ALIASES = {
+    "ollama": ProviderType.OLLAMA_CLOUD,
+    "ollama_cloud": ProviderType.OLLAMA_CLOUD,
+    "ollama-cloud": ProviderType.OLLAMA_CLOUD,
     "hf": ProviderType.HF, "huggingface": ProviderType.HF,
     "nvidia": ProviderType.NVIDIA, "nvidia_nim": ProviderType.NVIDIA,
     "or": ProviderType.OPENROUTER, "openrouter": ProviderType.OPENROUTER,

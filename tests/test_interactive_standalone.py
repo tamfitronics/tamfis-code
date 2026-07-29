@@ -179,6 +179,15 @@ def run_interactive_import(**kwargs):
 
 
 class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
+    def test_message_prompt_does_not_duplicate_mode_before_input(self):
+        from tamfis_code.interactive import message_prompt
+
+        rendered = "".join(
+            text for _style, text in message_prompt().__pt_formatted_text__()
+        )
+        self.assertEqual(rendered, "message› ")
+        self.assertNotIn("manual", rendered)
+
     def test_status_shows_standalone_not_server_id(self):
         output = _run(["/status", EOFError()])
         self.assertIn("standalone, local session", output)

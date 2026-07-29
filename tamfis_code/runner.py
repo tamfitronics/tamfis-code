@@ -411,6 +411,7 @@ async def _run_ai_task_and_stream_impl(
             client, renderer, console, session_id=session_id, task_id=task_id,
             approval_policy=approval_policy, interactive=interactive,
             from_event_id=stream_cursor, config=config,
+            requested_mutation=mode in {"coding", "agent", "edit", "debug"},
         )
     except BaseException:
         local_state.finish_action(session_id, action.id, status="failed", summary="stream failed")
@@ -458,6 +459,7 @@ async def retry_task_and_stream(
         session_id=session_id, task_id=new_task_id,
         approval_policy=approval_policy, interactive=interactive,
         from_event_id=stream_cursor, config=config,
+        requested_mutation=mode in {"coding", "agent", "edit", "debug"},
     )
     await _print_command_budget_if_notable(client, console, new_task_id)
     return outcome
@@ -475,11 +477,13 @@ async def attach_and_stream(
     config: Optional[Config] = None,
 ) -> TaskOutcome:
     from_event_id = local_state.get_session_state(session_id).last_event_id
+    active_mode = str(local_state.get_session_state(session_id).active_task.get("mode", "")) if local_state.get_session_state(session_id).active_task else ""
     return await _stream_task(
         client, renderer, console,
         session_id=session_id, task_id=task_id,
         approval_policy=approval_policy, interactive=interactive,
         from_event_id=from_event_id, on_interrupt="detach", config=config,
+        requested_mutation=active_mode in {"coding", "agent", "edit", "debug"},
     )
 
 
@@ -495,11 +499,17 @@ async def _stream_task(
     from_event_id: int = 0,
     on_interrupt: str = "cancel",
     reconnect_attempt: int = 0,
+    requested_mutation: bool = False,
     config: Optional[Config] = None,
 ) -> TaskOutcome:
     outcome: Optional[TaskOutcome] = None
     last_assistant_content: Optional[str] = None
     last_plan_items: list[dict[str, Any]] = []
+    initial_mutation_ids = {
+        str(item.get("mutation_id"))
+        for item in local_state.get_session_state(session_id).modified_files
+        if item.get("mutation_id")
+    }
     prompted_command_ids: set[int] = set()
     interrupted, uninstall_sigint = _install_sigint_watcher()
     queued_interrupt: Optional[dict[str, Any]] = None
@@ -670,6 +680,26 @@ async def _stream_task(
                 renderer.handle_event(event)
 
             if event_type == "ai_task_completed":
+                state = local_state.get_session_state(session_id)
+                new_mutations = {
+                    str(item.get("mutation_id"))
+                    for item in state.modified_files
+                    if item.get("mutation_id")
+                } - initial_mutation_ids
+                validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+                if validation.get("passed") is False:
+                    message = "TamfisGPT reported completion, but its validation did not pass."
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    outcome = TaskOutcome(status="failed", error=message, summary=last_assistant_content or "")
+                    return
+                if requested_mutation and not new_mutations:
+                    message = (
+                        "TamfisGPT reported completion, but no file mutation was recorded for this coding task. "
+                        "The task is not considered complete."
+                    )
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    outcome = TaskOutcome(status="failed", error=message, summary=last_assistant_content or "")
+                    return
                 outcome = TaskOutcome(status="completed", summary=last_assistant_content or "", plan_items=last_plan_items)
                 if last_assistant_content:
                     local_state.save_session_state(
@@ -727,6 +757,7 @@ async def _stream_task(
                     approval_policy=approval_policy, interactive=interactive,
                     from_event_id=cursor, on_interrupt=on_interrupt,
                     reconnect_attempt=reconnect_attempt + 1, config=config,
+                    requested_mutation=requested_mutation,
                 )
             outcome = TaskOutcome(status="detached", summary=task_id)
         else:

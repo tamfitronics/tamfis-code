@@ -380,6 +380,23 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("✓", output)
         self.assertIn("✗", output)
 
+    def test_failed_edit_is_never_labeled_edited(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "edit_file",
+                "result": {
+                    "content": "❌ Error: old_string not found -- no changes made",
+                    "success": False,
+                },
+            },
+        })
+        output = console.file.getvalue()
+        self.assertIn("✗ Edit failed", output)
+        self.assertNotIn("✓ Edited", output)
+
     def test_empty_tool_completion_envelope_is_not_rendered_as_fake_result(self):
         console = _console()
         renderer = StreamRenderer(console)

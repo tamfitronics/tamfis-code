@@ -119,6 +119,12 @@ def validate_completion(
             for check in checks
         ):
             severity = "error"
+        if profile.task_type in {TaskType.EDIT, TaskType.DEBUG} and not any_mutation:
+            # A requested edit/debug task without a recorded file mutation is
+            # not a completed task. Warnings used to flow through
+            # orchestrator.complete(), causing the CLI to claim success after
+            # the model merely described a change.
+            severity = "error"
         if profile.requires_tools and not successful_tools and _claims_completed_inspection(final_text):
             severity = "error"
             unresolved.append(
