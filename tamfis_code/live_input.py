@@ -28,6 +28,7 @@ _SHIFT_TAB = b"\x1b[Z"
 # specially by the live listener; it is ordinary editable prompt input.
 _CTRL_T = b"\x14"
 _CTRL_Y = b"\x19"
+_STATUS_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
 
 # Claude Code's own bottom-toolbar phrasing for the three MODE_CYCLE stops
 # that actually change what gets auto-approved -- "manual" (/mode's "ask")
@@ -151,6 +152,9 @@ class LiveInputListener:
         self._paused = False
         self._active = False
         self._last_invalidate = 0.0
+        self._status_tick = 0
+        self._ticker_task: Optional[asyncio.Task] = None
+        self._outcome_status: Optional[str] = None
 
     def start(self) -> None:
         if not self._is_tty:
@@ -161,6 +165,7 @@ class LiveInputListener:
         self.renderer.suspend_live()
         self.renderer.live_input_listener = self
         self._active = True
+        self._ticker_task = asyncio.create_task(self._status_ticker())
         self._schedule_prompt()
 
     def stop(self):
@@ -179,10 +184,37 @@ class LiveInputListener:
     async def _stop_async(self) -> None:
         """Stop input ownership and wait until prompt-toolkit releases stdin."""
         self._active = False
+        ticker = self._ticker_task
+        self._ticker_task = None
+        if ticker is not None and not ticker.done():
+            ticker.cancel()
+        if ticker is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await ticker
         await self._shutdown_prompt()
         if self.renderer.live_input_listener is self:
             self.renderer.live_input_listener = None
-        self.renderer.resume_live()
+        if self._outcome_status:
+            # The turn is over: do not restart Rich's transient live spinner
+            # for the few milliseconds before renderer.finish(). Replace the
+            # animated footer directly with one durable timing summary.
+            if hasattr(self.renderer, "print_work_summary"):
+                self.renderer.print_work_summary(self._outcome_status)
+        else:
+            self.renderer.resume_live()
+
+    def set_outcome_status(self, status: str) -> None:
+        self._outcome_status = status
+
+    async def _status_ticker(self) -> None:
+        """Animate and update elapsed time even during silent provider waits."""
+        try:
+            while self._active:
+                await asyncio.sleep(0.1)
+                self._status_tick = (self._status_tick + 1) % len(_STATUS_SPINNER_FRAMES)
+                self.invalidate()
+        except asyncio.CancelledError:
+            raise
 
     def pause(self) -> None:
         """Synchronously request prompt shutdown before another UI reads stdin."""
@@ -264,7 +296,8 @@ class LiveInputListener:
             app.invalidate()
 
     def _bottom_toolbar(self):
-        status = self.renderer.live_input_status()
+        spinner = _STATUS_SPINNER_FRAMES[self._status_tick]
+        status = self.renderer.live_input_status(spinner)
         return HTML(
             f" <ansigray>{status} · esc to interrupt ·</ansigray> "
             f"{_mode_and_agents_html(self.cli_config, self.session_id)}"

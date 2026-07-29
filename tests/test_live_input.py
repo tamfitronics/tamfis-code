@@ -62,6 +62,26 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         )
         self.assertFalse(attrs.reverse)
 
+    def test_running_footer_has_animation_and_phase_activity(self):
+        renderer = StreamRenderer(_console())
+        renderer._phase = "validate"
+        renderer._model = "kimi-k2.7-code:cloud"
+        listener = LiveInputListener(
+            session_id=1,
+            renderer=renderer,
+            cli_config=_config("ask"),
+        )
+        listener._status_tick = 2
+        rendered = "".join(
+            text for _style, text in listener._bottom_toolbar().__pt_formatted_text__()
+        )
+
+        self.assertIn("⠹", rendered)
+        self.assertTrue(
+            any(word in rendered for word in ("Evaluating", "Checking", "Verifying"))
+        )
+        self.assertIn("kimi-k2.7-code:cloud", rendered)
+
     def test_toolbar_is_not_suppressed_when_terminal_cpr_is_unknown(self):
         from prompt_toolkit import PromptSession
 

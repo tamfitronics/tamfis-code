@@ -118,6 +118,24 @@ _VERB_BY_PHASE = {
     "report": "Wrapping up",
 }
 
+_ACTIVITY_VARIANTS_BY_PHASE = {
+    "idle": ("Working", "Razzmatazzing", "Smoothing"),
+    "submitting": ("Submitting", "Packing", "Dispatching"),
+    "queued": ("Queuing", "Lining up", "Preparing"),
+    "understand": ("Analyzing", "Orienting", "Evaluating"),
+    "inspect": ("Inspecting", "Tracing", "Rummaging"),
+    "route": ("Routing", "Selecting", "Calibrating"),
+    "reasoning": ("Reasoning", "Evaluating", "Synthesizing"),
+    "respond": ("Composing", "Smoothing", "Summarizing"),
+    "plan": ("Planning", "Sequencing", "Plotting"),
+    "execute": ("Coding", "Wiring", "Polishing"),
+    "observe": ("Observing", "Reviewing", "Measuring"),
+    "repair": ("Repairing", "Untangling", "Mending"),
+    "waiting_for_approval": ("Waiting", "Holding", "Standing by"),
+    "validate": ("Evaluating", "Checking", "Verifying"),
+    "report": ("Wrapping up", "Summarizing", "Finishing"),
+}
+
 
 # Rotating hints shown under the live status line during longer-running
 # turns -- every one names a real, working command/flag (verified against
@@ -474,7 +492,7 @@ class StreamRenderer:
         self._mode_label = label
         self._refresh_live()
 
-    def live_input_status(self) -> str:
+    def live_input_status(self, spinner_frame: str = "") -> str:
         """Compact status text for prompt-toolkit's persistent footer.
 
         Rich's Live region is deliberately suspended while prompt-toolkit
@@ -487,9 +505,30 @@ class StreamRenderer:
         details = elapsed
         if tokens:
             details += f" · {_format_token_count(tokens)} tokens"
-        verb = _VERB_BY_PHASE.get(self._phase, self._phase).capitalize()
+        activities = _ACTIVITY_VARIANTS_BY_PHASE.get(
+            self._phase,
+            (_VERB_BY_PHASE.get(self._phase, self._phase).capitalize(),),
+        )
+        activity_index = int((time.monotonic() - self._task_start) // 2) % len(activities)
+        verb = activities[activity_index]
         model = self._model or "auto"
-        return f"{verb} · {self._status_detail}  │  {model}  │  {details}"
+        prefix = f"{spinner_frame} " if spinner_frame else ""
+        return f"{prefix}{verb}… · {model} · {details}"
+
+    def print_work_summary(self, status: str = "completed") -> None:
+        """Leave one Claude-style durable timing line after live UI exits."""
+        elapsed = _format_elapsed(time.monotonic() - self._task_start)
+        model = self._model or "auto"
+        if status == "completed":
+            marker, label, style = "✻", "Worked for", "dim"
+        elif status in {"cancelled", "exited"}:
+            marker, label, style = "■", "Stopped after", "yellow"
+        else:
+            marker, label, style = "✗", "Stopped after", "red"
+        self.console.print(
+            Text(f"{marker} {label} {elapsed} · {model}", style=style),
+            highlight=False,
+        )
 
     def _update_status_detail(self, event_type: str, payload: dict[str, Any]) -> None:
         """Turn structured stream events into human-readable footer detail."""

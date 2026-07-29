@@ -156,6 +156,32 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("thought for", label)
         renderer.finish()
 
+    def test_live_footer_has_spinner_rotating_activity_model_and_elapsed(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer._phase = "execute"
+        renderer._model = "kimi-k2.7-code:cloud"
+        renderer._task_start -= 5
+
+        status = renderer.live_input_status("⠹")
+
+        self.assertTrue(status.startswith("⠹ "))
+        self.assertTrue(any(word in status for word in ("Coding", "Wiring", "Polishing")))
+        self.assertIn("kimi-k2.7-code:cloud", status)
+        self.assertIn("5s", status)
+
+    def test_completed_turn_leaves_worked_for_summary(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer._model = "kimi-k2.7-code:cloud"
+        renderer._task_start -= 65
+
+        renderer.print_work_summary("completed")
+        output = console.file.getvalue()
+
+        self.assertIn("✻ Worked for 1m 5s", output)
+        self.assertIn("kimi-k2.7-code:cloud", output)
+
     def test_status_line_shows_no_mode_tag_by_default(self):
         console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
         renderer = StreamRenderer(console)

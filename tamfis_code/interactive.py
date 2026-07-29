@@ -105,20 +105,29 @@ async def _run_cancellable_local_turn(
     live_input.start()
 
     try:
-        return await agent_task
+        outcome = await agent_task
+        live_input.set_outcome_status(outcome.status)
+        return outcome
     except asyncio.CancelledError:
         classification = live_input.interrupt_classification or "cancel"
 
         if classification == "exit":
-            return TaskOutcome(
+            outcome = TaskOutcome(
                 status="exited",
                 error="Exit requested by user",
             )
+            live_input.set_outcome_status(outcome.status)
+            return outcome
 
-        return TaskOutcome(
+        outcome = TaskOutcome(
             status="cancelled",
             error="Task cancelled by user.",
         )
+        live_input.set_outcome_status(outcome.status)
+        return outcome
+    except BaseException:
+        live_input.set_outcome_status("failed")
+        raise
     finally:
         stop_result = live_input.stop()
         if inspect.isawaitable(stop_result):
