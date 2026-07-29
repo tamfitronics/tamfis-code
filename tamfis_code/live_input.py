@@ -17,6 +17,7 @@ from typing import Any, Callable, Optional
 
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.styles import Style
 
 from . import state as local_state
 from .config import Config, mode_label_for_policy, next_mode_in_cycle
@@ -84,15 +85,27 @@ def idle_bottom_toolbar(
     *,
     provider: str = "auto",
     model: Optional[str] = None,
+    has_suggestion: bool = False,
 ) -> HTML:
     """Bottom-toolbar content for the plain REPL prompt (no task running) --
     same mode/agents banner as the live in-task footer below, so the bar
     doesn't disappear the moment a turn finishes."""
-    return HTML(
-        "<b><ansicyan>◆</ansicyan></b> <b>Ready</b>  "
-        f"<ansigray>│ provider {provider} · model {model or 'auto'} │</ansigray> "
-        f"{_mode_and_agents_html(cli_config, session_id)}"
+    suggestion_hint = (
+        " <ansigray>· tab to use next suggestion</ansigray>"
+        if has_suggestion else ""
     )
+    return HTML(
+        f" <ansigray>ready · {provider}/{model or 'auto'} ·</ansigray> "
+        f"{_mode_and_agents_html(cli_config, session_id)}{suggestion_hint}"
+    )
+
+
+def composer_style() -> Style:
+    """Claude-like footer styling: plain/dim text, never a reverse block."""
+    return Style.from_dict({
+        "bottom-toolbar": "noreverse",
+        "bottom-toolbar.text": "noreverse",
+    })
 
 
 def force_bottom_toolbar_visible(session: Any) -> None:
@@ -253,8 +266,8 @@ class LiveInputListener:
     def _bottom_toolbar(self):
         status = self.renderer.live_input_status()
         return HTML(
-            f"<b><ansicyan>◆</ansicyan></b> <b>{status}</b>  "
-            f"<ansigray>│ esc interrupt │</ansigray> {_mode_and_agents_html(self.cli_config, self.session_id)}"
+            f" <ansigray>{status} · esc to interrupt ·</ansigray> "
+            f"{_mode_and_agents_html(self.cli_config, self.session_id)}"
         )
 
     async def _input_loop(self) -> None:
@@ -278,6 +291,13 @@ class LiveInputListener:
         def _ignore_focus_out(event) -> None:
             return
 
+        @bindings.add("enter")
+        def _submit_nonempty(event) -> None:
+            # Claude/Codex keep an empty composer open. Do not exit and
+            # recreate the prompt (or enqueue a blank follow-up) on Enter.
+            if event.current_buffer.text.strip():
+                event.current_buffer.validate_and_handle()
+
         @bindings.add("escape")
         def _cancel_running_turn(event) -> None:
             # Escape cancels the active turn immediately and returns control
@@ -297,6 +317,7 @@ class LiveInputListener:
             key_bindings=bindings,
             show_frame=True,
             reserve_space_for_menu=0,
+            style=composer_style(),
         )
         force_bottom_toolbar_visible(session)
         self._prompt_session = session

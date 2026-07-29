@@ -19,7 +19,15 @@ from prompt_toolkit.document import Document
 
 from tamfis_code import state as state_module
 from tamfis_code.config import Config
-from tamfis_code.interactive import PASTE_COLLAPSE_CHAR_THRESHOLD, PASTE_COLLAPSE_LINE_THRESHOLD, SLASH_COMMANDS, _SlashCommandCompleter, paste_placeholder
+from tamfis_code.interactive import (
+    PASTE_COLLAPSE_CHAR_THRESHOLD,
+    PASTE_COLLAPSE_LINE_THRESHOLD,
+    SLASH_COMMANDS,
+    _NextMessageAutoSuggest,
+    _SlashCommandCompleter,
+    next_message_suggestion,
+    paste_placeholder,
+)
 from tamfis_code.runner import TaskOutcome
 from tamfis_code.workspace import WorkspaceContext
 
@@ -97,6 +105,29 @@ class SlashCommandCompleterTests(unittest.TestCase):
     def test_bare_slash_offers_every_command(self):
         results = self._complete("/")
         self.assertEqual(set(results), {name for name, _ in SLASH_COMMANDS})
+
+
+class NextMessageSuggestionTests(unittest.TestCase):
+    def test_explicit_next_step_becomes_the_tab_suggestion(self):
+        answer = "Done.\n\nNext step: Run the integration tests"
+        self.assertEqual(
+            next_message_suggestion(answer),
+            "Run the integration tests",
+        )
+
+    def test_answer_without_explicit_next_step_gets_safe_fallback(self):
+        self.assertEqual(
+            next_message_suggestion("The issue is fixed."),
+            "Continue with the next recommended step",
+        )
+
+    def test_ghost_suggestion_only_appears_for_empty_composer(self):
+        suggest = _NextMessageAutoSuggest(lambda: "Next step: Verify production")
+        empty = suggest.get_suggestion(None, Document(""))
+        typed = suggest.get_suggestion(None, Document("already typing"))
+
+        self.assertEqual(empty.text, "Verify production")
+        self.assertIsNone(typed)
 
 
 class SlashCommandCompleterCustomCommandsTests(unittest.TestCase):

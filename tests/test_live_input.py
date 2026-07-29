@@ -14,6 +14,7 @@ from tamfis_code.live_input import (
     _CTRL_Y,
     _SHIFT_TAB,
     _active_agent_count,
+    composer_style,
     force_bottom_toolbar_visible,
     idle_bottom_toolbar,
 )
@@ -50,11 +51,16 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         ).__pt_formatted_text__()
         rendered = "".join(text for _style, text in fragments)
 
-        self.assertIn("Ready", rendered)
-        self.assertIn("provider ollama_cloud", rendered)
-        self.assertIn("model kimi", rendered)
+        self.assertIn("ready", rendered)
+        self.assertIn("ollama_cloud/kimi", rendered)
         self.assertIn("⏵⏵ manual", rendered)
         self.assertIn("shift+tab", rendered)
+
+    def test_footer_style_never_uses_reverse_background(self):
+        attrs = composer_style().get_attrs_for_style_str(
+            "class:bottom-toolbar class:bottom-toolbar.text"
+        )
+        self.assertFalse(attrs.reverse)
 
     def test_toolbar_is_not_suppressed_when_terminal_cpr_is_unknown(self):
         from prompt_toolkit import PromptSession

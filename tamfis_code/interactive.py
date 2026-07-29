@@ -10,10 +10,12 @@ import asyncio
 import inspect
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -46,6 +48,7 @@ from .custom_commands import (
 from .doctor import run_doctor
 from .live_input import (
     LiveInputListener,
+    composer_style,
     force_bottom_toolbar_visible,
     idle_bottom_toolbar,
 )
@@ -284,6 +287,41 @@ class Intent:
 MAX_STANDALONE_HISTORY_TURNS = 30
 
 
+def next_message_suggestion(answer: Optional[str]) -> Optional[str]:
+    """Derive a concise, editable next action from the last assistant turn."""
+    if not answer:
+        return None
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        match = re.match(
+            r"(?i)^(?:[-*]\s*)?(?:recommended\s+)?next\s+step(?:s)?\s*[:—-]\s*(.+)$",
+            line,
+        )
+        candidate = match.group(1).strip() if match else ""
+        if not candidate and re.match(
+            r"(?i)^#{0,4}\s*(?:recommended\s+)?next\s+step(?:s)?\s*:?\s*$",
+            line,
+        ):
+            for following in lines[index + 1:]:
+                candidate = re.sub(r"^[-*\d.)\s]+", "", following).strip()
+                if candidate:
+                    break
+        if candidate:
+            return candidate[:240]
+    return "Continue with the next recommended step"
+
+
+class _NextMessageAutoSuggest(AutoSuggest):
+    def __init__(self, get_answer: Callable[[], Optional[str]]) -> None:
+        self._get_answer = get_answer
+
+    def get_suggestion(self, buffer, document: Document) -> Optional[Suggestion]:
+        if document.text:
+            return None
+        value = next_message_suggestion(self._get_answer())
+        return Suggestion(value) if value else None
+
+
 def message_prompt() -> HTML:
     """The uncluttered editable-line label used by the interactive REPL."""
     return HTML("<b>message</b><ansicyan>›</ansicyan> ")
@@ -483,7 +521,10 @@ async def run_interactive(
 
     @bindings.add("enter")
     def _submit(event) -> None:
-        event.current_buffer.validate_and_handle()
+        # An empty Enter is a no-op: keep the same composer and footer on
+        # screen rather than submitting/redrawing a blank message.
+        if event.current_buffer.text.strip():
+            event.current_buffer.validate_and_handle()
 
     # Some SSH/terminal clients report focus changes as CSI sequences
     # (ESC [ I / ESC [ O). Consume them explicitly so the escape byte is
@@ -510,6 +551,15 @@ async def run_interactive(
         # prompt_toolkit re-evaluates a callable `message=` on invalidate.
         config.approval_policy = next_mode_in_cycle(config.approval_policy)
         event.app.invalidate()
+
+    @bindings.add("tab")
+    def _accept_next_suggestion(event) -> None:
+        buffer = event.current_buffer
+        suggestion = next_message_suggestion(last_response_text)
+        if not buffer.text and suggestion:
+            buffer.insert_text(suggestion)
+            return
+        buffer.start_completion(select_first=False)
 
     # Reported live: pasting a long block (clipboard paste, terminal
     # bracketed-paste mode) inserted the entire raw text into the input
@@ -561,7 +611,10 @@ async def run_interactive(
             workspace.session_id,
             provider=provider,
             model=model,
+            has_suggestion=bool(next_message_suggestion(last_response_text)),
         ),
+        auto_suggest=_NextMessageAutoSuggest(lambda: last_response_text),
+        style=composer_style(),
         reserve_space_for_menu=0,
         # prompt-toolkit supplies a real dynamic Frame around the entire
         # multiline editor. This is the composer box the previous prompt-only
