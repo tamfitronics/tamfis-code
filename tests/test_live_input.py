@@ -57,10 +57,14 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertIn("shift+tab", rendered)
 
     def test_footer_style_never_uses_reverse_background(self):
-        attrs = composer_style().get_attrs_for_style_str(
+        style = composer_style()
+        attrs = style.get_attrs_for_style_str(
             "class:bottom-toolbar class:bottom-toolbar.text"
         )
         self.assertFalse(attrs.reverse)
+        ghost = style.get_attrs_for_style_str("class:auto-suggestion")
+        self.assertEqual(ghost.color, "ansibrightblack")
+        self.assertTrue(ghost.italic)
 
     def test_running_footer_has_animation_and_phase_activity(self):
         renderer = StreamRenderer(_console())
@@ -93,7 +97,7 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertIn("renderer_height_is_known", before)
         self.assertNotIn("renderer_height_is_known", after)
 
-    def test_dispatch_cycles_approval_policy_and_emits_diagnostic(self):
+    def test_dispatch_cycles_approval_policy(self):
         renderer = StreamRenderer(_console())
         cfg = _config("ask")
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
@@ -104,6 +108,17 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
 
         self.assertEqual(cfg.approval_policy, expected)
         self.assertEqual(bytes(listener._buf), b"")
+
+    def test_in_task_cycle_updates_config_and_persistent_renderer_mode(self):
+        renderer = StreamRenderer(_console(), mode_label="manual")
+        cfg = _config("ask")
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+
+        label = listener._cycle_mode()
+
+        self.assertEqual(label, "accept-edits")
+        self.assertEqual(cfg.approval_policy, "accept-edits")
+        self.assertEqual(renderer._mode_label, "accept-edits")
 
     def test_incomplete_escape_sequence_is_not_dropped_prematurely(self):
         renderer = StreamRenderer(_console())

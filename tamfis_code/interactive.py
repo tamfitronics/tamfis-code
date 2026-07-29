@@ -331,6 +331,22 @@ class _NextMessageAutoSuggest(AutoSuggest):
         return Suggestion(value) if value else None
 
 
+def _seed_next_message_suggestion(
+    session: PromptSession,
+    answer: Optional[str],
+) -> None:
+    """Prime ghost text for an untouched, newly opened empty composer.
+
+    prompt-toolkit normally runs AutoSuggest only after the buffer changes.
+    A new post-response prompt starts empty and unchanged, so its first
+    suggestion otherwise remains invisible until the user types and erases a
+    character. Seeding Buffer.suggestion in pre_run makes the ghost visible
+    immediately.
+    """
+    value = next_message_suggestion(answer)
+    session.default_buffer.suggestion = Suggestion(value) if value else None
+
+
 def message_prompt() -> HTML:
     """The uncluttered editable-line label used by the interactive REPL."""
     return HTML("<b>message</b><ansicyan>›</ansicyan> ")
@@ -715,6 +731,10 @@ async def run_interactive(
                 text = await session.prompt_async(
                     _prompt_message,
                     show_frame=True,
+                    pre_run=lambda: _seed_next_message_suggestion(
+                        session,
+                        last_response_text,
+                    ),
                 )
             except KeyboardInterrupt:
             # NOTE: this used to just `continue`, silently redrawing the

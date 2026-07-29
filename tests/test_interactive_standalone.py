@@ -11,7 +11,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from rich.console import Console
 
@@ -25,6 +25,7 @@ from tamfis_code.interactive import (
     SLASH_COMMANDS,
     _NextMessageAutoSuggest,
     _SlashCommandCompleter,
+    _seed_next_message_suggestion,
     next_message_suggestion,
     paste_placeholder,
 )
@@ -128,6 +129,20 @@ class NextMessageSuggestionTests(unittest.TestCase):
 
         self.assertEqual(empty.text, "Verify production")
         self.assertIsNone(typed)
+
+    def test_new_empty_prompt_is_seeded_before_user_types(self):
+        session = MagicMock()
+        session.default_buffer = MagicMock()
+
+        _seed_next_message_suggestion(
+            session,
+            "Next step: Run the integration tests",
+        )
+
+        self.assertEqual(
+            session.default_buffer.suggestion.text,
+            "Run the integration tests",
+        )
 
 
 class SlashCommandCompleterCustomCommandsTests(unittest.TestCase):

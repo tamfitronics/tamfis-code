@@ -106,6 +106,10 @@ def composer_style() -> Style:
     return Style.from_dict({
         "bottom-toolbar": "noreverse",
         "bottom-toolbar.text": "noreverse",
+        # Do not rely on prompt-toolkit's palette-dependent #888 default:
+        # several SSH themes render it indistinguishably from the composer
+        # background. Bright-black is the portable ANSI "ghost text" color.
+        "auto-suggestion": "fg:ansibrightblack italic",
     })
 
 
@@ -237,13 +241,7 @@ class LiveInputListener:
         buf = bytes(getattr(self, "_buf", b""))
         if _SHIFT_TAB in buf:
             self._buf = bytearray()
-            self.cli_config.approval_policy = next_mode_in_cycle(self.cli_config.approval_policy)
-            self.renderer.handle_event({
-                "event_type": "diagnostics",
-                "payload": {"content": f"◆ Mode switched to {mode_label_for_policy(self.cli_config.approval_policy)}."},
-            })
-            if hasattr(self.renderer, "set_mode_label"):
-                self.renderer.set_mode_label(mode_label_for_policy(self.cli_config.approval_policy))
+            self._cycle_mode()
         elif buf in {b"\x1b", b"\x1b["}:
             return
         elif _CTRL_Y in buf:
@@ -252,6 +250,17 @@ class LiveInputListener:
                 self._interject_task = asyncio.create_task(self._interject())
         elif buf:
             self._buf = bytearray()
+
+    def _cycle_mode(self) -> str:
+        """Cycle mode without letting BackTab's ESC prefix cancel the task."""
+        self.cli_config.approval_policy = next_mode_in_cycle(
+            self.cli_config.approval_policy
+        )
+        label = mode_label_for_policy(self.cli_config.approval_policy)
+        if hasattr(self.renderer, "set_mode_label"):
+            self.renderer.set_mode_label(label)
+        self.invalidate()
+        return label
 
     def _schedule_prompt(self) -> None:
         if self._input_task is None or self._input_task.done():
@@ -323,6 +332,15 @@ class LiveInputListener:
         @bindings.add("escape", "[", "O")
         def _ignore_focus_out(event) -> None:
             return
+
+        @bindings.add("s-tab")
+        def _cycle_running_mode(event) -> None:
+            # BackTab is encoded by terminals as ESC [ Z. Registering the
+            # complete key explicitly makes prompt-toolkit wait for and
+            # consume that sequence instead of dispatching its ESC prefix as
+            # "cancel" and echoing the remaining bytes as ^[ / [Z.
+            self._cycle_mode()
+            event.app.invalidate()
 
         @bindings.add("enter")
         def _submit_nonempty(event) -> None:
