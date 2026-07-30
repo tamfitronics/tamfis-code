@@ -6,6 +6,7 @@ from rich.console import Console
 from types import SimpleNamespace
 
 from tamfis_code.render import (
+    BRANDED_PROVIDER_LABEL,
     StreamRenderer,
     _tool_action_label,
     _tool_result_message,
@@ -316,7 +317,10 @@ class StreamRendererTests(unittest.TestCase):
         self.assertNotIn("Focused workspace scope", output)
         self.assertNotIn("Reusing workspace context", output)
         self.assertNotIn("Workspace rescanned", output)
-        self.assertIn("Using nvidia · x", output)
+        # The route is visible, but branded -- the raw backend/model id
+        # ("nvidia · x") must never reach the user.
+        self.assertIn(f"Using {BRANDED_PROVIDER_LABEL}", output)
+        self.assertNotIn("nvidia", output)
         self.assertEqual(renderer._selected_provider, "nvidia")
 
     def test_standalone_banner_does_not_call_auto_provider_a_local_host(self):

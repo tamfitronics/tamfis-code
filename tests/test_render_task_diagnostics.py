@@ -3,7 +3,7 @@
 (session-awareness audit, Phase 17 follow-up)."""
 import unittest
 
-from tamfis_code.render import _format_diagnostics_line
+from tamfis_code.render import BRANDED_PROVIDER_LABEL, _format_diagnostics_line
 
 
 class FormatDiagnosticsLineTests(unittest.TestCase):
@@ -17,9 +17,10 @@ class FormatDiagnosticsLineTests(unittest.TestCase):
         })
         self.assertIn("context rescanned (git_head_changed)", line)
 
-    def test_provider_and_model_shown(self):
+    def test_provider_and_model_shown_as_branded_label_not_raw_backend(self):
         line = _format_diagnostics_line({"provider": "deepseek", "model": "deepseek-v3", "completion_status": "completed"})
-        self.assertIn("deepseek/deepseek-v3", line)
+        self.assertIn(BRANDED_PROVIDER_LABEL, line)
+        self.assertNotIn("deepseek", line)
 
     def test_tool_call_failures_counted(self):
         line = _format_diagnostics_line({

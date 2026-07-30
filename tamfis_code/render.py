@@ -31,6 +31,12 @@ from .safety import redact_secrets
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 
+# Which backend actually served a Remote turn (Ollama Cloud, OpenRouter,
+# NVIDIA NIM, a raw model id like "glm-5.2:cloud"...) is internal routing
+# detail. TamfisGPT is the product; every place that would otherwise print
+# a raw provider/model id to the user prints this branded label instead.
+BRANDED_PROVIDER_LABEL = "TamfisGPT Cloud"
+
 # Single source of truth for plan-step glyph/colour, shared by the transient
 # live spinner (_build_status) and the durable scrollback snapshot
 # (_print_plan_snapshot) -- these used to disagree (the live view showed
@@ -385,10 +391,8 @@ def _format_diagnostics_line(payload: dict[str, Any]) -> str:
         parts.append("context reused")
     elif reused is False:
         parts.append(f"context rescanned ({payload.get('rescan_reason') or 'unknown'})")
-    provider = payload.get("provider")
-    model = payload.get("model")
-    if provider or model:
-        parts.append(f"{provider or '?'}/{model or '?'}")
+    if payload.get("provider") or payload.get("model"):
+        parts.append(BRANDED_PROVIDER_LABEL)
     tool_calls = payload.get("tool_calls") or []
     if tool_calls:
         failed = sum(1 for tc in tool_calls if tc.get("success") is False)
@@ -992,7 +996,7 @@ class StreamRenderer:
                 # authoritative model_selected event exists, never display a
                 # contradictory provider claim in progress output.
                 if self._selected_provider and content.lower().startswith("executing with "):
-                    content = f"Executing with {self._selected_provider}..."
+                    content = f"Executing with {BRANDED_PROVIDER_LABEL}..."
                 self.console.print(f"[dim]· {escape(content)}[/dim]")
             return
 
@@ -1208,12 +1212,10 @@ class StreamRenderer:
             if self.debug:
                 self.console.print(f"[dim]· Provider: {escape(str(provider))} · Model: {escape(str(model))} · {escape(str(reason))}[/dim]")
             else:
-                # Persist the authoritative route in the scrollback. The
-                # previous debug-only display made "local:auto" in the
-                # banner look like local Ollama even when AUTO had selected
-                # NVIDIA/OpenRouter/HF; users could not tell which provider
-                # was actually responsible for a slow or bad response.
-                self.console.print(f"[dim]· Using {escape(str(provider))} · {escape(str(model))}[/dim]")
+                # Persist the authoritative route in the scrollback -- users
+                # need to know a route was resolved -- but never the raw
+                # backend/model id behind it; TamfisGPT owns that identity.
+                self.console.print(f"[dim]· Using {BRANDED_PROVIDER_LABEL}[/dim]")
             return
 
         if event_type == "ai_task_failed":

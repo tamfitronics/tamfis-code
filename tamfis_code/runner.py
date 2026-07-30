@@ -18,7 +18,7 @@ from rich.panel import Panel
 
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .config import Config, mode_label_for_policy, next_mode_in_cycle
-from .render import StreamRenderer, resume_live_if_active, suspend_live_if_active
+from .render import BRANDED_PROVIDER_LABEL, StreamRenderer, resume_live_if_active, suspend_live_if_active
 from . import state as local_state
 from .providers import ProviderManager, ProviderType
 
@@ -388,8 +388,10 @@ async def _run_ai_task_and_stream_impl(
     # replaced with auto or a different provider.
     provider = normalize_provider(provider)
 
-    provider_name = PROVIDER_NAME_MAP.get(provider or "auto", provider or "auto")
-    console.print(f"[dim]Using provider: {provider_name}[/dim]")
+    # PROVIDER_NAME_MAP still resolves the real backend name for internal/
+    # diagnostic use (see `tamfis-code providers`); the raw backend a Remote
+    # task actually lands on is never shown here -- TamfisGPT is the brand.
+    console.print(f"[dim]Using provider: {BRANDED_PROVIDER_LABEL}[/dim]")
 
     # Preserve auto selection for Tier IV. The CLI must not silently pin
     # automatic requests to a specific provider; the orchestration layer
