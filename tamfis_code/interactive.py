@@ -134,6 +134,39 @@ async def _run_cancellable_local_turn(
             await stop_result
 
 
+async def _run_remote_turn_with_live_ui(
+    *,
+    session_id: int,
+    renderer: StreamRenderer,
+    config: Config,
+    turn_coro,
+) -> TaskOutcome:
+    """Give Remote Workspace turns the same live composer/footer as local turns.
+
+    Escape is intentionally delivered through LiveInputListener's durable
+    instruction queue. runner._stream_task already watches that queue and
+    cancels the real server task, so the UI never abandons a task that keeps
+    running invisibly in TamfisGPT.
+    """
+    live_input = LiveInputListener(
+        session_id=session_id,
+        renderer=renderer,
+        cli_config=config,
+    )
+    live_input.start()
+    try:
+        outcome = await turn_coro
+        live_input.set_outcome_status(outcome.status)
+        return outcome
+    except BaseException:
+        live_input.set_outcome_status("failed")
+        raise
+    finally:
+        stop_result = live_input.stop()
+        if inspect.isawaitable(stop_result):
+            await stop_result
+
+
 HELP_TEXT = """\
 Natural-language text submits a full coding-agent task (mode: coding).
 $ <command>            explicit shell command
@@ -696,13 +729,18 @@ async def run_interactive(
             )
             last_turn = (plan_objective, "execute")
         else:
-            outcome = await run_ai_task_and_stream(
-                client, renderer, console,
+            outcome = await _run_remote_turn_with_live_ui(
                 session_id=workspace.session_id,
-                objective=plan_objective, mode="execute",
-                approval_policy=config.approval_policy, interactive=True,
-                model=model_state.selected_model, provider=model_state.selected_provider,
+                renderer=renderer,
                 config=config,
+                turn_coro=run_ai_task_and_stream(
+                    client, renderer, console,
+                    session_id=workspace.session_id,
+                    objective=plan_objective, mode="execute",
+                    approval_policy=config.approval_policy, interactive=True,
+                    model=model_state.selected_model, provider=model_state.selected_provider,
+                    config=config,
+                ),
             )
         if standalone:
             renderer.finish()
@@ -1584,10 +1622,15 @@ async def run_interactive(
                         continue
                     task_id = failed["id"]
                 renderer = StreamRenderer(console)
-                outcome = await retry_task_and_stream(
-                    client, renderer, console,
-                    session_id=workspace.session_id, task_id=task_id, mode=None,
-                    approval_policy=config.approval_policy, interactive=True, config=config,
+                outcome = await _run_remote_turn_with_live_ui(
+                    session_id=workspace.session_id,
+                    renderer=renderer,
+                    config=config,
+                    turn_coro=retry_task_and_stream(
+                        client, renderer, console,
+                        session_id=workspace.session_id, task_id=task_id, mode=None,
+                        approval_policy=config.approval_policy, interactive=True, config=config,
+                    ),
                 )
                 if outcome.status == "completed" and outcome.summary:
                     last_response_text = outcome.summary
@@ -1701,13 +1744,18 @@ async def run_interactive(
                         else:
                             console.print(f"[dim]Run /execute-plan {saved.id} to execute.[/dim]")
                 else:
-                    outcome = await run_ai_task_and_stream(
-                        client, renderer, console,
-                        session_id=workspace.session_id, objective=intent.objective, mode=intent.mode,
-                        approval_policy=config.approval_policy, interactive=True,
-                        model=model_state.selected_model,
-                        provider=model_state.selected_provider,
+                    outcome = await _run_remote_turn_with_live_ui(
+                        session_id=workspace.session_id,
+                        renderer=renderer,
                         config=config,
+                        turn_coro=run_ai_task_and_stream(
+                            client, renderer, console,
+                            session_id=workspace.session_id, objective=intent.objective, mode=intent.mode,
+                            approval_policy=config.approval_policy, interactive=True,
+                            model=model_state.selected_model,
+                            provider=model_state.selected_provider,
+                            config=config,
+                        ),
                     )
                 if outcome.status == "completed" and outcome.summary:
                     last_response_text = outcome.summary
