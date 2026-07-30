@@ -90,7 +90,11 @@ class ExecutionController:
         if self.snapshot.terminal:
             return GuardDecision(False, True, self.snapshot.failure_reason or "Runtime is terminal.")
         if self.snapshot.tool_calls >= self.budgets.max_tool_calls:
-            reason = f"Tool-call budget exhausted ({self.budgets.max_tool_calls})."
+            reason = (
+                f"Tool-call budget exhausted ({self.budgets.max_tool_calls}). "
+                "Set max_tool_calls in config.toml or TAMFIS_CODE_MAX_TOOL_CALLS "
+                "to raise it for larger tasks."
+            )
             self._fail(reason)
             return GuardDecision(False, True, reason)
 

@@ -3870,6 +3870,7 @@ async def _run_local_agent_turn_impl(
     orchestrator = AgentOrchestrator(
         session_id=session_id, workspace_root=workspace_root, emit=renderer.handle_event,
         budgets=RuntimeBudgets(
+            max_tool_calls=_turn_budget_config.max_tool_calls,
             max_runtime_seconds=int(_turn_budget_config.turn_runtime_seconds),
             max_runtime_extensions=_turn_budget_config.max_runtime_extensions,
             max_repair_extensions=_turn_budget_config.max_repair_extensions,

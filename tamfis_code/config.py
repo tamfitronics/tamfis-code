@@ -138,6 +138,11 @@ class Config:
     # raise it for slow cloud models; hitting it mid-generation discarded
     # the whole task instead of just ending the turn.
     turn_runtime_seconds: float = 900.0
+    # Raw tool calls permitted across one complete task. The outer agent loop
+    # already supports three 40-round windows for long, progressing work; the
+    # old inner default of 40 contradicted that extension and terminated the
+    # task first. Repetition/stall guards remain independently enforced.
+    max_tool_calls: int = 120
     # How many times a turn may auto-renew its runtime budget and continue
     # (rather than the task failing outright) when it runs out of time
     # mid-execution. Purely a safety cap on the continuation loop --
@@ -177,6 +182,7 @@ class Config:
             "output_mode": self.output_mode,
             "timeout_seconds": self.timeout_seconds,
             "turn_runtime_seconds": self.turn_runtime_seconds,
+            "max_tool_calls": self.max_tool_calls,
             "max_runtime_extensions": self.max_runtime_extensions,
             "max_repair_extensions": self.max_repair_extensions,
             "debug": self.debug,
@@ -215,6 +221,9 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "turn_runtime_seconds" in data:
             cfg.turn_runtime_seconds = float(data["turn_runtime_seconds"])
             cfg.sources["turn_runtime_seconds"] = source_name
+        if "max_tool_calls" in data:
+            cfg.max_tool_calls = int(data["max_tool_calls"])
+            cfg.sources["max_tool_calls"] = source_name
         if "max_runtime_extensions" in data:
             cfg.max_runtime_extensions = int(data["max_runtime_extensions"])
             cfg.sources["max_runtime_extensions"] = source_name
@@ -260,6 +269,11 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_turn_runtime:
         cfg.turn_runtime_seconds = float(env_turn_runtime)
         cfg.sources["turn_runtime_seconds"] = "env TAMFIS_CODE_TURN_RUNTIME_SECONDS"
+
+    env_max_tool_calls = os.environ.get("TAMFIS_CODE_MAX_TOOL_CALLS")
+    if env_max_tool_calls:
+        cfg.max_tool_calls = int(env_max_tool_calls)
+        cfg.sources["max_tool_calls"] = "env TAMFIS_CODE_MAX_TOOL_CALLS"
 
     env_runtime_extensions = os.environ.get("TAMFIS_CODE_MAX_RUNTIME_EXTENSIONS")
     if env_runtime_extensions:

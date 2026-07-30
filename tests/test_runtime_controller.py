@@ -78,4 +78,5 @@ def test_tool_budget_is_hard():
         controller.observe("read_file", args, _result("content"))
     blocked = controller.guard_action("read_file", {"path": "/tmp/third"})
     assert blocked.terminal
+    assert "TAMFIS_CODE_MAX_TOOL_CALLS" in blocked.reason
     assert controller.snapshot.phase == RuntimePhase.FAILED

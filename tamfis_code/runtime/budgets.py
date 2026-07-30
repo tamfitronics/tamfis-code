@@ -5,7 +5,10 @@ from dataclasses import dataclass
 
 @dataclass(frozen=True)
 class RuntimeBudgets:
-    max_tool_calls: int = 40
+    # Match runner_local's three bounded 40-round windows. This is still a
+    # hard safety ceiling; identical-action and empty-observation guards stop
+    # pathological loops much earlier.
+    max_tool_calls: int = 120
     max_identical_actions: int = 2
     max_consecutive_empty_observations: int = 3
     max_plan_revisions: int = 4

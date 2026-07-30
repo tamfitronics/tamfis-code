@@ -82,6 +82,26 @@ class LoadConfigTests(unittest.TestCase):
         cfg = config_module.load_config()
         self.assertEqual(cfg.api_base, config_module.DEFAULT_API_BASE)
         self.assertEqual(cfg.sources["api_base"], "default")
+        self.assertEqual(cfg.max_tool_calls, 120)
+
+    def test_tool_budget_can_be_set_in_config_file(self):
+        config_module.USER_CONFIG_PATH.write_text("max_tool_calls = 240\n")
+        cfg = config_module.load_config()
+        self.assertEqual(cfg.max_tool_calls, 240)
+        self.assertEqual(cfg.sources["max_tool_calls"], "user config")
+
+    def test_tool_budget_environment_override_wins(self):
+        config_module.USER_CONFIG_PATH.write_text("max_tool_calls = 160\n")
+        os.environ["TAMFIS_CODE_MAX_TOOL_CALLS"] = "300"
+        try:
+            cfg = config_module.load_config()
+        finally:
+            del os.environ["TAMFIS_CODE_MAX_TOOL_CALLS"]
+        self.assertEqual(cfg.max_tool_calls, 300)
+        self.assertEqual(
+            cfg.sources["max_tool_calls"],
+            "env TAMFIS_CODE_MAX_TOOL_CALLS",
+        )
 
     def test_user_config_overrides_default(self):
         config_module.USER_CONFIG_PATH.write_text('api_base = "http://user.invalid"\n')
