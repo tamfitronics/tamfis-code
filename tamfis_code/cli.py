@@ -83,11 +83,12 @@ def _run_async(coro):
 
 
 def _use_remote(config: Config, remote_flag: bool) -> bool:
-    """A per-command --remote flag always wins; otherwise fall back to the
-    persistent config.toml/env `default_backend` setting (see config.py) --
-    this is what lets a paid TamfisGPT tenant set it once instead of typing
-    --remote on every command."""
-    return remote_flag or config.default_backend == "remote"
+    """Use Remote automatically for authenticated TamfisGPT subscribers."""
+    if remote_flag or config.default_backend == "remote":
+        return True
+    if config.default_backend == "standalone":
+        return False
+    return load_credentials() is not None
 
 
 def async_command(fn):
@@ -951,7 +952,9 @@ async def _run_ai_command(
 
     async with RemoteAPIClient(config, creds) as client:
         try:
-            workspace = await resolve_workspace(client, workspace_root, discover=mode != "chat")
+            workspace = await resolve_workspace(
+                client, workspace_root, discover=mode != "chat",
+            )
         except AuthRequiredError:
             print_error(console, "Not authenticated -- run `tamfis-code login` first.")
             return EXIT_AUTH_FAILED
@@ -1489,6 +1492,40 @@ async def run(ctx: click.Context, command: str, background: bool, remote: bool):
 
     if outcome.status != "completed":
         raise SystemExit(EXIT_TASK_FAILED)
+
+
+@cli.command()
+@click.pass_context
+@async_command
+async def bridge(ctx: click.Context):
+    """Keep this workspace connected for tasks started in TamfisGPT Web."""
+    config: Config = ctx.obj["config"]
+    workspace_root: Path = ctx.obj["workspace_root"]
+    console = Console(no_color=not config.colour)
+    creds = load_credentials()
+    if creds is None:
+        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        raise SystemExit(EXIT_AUTH_FAILED)
+
+    try:
+        async with RemoteAPIClient(config, creds) as client:
+            workspace = await resolve_workspace(client, workspace_root)
+            console.print(
+                f"[green]connected[/green] · workspace {workspace.workspace_root} "
+                f"· shared session {workspace.session_id}"
+            )
+            console.print("TamfisGPT Web can now run tools here. Press Ctrl-C to disconnect.")
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                console.print("[dim]disconnected[/dim]")
+                return
+    except AuthRequiredError:
+        print_error(console, "Not authenticated -- run `tamfis-code login` first.")
+        raise SystemExit(EXIT_AUTH_FAILED)
+    except (RemoteAPIError, httpx.HTTPError, asyncio.TimeoutError) as exc:
+        print_error(console, str(exc))
+        raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
 
 
 @cli.command()

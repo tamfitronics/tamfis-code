@@ -417,11 +417,23 @@ async def _get_or_create_local_server(client: RemoteAPIClient) -> dict:
 
 async def resolve_workspace(
     client: RemoteAPIClient, cwd: Optional[Path] = None, *, discover: bool = True,
+    server_id: Optional[int] = None, workspace_id: Optional[str] = None,
 ) -> WorkspaceContext:
     workspace_root = str((cwd or Path.cwd()).resolve())
 
-    server = await _get_or_create_local_server(client)
-    server_id = server["id"]
+    if server_id is None:
+        if hasattr(client, "ensure_agent_bridge"):
+            bridge = await client.ensure_agent_bridge(workspace_root)
+            server_id = int(bridge.server["id"])
+            workspace_id = bridge.workspace_id
+        else:
+            # Compatibility for embedding clients that implement the older
+            # Remote API surface but haven't adopted the local-agent bridge.
+            server = await _get_or_create_local_server(client)
+            server_id = int(server["id"])
+            bridge = None
+    else:
+        bridge = None
 
     # A session can move to an explicitly approved sibling workspace. Reuse
     # it by its durable primary root rather than creating a new conversation
@@ -444,6 +456,8 @@ async def resolve_workspace(
             )
             if discover:
                 discover_local_repository(local_match, Path(current))
+            if bridge is not None:
+                bridge.session_id = local_match
             return WorkspaceContext(session_id=local_match, server_id=server_id, workspace_root=current)
 
     sessions = await client.list_sessions()
@@ -451,7 +465,10 @@ async def resolve_workspace(
         (
             s for s in sessions
             if s.get("server_id") == server_id
-            and s.get("working_directory") == workspace_root
+            and (
+                (workspace_id and s.get("workspace_id") == workspace_id)
+                or (not workspace_id and s.get("working_directory") == workspace_root)
+            )
             and str(s.get("status", "")).lower() in REUSABLE_STATUSES
         ),
         None,
@@ -460,12 +477,21 @@ async def resolve_workspace(
         local_state.save_session_state(existing["id"], workspace_root=workspace_root)
         if discover:
             discover_local_repository(existing["id"], Path(workspace_root))
+        if bridge is not None:
+            bridge.session_id = existing["id"]
         return WorkspaceContext(session_id=existing["id"], server_id=server_id, workspace_root=workspace_root)
 
-    created = await client.create_session(server_id, workspace_root)
+    if workspace_id:
+        created = await client.create_session(
+            server_id, workspace_root, workspace_id=workspace_id,
+        )
+    else:
+        created = await client.create_session(server_id, workspace_root)
     local_state.save_session_state(created["id"], workspace_root=workspace_root)
     if discover:
         discover_local_repository(created["id"], Path(workspace_root))
+    if bridge is not None:
+        bridge.session_id = created["id"]
     return WorkspaceContext(session_id=created["id"], server_id=server_id, workspace_root=workspace_root)
 
 

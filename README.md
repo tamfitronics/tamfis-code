@@ -11,17 +11,14 @@ entitlement, and the CLI makes outbound API calls from the machine where it
 is installed. Admin subscriptions are an account/billing policy, not a
 requirement for installing or running the CLI.
 
-The current standalone runtime can also call NVIDIA NIM, OpenRouter, or
-Hugging Face directly. Every provider uses the same local-tool contract:
-model traffic may be remote, but workspace files, commands, PTYs, approvals,
-and mutation evidence remain local unless the user explicitly selects
-`--remote`.
+After `tamfis-code login`, the CLI automatically uses the subscriber's
+TamfisGPT Remote Workspace account. A persistent authenticated local-agent
+connection executes tools against the launch directory, while the web app
+and CLI share the same session and repository state. No provider API key or
+`--remote` flag is required.
 
-`--remote` (or a persistent `default_backend = "remote"` config setting)
-switches to the original architecture: a thin client to the TamfisGPT
-Remote Workspace backend, for TamfisGPT tenants using their hosted account
-the same way Codex CLI uses a ChatGPT/OpenAI account, kimi-code uses a Kimi
-account, or Claude Code uses a Claude account.
+The standalone runtime can still call NVIDIA NIM, OpenRouter, or Hugging
+Face directly when `default_backend = "standalone"` is selected explicitly.
 
 ## Install
 
@@ -44,22 +41,26 @@ tamfis-code                                         # interactive REPL
 
 ### TamfisGPT subscription access
 
-Create a developer API key from the TamfisGPT account connected to the iOS
-subscription, then configure the machine where Tamfis-Code is installed:
+Sign in with the TamfisGPT account whose subscription includes Tamfis-Code:
 
 ```bash
-export TAMFIS_API_KEY='tamfis_sk_live_...'
-# Optional for a private gateway or regional deployment:
-export TAMFIS_API_BASE='https://gpt.tamfitronics.com/api/v1/openai'
+tamfis-code login
+cd /path/to/your/repository
 tamfis-code doctor
 tamfis-code agent "inspect this repository and fix the failing tests"
 ```
 
-The key is checked against the account's active subscription and API scopes
-on every request. The CLI remains portable: the model request goes to the
-TamfisGPT API, while repository files, shell commands, PTY sessions,
-approvals, and mutation evidence stay on the local machine. Admin access is
-not required for ordinary subscription users.
+The normal interactive and one-shot commands keep the local-agent connection
+alive for their lifetime. To make the repository available for work started
+from TamfisGPT Web without keeping an interactive chat open, run:
+
+```bash
+tamfis-code bridge
+```
+
+The bridge reconnects automatically, replays unacknowledged results after a
+network interruption, and exposes only the selected workspace. Admin access
+is not required for ordinary entitled subscribers.
 
 ## Providers
 
@@ -68,7 +69,7 @@ not required for ordinary subscription users.
 | NVIDIA NIM | `NVIDIA_API_KEY` | |
 | OpenRouter | `OPENROUTER_API_KEY` | |
 | Hugging Face | `HF_TOKEN` | |
-| TamfisGPT subscription API | `TAMFIS_API_KEY` | Key issued for an active TamfisGPT plan |
+| TamfisGPT subscription API | `TAMFIS_API_KEY` | Optional standalone provider route; not needed for the logged-in Remote Workspace |
 
 Select one explicitly with `--provider tamfis|hf|nvidia|openrouter`, or leave it
 as `auto` (default). Auto routes through eligible providers in

@@ -17,7 +17,7 @@ from tamfis_code.cli import (
     _use_remote,
     cli,
 )
-from tamfis_code.config import Config
+from tamfis_code.config import Config, Credentials
 
 
 class ExplicitAbsolutePathsTests(unittest.TestCase):
@@ -190,9 +190,7 @@ class LogoutCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
 
 
 class UseRemoteHelperTests(unittest.TestCase):
-    """The --remote flag always wins; otherwise a paid tenant's persistent
-    config.toml `default_backend = "remote"` makes every command use the
-    legacy backend without needing --remote on each invocation."""
+    """Logged-in subscribers use Remote without a per-command flag."""
 
     def test_flag_true_is_remote_regardless_of_config(self):
         self.assertTrue(_use_remote(Config(default_backend="standalone"), True))
@@ -202,6 +200,14 @@ class UseRemoteHelperTests(unittest.TestCase):
 
     def test_flag_false_defers_to_config_remote(self):
         self.assertTrue(_use_remote(Config(default_backend="remote"), False))
+
+    @patch("tamfis_code.cli.load_credentials", return_value=Credentials(access_token="tok"))
+    def test_auto_uses_remote_when_logged_in(self, _credentials):
+        self.assertTrue(_use_remote(Config(default_backend="auto"), False))
+
+    @patch("tamfis_code.cli.load_credentials", return_value=None)
+    def test_auto_uses_standalone_when_logged_out(self, _credentials):
+        self.assertFalse(_use_remote(Config(default_backend="auto"), False))
 
 
 class WorkspaceGroupCommandTests(_CliConfigIsolationMixin, unittest.TestCase):

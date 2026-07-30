@@ -113,7 +113,7 @@ CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 USER_CONFIG_PATH = CONFIG_DIR / "config.toml"
 PROJECT_CONFIG_RELATIVE = Path(".tamfis") / "config.toml"
 
-DEFAULT_API_BASE = "http://127.0.0.1:9500"
+DEFAULT_API_BASE = "https://gpt.tamfitronics.com"
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -160,13 +160,14 @@ class Config:
     # prompts interleaving across sessions, concurrent state.json writers)
     # that need validating against a live backend before being on by default.
     enable_subagent_delegation: bool = False
-    # "standalone" (default): call a provider directly, no TamfisGPT backend.
+    # "auto" (default): use TamfisGPT Remote after login, otherwise standalone.
+    # "standalone": call a provider directly, no TamfisGPT backend.
     # "remote": use the TamfisGPT Remote Workspace backend for every command
     # without needing --remote on each invocation -- set this once (via
     # `tamfis-code login` writing it, or manually in config.toml) for a paid
     # TamfisGPT tenant who wants that be the default, the same way Claude
     # Code/Codex/kimi-code default to their respective hosted accounts.
-    default_backend: str = "standalone"
+    default_backend: str = "auto"
     # Additional local roots that may be used by this installation. The
     # launch directory is always included separately; these roots make a
     # multi-project service practical without granting access to the whole
@@ -233,7 +234,7 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "enable_subagent_delegation" in data:
             cfg.enable_subagent_delegation = bool(data["enable_subagent_delegation"])
             cfg.sources["enable_subagent_delegation"] = source_name
-        if data.get("default_backend") in ("standalone", "remote"):
+        if data.get("default_backend") in ("auto", "standalone", "remote"):
             cfg.default_backend = str(data["default_backend"])
             cfg.sources["default_backend"] = source_name
         configured_roots = data.get("workspace_roots")
@@ -261,7 +262,7 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         cfg.sources["enable_subagent_delegation"] = "env TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION"
 
     env_backend = os.environ.get("TAMFIS_CODE_DEFAULT_BACKEND")
-    if env_backend in ("standalone", "remote"):
+    if env_backend in ("auto", "standalone", "remote"):
         cfg.default_backend = env_backend
         cfg.sources["default_backend"] = "env TAMFIS_CODE_DEFAULT_BACKEND"
 

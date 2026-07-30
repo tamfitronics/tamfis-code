@@ -110,9 +110,24 @@ class RemoteAPIClient:
         self.config = config
         self.credentials = credentials or load_secure_credentials()
         self._client = httpx.AsyncClient(timeout=config.timeout_seconds)
+        self._agent_bridges: dict[str, Any] = {}
 
     async def aclose(self) -> None:
+        for bridge in list(self._agent_bridges.values()):
+            await bridge.stop()
+        self._agent_bridges.clear()
         await self._client.aclose()
+
+    async def ensure_agent_bridge(self, workspace_root: str):
+        from .remote_agent import RemoteAgentBridge
+
+        root = str(Path(workspace_root).expanduser().resolve())
+        bridge = self._agent_bridges.get(root)
+        if bridge is None:
+            bridge = RemoteAgentBridge(self, root)
+            await bridge.start()
+            self._agent_bridges[root] = bridge
+        return bridge
 
     async def __aenter__(self) -> "RemoteAPIClient":
         return self
@@ -250,15 +265,29 @@ class RemoteAPIClient:
             "POST", "/remote/servers", json_body={"name": name, "transport_type": "local"}
         )
 
+    async def register_agent_device(
+        self, *, name: str, device_id: str, os_family: str,
+    ) -> dict[str, Any]:
+        data = await self.request("POST", "/remote/servers", json_body={
+            "name": name, "transport_type": "agent",
+            "device_id": device_id, "os_family": os_family,
+        })
+        return data.get("server") or data
+
     # -- sessions -----------------------------------------------------
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         return await self.request("GET", "/remote/sessions")
 
-    async def create_session(self, server_id: int, working_directory: Optional[str] = None) -> dict[str, Any]:
+    async def create_session(
+        self, server_id: int, working_directory: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {"server_id": server_id}
         if working_directory:
             body["working_directory"] = working_directory
+        if workspace_id:
+            body["workspace_id"] = workspace_id
         return await self.request("POST", "/remote/sessions", json_body=body)
 
     async def get_session(self, session_id: int) -> dict[str, Any]:

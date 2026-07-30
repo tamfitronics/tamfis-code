@@ -67,6 +67,7 @@ class LoadConfigTests(unittest.TestCase):
         config_module.USER_CONFIG_PATH = tmp_path / "config.toml"
         self._env_token = os.environ.pop("TAMFIS_CODE_TOKEN", None)
         self._env_api_base = os.environ.pop("TAMFIS_CODE_API_BASE", None)
+        self._env_max_tool_calls = os.environ.pop("TAMFIS_CODE_MAX_TOOL_CALLS", None)
 
     def tearDown(self):
         config_module.CONFIG_DIR = self._originals["CONFIG_DIR"]
@@ -77,6 +78,8 @@ class LoadConfigTests(unittest.TestCase):
             os.environ["TAMFIS_CODE_TOKEN"] = self._env_token
         if self._env_api_base is not None:
             os.environ["TAMFIS_CODE_API_BASE"] = self._env_api_base
+        if self._env_max_tool_calls is not None:
+            os.environ["TAMFIS_CODE_MAX_TOOL_CALLS"] = self._env_max_tool_calls
 
     def test_default_api_base_when_no_config_present(self):
         cfg = config_module.load_config()
@@ -151,9 +154,9 @@ class LoadConfigTests(unittest.TestCase):
             del os.environ["TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION"]
         self.assertTrue(cfg.enable_subagent_delegation)
 
-    def test_default_backend_defaults_to_standalone(self):
+    def test_default_backend_defaults_to_auto(self):
         cfg = config_module.load_config()
-        self.assertEqual(cfg.default_backend, "standalone")
+        self.assertEqual(cfg.default_backend, "auto")
 
     def test_default_backend_set_via_config_file(self):
         config_module.USER_CONFIG_PATH.write_text('default_backend = "remote"\n')
@@ -164,7 +167,7 @@ class LoadConfigTests(unittest.TestCase):
     def test_default_backend_invalid_value_in_config_file_is_ignored(self):
         config_module.USER_CONFIG_PATH.write_text('default_backend = "cloud"\n')
         cfg = config_module.load_config()
-        self.assertEqual(cfg.default_backend, "standalone")
+        self.assertEqual(cfg.default_backend, "auto")
 
     def test_default_backend_set_via_env_var(self):
         os.environ["TAMFIS_CODE_DEFAULT_BACKEND"] = "remote"
