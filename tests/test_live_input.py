@@ -14,6 +14,7 @@ from tamfis_code.live_input import (
     _CTRL_Y,
     _SHIFT_TAB,
     _active_agent_count,
+    _mode_and_agents_html,
     composer_style,
     force_bottom_toolbar_visible,
     idle_bottom_toolbar,
@@ -45,6 +46,31 @@ def _config(approval_policy: str = "ask") -> Config:
 
 
 class ShiftTabCyclesModeTests(unittest.TestCase):
+    @patch("tamfis_code.live_input._active_agent_count")
+    def test_cached_agent_count_keeps_state_reads_out_of_footer_render(
+        self,
+        active_agent_count,
+    ):
+        rendered = _mode_and_agents_html(
+            _config("ask"),
+            1,
+            active_agents=2,
+        )
+
+        active_agent_count.assert_not_called()
+        self.assertIn("2 agents", rendered)
+
+    def test_active_agent_count_reads_session_ledger_once(self):
+        sessions = {
+            "1": {"is_swarm_child": False, "execution_status": "running"},
+            "2": {"is_swarm_child": True, "execution_status": "running"},
+            "3": {"is_swarm_child": True, "execution_status": "completed"},
+        }
+        with patch.object(state_module, "_load_raw", return_value=sessions) as load:
+            self.assertEqual(_active_agent_count(1), 1)
+
+        load.assert_called_once()
+
     def test_idle_toolbar_keeps_ready_status_and_current_mode_below_input(self):
         fragments = idle_bottom_toolbar(
             _config("ask"), 1, provider="ollama_cloud", model="kimi",
@@ -203,15 +229,18 @@ class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCa
         cfg = _config("ask")
         listener = LiveInputListener(session_id=44, renderer=renderer, cli_config=cfg)
         seen_patched = False
+        batch_interval = None
 
         async def _check_patched(*_args, **_kwargs):
-            nonlocal seen_patched
+            nonlocal seen_patched, batch_interval
             seen_patched = isinstance(_sys.stdout, StdoutProxy)
+            batch_interval = getattr(_sys.stdout, "sleep_between_writes", None)
             return ""
 
         with patch("prompt_toolkit.PromptSession.prompt_async", side_effect=_check_patched):
             await listener._interject()
         self.assertTrue(seen_patched, "prompt_async did not run under patch_stdout()")
+        self.assertLessEqual(batch_interval, 0.01)
         self.assertNotIsInstance(_sys.stdout, StdoutProxy)  # restored afterward
 
     def test_ctrl_t_byte_schedules_an_interject_task(self):

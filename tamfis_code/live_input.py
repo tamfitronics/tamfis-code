@@ -29,6 +29,8 @@ _SHIFT_TAB = b"\x1b[Z"
 _CTRL_T = b"\x14"
 _CTRL_Y = b"\x19"
 _STATUS_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+_STATUS_REFRESH_INTERVAL_SECONDS = 0.25
+_STDOUT_BATCH_INTERVAL_SECONDS = 0.01
 
 # Claude Code's own bottom-toolbar phrasing for the three MODE_CYCLE stops
 # that actually change what gets auto-approved -- "manual" (/mode's "ask")
@@ -53,21 +55,21 @@ class _CompletedAwaitable:
 def _active_agent_count(exclude_session_id: int) -> int:
     """Count other known sessions currently mid-task (e.g. swarm children
     delegated via /delegate), for the "N agents" toolbar suffix."""
-    count = 0
-    for sid in local_state.all_known_session_ids():
-        if sid == exclude_session_id:
-            continue
-        state = local_state.get_session_state(sid)
-        # Ordinary sessions can remain marked "running" after a killed SSH
-        # process. Only real delegated swarm children belong in the agent
-        # counter; counting every stale top-level session produced nonsense
-        # footers such as "← 16 agents" on a fresh prompt.
-        if state.is_swarm_child and state.execution_status == "running":
-            count += 1
-    return count
+    # Ordinary sessions can remain marked "running" after a killed SSH
+    # process. Only real delegated swarm children belong in the agent
+    # counter; counting every stale top-level session produced nonsense
+    # footers such as "← 16 agents" on a fresh prompt.
+    return local_state.active_swarm_child_count(
+        exclude_session_id=exclude_session_id,
+    )
 
 
-def _mode_and_agents_html(cli_config: Config, session_id: int) -> str:
+def _mode_and_agents_html(
+    cli_config: Config,
+    session_id: int,
+    *,
+    active_agents: Optional[int] = None,
+) -> str:
     mode = mode_label_for_policy(cli_config.approval_policy)
     mode_on = _MODE_ON_LABEL.get(mode)
     mode_line = (
@@ -75,7 +77,11 @@ def _mode_and_agents_html(cli_config: Config, session_id: int) -> str:
         if mode_on
         else f"<ansigray>⏵⏵ {mode} · shift+tab</ansigray>"
     )
-    agents = _active_agent_count(session_id)
+    agents = (
+        _active_agent_count(session_id)
+        if active_agents is None
+        else active_agents
+    )
     agents_suffix = f" <ansigray>· ← {agents} agent{'s' if agents != 1 else ''}</ansigray>" if agents else ""
     return f"{mode_line}{agents_suffix}"
 
@@ -87,6 +93,7 @@ def idle_bottom_toolbar(
     provider: str = "auto",
     model: Optional[str] = None,
     has_suggestion: bool = False,
+    active_agents: Optional[int] = None,
 ) -> HTML:
     """Bottom-toolbar content for the plain REPL prompt (no task running) --
     same mode/agents banner as the live in-task footer below, so the bar
@@ -97,8 +104,29 @@ def idle_bottom_toolbar(
     )
     return HTML(
         f" <ansigray>ready · {provider}/{model or 'auto'} ·</ansigray> "
-        f"{_mode_and_agents_html(cli_config, session_id)}{suggestion_hint}"
+        f"{_mode_and_agents_html(cli_config, session_id, active_agents=active_agents)}"
+        f"{suggestion_hint}"
     )
+
+
+@contextlib.contextmanager
+def responsive_patch_stdout(*, raw: bool = False):
+    """Keep prompt-safe concurrent output without the default 200 ms lag."""
+    from prompt_toolkit.patch_stdout import StdoutProxy
+
+    with StdoutProxy(
+        sleep_between_writes=_STDOUT_BATCH_INTERVAL_SECONDS,
+        raw=raw,
+    ) as proxy:
+        original_stdout = sys.stdout
+        original_stderr = sys.stderr
+        sys.stdout = proxy
+        sys.stderr = proxy
+        try:
+            yield
+        finally:
+            sys.stdout = original_stdout
+            sys.stderr = original_stderr
 
 
 def composer_style() -> Style:
@@ -159,6 +187,14 @@ class LiveInputListener:
         self._status_tick = 0
         self._ticker_task: Optional[asyncio.Task] = None
         self._outcome_status: Optional[str] = None
+        # A footer callback runs for every redraw and keystroke. Snapshot the
+        # count once per listener instead of touching the multi-megabyte
+        # session-state file from prompt-toolkit's latency-sensitive path.
+        self._active_agents = (
+            _active_agent_count(session_id)
+            if self._is_tty
+            else 0
+        )
 
     def start(self) -> None:
         if not self._is_tty:
@@ -214,7 +250,7 @@ class LiveInputListener:
         """Animate and update elapsed time even during silent provider waits."""
         try:
             while self._active:
-                await asyncio.sleep(0.1)
+                await asyncio.sleep(_STATUS_REFRESH_INTERVAL_SECONDS)
                 self._status_tick = (self._status_tick + 1) % len(_STATUS_SPINNER_FRAMES)
                 self.invalidate()
         except asyncio.CancelledError:
@@ -296,10 +332,10 @@ class LiveInputListener:
             # Reasoning models can emit dozens of tiny deltas per second.
             # Invalidating prompt-toolkit for every delta makes the input UI
             # compete with Rich and makes the whole terminal feel sluggish.
-            # The footer is status-only, so a bounded 10 Hz refresh is enough
+            # The footer is status-only, so a bounded 4 Hz refresh is enough
             # while keeping phase/model/elapsed-time changes responsive.
             now = time.monotonic()
-            if now - self._last_invalidate < 0.1:
+            if now - self._last_invalidate < _STATUS_REFRESH_INTERVAL_SECONDS:
                 return
             self._last_invalidate = now
             app.invalidate()
@@ -309,13 +345,16 @@ class LiveInputListener:
         status = self.renderer.live_input_status(spinner)
         return HTML(
             f" <ansigray>{status} · esc to interrupt ·</ansigray> "
-            f"{_mode_and_agents_html(self.cli_config, self.session_id)}"
+            f"{_mode_and_agents_html(
+                self.cli_config,
+                self.session_id,
+                active_agents=self._active_agents,
+            )}"
         )
 
     async def _input_loop(self) -> None:
         from prompt_toolkit import PromptSession
         from prompt_toolkit.key_binding import KeyBindings
-        from prompt_toolkit.patch_stdout import patch_stdout
 
         bindings = KeyBindings()
 
@@ -375,7 +414,7 @@ class LiveInputListener:
         try:
             while self._active and not self._paused:
                 try:
-                    with patch_stdout(raw=True):
+                    with responsive_patch_stdout(raw=True):
                         text = await session.prompt_async(
                             "message› ",
                             bottom_toolbar=self._bottom_toolbar,
@@ -524,10 +563,9 @@ class LiveInputListener:
     async def _interject(self) -> None:
         """Compatibility helper for callers/tests that submit one line."""
         from prompt_toolkit import PromptSession
-        from prompt_toolkit.patch_stdout import patch_stdout
 
         try:
-            with patch_stdout(raw=True):
+            with responsive_patch_stdout(raw=True):
                 text = await PromptSession().prompt_async("message> ")
         except KeyboardInterrupt:
             self._enqueue_control("exit")

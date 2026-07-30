@@ -628,6 +628,12 @@ async def run_interactive(
     # completer -- constructed once, here -- always reflects the latest
     # command files without needing to be rebuilt.
     custom_commands: dict[str, CustomCommand] = load_custom_commands(workspace.workspace_root)
+    # Footer callbacks run on every keystroke. Resolve the delegated-agent
+    # count once before entering prompt-toolkit instead of reading the
+    # multi-megabyte session ledger from the rendering hot path.
+    idle_active_agents = local_state.active_swarm_child_count(
+        exclude_session_id=workspace.session_id,
+    )
     session: PromptSession = PromptSession(
         history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
         completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
@@ -637,6 +643,7 @@ async def run_interactive(
             provider=provider,
             model=model,
             has_suggestion=bool(next_message_suggestion(last_response_text)),
+            active_agents=idle_active_agents,
         ),
         auto_suggest=_NextMessageAutoSuggest(lambda: last_response_text),
         style=composer_style(),

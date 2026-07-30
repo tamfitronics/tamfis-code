@@ -111,6 +111,14 @@ def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
         ) == "kimi-k2.7-code:cloud"
 
 
+def test_ollama_exposes_glm_52_as_a_priority():
+    config = ProviderManager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
+    assert "glm-5.2:cloud" in config.models
+    assert config.models.index("glm-5.2:cloud") == (
+        config.models.index("kimi-k2.7-code:cloud") + 1
+    )
+
+
 def test_ollama_extra_usage_requires_operator_opt_in_and_heavy_task(monkeypatch):
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", "true")

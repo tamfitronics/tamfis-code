@@ -262,6 +262,11 @@ class ProviderManager:
                 # consume Ollama extra usage.
                 "kimi-k3:cloud",
                 "kimi-k2.7-code:cloud",
+                # GLM cloud route kept directly behind the current
+                # included-plan Kimi coding default. This makes it available
+                # as an explicit Ollama Cloud priority without unexpectedly
+                # changing the automatic model for every task.
+                "glm-5.2:cloud",
                 "minimax-m2.7:cloud",
             ],
             priority=0,

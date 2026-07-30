@@ -659,3 +659,27 @@ def all_known_session_ids() -> list[int]:
         except ValueError:
             continue
     return sorted(ids)
+
+
+def active_swarm_child_count(*, exclude_session_id: Optional[int] = None) -> int:
+    """Count running delegated sessions with one state-file read.
+
+    Terminal footer rendering used to call ``all_known_session_ids()`` and
+    then ``get_session_state()`` once per id. Since each helper reparses the
+    complete state file, one footer frame performed N+1 full JSON parses.
+    Read the raw snapshot once and inspect only the two fields needed by the
+    UI so rendering cost does not grow quadratically with session history.
+    """
+    count = 0
+    for raw_session_id, raw in _load_raw().items():
+        if not isinstance(raw, dict):
+            continue
+        try:
+            session_id = int(raw_session_id)
+        except (TypeError, ValueError):
+            continue
+        if exclude_session_id is not None and session_id == exclude_session_id:
+            continue
+        if raw.get("is_swarm_child") and raw.get("execution_status") == "running":
+            count += 1
+    return count
