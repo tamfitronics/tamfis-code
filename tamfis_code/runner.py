@@ -34,14 +34,21 @@ except (TypeError, ValueError):
     MAX_TASK_STREAM_RECONNECTS = 12
 
 # Allowed providers - expanded from just hf/openrouter
-ALLOWED_PROVIDERS = ["hf", "huggingface", "or", "openrouter", "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None]
-PROVIDER_ALIASES = {"hf": "huggingface", "nvidia": "nvidia_nim", "or": "openrouter"}
+ALLOWED_PROVIDERS = [
+    "hf", "huggingface", "or", "openrouter", "ollama", "ollama_cloud",
+    "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None,
+]
+PROVIDER_ALIASES = {
+    "hf": "huggingface", "nvidia": "nvidia_nim", "or": "openrouter",
+    "ollama": "ollama_cloud",
+}
 
 # Provider name mapping
 PROVIDER_NAME_MAP = {
     "hf": "Hugging Face",
     "huggingface": "Hugging Face",
     "openrouter": "OpenRouter",
+    "ollama_cloud": "Ollama Cloud",
     "nvidia": "NVIDIA NIM",
     "nvidia_nim": "NVIDIA NIM",
     "gemini": "Google Gemini",
