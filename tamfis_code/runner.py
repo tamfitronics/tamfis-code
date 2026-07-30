@@ -515,6 +515,13 @@ async def _stream_task(
     outcome: Optional[TaskOutcome] = None
     last_assistant_content: Optional[str] = None
     last_plan_items: list[dict[str, Any]] = []
+    # A "coding" mode task that answers a question, reports status, or
+    # decides nothing needs to change this turn is a legitimate outcome, not
+    # a failure -- the no-mutation check below must only fire once the model
+    # actually reached for a tool capable of changing something. Read-only
+    # tools (read_file/glob_files/grep_files) never set this.
+    _MUTATING_TOOL_NAMES = {"write_file", "edit_file", "remote_exec"}
+    mutation_attempted = False
     initial_mutation_ids = {
         str(item.get("mutation_id"))
         for item in local_state.get_session_state(session_id).modified_files
@@ -539,7 +546,7 @@ async def _stream_task(
             await asyncio.sleep(0.25)
 
     async def consume() -> None:
-        nonlocal outcome, last_assistant_content, last_plan_items, task_id
+        nonlocal outcome, last_assistant_content, last_plan_items, task_id, mutation_attempted
         async for event in client.stream_session(session_id, from_event_id):
             sequence = event.get("stream_sequence")
             if sequence is not None:
@@ -578,6 +585,11 @@ async def _stream_task(
             }
             if event_type in phase_by_event:
                 local_state.save_session_state(session_id, current_phase=phase_by_event[event_type])
+
+            if event_type == "tool_call_requested":
+                tool_name = str(payload.get("name") or payload.get("tool") or "")
+                if tool_name in _MUTATING_TOOL_NAMES:
+                    mutation_attempted = True
 
             if event_type == "plan_created":
                 items = payload.get("items") if isinstance(payload.get("items"), list) else []
@@ -702,7 +714,7 @@ async def _stream_task(
                     renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
                     outcome = TaskOutcome(status="failed", error=message, summary=last_assistant_content or "")
                     return
-                if requested_mutation and not new_mutations:
+                if requested_mutation and mutation_attempted and not new_mutations:
                     message = (
                         "TamfisGPT reported completion, but no file mutation was recorded for this coding task. "
                         "The task is not considered complete."
