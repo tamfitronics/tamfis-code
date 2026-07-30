@@ -40,7 +40,7 @@ class NormalizeProviderTests(unittest.TestCase):
         self.assertEqual(normalize_provider("ollama"), "ollama_cloud")
 
     def test_canonical_names_pass_through_unchanged(self):
-        for name in ("huggingface", "openrouter", "ollama_cloud", "nvidia_nim", "gemini", "apiframe", "auto"):
+        for name in ("huggingface", "openrouter", "ollama_cloud", "ollama_gpu", "nvidia_nim", "gemini", "apiframe", "auto"):
             self.assertEqual(normalize_provider(name), name)
 
     def test_unsupported_provider_raises_value_error(self):
@@ -50,7 +50,7 @@ class NormalizeProviderTests(unittest.TestCase):
 
 class ProviderNameMapTests(unittest.TestCase):
     def test_every_allowed_alias_target_has_a_display_name(self):
-        for canonical in ("huggingface", "openrouter", "ollama_cloud", "nvidia_nim", "gemini", "apiframe", "auto"):
+        for canonical in ("huggingface", "openrouter", "ollama_cloud", "ollama_gpu", "nvidia_nim", "gemini", "apiframe", "auto"):
             self.assertIn(canonical, PROVIDER_NAME_MAP)
 
 

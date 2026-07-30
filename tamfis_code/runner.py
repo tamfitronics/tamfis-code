@@ -35,7 +35,7 @@ except (TypeError, ValueError):
 
 # Allowed providers - expanded from just hf/openrouter
 ALLOWED_PROVIDERS = [
-    "hf", "huggingface", "or", "openrouter", "ollama", "ollama_cloud",
+    "hf", "huggingface", "or", "openrouter", "ollama", "ollama_cloud", "ollama_gpu",
     "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None,
 ]
 PROVIDER_ALIASES = {
@@ -49,6 +49,7 @@ PROVIDER_NAME_MAP = {
     "huggingface": "Hugging Face",
     "openrouter": "OpenRouter",
     "ollama_cloud": "Ollama Cloud",
+    "ollama_gpu": "Ollama GPU",
     "nvidia": "NVIDIA NIM",
     "nvidia_nim": "NVIDIA NIM",
     "gemini": "Google Gemini",

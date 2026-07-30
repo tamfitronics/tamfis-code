@@ -1029,8 +1029,8 @@ async def run_interactive(
                 console.print("[green]Model routing set to automatic: Hugging Face, then OpenRouter.[/green]")
                 continue
             route = parts[0].lower()
-            if route not in ("hf", "openrouter"):
-                print_error(console, "Usage: /model auto | /model <hf|openrouter> [catalog-model-id]")
+            if route not in ("hf", "openrouter", "ollama_cloud", "ollama_gpu", "nvidia", "nvidia_nim", "gemini", "apiframe"):
+                print_error(console, "Usage: /model auto | /model <provider> [catalog-model-id]")
                 continue
             model_id = parts[1] if len(parts) > 1 else "auto"
             if len(parts) > 2:
