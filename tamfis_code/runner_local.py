@@ -171,6 +171,18 @@ FABRICATED_RESULT_CORRECTION = (
     "and report only what it actually returns."
 )
 
+# Threshold for _round_tool_outcome's failure-streak guard, above.
+CONSECUTIVE_FAILED_ROUNDS_BEFORE_DIAGNOSIS_NUDGE = 3
+FAILURE_DIAGNOSIS_CORRECTION = (
+    f"Every tool call has failed for {{count}} rounds in a row, each with a different attempt "
+    "that still didn't work. Stop trying another fix blind. Before changing anything else: "
+    "re-read the exact error/output text already returned by the last failed call(s) -- the "
+    "real cause is usually stated there -- and, if relevant, inspect actual evidence (a log "
+    "file, the command's real exit code and stderr, the current state of the file you edited) "
+    "instead of assuming what went wrong. Only attempt a fix once you can state, from that "
+    "evidence, specifically why the previous attempts failed."
+)
+
 PERMISSION_BOUNDARY_CORRECTION = (
     "The last registered tool returned a real permission failure. Keep working in the "
     "canonical workspace. Do not copy or clone the project elsewhere, change ownership "
@@ -4175,6 +4187,18 @@ async def _run_local_agent_turn_impl(
     fake_tool_call_retries: dict[ProviderType, int] = {}
     fake_tool_call_failed_providers: set[ProviderType] = set()
     consecutive_scope_errors = 0
+    # Distinct from consecutive_identical_rounds/_is_cycling above: those
+    # catch the model retrying the SAME (or a short repeating cycle of)
+    # call(s). This catches the opposite shape of stall -- a *different*
+    # command/edit attempted each round, none of which land, e.g. three
+    # different "fix attempts" that each error out differently. Neither
+    # existing guard fires there since the calls are never identical or
+    # cycling; only this counts every round where every tool call this
+    # round failed and none succeeded. Nudged once per turn (like the
+    # narrated/capitulation/fabricated-result corrections above), not
+    # repeated -- this is a course-correction, not a running scold.
+    consecutive_failed_rounds = 0
+    failure_diagnosis_nudged = False
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
@@ -5890,6 +5914,55 @@ async def _run_local_agent_turn_impl(
         # replanning/provider request so a kill here never repeats a tool
         # that already ran (especially a file mutation or command).
         _persist_turn_checkpoint()
+
+        # Failure-streak stall guard (see consecutive_failed_rounds above).
+        # Matches this round's tool results by tool_call_id rather than by
+        # position/count -- every branch above appends its own "role":
+        # "tool" message independently, so an id match is the only way to
+        # gather them that doesn't depend on every branch appending exactly
+        # once (most do, but this must not silently miscount if one ever
+        # doesn't).
+        _round_call_ids = {tc.call_id for tc in tool_calls}
+        _round_outcomes = []
+        for _msg in reversed(working_messages):
+            if _msg.get("role") != "tool":
+                continue
+            if _msg.get("tool_call_id") not in _round_call_ids:
+                if len(_round_outcomes) >= len(_round_call_ids):
+                    break
+                continue
+            try:
+                _round_outcomes.append(json.loads(_msg.get("content") or "{}").get("success"))
+            except (json.JSONDecodeError, AttributeError):
+                _round_outcomes.append(None)
+            if len(_round_outcomes) >= len(_round_call_ids):
+                break
+        if _round_outcomes and all(outcome is False for outcome in _round_outcomes):
+            consecutive_failed_rounds += 1
+        else:
+            consecutive_failed_rounds = 0
+        if (
+            consecutive_failed_rounds >= CONSECUTIVE_FAILED_ROUNDS_BEFORE_DIAGNOSIS_NUDGE
+            and not failure_diagnosis_nudged
+        ):
+            failure_diagnosis_nudged = True
+            working_messages.append({
+                "role": "system",
+                "content": FAILURE_DIAGNOSIS_CORRECTION.format(count=consecutive_failed_rounds),
+            })
+            orchestrator.mark_repair(
+                f"{consecutive_failed_rounds} different tool-call attempts in a row all failed -- "
+                "asking the model to diagnose root cause from the actual error evidence before trying again"
+            )
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"{consecutive_failed_rounds} varied attempts in a row have all failed -- "
+                        "requesting root-cause diagnosis from the actual error output before the next attempt."
+                    ),
+                },
+            })
 
         # Adaptive replanning: the plan above (whether reasoning-based or
         # the deterministic template) was necessarily made before any tool
