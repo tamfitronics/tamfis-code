@@ -12,9 +12,12 @@ from tamfis_code.live_input import (
     LiveInputListener,
     _CTRL_T,
     _CTRL_Y,
+    _ROTATING_TIPS,
     _SHIFT_TAB,
     _active_agent_count,
     _mode_and_agents_html,
+    _right_align,
+    _right_chip,
     composer_style,
     force_bottom_toolbar_visible,
     idle_bottom_toolbar,
@@ -81,6 +84,40 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertIn("ollama_cloud/kimi", rendered)
         self.assertIn("⏵⏵ manual", rendered)
         self.assertIn("shift+tab", rendered)
+
+    def test_idle_toolbar_right_aligns_a_rotating_chip(self):
+        fragments = idle_bottom_toolbar(
+            _config("ask"), 1, provider="ollama_cloud", model="kimi",
+        ).__pt_formatted_text__()
+        rendered = "".join(text for _style, text in fragments)
+
+        chip = _right_chip()
+        # _right_chip returns HTML markup; the plain tip text is what
+        # actually lands in the rendered fragments.
+        plain_tip = chip.split(">", 1)[1].rsplit("<", 1)[0]
+        self.assertIn(plain_tip, rendered)
+        self.assertTrue(any(plain_tip in tip for tip in _ROTATING_TIPS) or plain_tip in _ROTATING_TIPS)
+        # Right-aligned: the chip is the last thing on the line, after padding.
+        self.assertTrue(rendered.rstrip().endswith(plain_tip))
+
+    def test_right_align_pads_to_terminal_width(self):
+        import shutil
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch("shutil.get_terminal_size", return_value=shutil.os.terminal_size((40, 24))):
+            result = _right_align("<ansigray>left</ansigray>", "right")
+        plain = result.replace("<ansigray>", "").replace("</ansigray>", "")
+        self.assertEqual(len(plain), 40)
+        self.assertTrue(plain.endswith("right"))
+        self.assertTrue(plain.startswith("left"))
+
+    def test_right_align_never_collapses_the_gap_on_a_narrow_terminal(self):
+        import shutil
+        from unittest.mock import patch as mock_patch
+
+        with mock_patch("shutil.get_terminal_size", return_value=shutil.os.terminal_size((10, 24))):
+            result = _right_align("<ansigray>a very long left side status line</ansigray>", "right")
+        self.assertIn("  right", result)
 
     def test_footer_style_never_uses_reverse_background(self):
         style = composer_style()

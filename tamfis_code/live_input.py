@@ -42,6 +42,44 @@ _MODE_ON_LABEL = {
     "plan-only": "plan mode on",
 }
 
+# Right-aligned corner chip, same layout as Claude Code's own bottom bar
+# (left-aligned status, one short hint flush right). Rotates on a slow clock
+# rather than every render -- the toolbar redraws several times a second
+# while a task streams, and a hint that changes that fast is just noise.
+_ROTATING_TIPS = (
+    "/plan to think before executing",
+    "/model to switch models",
+    "/diff to review pending changes",
+    "/agents to see what's running",
+    "/retry to rerun the last turn",
+    "/status for session, task, cwd",
+)
+_TIP_ROTATE_SECONDS = 8.0
+
+
+def _right_chip() -> str:
+    index = int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(_ROTATING_TIPS)
+    return f"<ansibrightblack>{_ROTATING_TIPS[index]}</ansibrightblack>"
+
+
+def _right_align(left_html: str, right_html: str, *, min_gap: int = 2) -> str:
+    """Pad `left_html` with spaces so `right_html` lands flush against the
+    terminal's right edge -- prompt-toolkit's bottom_toolbar has no builtin
+    two-zone layout, so this measures visible width by stripping the HTML
+    tags (there is no markup inside the tag text itself, so a plain regex
+    is exact here) rather than pulling in prompt_toolkit's heavier
+    formatted-text width calculation for what is just plain-ASCII content.
+    """
+    import re
+    import shutil
+
+    def visible_len(fragment: str) -> int:
+        return len(re.sub(r"<[^>]+>", "", fragment))
+
+    width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    gap = max(min_gap, width - visible_len(left_html) - visible_len(right_html))
+    return f"{left_html}{' ' * gap}{right_html}"
+
 
 class _CompletedAwaitable:
     """A no-op awaitable that is also safe to ignore for non-TTY callers."""
@@ -102,11 +140,12 @@ def idle_bottom_toolbar(
         " <ansigray>· tab to use next suggestion</ansigray>"
         if has_suggestion else ""
     )
-    return HTML(
+    left = (
         f" <ansigray>ready · {provider}/{model or 'auto'} ·</ansigray> "
         f"{_mode_and_agents_html(cli_config, session_id, active_agents=active_agents)}"
         f"{suggestion_hint}"
     )
+    return HTML(_right_align(left, _right_chip() + " "))
 
 
 @contextlib.contextmanager
@@ -343,7 +382,7 @@ class LiveInputListener:
     def _bottom_toolbar(self):
         spinner = _STATUS_SPINNER_FRAMES[self._status_tick]
         status = self.renderer.live_input_status(spinner)
-        return HTML(
+        left = (
             f" <ansigray>{status} · esc to interrupt ·</ansigray> "
             f"{_mode_and_agents_html(
                 self.cli_config,
@@ -351,6 +390,7 @@ class LiveInputListener:
                 active_agents=self._active_agents,
             )}"
         )
+        return HTML(_right_align(left, _right_chip() + " "))
 
     async def _input_loop(self) -> None:
         from prompt_toolkit import PromptSession
