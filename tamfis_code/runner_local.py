@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shlex
+import tempfile
 import time
 import uuid
 from collections import Counter
@@ -60,7 +61,7 @@ from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
-from .workspace import classify_root, detect_validation_commands
+from .workspace import classify_root, detect_validation_commands, scratch_root
 from .workspace_access import ensure_workspace_access
 from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
 
@@ -710,8 +711,17 @@ def _apply_mcp_task_scope(
     }
 
 
-def _scope_instruction(workspace_root: str, scope_roots: list[Path]) -> str:
+def _scope_instruction(workspace_root: str, scope_roots: list[Path], *, scratch_root: Optional[Path] = None) -> str:
     roots = "\n".join(f"- {path}" for path in scope_roots)
+    scratch_paragraph = (
+        f"\n\nSCRATCH SPACE: {scratch_root} is always available for throwaway work that "
+        "does not belong in the project itself -- downloading something to inspect, "
+        "extracting an archive to look through it, writing and running a one-off script "
+        "to test an idea, a temp file for a multi-step shell pipeline. It is not a "
+        "project root: do not treat files there as part of the task's deliverable, "
+        "report on them, or expect them to persist beyond this session."
+        if scratch_root else ""
+    )
     return (
         "WORKSPACE SCOPE (authoritative for this turn):\n"
         f"Workspace root: {Path(workspace_root).resolve()}\n"
@@ -725,6 +735,7 @@ def _scope_instruction(workspace_root: str, scope_roots: list[Path]) -> str:
         "Do not mention, inspect or propose files from excluded or unselected sibling "
         "directories. If a planned path falls outside the target roots, discard and "
         "regenerate that plan step before displaying it."
+        f"{scratch_paragraph}"
     )
 
 
@@ -3933,7 +3944,16 @@ async def _run_local_agent_turn_impl(
         workspace_resolution = resolve_workspace_targets(
             launch_root=workspace_root,
             objective=objective,
-            allowed_roots=prior_state.allowed_workspaces or [workspace_root],
+            # /tmp (not just the narrower per-session scratch_root(), which
+            # is only a recommended subpath within it) must be allowed here
+            # too, not just later in _apply_mcp_task_scope -- an objective
+            # that names /tmp itself, or any path under it, explicitly
+            # (e.g. "write a script to /tmp and run it") is resolved
+            # against THIS grant before scope_roots exists, and
+            # WorkspaceGrant.contains() only allows a candidate that is the
+            # granted root or a descendant of it -- granting just the
+            # deeper session subdirectory would still reject "/tmp" itself.
+            allowed_roots=[*(prior_state.allowed_workspaces or [workspace_root]), tempfile.gettempdir()],
         )
     except WorkspaceAuthorityError as exc:
         message = str(exc)
@@ -3952,11 +3972,25 @@ async def _run_local_agent_turn_impl(
         )
         return TaskOutcome(status="failed", error=message)
     scope_roots = list(workspace_resolution.roots)
-    _apply_mcp_task_scope(mcp_server, scope_roots)
+    turn_scratch_root = scratch_root(session_id)
     scope_message = {
         "role": "system",
-        "content": _scope_instruction(workspace_root, scope_roots),
+        "content": _scope_instruction(workspace_root, scope_roots, scratch_root=turn_scratch_root),
     }
+    # Always granted, unlike every other path outside the launch workspace
+    # (which needs an explicit objective-named path plus a durable session
+    # grant -- see resolve_workspace_targets) -- scratch space to actually
+    # run/write throwaway code in is infrastructure, not a workspace
+    # target, the same way Claude Code's own scratchpad is always available
+    # without being "granted" per task. Both /tmp itself (matching the
+    # objective-level grant above -- see its comment on why the bare
+    # directory, not just the deeper session subpath, must be listed) and
+    # the session-scoped subdirectory are appended only AFTER building the
+    # prompt's "Target project roots" list, so they're enforced (mcp_server
+    # tools, execute_command cwd, etc.) without being displayed as if they
+    # were project roots themselves.
+    scope_roots.extend([Path(tempfile.gettempdir()), turn_scratch_root])
+    _apply_mcp_task_scope(mcp_server, scope_roots)
     # Put the scope rule immediately after the leading system instruction so
     # it survives later compaction and remains authoritative in every round.
     insert_at = 1 if working_messages and working_messages[0].get("role") == "system" else 0

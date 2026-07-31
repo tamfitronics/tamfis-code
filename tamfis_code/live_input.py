@@ -58,8 +58,13 @@ _TIP_ROTATE_SECONDS = 8.0
 
 
 def _right_chip() -> str:
+    # ansibrightblack (the ghost-text/auto-suggestion color -- deliberately
+    # dim) renders as unreadable-to-invisible against some terminal themes'
+    # backgrounds for ordinary body text. ansigray is the same tone the rest
+    # of this toolbar's left-side status already uses, so the chip stays
+    # visually secondary without disappearing.
     index = int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(_ROTATING_TIPS)
-    return f"<ansibrightblack>{_ROTATING_TIPS[index]}</ansibrightblack>"
+    return f"<ansigray>{_ROTATING_TIPS[index]}</ansigray>"
 
 
 def _right_align(left_html: str, right_html: str, *, min_gap: int = 2) -> str:

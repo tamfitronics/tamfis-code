@@ -12,6 +12,7 @@ import hashlib
 import json
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,22 @@ from . import state as local_state
 from .config import load_config
 
 REUSABLE_STATUSES = {"idle", "active"}
+
+
+def scratch_root(session_id: int) -> Path:
+    """A per-session scratch directory under the OS temp dir, always
+    available to run/write throwaway code -- the same role Claude Code's
+    own scratchpad convention plays, and always granted (see
+    runner_local.py's _apply_mcp_task_scope) alongside the workspace's own
+    scope roots rather than requiring an explicit grant like any other path
+    outside the launch workspace would.
+
+    Session-scoped (not a single shared directory) so two sessions running
+    concurrently never collide on the same filenames.
+    """
+    root = Path(tempfile.gettempdir()) / "tamfis-code" / str(session_id)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 INSTRUCTION_NAMES = {
     "AGENTS.md", "CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis",
     "CONTRIBUTING.md", "README.md",

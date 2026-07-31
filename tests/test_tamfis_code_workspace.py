@@ -8,8 +8,38 @@ from tamfis_code import state as state_module
 from tamfis_code.workspace import (
     _indexable_files, _project_metadata, blocking_dirty_files, build_system_prompt, classify_root,
     context_from_session, discover_local_repository, find_resumable_session,
-    resolve_local_workspace, resolve_workspace,
+    resolve_local_workspace, resolve_workspace, scratch_root,
 )
+
+
+class ScratchRootTests(unittest.TestCase):
+    def test_creates_a_session_scoped_directory_under_the_os_temp_dir(self):
+        import tempfile as tempfile_module
+
+        root = scratch_root(90123)
+        try:
+            self.assertTrue(root.is_dir())
+            self.assertTrue(str(root).startswith(str(Path(tempfile_module.gettempdir()).resolve())))
+            self.assertIn("90123", root.parts)
+        finally:
+            root.rmdir()
+
+    def test_different_sessions_get_different_directories(self):
+        first = scratch_root(1)
+        second = scratch_root(2)
+        try:
+            self.assertNotEqual(first, second)
+        finally:
+            first.rmdir()
+            second.rmdir()
+
+    def test_is_idempotent_across_calls(self):
+        root = scratch_root(90124)
+        try:
+            self.assertEqual(scratch_root(90124), root)
+            self.assertTrue(root.is_dir())
+        finally:
+            root.rmdir()
 
 
 class WordpressProjectMetadataTests(unittest.TestCase):
