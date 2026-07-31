@@ -2,10 +2,23 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from unittest.mock import AsyncMock
 
 import pytest
 
 from tamfis_code.runtime.unified import ExecutionMode, ExecutionRequest, UnifiedAgentRuntime
+
+
+@pytest.fixture
+def isolated_state(tmp_path, monkeypatch):
+    """Redirect state.json/.memory to a throwaway dir so these tests never
+    touch a real user's session state."""
+    import tamfis_code.state as state
+
+    monkeypatch.setattr(state, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(state, "STATE_PATH", tmp_path / "state.json")
+    state._VOLATILE_STATE.clear()
+    return state
 
 
 @dataclass
@@ -111,3 +124,129 @@ async def test_runtime_persists_failure_journal(monkeypatch, tmp_path):
     assert events[-1]["status"] == "failed"
     assert "classified failure" in events[-1]["error"]
     assert events[-1]["execution_id"]
+
+
+def _remote_kwargs(**overrides):
+    base = dict(
+        client=AsyncMock(), renderer=None, console=None,
+        session_id=50, objective="fix the bug", mode="coding",
+        approval_policy="ask", interactive=True, model="auto", provider="auto",
+        attachments=None, config=None,
+    )
+    base.update(overrides)
+    return base
+
+
+@pytest.mark.asyncio
+async def test_execute_remote_falls_back_to_local_on_infra_failure(monkeypatch, isolated_state):
+    import tamfis_code.runner as runner
+    import tamfis_code.runner_local as runner_local
+    from tamfis_code.runtime.unified import UnifiedAgentRuntime
+
+    monkeypatch.setattr(
+        runner, "_run_ai_task_and_stream_impl",
+        AsyncMock(return_value=Outcome(status="failed", error="Remote agent runtime is unavailable")),
+    )
+    local_impl = AsyncMock(return_value=Outcome(status="completed", summary="done locally"))
+    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
+
+    runtime = UnifiedAgentRuntime()
+    result = await runtime.execute_remote(**_remote_kwargs())
+
+    local_impl.assert_awaited_once()
+    assert result.status == "completed"
+    assert isolated_state.get_session_state(50).remote_degraded_since is not None
+
+
+@pytest.mark.asyncio
+async def test_execute_remote_does_not_fallback_on_ordinary_task_failure(monkeypatch, isolated_state):
+    import tamfis_code.runner as runner
+    import tamfis_code.runner_local as runner_local
+    from tamfis_code.runtime.unified import UnifiedAgentRuntime
+
+    monkeypatch.setattr(
+        runner, "_run_ai_task_and_stream_impl",
+        AsyncMock(return_value=Outcome(status="failed", error="2 of 5 tests failed")),
+    )
+    local_impl = AsyncMock()
+    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
+
+    runtime = UnifiedAgentRuntime()
+    result = await runtime.execute_remote(**_remote_kwargs())
+
+    local_impl.assert_not_called()
+    assert result.status == "failed"
+    assert isolated_state.get_session_state(50).remote_degraded_since is None
+
+
+@pytest.mark.asyncio
+async def test_execute_remote_falls_back_on_connection_exception(monkeypatch, isolated_state):
+    import tamfis_code.runner as runner
+    import tamfis_code.runner_local as runner_local
+    from tamfis_code.api_client import RemoteAPIError
+    from tamfis_code.runtime.unified import UnifiedAgentRuntime
+
+    monkeypatch.setattr(
+        runner, "_run_ai_task_and_stream_impl",
+        AsyncMock(side_effect=RemoteAPIError(503, "bad gateway")),
+    )
+    local_impl = AsyncMock(return_value=Outcome(status="completed", summary="done locally"))
+    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
+
+    runtime = UnifiedAgentRuntime()
+    result = await runtime.execute_remote(**_remote_kwargs())
+
+    local_impl.assert_awaited_once()
+    assert result.status == "completed"
+
+
+@pytest.mark.asyncio
+async def test_execute_remote_does_not_fallback_on_auth_error(monkeypatch, isolated_state):
+    import tamfis_code.runner as runner
+    import tamfis_code.runner_local as runner_local
+    from tamfis_code.api_client import AuthRequiredError
+    from tamfis_code.runtime.unified import UnifiedAgentRuntime
+
+    monkeypatch.setattr(
+        runner, "_run_ai_task_and_stream_impl",
+        AsyncMock(side_effect=AuthRequiredError(401, "not logged in")),
+    )
+    local_impl = AsyncMock()
+    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
+
+    runtime = UnifiedAgentRuntime()
+    with pytest.raises(AuthRequiredError):
+        await runtime.execute_remote(**_remote_kwargs())
+
+    local_impl.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_execute_remote_sticky_degraded_skips_remote_until_probe_succeeds(monkeypatch, isolated_state):
+    import tamfis_code.runner as runner
+    import tamfis_code.runner_local as runner_local
+    from tamfis_code.runtime.unified import UnifiedAgentRuntime
+
+    isolated_state.mark_remote_degraded(50, reason="prior outage")
+    remote_impl = AsyncMock(return_value=Outcome(status="completed"))
+    monkeypatch.setattr(runner, "_run_ai_task_and_stream_impl", remote_impl)
+    local_impl = AsyncMock(return_value=Outcome(status="completed", summary="done locally"))
+    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
+
+    # Health probe still failing: stays local, remote is never attempted.
+    client = AsyncMock()
+    client.get_session.side_effect = RuntimeError("still down")
+    runtime = UnifiedAgentRuntime()
+    result = await runtime.execute_remote(**_remote_kwargs(client=client))
+    remote_impl.assert_not_called()
+    local_impl.assert_awaited_once()
+    assert result.summary == "done locally"
+    assert isolated_state.get_session_state(50).remote_degraded_since is not None
+
+    # Health probe now succeeding: clears the flag and resumes Remote.
+    client.get_session.side_effect = None
+    client.get_session.return_value = {"id": 50, "status": "idle"}
+    result = await runtime.execute_remote(**_remote_kwargs(client=client))
+    remote_impl.assert_awaited_once()
+    assert result.status == "completed"
+    assert isolated_state.get_session_state(50).remote_degraded_since is None

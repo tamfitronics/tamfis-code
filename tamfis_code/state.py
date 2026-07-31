@@ -208,6 +208,16 @@ class SessionState:
     parent_session_id: Optional[int] = None
     is_swarm_child: bool = False
     swarm_label: str = ""
+    # Sticky Remote-outage fallback (see runtime/unified.py's execute_remote).
+    # Set when a Remote task fails for an infra reason (runtime/backend
+    # unavailable, not an ordinary task failure) rather than clearing itself
+    # after one retry -- every subsequent turn in this session runs locally
+    # until a health probe confirms Remote is reachable again, so a flapping
+    # backend cannot make each turn separately pay for a failed remote
+    # attempt before falling back. None means Remote is (or is assumed)
+    # healthy for this session.
+    remote_degraded_since: Optional[str] = None
+    remote_degraded_reason: str = ""
 
 
 def _load_raw() -> dict[str, Any]:
@@ -432,6 +442,27 @@ def mark_turn_checkpoint_interrupted(session_id: int, *, error: str) -> None:
 def clear_turn_checkpoint(session_id: int) -> None:
     state = get_session_state(session_id)
     state.turn_checkpoint = None
+    put_session_state(state)
+
+
+def mark_remote_degraded(session_id: int, *, reason: str) -> None:
+    """Sticky: only records the first outage's timestamp/reason, so a run of
+    repeated failures while degraded doesn't keep resetting how long Remote
+    has been down."""
+    state = get_session_state(session_id)
+    if state.remote_degraded_since:
+        return
+    state.remote_degraded_since = _now()
+    state.remote_degraded_reason = reason
+    put_session_state(state)
+
+
+def clear_remote_degraded(session_id: int) -> None:
+    state = get_session_state(session_id)
+    if not state.remote_degraded_since:
+        return
+    state.remote_degraded_since = None
+    state.remote_degraded_reason = ""
     put_session_state(state)
 
 
