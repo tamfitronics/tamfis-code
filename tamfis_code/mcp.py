@@ -2,6 +2,7 @@
 
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
+import contextlib
 import html
 import json
 import os
@@ -15,6 +16,8 @@ import sys
 import shutil
 import tarfile
 import tempfile
+import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -155,6 +158,88 @@ MAX_SEARCH_RESULTS = 200
 # set with one or two enormous match lines.
 MAX_SEARCH_FILE_SIZE_BYTES = 2_000_000
 MAX_SEARCH_MATCH_CHARS = 500
+
+# How much of a still-running (or already-finished) background job's own
+# output read_background_job returns per call -- same bounded-tail idea as
+# the rest of this module's output caps, so polling a chatty long-running
+# command repeatedly can't blow the context budget.
+MAX_BACKGROUND_OUTPUT_CHARS = 20_000
+
+
+@dataclass
+class BackgroundJob:
+    """A command detached from execute_command's normal blocking wait (see
+    _execute_command's background_signal) -- the real asyncio.subprocess.
+    Process keeps running exactly as it was, not restarted under a
+    different mechanism; only who's waiting on it changes.
+
+    Registered at module level, not per-MCPServer-instance: MCPServer is
+    recreated fresh every turn (see runner_local.py), but a backgrounded
+    job legitimately needs to survive past the turn that started it -- the
+    whole point is "keep working, check on this later," possibly several
+    turns later.
+    """
+    job_id: str
+    command: str
+    cwd: str
+    started_at: float
+    proc: "asyncio.subprocess.Process"
+    # The SAME communicate() call _execute_command already had in flight
+    # when it detached -- must be awaited here, not re-issued. A second,
+    # concurrent proc.communicate() call on top of the first would race it
+    # for the same stdout/stderr pipes, which asyncio explicitly forbids.
+    communicate_task: "asyncio.Task"
+    stdout: str = ""
+    stderr: str = ""
+    return_code: Optional[int] = None
+    finished: bool = False
+    error: str = ""
+
+
+_BACKGROUND_JOBS: Dict[str, BackgroundJob] = {}
+
+
+async def _watch_background_job(job: BackgroundJob) -> None:
+    """Keeps draining the detached process's already-in-flight communicate()
+    after _execute_command has returned -- if nothing awaited it at all, an
+    exited process becomes a zombie and stdout/stderr pipes can fill and
+    deadlock the child. Fills in the job record for read_background_job to
+    report once this completes."""
+    try:
+        stdout, stderr = await job.communicate_task
+        job.stdout = stdout.decode("utf-8", errors="ignore")
+        job.stderr = stderr.decode("utf-8", errors="ignore")
+        job.return_code = job.proc.returncode
+    except Exception as exc:
+        job.error = str(exc)
+    finally:
+        job.finished = True
+
+
+def read_background_job_status(job_id: str) -> Dict[str, Any]:
+    """Module-level (not an MCPServer method -- see BackgroundJob's
+    docstring on why the registry itself is module-level) lookup used by
+    runner_local.py's read_background_job tool dispatch."""
+    job = _BACKGROUND_JOBS.get(job_id)
+    if job is None:
+        return {"success": False, "error": f"No background job found with id {job_id!r}."}
+    elapsed = time.monotonic() - job.started_at
+    if not job.finished:
+        return {
+            "success": True, "job_id": job_id, "command": job.command,
+            "status": "running", "elapsed_seconds": round(elapsed, 1),
+        }
+    result: Dict[str, Any] = {
+        "success": True, "job_id": job_id, "command": job.command,
+        "status": "failed" if job.error else "finished",
+        "elapsed_seconds": round(elapsed, 1), "return_code": job.return_code,
+        "stdout": job.stdout[-MAX_BACKGROUND_OUTPUT_CHARS:],
+        "stderr": job.stderr[-MAX_BACKGROUND_OUTPUT_CHARS:],
+    }
+    if job.error:
+        result["error"] = job.error
+    return result
+
 
 @dataclass
 class ToolDefinition:
@@ -583,8 +668,18 @@ class MCPServer:
                 await bridge.shutdown()
         return tools
     
-    async def call_tool(self, name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Call a tool by name"""
+    async def call_tool(
+        self, name: str, parameters: Dict[str, Any], *, extra_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Call a tool by name.
+
+        `extra_kwargs` (e.g. execute_command's background_signal) is passed
+        straight to the handler alongside `parameters` but is never merged
+        into it -- `parameters` is the model's own tool-call arguments,
+        which get echoed back into working_messages and persisted (see
+        state.py's completed_actions); a live object like an asyncio.Event
+        in there would break json.dumps on the very next round.
+        """
         if name not in self.tools:
             bridge = None
             owns_bridge = False
@@ -618,7 +713,7 @@ class MCPServer:
         
         tool = self.tools[name]
         try:
-            result = await tool.handler(**parameters)
+            result = await tool.handler(**parameters, **(extra_kwargs or {}))
             return {"result": result, "tool": name, "success": True}
         except Exception as e:
             return {"error": str(e), "tool": name, "success": False}
@@ -1095,7 +1190,13 @@ class MCPServer:
         self, command: str, cwd: Optional[str] = None, timeout: int = 60,
         environment: Optional[Dict[str, str]] = None, shell: str = "bash",
         approval_metadata: Optional[Dict[str, Any]] = None,
+        background_signal: Optional[asyncio.Event] = None,
     ) -> Dict[str, Any]:
+        # `background_signal` is never part of this tool's schema and the
+        # model never sets it -- runner_local.py injects it into arguments
+        # right before dispatch, sourced from the live REPL's Ctrl+B
+        # keybinding (see live_input.py), so it can only ever be set by the
+        # human actually watching this specific command run.
         # `timeout: int` above is only a type hint -- the tool schema
         # declares it as an integer, but nothing coerces a model's actual
         # tool-call arguments to match it. Confirmed live: a real turn sent
@@ -1160,13 +1261,60 @@ class MCPServer:
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(run_dir), env=env,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return {
-                "stdout": stdout.decode('utf-8', errors='ignore'),
-                "stderr": stderr.decode('utf-8', errors='ignore'),
-                "return_code": proc.returncode,
-                "success": proc.returncode == 0
-            }
+            if background_signal is None:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                return {
+                    "stdout": stdout.decode('utf-8', errors='ignore'),
+                    "stderr": stderr.decode('utf-8', errors='ignore'),
+                    "return_code": proc.returncode,
+                    "success": proc.returncode == 0
+                }
+            # Race the ordinary completion wait against a possible mid-flight
+            # background request -- the SAME already-running proc either way;
+            # detaching never restarts it under a different mechanism, only
+            # who is waiting on it changes.
+            communicate_task = asyncio.ensure_future(proc.communicate())
+            background_wait = asyncio.ensure_future(background_signal.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {communicate_task, background_wait},
+                    timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not background_wait.done():
+                    background_wait.cancel()
+            if communicate_task in done:
+                stdout, stderr = communicate_task.result()
+                return {
+                    "stdout": stdout.decode('utf-8', errors='ignore'),
+                    "stderr": stderr.decode('utf-8', errors='ignore'),
+                    "return_code": proc.returncode,
+                    "success": proc.returncode == 0
+                }
+            if background_wait in done:
+                job_id = uuid.uuid4().hex[:12]
+                job = BackgroundJob(
+                    job_id=job_id, command=command, cwd=str(run_dir),
+                    started_at=time.monotonic(), proc=proc,
+                    communicate_task=communicate_task,
+                )
+                _BACKGROUND_JOBS[job_id] = job
+                asyncio.ensure_future(_watch_background_job(job))
+                return {
+                    "success": True, "backgrounded": True, "job_id": job_id,
+                    "message": (
+                        f"Moved to the background as job {job_id} -- it keeps running. "
+                        "Continue with other work now; call read_background_job with this "
+                        "job_id later to check on it or collect its output."
+                    ),
+                }
+            # Neither finished in time: a genuine timeout, not a background
+            # request. Same outcome as the no-signal path above.
+            communicate_task.cancel()
+            proc.kill()
+            with contextlib.suppress(ProcessLookupError):
+                await proc.wait()
+            return {"error": f"Command timed out after {timeout} seconds", "success": False}
         except asyncio.TimeoutError:
             return {"error": f"Command timed out after {timeout} seconds", "success": False}
         except Exception as e:

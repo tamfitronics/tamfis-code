@@ -10,6 +10,7 @@ calls, no approval decisions -- see runner.py for that.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -457,6 +458,12 @@ class StreamRenderer:
         # long-running command inside a multi-step turn needs its own clock.
         self._running_command: Optional[str] = None
         self._running_command_started: Optional[float] = None
+        # Set by live_input.py's Ctrl+B keybinding, read by runner_local.py's
+        # tool-dispatch loop (see mcp.py's _execute_command background_signal
+        # param) -- an asyncio.Event rather than a plain bool since
+        # _execute_command actually awaits it (asyncio.wait alongside the
+        # command's own completion), not just polls it.
+        self.background_requested = asyncio.Event()
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
         self._metrics = MetricsTracker()
@@ -613,6 +620,13 @@ class StreamRenderer:
             lines.append(Text.from_markup(
                 f"  [dim]⎿  $ {escape(preview)} ({command_elapsed})[/dim]"
             ))
+            # Only shown while the live REPL editor (live_input.py) actually
+            # owns a Ctrl+B binding that does something -- see
+            # LiveInputListener._input_loop -- never a hint for a keypress
+            # that would silently do nothing (e.g. a non-interactive `agent`
+            # run with no live_input_listener at all).
+            if self.live_input_listener is not None:
+                lines.append(Text.from_markup("     [dim](ctrl+b to run in background)[/dim]"))
         if self.live_input_listener is not None:
             # Keep a real, persistent input box in the live task display. The
             # ordinary REPL editor is suspended while the agent owns the

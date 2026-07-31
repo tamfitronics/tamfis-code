@@ -3181,6 +3181,29 @@ RETRIEVE_EVIDENCE_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+READ_BACKGROUND_JOB_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_background_job",
+        "description": (
+            "Check on a command that was moved to the background (the user pressed "
+            "Ctrl+B while it was running -- an execute_command result with "
+            "backgrounded=true and a job_id means this happened). Returns status="
+            "'running' with elapsed time if it's still going, or status='finished'/"
+            "'failed' with its exit code and captured stdout/stderr once it's done. "
+            "Safe to call more than once to poll the same job_id."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "The job_id from the backgrounded execute_command result"},
+            },
+            "required": ["job_id"],
+        },
+    },
+}
+
+
 SWARM_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -3926,12 +3949,13 @@ async def _run_local_agent_turn_impl(
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
     )
-    # retrieve_evidence is always safe (a local, read-only lookup by id) and
-    # only useful once a rollover has actually happened; offering it
-    # whenever any other tool is offered costs one small schema entry and
-    # means the model never has to be told about it mid-turn.
+    # retrieve_evidence and read_background_job are both always safe (local,
+    # read-only lookups by id) and only useful once a rollover/backgrounded
+    # command has actually happened; offering them whenever any other tool
+    # is offered costs one small schema entry each and means the model
+    # never has to be told about them mid-turn.
     if tools:
-        tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA]
+        tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA, READ_BACKGROUND_JOB_TOOL_SCHEMA]
         if allow_swarm_tool and not read_only and cli_config is not None and cli_config.enable_subagent_delegation:
             tools = [*tools, SWARM_TOOL_SCHEMA]
 
@@ -5656,6 +5680,18 @@ async def _run_local_agent_turn_impl(
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": _tool_output_for_render(result)}})
                 continue
 
+            if tc.name == "read_background_job":
+                # Same shape as retrieve_evidence above: a pure local lookup
+                # by id, not a filesystem/shell tool -- no workspace scope or
+                # approval gate applies.
+                from .mcp import read_background_job_status
+
+                renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+                result = read_background_job_status(str(arguments.get("job_id") or ""))
+                working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result, default=str)})
+                renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                continue
+
             if tc.name == "delegate_parallel_tasks":
                 # Not a filesystem/shell tool either -- no workspace scope
                 # or per-call approval gate applies to the call itself
@@ -5831,7 +5867,16 @@ async def _run_local_agent_turn_impl(
                 purpose=f"Execute {tc.name} for: {objective[:160]}", risk=risk,
                 requires_approval=risk != "read_only", cwd=str(arguments.get("cwd") or workspace_root),
             )
-            result = await mcp_server.call_tool(tc.name, arguments)
+            tool_extra_kwargs: Optional[dict[str, Any]] = None
+            if tc.name == "execute_command":
+                # Cleared right before each command starts, not just once
+                # per turn -- a Ctrl+B press that arrived after the PREVIOUS
+                # command already finished (or during model "thinking" time
+                # between rounds) must not immediately background the next,
+                # unrelated command the moment it starts.
+                renderer.background_requested.clear()
+                tool_extra_kwargs = {"background_signal": renderer.background_requested}
+            result = await mcp_server.call_tool(tc.name, arguments, extra_kwargs=tool_extra_kwargs)
             result = _normalise_tool_result(tc.name, arguments, result, workspace_root)
             envelope.finish(result=result, success=bool(result.get("success")))
             observation = orchestrator.record_tool(envelope)

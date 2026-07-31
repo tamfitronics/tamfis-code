@@ -433,6 +433,19 @@ class LiveInputListener:
             if event.current_buffer.text.strip():
                 event.current_buffer.validate_and_handle()
 
+        @bindings.add("c-b")
+        def _background_running_command(event) -> None:
+            # Only meaningful while execute_command actually has a command
+            # in flight (see render.py's _running_command / the "ctrl+b to
+            # run in background" hint, which is only shown under the same
+            # condition) -- an idle prompt or a non-command tool call (a
+            # file edit, a search) has nothing to detach, so this is a
+            # deliberate no-op rather than an error, matching Ctrl+B being
+            # otherwise unbound everywhere else in this REPL.
+            if not self.renderer._running_command:
+                return
+            self.renderer.background_requested.set()
+
         @bindings.add("escape")
         def _cancel_running_turn(event) -> None:
             # Escape cancels the active turn immediately and returns control
