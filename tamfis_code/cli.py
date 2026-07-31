@@ -194,7 +194,56 @@ async def _interactive_entry(
             print_error(console, f"Could not reach TamfisGPT Remote runtime: {e}")
             raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
 
+        await _resume_interrupted_task_if_any(client, console, config, workspace)
         await run_interactive(client, config, workspace)
+
+
+async def _resume_interrupted_task_if_any(
+    client: RemoteAPIClient, console: Console, config: Config, workspace,
+) -> None:
+    """If this session's own last-saved local state (state.py's realtime
+    ``.memory`` mirror -- written on every event, not just at task
+    start/end) still shows a task in flight, offer to pick back up before
+    dropping into the ordinary idle prompt.
+
+    That local write was never the gap: it happens continuously already.
+    What was missing is that nothing ever *read* it back on the next
+    launch -- an interrupted session (killed CLI, closed terminal, crashed
+    process) landed at a blank prompt with no indication anything had been
+    running, even though the exact task id and event cursor were sitting
+    in state.json the whole time. `tamfis-code attach <session>` already
+    did this on request; this just offers the same thing automatically,
+    using the running session's own last-known task instead of requiring
+    the id to be typed in.
+    """
+    state = local_state.get_session_state(workspace.session_id)
+    if state.execution_status not in ("running", "backgrounded") or not state.last_task_id:
+        return
+    try:
+        task = await client.get_task(state.last_task_id)
+    except (AuthRequiredError, RemoteAPIError, httpx.HTTPError):
+        return
+    task_status = str(task.get("status", ""))
+    objective = str((state.active_task or {}).get("objective") or task.get("objective") or "")
+    if task_status in ACTIVE_TASK_STATUSES:
+        console.print(
+            f"[yellow]◆ Reattaching to a task still running from before this session ended:[/yellow] "
+            f"[dim]{objective or state.last_task_id}[/dim]"
+        )
+        renderer = StreamRenderer(console)
+        await attach_and_stream(
+            client, renderer, console,
+            session_id=workspace.session_id, task_id=state.last_task_id,
+            approval_policy=config.approval_policy, interactive=True,
+        )
+        return
+    # The task finished (or failed) while no CLI was attached to see it --
+    # say so once, concretely, instead of silently dropping that outcome.
+    console.print(
+        f"[dim]◆ While this session was disconnected, task {state.last_task_id} "
+        f"({objective or 'no objective recorded'}) ended: {task_status}.[/dim]"
+    )
+    local_state.save_session_state(workspace.session_id, execution_status=task_status, active_task=None)
 
 
 # -- login / logout ------------------------------------------------------
