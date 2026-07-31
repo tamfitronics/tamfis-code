@@ -161,6 +161,7 @@ _TIPS = [
     "Tip: `/compact` in the REPL saves a context checkpoint you can return to later.",
     "Tip: `tamfis-code tools list` shows every tool this agent knows how to call.",
     "Tip: `--approval` (or `/mode`) controls how much gets auto-approved: ask/safe/full-auto/never/...",
+    "Tip: While a task is running in `tamfis-code`, just type and press Enter -- it queues as a follow-up without interrupting the current work.",
 ]
 
 # Seconds of elapsed time before the first tip appears, and how long each
@@ -227,6 +228,15 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
         target = redact_secrets(target)
     verbs = {
         "read_file": ("Reading", "Read"),
+        # search_code is the real, currently-registered local tool
+        # (mcp.py) -- glob_files/search_files/grep_files/remote_exec/
+        # run_command are kept here only because an external tool
+        # reachable through the shared MCP bridge's own naming convention
+        # (see mcp.py's call_tool fallback to _get_shared_mcp_bridge) might
+        # still use them; they are not names this codebase's own local
+        # engine emits.
+        "search_code": ("Searching repository contents", "Searched repository contents"),
+        "find_references": ("Finding references", "Found references"),
         "glob_files": ("Finding repository files", "Found repository files"),
         "search_files": ("Searching repository files", "Searched repository files"),
         "grep_files": ("Searching repository contents", "Searched repository contents"),
@@ -248,7 +258,8 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
 
 
 _READ_ONLY_TOOLS = {
-    "read_file", "glob_files", "search_files", "grep_files", "list_directory",
+    "read_file", "search_code", "find_references", "get_git_info", "read_background_job",
+    "glob_files", "search_files", "grep_files", "list_directory",
 }
 _MUTATION_TOOLS = {"write_file", "edit_file", "file_edit", "create_file", "update_file"}
 
@@ -263,6 +274,58 @@ def _is_read_only_tool(name: str) -> bool:
 
 def _is_mutation_tool(name: str) -> bool:
     return _normalized_tool_name(name) in _MUTATION_TOOLS
+
+
+# Category label (gerund, singular noun, plural noun) for the round-summary
+# line -- "Searching for 1 pattern, reading 2 files…" -- keyed by the same
+# normalized tool names as everything else in this module. Tools with no
+# entry here (retrieve_evidence, ask_user_question, ...) are simply not
+# counted; they're not the kind of visible repository action this line is
+# for.
+_TOOL_CATEGORY = {
+    "search_code": ("Searching for", "pattern", "patterns"),
+    "grep_files": ("Searching for", "pattern", "patterns"),
+    "search_files": ("Searching for", "pattern", "patterns"),
+    "find_references": ("Finding references for", "symbol", "symbols"),
+    "read_file": ("Reading", "file", "files"),
+    "list_directory": ("Listing", "directory", "directories"),
+    "glob_files": ("Finding", "file", "files"),
+    "execute_command": ("Running", "shell command", "shell commands"),
+    "remote_exec": ("Running", "shell command", "shell commands"),
+    "run_command": ("Running", "shell command", "shell commands"),
+    "read_background_job": ("Checking on", "background job", "background jobs"),
+    "write_file": ("Writing", "file", "files"),
+    "edit_file": ("Editing", "file", "files"),
+    "extract_archive": ("Extracting", "archive", "archives"),
+    "repackage_archive": ("Repackaging", "archive", "archives"),
+    "get_git_info": ("Reading", "Git repository", "Git repositories"),
+    "web_search": ("Searching", "web query", "web queries"),
+}
+
+
+def _round_activity_summary(counts: dict[str, int]) -> str:
+    """The aggregated "Searching for 1 pattern, reading 1 file, running 1
+    shell command…" line, built from a {normalized_tool_name: count} tally
+    -- see StreamRenderer._round_tool_counts. Renders in first-used order
+    (dict insertion order), not alphabetically, so the summary reads in the
+    same sequence the actions actually happened."""
+    parts = []
+    for name, count in counts.items():
+        if count <= 0:
+            continue
+        category = _TOOL_CATEGORY.get(name)
+        if category is None:
+            continue
+        verb, singular, plural = category
+        noun = singular if count == 1 else plural
+        parts.append(f"{verb} {count} {noun}")
+    if not parts:
+        return ""
+    # Lowercase every part after the first so they read as one sentence
+    # ("Searching for 1 pattern, reading 1 file…") rather than a list of
+    # separately-capitalized clauses.
+    parts = [parts[0], *(p[0].lower() + p[1:] for p in parts[1:])]
+    return ", ".join(parts) + "…"
 
 
 def _read_target(arguments: Optional[dict[str, Any]]) -> str:
@@ -458,6 +521,18 @@ class StreamRenderer:
         # long-running command inside a multi-step turn needs its own clock.
         self._running_command: Optional[str] = None
         self._running_command_started: Optional[float] = None
+        # Tally of tool calls issued so far THIS TASK, for the aggregated
+        # "Searching for 1 pattern, reading 1 file…" summary line -- a
+        # cumulative running total across every round of the current turn,
+        # not just the latest round (a model that issues one tool call per
+        # round, the common case, would otherwise almost always show a
+        # single-item summary, defeating the point of aggregating at all).
+        # Reset on task_submitting/task_started (see _update_status_detail),
+        # not on completion, so it stays visible through _finalize's summary
+        # line rather than disappearing right before the task's own status.
+        # dict, not Counter, to preserve first-used insertion order for
+        # _round_activity_summary's rendering order.
+        self._round_tool_counts: dict[str, int] = {}
         # Set by live_input.py's Ctrl+B keybinding, read by runner_local.py's
         # tool-dispatch loop (see mcp.py's _execute_command background_signal
         # param) -- an asyncio.Event rather than a plain bool since
@@ -554,6 +629,12 @@ class StreamRenderer:
             self._status_detail = "Submitting the task"
         elif event_type in {"task_started", "context_loading"}:
             self._status_detail = "Loading workspace context"
+            # task_started fires once at the very start of a turn (see
+            # runner_local.py) -- task_submitting/task_submitted, checked
+            # above, are dead: only the retired Remote engine ever sent
+            # them. This is the real point at which a fresh tool-usage
+            # tally should begin.
+            self._round_tool_counts = {}
         elif event_type in {"context_reused", "context_rescanned"}:
             self._status_detail = "Preparing repository context"
         elif event_type in {"routing_started", "model_selected"}:
@@ -566,6 +647,9 @@ class StreamRenderer:
             name = str(payload.get("name") or payload.get("tool_name") or "tool")
             arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
             self._status_detail = _tool_action_label(name, arguments)
+            normalized_name = _normalized_tool_name(name)
+            if normalized_name in _TOOL_CATEGORY:
+                self._round_tool_counts[normalized_name] = self._round_tool_counts.get(normalized_name, 0) + 1
             # execute_command gets its own live line with its own elapsed
             # timer (see _build_status) -- the local engine's actual event
             # vocabulary (this and tool_output below) never emits the
@@ -609,15 +693,25 @@ class StreamRenderer:
         label = f"{mode_tag}[bold]{verb}…[/bold] [dim]({' · '.join(detail_parts)})[/dim]"
         self._spinner.update(text=Text.from_markup(label))
         tip = _current_tip(elapsed)
-        if not self._plan_steps and not tip and self.live_input_listener is None and not self._running_command:
+        activity_summary = _round_activity_summary(self._round_tool_counts)
+        if (
+            not self._plan_steps and not tip and self.live_input_listener is None
+            and not self._running_command and not activity_summary
+        ):
             return self._spinner
-        lines = []
+        # Above the spinner, not in `lines` below -- matches Claude Code's
+        # own layout: the aggregated tally of what's happened so far this
+        # turn, and the specific command currently running, both read as
+        # a heading above the live verb/elapsed spinner underneath them.
+        top_lines = []
+        if activity_summary:
+            top_lines.append(Text.from_markup(f"[bold]{escape(activity_summary)}[/bold]"))
         if self._running_command:
             command_elapsed = _format_elapsed(
                 time.monotonic() - (self._running_command_started or time.monotonic())
             )
             preview = self._running_command[:200]
-            lines.append(Text.from_markup(
+            top_lines.append(Text.from_markup(
                 f"  [dim]⎿  $ {escape(preview)} ({command_elapsed})[/dim]"
             ))
             # Only shown while the live REPL editor (live_input.py) actually
@@ -626,7 +720,8 @@ class StreamRenderer:
             # that would silently do nothing (e.g. a non-interactive `agent`
             # run with no live_input_listener at all).
             if self.live_input_listener is not None:
-                lines.append(Text.from_markup("     [dim](ctrl+b to run in background)[/dim]"))
+                top_lines.append(Text.from_markup("     [dim](ctrl+b to run in background)[/dim]"))
+        lines = []
         if self.live_input_listener is not None:
             # Keep a real, persistent input box in the live task display. The
             # ordinary REPL editor is suspended while the agent owns the
@@ -661,7 +756,7 @@ class StreamRenderer:
                 line.append("~ ", style=marker_style)
             line.append(str(step.get("step") or ""), style=text_style)
             lines.append(line)
-        return Group(self._spinner, *lines)
+        return Group(*top_lines, self._spinner, *lines)
 
     def _refresh_live(self) -> None:
         if self._live is not None:

@@ -1078,42 +1078,35 @@ async def run_interactive(
             console.print(f"[green]Pinned {route} route[/green]  model={model_id}")
             continue
         if text == "/tools":
+            # One real tool set regardless of standalone vs --remote: every
+            # task -- remote-mode ones included -- now executes through the
+            # local engine (mcp.py), never a server-side agent loop (see
+            # runtime/unified.py's execute_remote). This used to branch on
+            # `standalone` and show a second, Remote-only table (grep_files,
+            # remote_exec, codex_apps.*, ...) describing a tool catalog that
+            # no longer exists anywhere -- stale documentation for a
+            # retired execution path, not a real second tool set.
             table = Table(show_header=True, header_style="bold")
             table.add_column("Tool")
             table.add_column("Purpose")
             table.add_column("Safeguard")
-            if standalone:
-                table.add_row("read_file", "Read a file's contents", "Read-only")
-                table.add_row("list_directory", "List a directory's contents", "Read-only")
-                table.add_row("search_code", "ripgrep-backed content search", "Read-only")
-                table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
-                table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Local risk classifier + approval + mutation ledger")
-                table.add_row("write_file", "Create or fully replace a file", "Workspace-boundary check + approval + mutation ledger")
-                table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
-                table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
-                table.add_row("web_search", "Tavily (if TAVILY_API_KEY set) or DuckDuckGo fallback", "Read-only; self-contained, no monorepo required")
-                console.print(table)
-                console.print(
-                    "[dim]This is the real local tool set (mcp.py) the standalone agent loop uses -- "
-                    "see safety.py for how risk is classified and see /diffs for the mutation ledger.[/dim]"
-                )
-                continue
-            table.add_row("read_file", "Bounded, line-numbered file reads", "Read-only + CWD confinement")
-            table.add_row("glob_files", "Find files by filename glob, not full paths", "Read-only + CWD confinement")
-            table.add_row("grep_files", "Search repository contents", "Read-only + CWD confinement")
-            table.add_row("list_symbols", "List definitions in a source file", "Read-only + CWD confinement")
-            table.add_row("find_dependencies", "Inspect imports and require targets", "Read-only + CWD confinement")
-            table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Approval + mutation ledger")
-            table.add_row("write_file", "Create or fully replace a file", "Approval + mutation ledger")
-            table.add_row("extract/repackage_archive", "Inspect and rebuild repository archives", "CWD confinement + approval for writes")
-            table.add_row("remote_exec", "Tests, builds, Git and shell operations", "CWD confinement + risk approval")
-            table.add_row("browser", "Public Chromium navigation and screenshots", "Clean session + SSRF protection")
-            table.add_row("web_search", "Current external research when needed", "Read-only; provider/network policy")
-            table.add_row("codex_apps.*", "Optional organization-operated connector gateway", "Unavailable unless explicitly configured")
-            table.add_row("claude_apps.*", "Optional organization-operated connector gateway", "Unavailable unless explicitly configured")
+            table.add_row("read_file", "Read a file's contents", "Read-only")
+            table.add_row("list_directory", "List a directory's contents", "Read-only")
+            table.add_row("search_code", "ripgrep-backed content search", "Read-only")
+            table.add_row("find_references", "Find where a symbol is defined and referenced", "Read-only")
+            table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
+            table.add_row("read_background_job", "Check on a Ctrl+B-backgrounded command", "Read-only")
+            table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Local risk classifier + approval + mutation ledger")
+            table.add_row("write_file", "Create or fully replace a file", "Workspace-boundary check + approval + mutation ledger")
+            table.add_row("extract_archive / repackage_archive", "Inspect and rebuild archives", "Workspace-boundary check + approval for writes")
+            table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
+            table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
+            table.add_row("web_search", "Tavily (if TAVILY_API_KEY set) or DuckDuckGo fallback", "Read-only; self-contained, no monorepo required")
             console.print(table)
-            console.print("[dim]Use glob_files with patterns like '*.tsx' or 'src/**/*.tsx'. Do not paste a full filesystem path into pattern; use path for the search root instead.[/dim]")
-            console.print("[dim]Native coding tools above do not require Codex Apps, Claude Apps, or MCP. Optional connector tools appear only when a real gateway is enabled and successfully discovered.[/dim]")
+            console.print(
+                "[dim]This is the real local tool set (mcp.py) every turn uses -- see safety.py for how "
+                "risk is classified and see /diffs for the mutation ledger.[/dim]"
+            )
             continue
         if text == "/commands":
             if not custom_commands:

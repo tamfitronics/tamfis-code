@@ -257,6 +257,52 @@ class StreamRendererTests(unittest.TestCase):
         finally:
             renderer.finish()
 
+    def test_round_activity_summary_aggregates_across_the_whole_task(self):
+        from tamfis_code.render import _round_activity_summary
+
+        # First-used order, not alphabetical: search then read then a shell
+        # command, matching a real turn's actual sequence of actions.
+        summary = _round_activity_summary({"search_code": 1, "read_file": 1, "execute_command": 1})
+        self.assertEqual(
+            summary, "Searching for 1 pattern, reading 1 file, running 1 shell command…",
+        )
+        self.assertEqual(_round_activity_summary({"read_file": 2}), "Reading 2 files…")
+        self.assertEqual(_round_activity_summary({}), "")
+        # Tools with no category entry (e.g. retrieve_evidence) are simply
+        # not counted, not an error.
+        self.assertEqual(_round_activity_summary({"retrieve_evidence": 3}), "")
+
+    def test_activity_summary_survives_across_rounds_and_shows_above_the_spinner(self):
+        # Renders via StreamRenderer's own automatic Live region (force_terminal
+        # triggers it in __init__), so the console's captured text interleaves
+        # several async self-refreshes -- not reliable for an ordering check.
+        # Inspect the Group's renderables directly instead.
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.handle_event({"event_type": "task_started", "payload": {}})
+            renderer.handle_event({
+                "event_type": "tool_call_requested",
+                "payload": {"name": "search_code", "arguments": {"query": "foo"}},
+            })
+            renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "search_code"}})
+            # A second, later round's tool call must ADD to the tally, not
+            # replace it -- see _round_tool_counts only resetting on
+            # task_started/context_loading, never per round.
+            renderer.handle_event({
+                "event_type": "tool_call_requested",
+                "payload": {"name": "read_file", "arguments": {"path": "x.py"}},
+            })
+            group = renderer._build_status()
+            summary_index = next(
+                i for i, item in enumerate(group.renderables)
+                if "Searching for 1 pattern, reading 1 file" in getattr(item, "plain", "")
+            )
+            spinner_index = list(group.renderables).index(renderer._spinner)
+            self.assertLess(summary_index, spinner_index)
+        finally:
+            renderer.finish()
+
     def test_running_shell_command_gets_its_own_live_line(self):
         console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
         renderer = StreamRenderer(console)
