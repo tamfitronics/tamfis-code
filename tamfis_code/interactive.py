@@ -25,6 +25,7 @@ from rich.markup import escape
 from rich.markdown import Markdown
 from rich.table import Table
 
+from . import __version__
 from . import state as local_state
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .clipboard import copy_to_clipboard
@@ -264,6 +265,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/permissions", "show approval policy and immutable server safeguards"),
     ("/mode", "show or switch the active approval mode"),
     ("/model", "show or switch the active model route"),
+    ("/update", "apply a newer installed version and restart into this session"),
     ("/tools", "show the tools exposed to tamfis-code tasks"),
     ("/commands", "list user-defined custom slash commands loaded from .md files"),
     ("/agent-types", "list declarative subagent types available to /delegate and /swarm"),
@@ -566,6 +568,14 @@ async def run_interactive(
         "While a task runs, a normal message prompt remains available: type and press Enter; "
         "your text is queued without a special shortcut. Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
+
+    from .self_update import check_update_available
+    _available_update = check_update_available()
+    if _available_update:
+        console.print(
+            f"[yellow]◆ Update available: {__version__} -> {_available_update}.[/yellow] "
+            "[dim]Type /update to apply and restart into this same session.[/dim]\n"
+        )
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
@@ -936,6 +946,21 @@ async def run_interactive(
                 f"[dim]Objective:[/dim] {plan.get('objective', '')}"
             )
             console.print(Markdown(str(plan.get("content") or "")))
+            continue
+        if text == "/update":
+            from .self_update import apply_update, check_update_available, reexec
+
+            pending = check_update_available()
+            if not pending:
+                console.print("[dim]No newer version available.[/dim]")
+                continue
+            console.print(f"[dim]Updating {__version__} -> {pending}...[/dim]")
+            ok, message = apply_update()
+            if not ok:
+                print_error(console, message)
+                continue
+            console.print(f"[green]{message}[/green] [dim]Restarting into this session...[/dim]")
+            reexec()
             continue
         if text == "/queue" or text.startswith("/queue "):
             arg = text[len("/queue"):].strip()
