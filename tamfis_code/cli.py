@@ -217,10 +217,19 @@ async def _resume_interrupted_task_if_any(
     the id to be typed in.
     """
     state = local_state.get_session_state(workspace.session_id)
-    if state.execution_status not in ("running", "backgrounded") or not state.last_task_id:
+    # A local (non-Remote) turn (cli.py's run_local_agent_turn path) writes
+    # active_task on every turn but never touches last_task_id -- that field
+    # is only ever set by the Remote task-streaming paths in runner.py. A
+    # session left "running" by a killed local turn therefore has its task
+    # id sitting in active_task, not last_task_id; falling back to it here
+    # is required for those sessions to be found at all, not an alternate
+    # or preferred source -- last_task_id wins when both are present since
+    # it reflects the most recent Remote-confirmed task.
+    task_id = state.last_task_id or str((state.active_task or {}).get("id") or "")
+    if state.execution_status not in ("running", "backgrounded") or not task_id:
         return
     try:
-        task = await client.get_task(state.last_task_id)
+        task = await client.get_task(task_id)
     except (AuthRequiredError, RemoteAPIError, httpx.HTTPError):
         return
     task_status = str(task.get("status", ""))
@@ -228,19 +237,19 @@ async def _resume_interrupted_task_if_any(
     if task_status in ACTIVE_TASK_STATUSES:
         console.print(
             f"[yellow]◆ Reattaching to a task still running from before this session ended:[/yellow] "
-            f"[dim]{objective or state.last_task_id}[/dim]"
+            f"[dim]{objective or task_id}[/dim]"
         )
         renderer = StreamRenderer(console)
         await attach_and_stream(
             client, renderer, console,
-            session_id=workspace.session_id, task_id=state.last_task_id,
+            session_id=workspace.session_id, task_id=task_id,
             approval_policy=config.approval_policy, interactive=True,
         )
         return
     # The task finished (or failed) while no CLI was attached to see it --
     # say so once, concretely, instead of silently dropping that outcome.
     console.print(
-        f"[dim]◆ While this session was disconnected, task {state.last_task_id} "
+        f"[dim]◆ While this session was disconnected, task {task_id} "
         f"({objective or 'no objective recorded'}) ended: {task_status}.[/dim]"
     )
     local_state.save_session_state(workspace.session_id, execution_status=task_status, active_task=None)

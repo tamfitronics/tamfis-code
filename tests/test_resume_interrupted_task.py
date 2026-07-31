@@ -96,6 +96,28 @@ class ResumeInterruptedTaskTests(unittest.TestCase):
         # the ordinary interactive REPL from opening at all.
         asyncio.run(_resume_interrupted_task_if_any(client, console, MagicMock(), self._workspace()))
 
+    def test_falls_back_to_active_task_id_when_last_task_id_missing(self):
+        # A local (non-Remote) turn writes active_task on every turn but
+        # never sets last_task_id -- that field is only ever written by the
+        # Remote task-streaming paths in runner.py. A session left "running"
+        # by a killed local turn therefore has its task id sitting only in
+        # active_task["id"], reproducing real state observed in
+        # .memory/session-<id>.json where last_task_id was None despite an
+        # in-flight active_task.
+        state_module.save_session_state(
+            50, execution_status="running",
+            active_task={"id": "t-4", "objective": "fix the bug"},
+        )
+        self.assertIsNone(state_module.get_session_state(50).last_task_id)
+        client = AsyncMock()
+        client.get_task.return_value = {"status": "running", "objective": "fix the bug"}
+        console = MagicMock()
+        with patch("tamfis_code.cli.attach_and_stream", new=AsyncMock()) as attach_mock:
+            asyncio.run(_resume_interrupted_task_if_any(client, console, MagicMock(), self._workspace()))
+        attach_mock.assert_awaited_once()
+        _, kwargs = attach_mock.call_args
+        self.assertEqual(kwargs["task_id"], "t-4")
+
 
 if __name__ == "__main__":
     unittest.main()
