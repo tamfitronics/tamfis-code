@@ -22,6 +22,13 @@ import httpx
 from rich.panel import Panel
 
 from .render import resume_live_if_active, suspend_live_if_active
+# MCP commands can be invoked without constructing a ProviderManager (for
+# example, `tamfis-code tools list`). Reuse the canonical project `.env`
+# loader here so TAMGPT_MCP_CONFIG and TAMFIS_MONOREPO_ROOT are available in
+# that path too, while preserving already-exported environment variables.
+from .providers import _load_project_env
+
+_load_project_env()
 
 # web_search (see MCPServer._web_search) is self-contained rather than
 # reusing tamgpt6's WebSearchManager via _import_monorepo_attr, unlike

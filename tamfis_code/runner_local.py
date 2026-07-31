@@ -61,6 +61,7 @@ from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
 from .workspace import classify_root, detect_validation_commands
+from .workspace_access import ensure_workspace_access
 from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
@@ -168,6 +169,15 @@ FABRICATED_RESULT_CORRECTION = (
     "was fabricated. Do not describe what a tool found, returned, or denied unless you just "
     "called it and are reporting its real result. Call the appropriate registered tool now "
     "and report only what it actually returns."
+)
+
+PERMISSION_BOUNDARY_CORRECTION = (
+    "The last registered tool returned a real permission failure. Keep working in the "
+    "canonical workspace. Do not copy or clone the project elsewhere, change ownership "
+    "or permissions recursively, invoke sudo, ask for a password, or narrate speculative "
+    "permission workarounds. Do not retry the identical failing command. If no other "
+    "in-scope tool action can progress the task, report only the exact denied command/path "
+    "as a host permission-boundary blocker; the platform or operator handles that boundary."
 )
 
 # Same one-chance-then-fallback shape as narrated tool intent, capitulation,
@@ -3826,6 +3836,17 @@ async def _run_local_agent_turn_impl(
     # while get_client()/chat.completions.create() is resolving or waiting.
     renderer.handle_event({"event_type": "task_started", "payload": {"mode": "local"}})
     renderer.handle_event({"event_type": "context_loading", "payload": {"workspace_root": workspace_root}})
+    workspace_access_ok, workspace_access_error = await ensure_workspace_access(
+        workspace_root, read_only=read_only,
+    )
+    if not workspace_access_ok:
+        # Resolve host access before involving a model. This prevents a real
+        # boundary error from becoming a speculative sudo/chown/copy loop.
+        renderer.handle_event({
+            "event_type": "ai_task_failed",
+            "payload": {"error": workspace_access_error},
+        })
+        return TaskOutcome(status="failed", error=workspace_access_error)
 
     # One id for every mutation this turn makes, so a multi-file edit can
     # later be reverted together (safety.revert_transaction) instead of
@@ -5774,6 +5795,16 @@ async def _run_local_agent_turn_impl(
                 "tool_call_id": tc.call_id,
                 "content": json.dumps(result, default=str),
             })
+            if (
+                result.get("success") is False
+                and "permission denied" in json.dumps(result, default=str).lower()
+            ):
+                # Keep a single EACCES from turning into a long
+                # sudo/password/chown/copy-the-repository monologue.
+                working_messages.append({
+                    "role": "system",
+                    "content": PERMISSION_BOUNDARY_CORRECTION,
+                })
             if _is_old_string_not_found(tc.name, result):
                 refresh_path = str(arguments.get("path") or "")
                 if refresh_path:

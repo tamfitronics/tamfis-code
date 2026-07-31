@@ -56,7 +56,15 @@ def choose_repair(*, tool_name: str, result: dict[str, Any] | str, attempt: int)
     if failure == FailureClass.FILE_NOT_FOUND:
         return RepairDecision(failure, "refresh workspace inventory and resolve the canonical path", attempt < 2)
     if failure == FailureClass.PERMISSION_DENIED:
-        return RepairDecision(failure, "request grouped approval or choose a permitted path", attempt < 1)
+        return RepairDecision(
+            failure,
+            (
+                "preserve the canonical workspace; report the exact denied path and command "
+                "through the approval boundary without sudo, password guessing, ownership "
+                "changes, or copying the project"
+            ),
+            attempt < 1,
+        )
     if failure == FailureClass.VALIDATION_FAILURE:
         return RepairDecision(failure, "rollback the mutation, inspect validator output, then generate a corrected change", attempt < 2)
     if failure == FailureClass.PROVIDER_STALL:

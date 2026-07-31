@@ -1067,6 +1067,14 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "do. If the request is too broad to make that concrete next choice at all, say so "
         "and ask the user to narrow it (a specific component, directory, or concern) instead "
         "of stalling on repeated top-level listings.",
+        "A real filesystem permission failure is a host execution-boundary problem, not a "
+        "reason to relocate the repository. Never copy or clone the project into another "
+        "home directory, recursively change its ownership/mode, try sudo, ask for a sudo "
+        "password, or narrate those possibilities. Keep the canonical workspace unchanged. "
+        "After one real denied tool result, identify the exact command and denied path "
+        "concisely and let the platform approval/host-permission boundary handle access; "
+        "do not repeat the same command or produce a running monologue about users, groups, "
+        "ownership, or hypothetical workarounds.",
         "Before checking whether any local service is 'healthy' or 'running', you must "
         "first find its REAL configured port -- do not use 8080/3000/5000/8000 or any "
         "other common default unless you have actually confirmed that's the real one. "

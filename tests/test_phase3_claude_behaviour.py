@@ -56,6 +56,18 @@ def test_shell_quoting_repair_forces_native_tool():
     assert "native write_file" in decision.strategy
 
 
+def test_permission_repair_preserves_canonical_workspace():
+    decision = choose_repair(
+        tool_name="execute_command",
+        result="npm: EACCES: permission denied, mkdir '/workspace/dist'",
+        attempt=0,
+    )
+    assert decision.failure_class == FailureClass.PERMISSION_DENIED
+    assert decision.retry_allowed is True
+    assert "without sudo" in decision.strategy
+    assert "copying the project" in decision.strategy
+
+
 def test_truthful_completion_statuses():
     assert determine_completion(
         requested_mutation=True, changed_files=["a.py"], validation_passed=True, unresolved=[]
