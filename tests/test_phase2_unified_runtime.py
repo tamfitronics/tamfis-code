@@ -138,115 +138,64 @@ def _remote_kwargs(**overrides):
 
 
 @pytest.mark.asyncio
-async def test_execute_remote_falls_back_to_local_on_infra_failure(monkeypatch, isolated_state):
+async def test_execute_remote_always_runs_the_local_provider(monkeypatch, isolated_state):
+    """The local engine (runner_local.py) is the richer, better-tested
+    implementation; a --remote task must never delegate reasoning to the
+    Remote backend's own agent loop -- see execute_remote's docstring."""
     import tamfis_code.runner as runner
     import tamfis_code.runner_local as runner_local
     from tamfis_code.runtime.unified import UnifiedAgentRuntime
 
-    monkeypatch.setattr(
-        runner, "_run_ai_task_and_stream_impl",
-        AsyncMock(return_value=Outcome(status="failed", error="Remote agent runtime is unavailable")),
-    )
-    local_impl = AsyncMock(return_value=Outcome(status="completed", summary="done locally"))
-    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
-
-    runtime = UnifiedAgentRuntime()
-    result = await runtime.execute_remote(**_remote_kwargs())
-
-    local_impl.assert_awaited_once()
-    assert result.status == "completed"
-    assert isolated_state.get_session_state(50).remote_degraded_since is not None
-
-
-@pytest.mark.asyncio
-async def test_execute_remote_does_not_fallback_on_ordinary_task_failure(monkeypatch, isolated_state):
-    import tamfis_code.runner as runner
-    import tamfis_code.runner_local as runner_local
-    from tamfis_code.runtime.unified import UnifiedAgentRuntime
-
-    monkeypatch.setattr(
-        runner, "_run_ai_task_and_stream_impl",
-        AsyncMock(return_value=Outcome(status="failed", error="2 of 5 tests failed")),
-    )
-    local_impl = AsyncMock()
-    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
-
-    runtime = UnifiedAgentRuntime()
-    result = await runtime.execute_remote(**_remote_kwargs())
-
-    local_impl.assert_not_called()
-    assert result.status == "failed"
-    assert isolated_state.get_session_state(50).remote_degraded_since is None
-
-
-@pytest.mark.asyncio
-async def test_execute_remote_falls_back_on_connection_exception(monkeypatch, isolated_state):
-    import tamfis_code.runner as runner
-    import tamfis_code.runner_local as runner_local
-    from tamfis_code.api_client import RemoteAPIError
-    from tamfis_code.runtime.unified import UnifiedAgentRuntime
-
-    monkeypatch.setattr(
-        runner, "_run_ai_task_and_stream_impl",
-        AsyncMock(side_effect=RemoteAPIError(503, "bad gateway")),
-    )
-    local_impl = AsyncMock(return_value=Outcome(status="completed", summary="done locally"))
-    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
-
-    runtime = UnifiedAgentRuntime()
-    result = await runtime.execute_remote(**_remote_kwargs())
-
-    local_impl.assert_awaited_once()
-    assert result.status == "completed"
-
-
-@pytest.mark.asyncio
-async def test_execute_remote_does_not_fallback_on_auth_error(monkeypatch, isolated_state):
-    import tamfis_code.runner as runner
-    import tamfis_code.runner_local as runner_local
-    from tamfis_code.api_client import AuthRequiredError
-    from tamfis_code.runtime.unified import UnifiedAgentRuntime
-
-    monkeypatch.setattr(
-        runner, "_run_ai_task_and_stream_impl",
-        AsyncMock(side_effect=AuthRequiredError(401, "not logged in")),
-    )
-    local_impl = AsyncMock()
-    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
-
-    runtime = UnifiedAgentRuntime()
-    with pytest.raises(AuthRequiredError):
-        await runtime.execute_remote(**_remote_kwargs())
-
-    local_impl.assert_not_called()
-
-
-@pytest.mark.asyncio
-async def test_execute_remote_sticky_degraded_skips_remote_until_probe_succeeds(monkeypatch, isolated_state):
-    import tamfis_code.runner as runner
-    import tamfis_code.runner_local as runner_local
-    from tamfis_code.runtime.unified import UnifiedAgentRuntime
-
-    isolated_state.mark_remote_degraded(50, reason="prior outage")
     remote_impl = AsyncMock(return_value=Outcome(status="completed"))
     monkeypatch.setattr(runner, "_run_ai_task_and_stream_impl", remote_impl)
     local_impl = AsyncMock(return_value=Outcome(status="completed", summary="done locally"))
     monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
 
-    # Health probe still failing: stays local, remote is never attempted.
-    client = AsyncMock()
-    client.get_session.side_effect = RuntimeError("still down")
     runtime = UnifiedAgentRuntime()
-    result = await runtime.execute_remote(**_remote_kwargs(client=client))
+    result = await runtime.execute_remote(**_remote_kwargs())
+
     remote_impl.assert_not_called()
     local_impl.assert_awaited_once()
     assert result.summary == "done locally"
-    assert isolated_state.get_session_state(50).remote_degraded_since is not None
+    _, kwargs = local_impl.call_args
+    assert kwargs["session_id"] == 50
+    assert kwargs["messages"] == [{"role": "user", "content": "fix the bug"}]
 
-    # Health probe now succeeding: clears the flag and resumes Remote.
-    client.get_session.side_effect = None
-    client.get_session.return_value = {"id": 50, "status": "idle"}
-    result = await runtime.execute_remote(**_remote_kwargs(client=client))
-    remote_impl.assert_awaited_once()
-    assert result.status == "completed"
-    assert isolated_state.get_session_state(50).remote_degraded_since is None
+
+@pytest.mark.asyncio
+async def test_execute_remote_carries_prior_turns_as_conversation_history(monkeypatch, isolated_state):
+    """A --remote session now has multi-turn memory the same way a
+    standalone session does: _run_local_agent_turn_impl durably appends each
+    completed turn via state.remember_conversation_turn, and execute_remote
+    reads it back for the next call -- nothing server-side tracks it."""
+    import tamfis_code.runner_local as runner_local
+    from tamfis_code.runtime.unified import UnifiedAgentRuntime
+
+    isolated_state.remember_conversation_turn(50, objective="what does this repo do", answer="It's a CLI.")
+    local_impl = AsyncMock(return_value=Outcome(status="completed", summary="ok"))
+    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
+
+    runtime = UnifiedAgentRuntime()
+    await runtime.execute_remote(**_remote_kwargs(objective="now add a test for it"))
+
+    _, kwargs = local_impl.call_args
+    assert kwargs["messages"] == [
+        {"role": "user", "content": "what does this repo do"},
+        {"role": "assistant", "content": "It's a CLI."},
+        {"role": "user", "content": "now add a test for it"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_execute_remote_read_only_mode_maps_to_local_read_only(monkeypatch, isolated_state):
+    import tamfis_code.runner_local as runner_local
+    from tamfis_code.runtime.unified import UnifiedAgentRuntime
+
+    local_impl = AsyncMock(return_value=Outcome(status="completed"))
+    monkeypatch.setattr(runner_local, "_run_local_agent_turn_impl", local_impl)
+
+    runtime = UnifiedAgentRuntime()
+    await runtime.execute_remote(**_remote_kwargs(mode="chat"))
+
+    _, kwargs = local_impl.call_args
+    assert kwargs["read_only"] is True

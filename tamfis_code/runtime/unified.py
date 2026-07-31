@@ -281,95 +281,72 @@ class UnifiedAgentRuntime:
         return await self._run_exclusive(request, lambda: _run_local_agent_turn_impl(**kwargs))
 
     async def execute_remote(self, **kwargs: Any) -> Any:
-        from tamfis_code.runner import _run_ai_task_and_stream_impl
+        """Public name kept for callers (`run_ai_task_and_stream`, i.e. every
+        `--remote` task) -- what actually runs is always the local provider
+        engine, never the Remote backend's own agent loop.
 
-        session_id = int(kwargs.get("session_id", 0))
-        request = ExecutionRequest(
-            mode=ExecutionMode.REMOTE_AGENT,
-            session_id=session_id,
-            objective=str(kwargs.get("objective") or ""),
-            interactive=bool(kwargs.get("interactive", True)),
-            approval_policy=str(kwargs.get("approval_policy") or "ask"),
-            read_only=str(kwargs.get("mode") or "") in {"chat", "audit", "plan"},
-        )
-        console = kwargs.get("console")
-
-        # Sticky degrade: a session already known to be riding out a Remote
-        # outage (see mark_remote_degraded) skips straight to local rather
-        # than paying for a fresh failed Remote attempt on every turn. A
-        # cheap health probe each turn is what lets it recover on its own
-        # once Remote comes back, instead of staying local for the rest of
-        # the process.
-        if session_id and local_state.get_session_state(session_id).remote_degraded_since:
-            client = kwargs.get("client")
-            if await _remote_session_reachable(client, session_id):
-                local_state.clear_remote_degraded(session_id)
-                if console is not None:
-                    console.print("[green]◆ TamfisGPT Remote is back -- resuming Remote execution.[/green]")
-            else:
-                return await self._fallback_to_local(session_id, kwargs, reason="Remote runtime is still unavailable")
-
-        try:
-            outcome = await self._run_exclusive(request, lambda: _run_ai_task_and_stream_impl(**kwargs))
-        except Exception as exc:
-            if not session_id or not _is_remote_infra_failure(exc):
-                raise
-            return await self._fallback_to_local(session_id, kwargs, reason=str(exc))
-        if session_id and _is_remote_infra_failure(outcome):
-            return await self._fallback_to_local(session_id, kwargs, reason=str(getattr(outcome, "error", "") or ""))
-        return outcome
-
-    async def _fallback_to_local(self, session_id: int, remote_kwargs: dict[str, Any], *, reason: str) -> Any:
-        """Re-run the same turn against the local provider path instead of
-        the Remote backend that just failed for an infra reason (not an
-        ordinary task failure -- see _is_remote_infra_failure).
-
-        This is a degraded turn, not a transparent one: it starts a fresh
-        `messages` list from just this objective (the Remote conversation
-        history lives server-side and this client never mirrored it) and
-        drops any attachments the Remote call carried (Remote's attachment
-        payload shape isn't the local turn's attachment_paths/
-        image_content_blocks -- there is nothing meaningful to translate).
-        Marks the session sticky-degraded so every later turn skips Remote
-        (after one cheap health probe) instead of re-paying for a failed
-        attempt each time; execute_remote clears that once Remote is
-        reachable again.
+        The local engine (runner_local.py, same one standalone mode uses) is
+        the richer, better-tested implementation; the Remote backend's own
+        loop existed only to make a session usable from a device with no
+        local provider configured. Remote's session registration, listing,
+        and cross-device sync (resolve_workspace, list_sessions, the
+        RemoteAgentBridge websocket) are untouched by this -- only task
+        *execution* stops being delegated to the server. Consequently, other
+        devices / `tamfis-code sessions` on this account will not see a task
+        as running while it executes here: the server is never told one
+        started, because it isn't the one running it. There is currently no
+        API to report a locally-executed turn's outcome back to a Remote
+        session; if that's wanted, it needs a new server endpoint (out of
+        this client repo's reach).
         """
         from tamfis_code.local_chat import resolve_provider_type
         from tamfis_code.providers import ProviderManager
         from tamfis_code.runner_local import _run_local_agent_turn_impl
 
-        local_state.mark_remote_degraded(session_id, reason=reason)
-        console = remote_kwargs.get("console")
-        objective = str(remote_kwargs.get("objective") or "")
-        mode = str(remote_kwargs.get("mode") or "coding")
-        session_state = local_state.get_session_state(session_id)
-        workspace_root = session_state.workspace_root or session_state.primary_workspace or "."
-        if console is not None:
-            console.print(
-                f"[yellow]▲ TamfisGPT Remote is unavailable ({reason}). "
-                "Continuing this turn on the local provider; Remote will resume automatically once it's reachable.[/yellow]"
-            )
+        session_id = int(kwargs.get("session_id", 0))
+        console = kwargs.get("console")
+        objective = str(kwargs.get("objective") or "")
+        mode = str(kwargs.get("mode") or "coding")
+        session_state = local_state.get_session_state(session_id) if session_id else None
+        workspace_root = (
+            (session_state.workspace_root or session_state.primary_workspace) if session_state else ""
+        ) or "."
+        # Continuity across turns of what would otherwise be a Remote
+        # session: _run_local_agent_turn_impl durably appends every
+        # completed turn to this same session's conversation_history (see
+        # state.remember_conversation_turn), so reading it back here is
+        # enough to give a multi-turn "remote" session real memory of its
+        # own prior turns even though nothing server-side is tracking them.
+        saved_history = session_state.conversation_history if session_state else []
+        history = [
+            {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
+            for item in saved_history
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        ]
         try:
-            provider_type = resolve_provider_type(remote_kwargs.get("provider"))
+            provider_type = resolve_provider_type(kwargs.get("provider"))
         except ValueError:
             provider_type = resolve_provider_type("auto")
+        # Remote's attachment payload shape (see client.upload_attachment)
+        # isn't the local turn's attachment_paths/image_content_blocks --
+        # there is nothing meaningful to translate, so attachments passed to
+        # a --remote task are not carried into local execution.
         local_kwargs = {
             "manager": ProviderManager(),
             "provider": provider_type,
-            "model": remote_kwargs.get("model"),
-            "messages": [{"role": "user", "content": objective}],
+            "model": kwargs.get("model"),
+            "messages": [*history, {"role": "user", "content": objective}],
             "console": console,
-            "renderer": remote_kwargs.get("renderer"),
+            "renderer": kwargs.get("renderer"),
             "workspace_root": workspace_root,
             "session_id": session_id,
-            "approval_policy": str(remote_kwargs.get("approval_policy") or "ask"),
-            "interactive": bool(remote_kwargs.get("interactive", True)),
+            "approval_policy": str(kwargs.get("approval_policy") or "ask"),
+            "interactive": bool(kwargs.get("interactive", True)),
             "read_only": mode in {"chat", "audit", "plan"},
-            "cli_config": remote_kwargs.get("config"),
+            "cli_config": kwargs.get("config"),
             "allow_swarm_tool": True,
         }
-        local_request = ExecutionRequest(
+        request = ExecutionRequest(
             mode=ExecutionMode.LOCAL_AGENT,
             session_id=session_id,
             objective=objective,
@@ -378,7 +355,7 @@ class UnifiedAgentRuntime:
             approval_policy=local_kwargs["approval_policy"],
             read_only=local_kwargs["read_only"],
         )
-        return await self._run_exclusive(local_request, lambda: _run_local_agent_turn_impl(**local_kwargs))
+        return await self._run_exclusive(request, lambda: _run_local_agent_turn_impl(**local_kwargs))
 
     async def execute_local_chat(self, **kwargs: Any) -> str:
         from tamfis_code.local_chat import _run_local_turn_impl
@@ -437,59 +414,6 @@ class UnifiedAgentRuntime:
             finally:
                 self._active_task = None
                 self._active_request = None
-
-
-_REMOTE_INFRA_FAILURE_PHRASES = (
-    "runtime is unavailable",
-    "runtime unavailable",
-    "agent runtime",
-    "service unavailable",
-    "backend unavailable",
-    "could not reach",
-)
-
-
-def _is_remote_infra_failure(result: Any) -> bool:
-    """True for a Remote outage (worth silently falling back to local for),
-    false for an ordinary task failure (bad tests, rejected approval, model
-    refusal -- local wouldn't fare any better and retrying it there would
-    just hide a real failure behind a confusing provider switch).
-
-    AuthRequiredError is deliberately excluded even though it subclasses
-    RemoteAPIError: "not logged in" isn't "Remote is down", and silently
-    running the objective through a different, unauthenticated execution
-    path would be a surprising way to respond to an auth problem.
-    """
-    from tamfis_code.api_client import AuthRequiredError, RemoteAPIError
-    import httpx
-
-    if isinstance(result, AuthRequiredError):
-        return False
-    if isinstance(result, RemoteAPIError):
-        return result.status_code >= 500 or result.status_code in (408, 425, 429)
-    if isinstance(result, httpx.HTTPError):
-        return True
-    if isinstance(result, BaseException):
-        return False
-    error_text = str(getattr(result, "error", "") or "").lower()
-    status = str(getattr(result, "status", "") or "")
-    if status != "failed" or not error_text:
-        return False
-    return any(phrase in error_text for phrase in _REMOTE_INFRA_FAILURE_PHRASES)
-
-
-async def _remote_session_reachable(client: Any, session_id: int) -> bool:
-    """Cheapest possible Remote health probe: can this session's own record
-    still be fetched. Any failure (network, 5xx, timeout) means "still
-    down" -- this must never raise into the caller, since it runs on every
-    turn of an already-degraded session."""
-    if client is None:
-        return False
-    try:
-        await client.get_session(session_id)
-        return True
-    except Exception:
-        return False
 
 
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
