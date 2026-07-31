@@ -450,6 +450,13 @@ class StreamRenderer:
         # than a boxed multi-line status card.
         self._phase = "idle"
         self._status_detail = "Preparing the task"
+        # A shell command currently executing, shown as its own live line
+        # (see _build_status) with its own elapsed timer -- distinct from
+        # _status_detail (set but, before this, never actually rendered
+        # anywhere) and from the overall task elapsed time, since a single
+        # long-running command inside a multi-step turn needs its own clock.
+        self._running_command: Optional[str] = None
+        self._running_command_started: Optional[float] = None
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
         self._metrics = MetricsTracker()
@@ -552,11 +559,19 @@ class StreamRenderer:
             name = str(payload.get("name") or payload.get("tool_name") or "tool")
             arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
             self._status_detail = _tool_action_label(name, arguments)
+            # execute_command gets its own live line with its own elapsed
+            # timer (see _build_status) -- the local engine's actual event
+            # vocabulary (this and tool_output below) never emits the
+            # separate command_started/command_completed/command_failed
+            # events this used to key off of, which only the retired Remote
+            # engine ever sent.
+            if _normalized_tool_name(name) == "execute_command":
+                self._running_command = str(arguments.get("command") or "the requested command")
+                self._running_command_started = time.monotonic()
         elif event_type == "tool_output":
             self._status_detail = "Reviewing the tool result"
-        elif event_type in {"command_started", "command_completed", "command_failed"}:
-            command = str(payload.get("command") or "the requested command")
-            self._status_detail = f"Running {command[:120]}"
+            self._running_command = None
+            self._running_command_started = None
         elif event_type == "file_mutation":
             path = str(payload.get("path") or payload.get("resolved_path") or "the requested file")
             self._status_detail = f"Applying the change to {path[:120]}"
@@ -587,9 +602,17 @@ class StreamRenderer:
         label = f"{mode_tag}[bold]{verb}…[/bold] [dim]({' · '.join(detail_parts)})[/dim]"
         self._spinner.update(text=Text.from_markup(label))
         tip = _current_tip(elapsed)
-        if not self._plan_steps and not tip and self.live_input_listener is None:
+        if not self._plan_steps and not tip and self.live_input_listener is None and not self._running_command:
             return self._spinner
         lines = []
+        if self._running_command:
+            command_elapsed = _format_elapsed(
+                time.monotonic() - (self._running_command_started or time.monotonic())
+            )
+            preview = self._running_command[:200]
+            lines.append(Text.from_markup(
+                f"  [dim]⎿  $ {escape(preview)} ({command_elapsed})[/dim]"
+            ))
         if self.live_input_listener is not None:
             # Keep a real, persistent input box in the live task display. The
             # ordinary REPL editor is suspended while the agent owns the

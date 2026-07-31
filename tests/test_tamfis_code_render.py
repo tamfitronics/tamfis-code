@@ -257,6 +257,29 @@ class StreamRendererTests(unittest.TestCase):
         finally:
             renderer.finish()
 
+    def test_running_shell_command_gets_its_own_live_line(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.handle_event({
+                "event_type": "tool_call_requested",
+                "payload": {"name": "execute_command", "arguments": {"command": "pytest -q"}},
+            })
+            output_running = console.file.getvalue()
+            console.print(renderer._build_status())
+            output_running = console.file.getvalue()
+            self.assertIn("$ pytest -q", output_running)
+
+            renderer.handle_event({
+                "event_type": "tool_output",
+                "payload": {"tool": "execute_command", "result": {"success": True}},
+            })
+            console.print(renderer._build_status())
+            output_after = console.file.getvalue()[len(output_running):]
+            self.assertNotIn("$ pytest -q", output_after)
+        finally:
+            renderer.finish()
+
     def test_all_tips_reference_real_commands_only(self):
         # Every tip must name a command that actually exists in cli.py's
         # registered command set (or a real REPL slash command) -- this
