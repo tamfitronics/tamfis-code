@@ -398,7 +398,13 @@ _ABS_PATH_RE = re.compile(r"(?<![\w.])(/[A-Za-z0-9_./+@%:=-]+)")
 
 
 def _explicit_absolute_paths(objective: str) -> list[Path]:
-    return [Path(raw.rstrip(".,;:)]}")) for raw in _ABS_PATH_RE.findall(objective)]
+    paths: list[Path] = []
+    for raw in _ABS_PATH_RE.findall(objective):
+        candidate = Path(raw.rstrip(".,;:)]}"))
+        if raw.count("/") == 1 and not candidate.exists():
+            continue
+        paths.append(candidate)
+    return paths
 
 
 def _project_root_for_target(target: Path) -> Path:
@@ -1103,8 +1109,6 @@ async def _run_ai_command(
             except PermissionError:
                 console.print(f"Permission denied: {requested_path}")
                 return EXIT_TASK_FAILED
-            if requested_path.is_dir():
-                continue
             approved = any(
                 str(requested_path.resolve()) == root_path
                 or str(requested_path.resolve()).startswith(root_path.rstrip("/") + "/")
@@ -1113,14 +1117,9 @@ async def _run_ai_command(
             if approved:
                 continue
             expansion_root = _project_root_for_target(requested_path)
-            console.print(
-                f"Access to this path requires workspace approval:\n\n{expansion_root}\n\n"
-                "Approve adding it to this session's allowed workspaces?"
-            )
-            if not sys.stdin.isatty() or not click.confirm("Approve", default=False):
-                console.print(f"\n  tamfis-code workspace add {expansion_root}")
-                return EXIT_TASK_FAILED
-            # Grants an ADDITIONAL allowed root (e.g. /tmp) alongside the
+            # The user explicitly named this absolute path in the current
+            # objective, which is the approval signal. Grant an ADDITIONAL
+            # allowed root (e.g. /tmp) alongside the
             # existing primary workspace -- previously this called
             # set_session_cwd, which instead REPLACES working_directory
             # session-wide, silently abandoning the original repo root for
@@ -1139,6 +1138,7 @@ async def _run_ai_command(
             ]))
             local_state.save_session_state(workspace.session_id, allowed_workspaces=allowed)
             state = local_state.get_session_state(workspace.session_id)
+            console.print(f"[dim]Workspace added from explicit target: {expansion_root}[/dim]")
         if mode in {"coding", "agent", "execute"}:
             repeated_failure = next(
                 (
@@ -1291,8 +1291,6 @@ async def _run_local_ai_command(
         except PermissionError:
             console.print(f"Permission denied: {requested_path}")
             return EXIT_TASK_FAILED
-        if requested_path.is_dir():
-            continue
         approved = any(
             str(requested_path.resolve()) == root_path
             or str(requested_path.resolve()).startswith(root_path.rstrip("/") + "/")
@@ -1301,18 +1299,13 @@ async def _run_local_ai_command(
         if approved:
             continue
         expansion_root = _project_root_for_target(requested_path)
-        console.print(
-            f"Access to this path requires workspace approval:\n\n{expansion_root}\n\n"
-            "Approve adding it to this session's allowed workspaces?"
-        )
-        if not sys.stdin.isatty() or not click.confirm("Approve", default=False):
-            console.print(f"\n  tamfis-code workspace add {expansion_root}")
-            return EXIT_TASK_FAILED
-        # No remote session to notify -- allowed_workspaces is (and always
+        # The explicit absolute path is direct authorization. No remote
+        # session needs notification -- allowed_workspaces is (and always
         # was) purely a local state.py concept for this client.
         allowed = list(dict.fromkeys([*state.allowed_workspaces, str(expansion_root)]))
         local_state.save_session_state(workspace.session_id, allowed_workspaces=allowed)
         state = local_state.get_session_state(workspace.session_id)
+        console.print(f"[dim]Workspace added from explicit target: {expansion_root}[/dim]")
 
     if mode in {"coding", "agent", "execute"}:
         repeated_failure = next(

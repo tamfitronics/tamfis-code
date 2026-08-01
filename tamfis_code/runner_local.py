@@ -65,7 +65,11 @@ from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, red
 from .sandbox import SandboxPolicy
 from .workspace import classify_root, detect_validation_commands, scratch_root
 from .workspace_access import ensure_workspace_access
-from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
+from .runtime.workspace_authority import (
+    WorkspaceAuthorityError,
+    auto_grant_explicit_targets,
+    resolve_workspace_targets,
+)
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
 # was appropriate for a read-only Q&A loop; a real coding-agent task
@@ -3981,9 +3985,24 @@ async def _run_local_agent_turn_impl(
 
     working_messages = list(orchestration.context.messages if orchestration.context else messages)
     # Resolve workspace authority before planning or repository inspection.
-    # Product names and sibling directory names never expand scope. External
-    # roots require both an explicit absolute path in the objective and a
-    # durable session grant.
+    # An absolute path in the current user objective is direct authorization:
+    # persist its existing project/directory root so interactive turns can
+    # continue without asking the user to run a second CLI command. Product
+    # names and sibling-directory inference still never expand scope.
+    durable_roots, added_roots = auto_grant_explicit_targets(
+        launch_root=workspace_root,
+        objective=objective,
+        allowed_roots=prior_state.allowed_workspaces or [workspace_root],
+    )
+    if added_roots:
+        local_state.save_session_state(
+            session_id,
+            allowed_workspaces=[str(path) for path in durable_roots],
+        )
+        renderer.handle_event({
+            "event_type": "workspace_expanded",
+            "payload": {"roots": [str(path) for path in added_roots]},
+        })
     try:
         workspace_resolution = resolve_workspace_targets(
             launch_root=workspace_root,
@@ -3997,7 +4016,7 @@ async def _run_local_agent_turn_impl(
             # WorkspaceGrant.contains() only allows a candidate that is the
             # granted root or a descendant of it -- granting just the
             # deeper session subdirectory would still reject "/tmp" itself.
-            allowed_roots=[*(prior_state.allowed_workspaces or [workspace_root]), tempfile.gettempdir()],
+            allowed_roots=[*durable_roots, tempfile.gettempdir()],
         )
     except WorkspaceAuthorityError as exc:
         message = str(exc)

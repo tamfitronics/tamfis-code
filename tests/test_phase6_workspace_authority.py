@@ -4,6 +4,7 @@ import pytest
 
 from tamfis_code.runtime.workspace_authority import (
     WorkspaceAuthorityError,
+    auto_grant_explicit_targets,
     explicit_absolute_targets,
     resolve_workspace_targets,
 )
@@ -64,6 +65,40 @@ def test_unrelated_absolute_file_does_not_expand_to_sibling(tmp_path: Path):
     target = current / "README.md"
     target.write_text("x", encoding="utf-8")
     assert explicit_absolute_targets(f"read {target}") == (current.resolve(),)
+
+
+def test_pasted_status_hint_is_not_an_absolute_target(tmp_path: Path):
+    current = _project(tmp_path / "tamfisseo")
+    assert explicit_absolute_targets("ready · /status for session, task, cwd") == ()
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective="ready · /status for session, task, cwd",
+        allowed_roots=[current],
+    )
+    assert result.roots == (current.resolve(),)
+
+
+def test_explicit_external_path_is_automatically_added_to_grant(tmp_path: Path):
+    current = _project(tmp_path / "tamfisseo")
+    other = _project(tmp_path / "tamfisgpt")
+    target = other / "src" / "App.tsx"
+    target.parent.mkdir()
+    target.write_text("export default null", encoding="utf-8")
+
+    allowed, added = auto_grant_explicit_targets(
+        launch_root=current,
+        objective=f"read {target}",
+        allowed_roots=[current],
+    )
+
+    assert added == (other.resolve(),)
+    assert allowed == (current.resolve(), other.resolve())
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective=f"read {target}",
+        allowed_roots=allowed,
+    )
+    assert result.roots == (other.resolve(),)
 
 
 def test_runner_integrates_authority_and_freshness_rules():

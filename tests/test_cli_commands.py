@@ -38,6 +38,12 @@ class ExplicitAbsolutePathsTests(unittest.TestCase):
     def test_relative_looking_path_is_not_matched(self):
         self.assertEqual(_explicit_absolute_paths("edit src/app.py"), [])
 
+    def test_pasted_slash_command_is_not_a_filesystem_target(self):
+        self.assertEqual(
+            _explicit_absolute_paths("ready · /status for session, task, cwd"),
+            [],
+        )
+
 
 class ProjectRootForTargetTests(unittest.TestCase):
     def test_finds_git_root_from_nested_file(self):

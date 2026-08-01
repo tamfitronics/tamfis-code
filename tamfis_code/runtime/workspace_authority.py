@@ -1,9 +1,9 @@
 """Fail-closed workspace grants and target resolution.
 
 The launch directory is the only implicit workspace. Additional roots are
-usable only when they are both named explicitly by absolute path in the user
-objective and already present in the durable session grant list. Product names
-or sibling directory names never expand scope by themselves.
+usable when they are named explicitly by absolute path in the user objective.
+The local runner persists those explicit roots in the session grant before
+tool execution; inferred product or sibling names never expand scope.
 """
 from __future__ import annotations
 
@@ -69,7 +69,14 @@ class WorkspaceResolution:
 
 def _project_root(path: Path) -> Path:
     candidate = path.resolve()
-    return candidate.parent if candidate.is_file() else candidate
+    start = candidate if candidate.is_dir() else candidate.parent
+    for root in (start, *start.parents):
+        if any(
+            (root / marker).exists()
+            for marker in (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+        ):
+            return root
+    return start
 
 
 def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
@@ -78,6 +85,12 @@ def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
     scrubbed = _URL_RE.sub(" ", objective or "")
     for raw in _ABSOLUTE_PATH_RE.findall(scrubbed):
         candidate = Path(raw.rstrip(".,;:)]}")).expanduser()
+        # Terminal hints and pasted transcripts commonly contain standalone
+        # slash commands such as `/status` and `/model`. A nonexistent,
+        # single-component token is not useful as a filesystem target and
+        # must not become a fake root-level path that blocks the whole turn.
+        if raw.count("/") == 1 and not candidate.exists():
+            continue
         try:
             candidate = _project_root(candidate)
         except OSError:
@@ -87,6 +100,28 @@ def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
             seen.add(key)
             targets.append(candidate)
     return tuple(targets)
+
+
+def auto_grant_explicit_targets(
+    *, launch_root: str | Path, objective: str, allowed_roots: Iterable[str | Path] = ()
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """Add explicit, usable targets to a local session grant.
+
+    Naming an absolute path in the current user objective is direct scope
+    authorization. Only a resolved directory that already exists is added;
+    inferred names, pasted slash commands, and unresolved root-level tokens
+    cannot widen the grant.
+    """
+    grant = WorkspaceGrant.create(launch_root, allowed_roots)
+    roots = list(grant.allowed_roots)
+    added: list[Path] = []
+    for target in explicit_absolute_targets(objective):
+        if grant.contains(target) or not target.is_dir():
+            continue
+        roots.append(target)
+        added.append(target)
+        grant = WorkspaceGrant.create(launch_root, roots)
+    return tuple(roots), tuple(added)
 
 
 def infer_named_external_project(launch_root: Path, objective: str) -> tuple[Path, ...]:
