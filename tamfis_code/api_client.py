@@ -410,7 +410,9 @@ class RemoteAPIClient:
 
     # -- streaming ---------------------------------------------------------
 
-    async def stream_session(self, session_id: int, last_event_id: int = 0) -> AsyncIterator[dict[str, Any]]:
+    async def stream_session(
+        self, session_id: int, last_event_id: int = 0, *, idle_timeout: Optional[float] = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         """Yields parsed event envelopes from GET /sessions/{id}/stream.
 
         Mirrors remoteStore.ts's connectSessionStream: an authenticated raw
@@ -418,11 +420,26 @@ class RemoteAPIClient:
         header), reconnecting the caller's responsibility -- this generator
         ends when the server closes the stream or on a connection error, and
         does not retry itself, so `interactive.py`/non-interactive callers
-        control reconnect-with-last-event-id explicitly."""
+        control reconnect-with-last-event-id explicitly.
+
+        `idle_timeout` bounds how long a read may block waiting for the NEXT
+        byte (httpx.ReadTimeout on expiry) -- default None preserves the
+        original unbounded behaviour for a normal live turn. Reattaching to
+        a task from a previous CLI session (see cli.py's
+        `_resume_interrupted_task_if_any` / `attach` command) needs a bound:
+        confirmed live -- a task that had already gone stale server-side
+        (nothing left to ever emit another event) left the CLI parked in
+        `select()` forever with no way to Ctrl+C out, since the interrupt
+        watcher only gets a chance to run between received events.
+        """
         url = f"{_api_root(self.config.api_base)}/remote/sessions/{session_id}/stream"
         params = {"last_event_id": max(0, last_event_id)}
+        stream_timeout = (
+            httpx.Timeout(connect=10.0, read=idle_timeout, write=10.0, pool=10.0)
+            if idle_timeout is not None else None
+        )
         async with self._client.stream(
-            "GET", url, params=params, headers=self._headers(), timeout=None
+            "GET", url, params=params, headers=self._headers(), timeout=stream_timeout
         ) as resp:
             if resp.status_code == 401:
                 if await self._refresh():

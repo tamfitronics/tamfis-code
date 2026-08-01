@@ -13,6 +13,7 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Optional, AsyncGenerator
 
+import httpx
 from rich.console import Console
 from rich.panel import Panel
 
@@ -32,6 +33,22 @@ try:
     )
 except (TypeError, ValueError):
     MAX_TASK_STREAM_RECONNECTS = 12
+
+# How long a reattached event stream may sit completely silent before it's
+# treated as dead rather than merely slow. Confirmed live: a task reattached
+# via cli.py's startup `_resume_interrupted_task_if_any` (or the explicit
+# `attach` command) that had gone stale server-side -- no more events ever
+# coming -- left the CLI parked in select() indefinitely (500+ minutes in
+# one report), with Ctrl+C unable to reach the blocked read because the
+# interrupt watcher only gets scheduled between received events. This does
+# NOT bound a normal live turn's total runtime, only the gap between two
+# consecutive events/keepalives.
+try:
+    STREAM_IDLE_TIMEOUT_SECONDS = max(
+        10.0, float(os.getenv("TAMFIS_CODE_STREAM_IDLE_TIMEOUT", "90"))
+    )
+except (TypeError, ValueError):
+    STREAM_IDLE_TIMEOUT_SECONDS = 90.0
 
 # Allowed providers - expanded from just hf/openrouter
 ALLOWED_PROVIDERS = [
@@ -494,6 +511,7 @@ async def attach_and_stream(
         approval_policy=approval_policy, interactive=interactive,
         from_event_id=from_event_id, on_interrupt="detach", config=config,
         requested_mutation=active_mode in {"coding", "agent", "edit", "debug"},
+        idle_timeout=STREAM_IDLE_TIMEOUT_SECONDS,
     )
 
 
@@ -511,6 +529,7 @@ async def _stream_task(
     reconnect_attempt: int = 0,
     requested_mutation: bool = False,
     config: Optional[Config] = None,
+    idle_timeout: Optional[float] = None,
 ) -> TaskOutcome:
     outcome: Optional[TaskOutcome] = None
     last_assistant_content: Optional[str] = None
@@ -547,7 +566,27 @@ async def _stream_task(
 
     async def consume() -> None:
         nonlocal outcome, last_assistant_content, last_plan_items, task_id, mutation_attempted
-        async for event in client.stream_session(session_id, from_event_id):
+        # Iterate the stream manually (rather than `async for`) so a
+        # silent-too-long read raises httpx.TimeoutException *into this
+        # loop* instead of propagating out uncaught -- a task reattached
+        # from a previous session that had gone stale server-side (no more
+        # events ever coming) otherwise left the CLI parked here forever,
+        # with Ctrl+C unable to reach the blocked read since the interrupt
+        # watcher only gets scheduled between received events.
+        stream_iter = client.stream_session(
+            session_id, from_event_id, idle_timeout=idle_timeout,
+        ).__aiter__()
+        while True:
+            try:
+                event = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                return
+            except httpx.TimeoutException:
+                console.print(
+                    "[dim]· No update from the server in a while; checking task status...[/dim]"
+                )
+                return
+
             sequence = event.get("stream_sequence")
             if sequence is not None:
                 local_state.save_session_state(session_id, last_event_id=int(sequence))
@@ -779,7 +818,7 @@ async def _stream_task(
                     approval_policy=approval_policy, interactive=interactive,
                     from_event_id=cursor, on_interrupt=on_interrupt,
                     reconnect_attempt=reconnect_attempt + 1, config=config,
-                    requested_mutation=requested_mutation,
+                    requested_mutation=requested_mutation, idle_timeout=idle_timeout,
                 )
             outcome = TaskOutcome(status="detached", summary=task_id)
         else:
