@@ -7,6 +7,7 @@ import html
 import json
 import os
 import re
+import signal
 import subprocess
 import fnmatch
 import asyncio
@@ -1186,6 +1187,21 @@ class MCPServer:
             "file_count": len(files), "artifact_type": "archive",
         }
     
+    async def _kill_process_group(self, proc: "asyncio.subprocess.Process") -> None:
+        # Kill the whole process group (the shell was started with
+        # start_new_session=True) rather than just the immediate `sh -lc`
+        # process, so children the command spawned die too. Bound the
+        # follow-up wait() -- if the process is stuck (e.g. uninterruptible
+        # I/O) it must not block the caller forever; a prior version of this
+        # code awaited proc.wait() with no timeout at all and could hang a
+        # turn indefinitely once a command's own timeout had already fired.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=10)
+
     async def _execute_command(
         self, command: str, cwd: Optional[str] = None, timeout: int = 60,
         environment: Optional[Dict[str, str]] = None, shell: str = "bash",
@@ -1260,15 +1276,28 @@ class MCPServer:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(run_dir), env=env,
+                # New session/process group so a kill on timeout can reach
+                # any children the command spawns (e.g. `npm run dev`),
+                # not just the immediate shell -- see the kill/wait paths
+                # below, which target the group via os.killpg.
+                start_new_session=True,
             )
             if background_signal is None:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                return {
-                    "stdout": stdout.decode('utf-8', errors='ignore'),
-                    "stderr": stderr.decode('utf-8', errors='ignore'),
-                    "return_code": proc.returncode,
-                    "success": proc.returncode == 0
-                }
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    return {
+                        "stdout": stdout.decode('utf-8', errors='ignore'),
+                        "stderr": stderr.decode('utf-8', errors='ignore'),
+                        "return_code": proc.returncode,
+                        "success": proc.returncode == 0
+                    }
+                except asyncio.TimeoutError:
+                    # asyncio.wait_for only cancels the communicate() task on
+                    # timeout, it never touches the subprocess -- without an
+                    # explicit kill here the process (and any children) leak
+                    # and keep running forever in the background.
+                    await self._kill_process_group(proc)
+                    return {"error": f"Command timed out after {timeout} seconds", "success": False}
             # Race the ordinary completion wait against a possible mid-flight
             # background request -- the SAME already-running proc either way;
             # detaching never restarts it under a different mechanism, only
@@ -1311,9 +1340,7 @@ class MCPServer:
             # Neither finished in time: a genuine timeout, not a background
             # request. Same outcome as the no-signal path above.
             communicate_task.cancel()
-            proc.kill()
-            with contextlib.suppress(ProcessLookupError):
-                await proc.wait()
+            await self._kill_process_group(proc)
             return {"error": f"Command timed out after {timeout} seconds", "success": False}
         except asyncio.TimeoutError:
             return {"error": f"Command timed out after {timeout} seconds", "success": False}
