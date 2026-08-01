@@ -7,6 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..config import CONFIG_DIR
+
 
 @dataclass(frozen=True, slots=True)
 class Skill:
@@ -28,7 +30,11 @@ class SkillRegistry:
             if not root.exists(): continue
             for path in sorted(root.rglob("*")):
                 if path.is_file() and path.name.lower() in {"skill.md","skill.toml","skill.json"}:
-                    skill=self._parse(path); self._skills[skill.name]=skill
+                    try:
+                        skill=self._parse(path)
+                    except (OSError, ValueError, json.JSONDecodeError, tomllib.TOMLDecodeError):
+                        continue
+                    self._skills[skill.name]=skill
         return dict(self._skills)
     def _parse(self, path: Path) -> Skill:
         if path.suffix==".toml": data=tomllib.loads(path.read_text(encoding="utf-8")); instructions=str(data.get("instructions", ""))
@@ -53,3 +59,39 @@ class SkillRegistry:
         for skill in self.list():
             hay=set(re.findall(r"[a-z0-9_-]+", f"{skill.name} {skill.description} {' '.join(skill.tags)}".lower())); scored.append((len(words&hay),skill))
         return [skill for score,skill in sorted(scored,key=lambda x:(-x[0],x[1].name)) if score>0][:limit]
+
+
+def workspace_skill_registry(workspace_root: str | Path) -> SkillRegistry:
+    """Return layered personal/Codex/Claude/Tamfis project skills."""
+    root = Path(workspace_root).expanduser().resolve()
+    from ..plugins import plugin_skill_roots
+    return SkillRegistry([
+        CONFIG_DIR / "skills",
+        *plugin_skill_roots(),
+        root / ".claude" / "skills",
+        root / ".codex" / "skills",
+        root / ".tamfis" / "skills",
+    ])
+
+
+def skill_prompt(workspace_root: str | Path, objective: str, *, max_chars: int = 12_000) -> str:
+    registry = workspace_skill_registry(workspace_root)
+    registry.load()
+    available = registry.list()
+    if not available:
+        return ""
+    matched = registry.match(objective)
+    lines = [
+        "Available skills (use when the request names one or clearly matches its description):",
+        *[f"- {skill.name}: {skill.description}" for skill in available],
+    ]
+    if matched:
+        lines.append("\nMatched skill instructions for this objective:")
+        remaining = max_chars
+        for skill in matched:
+            body = skill.instructions[:remaining]
+            if not body:
+                break
+            lines.append(f"\n--- skill: {skill.name} ({skill.source}) ---\n{body}")
+            remaining -= len(body)
+    return "\n".join(lines)

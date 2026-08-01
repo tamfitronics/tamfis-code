@@ -10,6 +10,7 @@ from click.testing import CliRunner
 from tamfis_code import config as config_module
 from tamfis_code import state as state_module
 from tamfis_code.cli import (
+    _apply_pending_update_after_login,
     _explicit_absolute_paths,
     _print_bg_hint,
     _project_root_for_target,
@@ -156,6 +157,41 @@ class LoginCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertIn("Logged in", result.output)
         self.assertIn("dev@example.com", result.output)
 
+    @patch("tamfis_code.self_update.apply_update", return_value=(True, "Updated to 9.9.9."))
+    @patch("tamfis_code.self_update.check_update_available", return_value="9.9.9")
+    def test_login_applies_available_update_after_credentials_are_saved(self, _check, apply):
+        fake_client = AsyncMock()
+        fake_client.me = AsyncMock(return_value={
+            "authenticated": True,
+            "user": {"id": "u1", "email": "dev@example.com"},
+        })
+        fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = AsyncMock(return_value=False)
+        with patch("tamfis_code.cli.RemoteAPIClient", return_value=fake_client):
+            result = self.runner.invoke(cli, ["login", "--token", "sometoken123"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(config_module.CREDENTIALS_PATH.exists())
+        apply.assert_called_once_with()
+        self.assertIn("next command will use the new version", result.output)
+
+    @patch("tamfis_code.self_update.apply_update", return_value=(False, "Update failed: offline"))
+    @patch("tamfis_code.self_update.check_update_available", return_value="9.9.9")
+    def test_update_failure_is_nonfatal_after_login(self, _check, _apply):
+        from rich.console import Console
+        from io import StringIO
+
+        stream = StringIO()
+        _apply_pending_update_after_login(Console(file=stream, force_terminal=False))
+        self.assertIn("Login succeeded", stream.getvalue())
+
+    @patch.dict(os.environ, {"TAMFIS_CODE_AUTO_UPDATE": "0"})
+    @patch("tamfis_code.self_update.check_update_available")
+    def test_managed_install_can_disable_login_update(self, check):
+        from rich.console import Console
+
+        _apply_pending_update_after_login(Console(force_terminal=False))
+        check.assert_not_called()
+
     def test_login_with_invalid_token_exits_with_auth_failure(self):
         from tamfis_code.api_client import RemoteAPIError
 
@@ -190,7 +226,7 @@ class LogoutCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
 
 
 class UseRemoteHelperTests(unittest.TestCase):
-    """Logged-in subscribers use Remote without a per-command flag."""
+    """Subscription login never changes the local execution boundary."""
 
     def test_flag_true_is_remote_regardless_of_config(self):
         self.assertTrue(_use_remote(Config(default_backend="standalone"), True))
@@ -202,8 +238,8 @@ class UseRemoteHelperTests(unittest.TestCase):
         self.assertTrue(_use_remote(Config(default_backend="remote"), False))
 
     @patch("tamfis_code.cli.load_credentials", return_value=Credentials(access_token="tok"))
-    def test_auto_uses_remote_when_logged_in(self, _credentials):
-        self.assertTrue(_use_remote(Config(default_backend="auto"), False))
+    def test_auto_stays_standalone_when_logged_in(self, _credentials):
+        self.assertFalse(_use_remote(Config(default_backend="auto"), False))
 
     @patch("tamfis_code.cli.load_credentials", return_value=None)
     def test_auto_uses_standalone_when_logged_out(self, _credentials):

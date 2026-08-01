@@ -445,8 +445,46 @@ class BuildSystemPromptTests(_StatePatchMixin, unittest.TestCase):
             root = Path(tmp)
             (root / "AGENTS.md").write_text("x" * 50_000)
             prompt = build_system_prompt(1, root)
-        self.assertLess(len(prompt), 20_000)
+        self.assertLess(len(prompt), 40_000)
         self.assertIn("(truncated)", prompt)
+
+    def test_instruction_chain_uses_root_to_cwd_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = root / "services" / "payments"
+            child.mkdir(parents=True)
+            (root / "AGENTS.md").write_text("ROOT-RULE")
+            (root / "services" / "CLAUDE.md").write_text("SERVICE-RULE")
+            (child / "TAMFIS.md").write_text("PAYMENTS-RULE")
+            with patch("tamfis_code.workspace._git") as git:
+                git.side_effect = lambda _cwd, *args: str(root) if args == ("rev-parse", "--show-toplevel") else ""
+                prompt = build_system_prompt(1, child)
+        self.assertLess(prompt.index("ROOT-RULE"), prompt.index("SERVICE-RULE"))
+        self.assertLess(prompt.index("SERVICE-RULE"), prompt.index("PAYMENTS-RULE"))
+
+    def test_agents_override_replaces_agents_in_same_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_text("BASE-AGENT-RULE")
+            (root / "AGENTS.override.md").write_text("OVERRIDE-AGENT-RULE")
+            prompt = build_system_prompt(1, root)
+        self.assertIn("OVERRIDE-AGENT-RULE", prompt)
+        self.assertNotIn("BASE-AGENT-RULE", prompt)
+
+    def test_unrelated_nested_instructions_are_not_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            active = root / "active"
+            sibling = root / "unrelated"
+            active.mkdir()
+            sibling.mkdir()
+            (root / "AGENTS.md").write_text("ROOT-RULE")
+            (sibling / "AGENTS.md").write_text("UNRELATED-RULE")
+            with patch("tamfis_code.workspace._git") as git:
+                git.side_effect = lambda _cwd, *args: str(root) if args == ("rev-parse", "--show-toplevel") else ""
+                prompt = build_system_prompt(1, active)
+        self.assertIn("ROOT-RULE", prompt)
+        self.assertNotIn("UNRELATED-RULE", prompt)
 
     def test_dirty_repo_is_flagged(self):
         with patch("tamfis_code.workspace._git") as git:

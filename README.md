@@ -11,14 +11,17 @@ entitlement, and the CLI makes outbound API calls from the machine where it
 is installed. Admin subscriptions are an account/billing policy, not a
 requirement for installing or running the CLI.
 
-After `tamfis-code login`, the CLI automatically uses the subscriber's
-TamfisGPT Remote Workspace account. A persistent authenticated local-agent
-connection executes tools against the launch directory, while the web app
-and CLI share the same session and repository state. No provider API key or
-`--remote` flag is required.
+After `tamfis-code login`, the saved TamfisGPT credential unlocks
+subscription-backed inference in the standalone runtime. Provider routing,
+tools, approvals, shell execution, memory, and repository state stay inside
+the local `tamfis-code` process. Remote Workspace is a separate legacy mode
+that is selected only with `--remote` or `default_backend = "remote"`.
+Login also applies a newer version already present in the configured Tamfis
+Code source checkout after credentials are saved; set
+`TAMFIS_CODE_AUTO_UPDATE=0` for centrally managed installations.
 
-The standalone runtime can still call NVIDIA NIM, OpenRouter, or Hugging
-Face directly when `default_backend = "standalone"` is selected explicitly.
+The standalone runtime can also call Ollama Cloud, NVIDIA NIM, OpenRouter,
+or Hugging Face directly. `standalone` is the default runtime boundary.
 
 ## Install
 
@@ -156,6 +159,41 @@ typed text appended on a new line. Run `/commands` in the REPL to list
 what's currently loaded. A custom command can never shadow a built-in one
 (`/plan`, `/agent`, etc. always win on a name collision).
 
+## Skills
+
+Tamfis Code discovers `SKILL.md`, `skill.toml`, and `skill.json` from the
+personal config `skills/` directory and project-local `.tamfis/skills/`,
+`.claude/skills/`, and `.codex/skills/` trees. Skills whose name, description,
+or tags match the objective are injected with their instructions; project
+definitions override same-named personal definitions.
+
+## Complete projects and artifacts
+
+Large multi-file builds use the same long-running plan/checkpoint/repair loop as
+ordinary coding tasks. If an objective supplies an explicit project tree,
+Tamfis Code verifies that every requested file exists and is non-empty before
+allowing a completion claim. ZIP/TAR projects can be safely extracted, edited,
+validated, and repackaged.
+
+The `create_artifact` and `inspect_artifact` tools create and verify real binary
+DOCX, XLSX, PPTX, and PDF deliverables. XLSX cells that could trigger formula
+injection are escaped unless formulas are explicitly enabled. This supports
+mixed requests such as building a complete WordPress theme and delivering its
+proposal, content inventory, budget workbook, launch deck, PDF manual, and
+installable theme archive in one task.
+
+## MCP, plugins, and machine output
+
+External MCP servers stay under the local Tamfis Code runtime. Configure them
+in the personal `mcp.json`, project `.mcp.json`, or `.tamfis/mcp.json` using the
+standard `mcpServers` shape; discovered tools are namespaced and enter the same
+approval policy as native tools. Installed Python packages can contribute tools
+and skill roots through the `tamfis_code.plugins` entry-point group. Use
+`tamfis-code plugins` to inspect them.
+
+Pass global `--output-mode json` for a single machine-readable event document,
+or `--output-mode jsonl` for streaming events suitable for CI and editors.
+
 ## Declarative subagent types
 
 Give a delegated sub-task its own specialised system prompt (and,
@@ -203,15 +241,14 @@ Every mutating tool call (`write_file`, `edit_file`, `execute_command`) is
 risk-classified locally (`tamfis_code/safety.py`), gated by
 `--approval-policy` (or the `/mode` REPL command), and recorded in a local
 mutation ledger — see `tamfis-code diffs` / `tamfis-code diff` /
-`tamfis-code revert`. There is no sandboxing beyond risk classification;
-review dangerous commands yourself before approving them.
+`tamfis-code revert`. Shell commands additionally run under an OS-enforced
+read-only/workspace-write sandbox (bubblewrap on Linux) with network disabled
+by default. A tool may request `require_escalated`, but that request is always
+classified dangerous and enters the explicit approval flow.
 
 ## License
 
-TBD — decide before the first public PyPI release (a public package still
-needs a stated license; "all rights reserved"/proprietary is a valid choice
-if you don't want redistribution/modification, but it should be explicit
-rather than absent).
+Copyright © 2026 Tamfitronics. All rights reserved. See [LICENSE](./LICENSE).
 
 ## OpenHands-Class Runtime (0.6.1)
 

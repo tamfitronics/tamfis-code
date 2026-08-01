@@ -1,6 +1,7 @@
 """Code indexing and semantic search for TAMFIS-CODE"""
 
 import hashlib
+import ast
 import os
 import re
 import json
@@ -244,38 +245,69 @@ class CodeIndexer:
         return True
     
     def _parse_python(self, content: str, file_path: Path) -> List[CodeSymbol]:
-        """Parse Python file for symbols"""
-        symbols = []
+        """Parse Python with the language AST, retaining regex fallback for
+        temporarily invalid files being edited by the agent."""
+        try:
+            tree = ast.parse(content, filename=str(file_path), type_comments=True)
+        except SyntaxError:
+            return self._parse_python_regex(content, file_path)
+
+        symbols: List[CodeSymbol] = []
+
+        class Visitor(ast.NodeVisitor):
+            def __init__(self) -> None:
+                self.parents: list[str] = []
+
+            def visit_ClassDef(self, node: ast.ClassDef) -> None:
+                bases = ", ".join(ast.unparse(base) for base in node.bases)
+                symbols.append(CodeSymbol(
+                    name=node.name, kind="class", file_path=str(file_path),
+                    line_start=node.lineno, line_end=getattr(node, "end_lineno", node.lineno),
+                    signature=bases or None, docstring=ast.get_docstring(node, clean=False),
+                    parent=".".join(self.parents) or None,
+                    metadata={"decorators": [ast.unparse(item) for item in node.decorator_list]},
+                ))
+                self.parents.append(node.name)
+                self.generic_visit(node)
+                self.parents.pop()
+
+            def _function(self, node: ast.FunctionDef | ast.AsyncFunctionDef) -> None:
+                prefix = "async " if isinstance(node, ast.AsyncFunctionDef) else ""
+                symbols.append(CodeSymbol(
+                    name=node.name, kind="method" if self.parents else "function",
+                    file_path=str(file_path), line_start=node.lineno,
+                    line_end=getattr(node, "end_lineno", node.lineno),
+                    signature=prefix + ast.unparse(node.args),
+                    docstring=ast.get_docstring(node, clean=False),
+                    parent=".".join(self.parents) or None,
+                    metadata={"decorators": [ast.unparse(item) for item in node.decorator_list]},
+                ))
+                self.parents.append(node.name)
+                self.generic_visit(node)
+                self.parents.pop()
+
+            visit_FunctionDef = _function
+            visit_AsyncFunctionDef = _function
+
+        Visitor().visit(tree)
+        return symbols
+
+    def _parse_python_regex(self, content: str, file_path: Path) -> List[CodeSymbol]:
+        """Best-effort symbol extraction for syntactically incomplete code."""
+        symbols: List[CodeSymbol] = []
         lines = content.split('\n')
-        
-        func_pattern = re.compile(r'^\s*def\s+(\w+)\s*\(([^)]*)\)')
+        func_pattern = re.compile(r'^\s*(?:async\s+)?def\s+(\w+)\s*\(([^)]*)\)')
         class_pattern = re.compile(r'^\s*class\s+(\w+)(?:\s*\(([^)]*)\))?')
-        
         for i, line in enumerate(lines, 1):
             func_match = func_pattern.search(line)
             if func_match:
-                symbols.append(CodeSymbol(
-                    name=func_match.group(1),
-                    kind='function',
-                    file_path=str(file_path),
-                    line_start=i,
-                    line_end=self._find_function_end(lines, i),
-                    signature=func_match.group(2),
-                ))
+                symbols.append(CodeSymbol(func_match.group(1), 'function', str(file_path), i,
+                                          self._find_function_end(lines, i), func_match.group(2)))
                 continue
-            
             class_match = class_pattern.search(line)
             if class_match:
-                symbols.append(CodeSymbol(
-                    name=class_match.group(1),
-                    kind='class',
-                    file_path=str(file_path),
-                    line_start=i,
-                    line_end=self._find_class_end(lines, i),
-                    signature=class_match.group(2) if class_match.group(2) else None,
-                ))
-                continue
-        
+                symbols.append(CodeSymbol(class_match.group(1), 'class', str(file_path), i,
+                                          self._find_class_end(lines, i), class_match.group(2) or None))
         return symbols
     
     def _find_function_end(self, lines: List[str], start: int) -> int:
@@ -312,12 +344,20 @@ class CodeIndexer:
     
     def _parse_python_imports(self, content: str) -> List[str]:
         """Parse Python imports"""
-        imports = []
-        for line in content.split('\n'):
-            if line.startswith('import ') or line.startswith('from '):
-                parts = line.split()
-                if len(parts) > 1:
-                    imports.append(parts[1].split('.')[0])
+        try:
+            tree = ast.parse(content)
+        except SyntaxError:
+            return [
+                line.split()[1].split('.')[0]
+                for line in content.splitlines()
+                if (line.startswith('import ') or line.startswith('from ')) and len(line.split()) > 1
+            ]
+        imports: List[str] = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                imports.extend(alias.name for alias in node.names)
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                imports.append(("." * node.level) + node.module)
         return imports
     
     def _parse_javascript(self, content: str, file_path: Path) -> List[CodeSymbol]:
@@ -526,6 +566,8 @@ class CodeIndexer:
                         'line_end': s.line_end,
                         'signature': s.signature,
                         'docstring': s.docstring,
+                        'parent': s.parent,
+                        'metadata': s.metadata,
                     }
                     for s in code_file.symbols
                 ]
@@ -555,6 +597,8 @@ class CodeIndexer:
                     line_end=s.get('line_end', 0),
                     signature=s.get('signature'),
                     docstring=s.get('docstring'),
+                    parent=s.get('parent'),
+                    metadata=s.get('metadata', {}),
                 )
                 for s in data.get('symbols', [])
             ]

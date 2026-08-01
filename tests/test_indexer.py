@@ -47,6 +47,30 @@ class MyClass:
         assert code_file.language == 'python'
         assert len(code_file.symbols) >= 2  # hello, MyClass
 
+    def test_python_ast_captures_async_methods_ranges_docs_and_imports(self):
+        test_file = Path(self.temp_dir) / 'semantic.py'
+        test_file.write_text('''from collections import defaultdict
+
+class Worker(Base):
+    """Runs work."""
+    @classmethod
+    async def run(cls, item: str = "x") -> bool:
+        """Execute one item."""
+        return bool(item)
+''')
+        self.indexer.index([str(test_file)])
+        indexed = self.indexer.files[str(test_file)]
+        worker = next(symbol for symbol in indexed.symbols if symbol.name == 'Worker')
+        run = next(symbol for symbol in indexed.symbols if symbol.name == 'run')
+        assert worker.docstring == 'Runs work.'
+        assert worker.signature == 'Base'
+        assert run.kind == 'method'
+        assert run.parent == 'Worker'
+        assert run.line_end > run.line_start
+        assert run.signature.startswith('async ')
+        assert run.metadata['decorators'] == ['classmethod']
+        assert indexed.imports == ['collections']
+
     def test_index_js(self):
         """Test indexing JavaScript files"""
         test_file = Path(self.temp_dir) / 'test.js'

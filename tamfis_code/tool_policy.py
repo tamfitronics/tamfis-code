@@ -11,7 +11,7 @@ from .routing import TaskProfile, TaskType
 # type it can't otherwise verify).
 READ_TOOLS = [
     "list_directory", "search_code", "find_references", "read_file",
-    "get_git_info", "ask_user_question", "execute_command",
+    "get_git_info", "ask_user_question", "execute_command", "inspect_artifact",
 ]
 EDIT_TOOLS = [
     *READ_TOOLS,
@@ -19,6 +19,7 @@ EDIT_TOOLS = [
     "edit_file",
     "extract_archive",
     "repackage_archive",
+    "create_artifact",
 ]
 EXECUTE_TOOLS = [*READ_TOOLS, "execute_command"]
 GIT_TOOLS = ["get_git_info", "read_file", "search_code", "find_references", "execute_command", "ask_user_question"]

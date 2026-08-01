@@ -4,9 +4,8 @@ Command surface includes login, workspace/session management, conversational
 chat, read-only audit, durable plan/list/execute-plan workflows, full agent
 execution, explicit shell commands, approvals, diffs/revert, retries,
 background tasks, attach/logs, and the bare `tamfis-code` interactive mode.
-Deliberately deferred: JSON/jsonl/sarif output modes,
-shell completion, @file/@stdin references, TAMFIS.md hierarchical
-instructions, --server/--session remote-session mode, compact as a distinct
+Deliberately deferred: SARIF output mode,
+shell completion, --server/--session remote-session mode, compact as a distinct
 command, the network-outage retry state machine, and a durable multi-
 channel notification outbox (separate follow-up -- see project memory).
 """
@@ -38,7 +37,7 @@ from .config import APPROVAL_MODES, CONFIG_DIR, Config, Credentials, load_config
 from .doctor import run_doctor
 from .runtime.memory import MemoryRecord, MemoryType, get_memory_store
 from .runtime.worktree import WorktreeError, create_worktree, list_worktrees, remove_worktree
-from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
+from .render import StructuredRenderer, StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
 from .runner import (
     ACTIVE_TASK_STATUSES,
     attach_and_stream, follow_session_logs, retry_task_and_stream,
@@ -83,12 +82,13 @@ def _run_async(coro):
 
 
 def _use_remote(config: Config, remote_flag: bool) -> bool:
-    """Use Remote automatically for authenticated TamfisGPT subscribers."""
-    if remote_flag or config.default_backend == "remote":
-        return True
-    if config.default_backend == "standalone":
-        return False
-    return load_credentials() is not None
+    """Select Remote Workspace only when the operator explicitly requests it.
+
+    TamfisGPT authentication is an entitlement/inference boundary.  Local
+    files, tools, approvals, provider routing, and state remain owned by this
+    process after login, matching Codex/Claude Code's local-runtime contract.
+    """
+    return bool(remote_flag or config.default_backend == "remote")
 
 
 def async_command(fn):
@@ -127,11 +127,13 @@ def _print_local_sessions(console: Console, *, show_all: bool) -> None:
 @click.option("--provider", default="auto", help="ollama_cloud, nvidia, hf, openrouter, or auto (default) -- which provider the bare (no-subcommand) interactive REPL calls directly.")
 @click.option("--model", default=None, help="Provider-specific model id for the bare interactive REPL; defaults to that provider's default model.")
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend for the bare interactive REPL instead of calling a provider directly.")
+@click.option("--output-mode", type=click.Choice(["text", "json", "jsonl"]), default=None, help="Render human text, one JSON document, or streaming JSON Lines.")
 @click.version_option(__version__, prog_name="tamfis-code")
 @click.pass_context
 def cli(
     ctx: click.Context, debug: bool, approval_policy: Optional[str], api_base: Optional[str],
     cwd_override: Optional[str], provider: str, model: Optional[str], remote: bool,
+    output_mode: Optional[str],
 ):
     """TamfisGPT Code -- a standalone terminal coding agent."""
     workspace_root = Path(cwd_override).resolve() if cwd_override else Path.cwd()
@@ -155,6 +157,11 @@ def cli(
         config.debug = True
         config.sources["debug"] = "--debug flag"
         os.environ["TAMFIS_CODE_DEBUG"] = "1"
+    if output_mode:
+        config.output_mode = output_mode
+        config.sources["output_mode"] = "--output-mode flag"
+    if config.output_mode not in {"text", "json", "jsonl"}:
+        raise click.UsageError("output_mode must be text, json, or jsonl")
 
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
@@ -257,13 +264,41 @@ async def _resume_interrupted_task_if_any(
 
 # -- login / logout ------------------------------------------------------
 
+def _apply_pending_update_after_login(console: Console) -> None:
+    """Apply a checkout-backed update after credentials are safely stored.
+
+    Login is an idle, process-ending boundary, so updating here cannot
+    interrupt an agent turn. A failed update is deliberately non-fatal: the
+    user remains authenticated on the working version and can retry later.
+    """
+    if os.environ.get("TAMFIS_CODE_AUTO_UPDATE", "1").strip().lower() in {"0", "false", "no", "off"}:
+        return
+    from .self_update import apply_update, check_update_available
+
+    pending = check_update_available()
+    if not pending:
+        return
+    console.print(f"[dim]Applying Tamfis Code update {__version__} -> {pending}...[/dim]")
+    ok, message = apply_update()
+    if ok:
+        console.print(f"[green]{message}[/green] [dim]The next command will use the new version.[/dim]")
+    else:
+        console.print(
+            f"[yellow]Login succeeded, but the in-flight update could not be applied: {message} "
+            "Run /update to retry.[/yellow]"
+        )
+
 @cli.command()
 @click.option("--email", default=None)
 @click.option("--token", "existing_token", default=None, envvar="TAMFIS_CODE_LOGIN_TOKEN",
               help="Use an existing TamfisGPT access token (prefer the environment variable to shell history).")
 @click.pass_context
 def login(ctx: click.Context, email: Optional[str], existing_token: Optional[str]):
-    """Authenticate against the TamfisGPT account system (only needed for --remote commands -- standalone mode never requires login)."""
+    """Sign in for TamfisGPT subscription-backed local inference.
+
+    Login does not enable Remote Workspace or move tools off this machine;
+    pass --remote explicitly when that legacy workflow is actually wanted.
+    """
     config: Config = ctx.obj["config"]
     console = Console(no_color=not config.colour)
 
@@ -296,6 +331,7 @@ def login(ctx: click.Context, email: Optional[str], existing_token: Optional[str
             print_error(console, f"Token login failed: {e}")
             raise SystemExit(EXIT_AUTH_FAILED)
         console.print(f"[green]Logged in[/green] as {user.get('email', 'TamfisGPT user')} · storage={backend}")
+        _apply_pending_update_after_login(console)
         return
 
     email = email or click.prompt("Email")
@@ -321,6 +357,7 @@ def login(ctx: click.Context, email: Optional[str], existing_token: Optional[str
         raise SystemExit(EXIT_AUTH_FAILED)
 
     console.print(f"[green]Logged in[/green] as {user.get('email', email)} (plan: {user.get('plan', 'unknown')}) · storage={backend}")
+    _apply_pending_update_after_login(console)
 
 
 @cli.command()
@@ -1315,8 +1352,11 @@ async def _run_local_ai_command(
     # "continue" destroys the last useful legacy resume pointer.
     if not _is_resume_request(objective):
         local_state.save_session_state(workspace.session_id, active_task={"objective": objective, "mode": mode})
-    print_banner(console, host=f"local:{provider_type.value}", workspace_root=workspace.workspace_root, mode=mode, approval_policy=config.approval_policy)
-    renderer = StreamRenderer(console)
+    if config.output_mode == "text":
+        print_banner(console, host=f"local:{provider_type.value}", workspace_root=workspace.workspace_root, mode=mode, approval_policy=config.approval_policy)
+        renderer = StreamRenderer(console)
+    else:
+        renderer = StructuredRenderer(mode=config.output_mode)
     manager = ProviderManager()
     turn_messages: list[dict[str, str]] = []
     image_attachments = [p for p in resolved_attachments if is_vision_image_path(p)]
@@ -1363,10 +1403,12 @@ async def _run_local_ai_command(
         attachment_paths=tuple(resolved_attachments),
         image_content_blocks=image_content_blocks,
     )
+    if isinstance(renderer, StructuredRenderer):
+        renderer.record_outcome(outcome)
     renderer.finish()
 
     if outcome.status == "completed":
-        if outcome.summary and not renderer.streamed_final_text:
+        if outcome.summary and not renderer.streamed_final_text and config.output_mode == "text":
             console.print(outcome.summary)
         if outcome.summary:
             local_state.save_session_state(workspace.session_id, conversation_summary=outcome.summary[-4000:])
@@ -2289,9 +2331,10 @@ def tools_cmd(action: str, name: str, params: str):
             click.echo("❌ Please specify a tool with --name")
             return
 
-        if name in {"write_file", "execute_command"}:
+        from .safety import READ_ONLY_TOOLS
+        if name not in READ_ONLY_TOOLS:
             click.echo(
-                "Approval required: direct mutation through 'tools call' is disabled. "
+                "Approval required: direct non-read-only tools are disabled. "
                 "Use 'tamfis-code ask' or 'tamfis-code chat' so the command, working "
                 "directory, risk, and approval record are shown first."
             )
@@ -2303,6 +2346,24 @@ def tools_cmd(action: str, name: str, params: str):
             click.echo(json.dumps(result.get('result', {}), indent=2))
         else:
             click.echo(f"❌ {result.get('error', 'Unknown error')}")
+
+
+@cli.command("plugins")
+def plugins_command():
+    """List installed Tamfis Code entry-point plugins and load failures."""
+    from .plugins import load_plugins
+    plugins = load_plugins()
+    if not plugins:
+        click.echo("No Tamfis Code plugins installed.")
+        return
+    for plugin in plugins:
+        if plugin.error:
+            click.echo(f"✗ {plugin.name}: {plugin.error}")
+        else:
+            click.echo(
+                f"✓ {plugin.name} {plugin.version} · {len(plugin.tools)} tool(s) · "
+                f"{len(plugin.skill_roots)} skill root(s)"
+            )
 
 
 @cli.command('index')

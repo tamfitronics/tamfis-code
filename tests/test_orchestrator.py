@@ -357,3 +357,50 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertEqual(report.severity, "error")
         self.assertTrue(any("latest verification command failed" in item for item in report.unresolved))
+
+    def test_verified_already_resolved_debug_task_does_not_require_meaningless_edit(self):
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the Web Submission Blast insert error"),
+            tool_records=[
+                {"tool_name": "read_file", "success": True},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "npm run build"},
+                },
+            ],
+            any_mutation=False,
+            final_text=(
+                "The insert error is now resolved because the running server "
+                "has the correct partial-index conflict clause."
+            ),
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        mutation_check = next(item for item in report.checks if item["name"] == "mutation_recorded")
+        self.assertTrue(mutation_check["accepted_verified_no_change"])
+
+    def test_no_change_claim_after_failed_edit_still_fails(self):
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken router"),
+            tool_records=[
+                {"tool_name": "edit_file", "success": False},
+                {"tool_name": "read_file", "success": True},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "npm run build"},
+                },
+            ],
+            any_mutation=False,
+            final_text="The issue is now resolved; no code changes were needed.",
+        )
+
+        self.assertFalse(report.passed)
+        self.assertEqual(report.severity, "error")
+        self.assertTrue(any("no successful file mutation" in item for item in report.unresolved))

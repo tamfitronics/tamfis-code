@@ -18,8 +18,8 @@ Ollama Cloud is accessed through the signed-in local Ollama daemon at
 Ollama Cloud while preserving the OpenAI-compatible tools/streaming contract
 already used throughout Tamfis-Code.
 
-Canonical project environment file:
-    /home/tamfiscode/.env
+In a source checkout, a sibling ``.env`` is loaded for development. Installed
+packages use process/user configuration and never assume a builder's path.
 """
 
 from __future__ import annotations
@@ -41,7 +41,7 @@ def _load_project_env() -> None:
     """
 
     default_root = Path(
-        os.environ.get("TAMFIS_CODE_ROOT", "/home/tamfiscode")
+        os.environ.get("TAMFIS_CODE_ROOT") or Path(__file__).resolve().parents[1]
     ).expanduser()
     env_path = Path(
         os.environ.get(
@@ -617,6 +617,22 @@ class ProviderManager:
             # but the local Ollama endpoint ignores it. Preserve the real key
             # in the environment for direct native API use elsewhere.
             return os.environ.get(config.api_key_env, "").strip() or "ollama"
+
+        if provider_type == ProviderType.TAMFIS:
+            # An explicitly supplied developer key wins.  Otherwise reuse
+            # the renewable credential created by `tamfis-code login`; the
+            # subscription gateway accepts either credential type while all
+            # tools and orchestration remain in this local runtime.
+            developer_key = os.environ.get(config.api_key_env, "").strip()
+            if developer_key:
+                return developer_key
+            try:
+                from .api_client import load_secure_credentials
+
+                credentials = load_secure_credentials()
+            except Exception:
+                credentials = None
+            return str(getattr(credentials, "access_token", "") or "").strip() or None
 
         key = os.environ.get(config.api_key_env, "").strip()
         return key or None

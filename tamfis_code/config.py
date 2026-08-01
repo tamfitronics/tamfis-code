@@ -160,19 +160,27 @@ class Config:
     # prompts interleaving across sessions, concurrent state.json writers)
     # that need validating against a live backend before being on by default.
     enable_subagent_delegation: bool = False
-    # "auto" (default): use TamfisGPT Remote after login, otherwise standalone.
+    # "auto" is retained as a compatibility spelling for the local runtime.
+    # Authentication controls subscription/model entitlement only; it must
+    # never transfer tool or workspace execution to a remote agent runtime.
     # "standalone": call a provider directly, no TamfisGPT backend.
     # "remote": use the TamfisGPT Remote Workspace backend for every command
     # without needing --remote on each invocation -- set this once (via
     # `tamfis-code login` writing it, or manually in config.toml) for a paid
     # TamfisGPT tenant who wants that be the default, the same way Claude
     # Code/Codex/kimi-code default to their respective hosted accounts.
-    default_backend: str = "auto"
+    default_backend: str = "standalone"
     # Additional local roots that may be used by this installation. The
     # launch directory is always included separately; these roots make a
     # multi-project service practical without granting access to the whole
     # filesystem.
     workspace_roots: list[str] = field(default_factory=list)
+    # Shell commands are kernel-isolated by default. File tools retain their
+    # existing workspace boundary independently of this setting.
+    sandbox_mode: str = "workspace-write"
+    sandbox_network_access: bool = False
+    sandbox_writable_roots: list[str] = field(default_factory=list)
+    sandbox_fail_if_unavailable: bool = False
     sources: dict[str, str] = field(default_factory=dict)  # field -> where it came from, for `doctor`/`config`
 
     def as_dict(self) -> dict[str, Any]:
@@ -190,6 +198,10 @@ class Config:
             "enable_subagent_delegation": self.enable_subagent_delegation,
             "default_backend": self.default_backend,
             "workspace_roots": self.workspace_roots,
+            "sandbox_mode": self.sandbox_mode,
+            "sandbox_network_access": self.sandbox_network_access,
+            "sandbox_writable_roots": self.sandbox_writable_roots,
+            "sandbox_fail_if_unavailable": self.sandbox_fail_if_unavailable,
         }
 
 
@@ -245,6 +257,22 @@ def load_config(project_root: Optional[Path] = None) -> Config:
                 if isinstance(item, str) and item.strip()
             ]
             cfg.sources["workspace_roots"] = source_name
+        if data.get("sandbox_mode") in ("read-only", "workspace-write", "danger-full-access"):
+            cfg.sandbox_mode = str(data["sandbox_mode"])
+            cfg.sources["sandbox_mode"] = source_name
+        if "sandbox_network_access" in data:
+            cfg.sandbox_network_access = bool(data["sandbox_network_access"])
+            cfg.sources["sandbox_network_access"] = source_name
+        sandbox_roots = data.get("sandbox_writable_roots")
+        if isinstance(sandbox_roots, list):
+            cfg.sandbox_writable_roots = [
+                str(Path(item).expanduser().resolve()) for item in sandbox_roots
+                if isinstance(item, str) and item.strip()
+            ]
+            cfg.sources["sandbox_writable_roots"] = source_name
+        if "sandbox_fail_if_unavailable" in data:
+            cfg.sandbox_fail_if_unavailable = bool(data["sandbox_fail_if_unavailable"])
+            cfg.sources["sandbox_fail_if_unavailable"] = source_name
 
     env_api_base = os.environ.get("TAMFIS_CODE_API_BASE")
     if env_api_base:
@@ -294,6 +322,24 @@ def load_config(project_root: Optional[Path] = None) -> Config:
             if item.strip()
         ]
         cfg.sources["workspace_roots"] = "env TAMFIS_CODE_WORKSPACE_ROOTS"
+
+    env_sandbox = os.environ.get("TAMFIS_CODE_SANDBOX_MODE")
+    if env_sandbox in ("read-only", "workspace-write", "danger-full-access"):
+        cfg.sandbox_mode = env_sandbox
+        cfg.sources["sandbox_mode"] = "env TAMFIS_CODE_SANDBOX_MODE"
+
+    env_sandbox_network = os.environ.get("TAMFIS_CODE_SANDBOX_NETWORK_ACCESS")
+    if env_sandbox_network is not None:
+        cfg.sandbox_network_access = env_sandbox_network.lower() in {"1", "true", "yes"}
+        cfg.sources["sandbox_network_access"] = "env TAMFIS_CODE_SANDBOX_NETWORK_ACCESS"
+
+    env_sandbox_roots = os.environ.get("TAMFIS_CODE_SANDBOX_WRITABLE_ROOTS")
+    if env_sandbox_roots:
+        cfg.sandbox_writable_roots = [
+            str(Path(item.strip()).expanduser().resolve())
+            for item in env_sandbox_roots.split(os.pathsep) if item.strip()
+        ]
+        cfg.sources["sandbox_writable_roots"] = "env TAMFIS_CODE_SANDBOX_WRITABLE_ROOTS"
 
     return cfg
 

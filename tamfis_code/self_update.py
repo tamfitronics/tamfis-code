@@ -25,7 +25,9 @@ from typing import Optional, Tuple
 
 from . import __version__
 
-DEFAULT_REPO_PATH = Path(os.environ.get("TAMFIS_CODE_REPO", "/home/tamfiscode"))
+DEFAULT_REPO_PATH = Path(
+    os.environ.get("TAMFIS_CODE_REPO") or Path(__file__).resolve().parents[1]
+).expanduser()
 _VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
 
 

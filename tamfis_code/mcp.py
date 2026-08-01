@@ -26,6 +26,7 @@ import httpx
 from rich.panel import Panel
 
 from .render import resume_live_if_active, suspend_live_if_active
+from .sandbox import SandboxPolicy, build_sandbox_command
 # MCP commands can be invoked without constructing a ProviderManager (for
 # example, `tamfis-code tools list`). Reuse the canonical project `.env`
 # loader here so TAMGPT_MCP_CONFIG and TAMFIS_MONOREPO_ROOT are available in
@@ -36,8 +37,8 @@ _load_project_env()
 
 # web_search (see MCPServer._web_search) is self-contained rather than
 # reusing tamgpt6's WebSearchManager via _import_monorepo_attr, unlike
-# browser (which needs Playwright's real headless browser binary and is
-# only meaningful when co-located). A plain search-API HTTP call is cheap
+# browser. Both capabilities are implemented in this standalone package.
+# A plain search-API HTTP call is cheap
 # enough to implement natively, so tamfis-code keeps a working web_search
 # tool when installed standalone on a machine that never had tamgpt6 on it
 # at all -- confirmed as the right call by the user (portability over
@@ -56,6 +57,15 @@ _DDG_RESULT_RE = re.compile(
 )
 _DDG_SNIPPET_RE = re.compile(r'<a class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _sandbox_result(command: Any) -> Dict[str, Any]:
+    if command is None:
+        return {"active": False, "backend": "not-configured"}
+    result: Dict[str, Any] = {"active": command.active, "backend": command.backend}
+    if command.warning:
+        result["warning"] = command.warning
+    return result
 
 
 def _parse_duckduckgo_html(html_text: str, max_results: int) -> List[Dict[str, str]]:
@@ -124,18 +134,17 @@ def _import_monorepo_attr(module_path: str, attr: str):
     return None
 
 
-def _get_shared_mcp_bridge():
-    """Load the monorepo MCP bridge, if a tamgpt6 checkout is co-located.
-
-    Returns None otherwise -- see _import_monorepo_attr's docstring.
-    """
-    get_mcp_bridge = _import_monorepo_attr("tier_viii_infrastructure.mcp.orchestrator_bridge", "get_mcp_bridge")
-    return get_mcp_bridge() if get_mcp_bridge is not None else None
+def _get_shared_mcp_bridge(workspace_root: str | None = None):
+    """Return Tamfis Code's standalone MCP client bridge."""
+    from .mcp_client import StandaloneMCPBridge
+    return StandaloneMCPBridge(workspace_root)
 
 
 def get_browser_tool_class():
-    """Load BrowserTool, if a tamgpt6 checkout is co-located, else None."""
-    return _import_monorepo_attr("tier_iv_orchestration.tools.browser_tool", "BrowserTool")
+    """Return tamfis-code's portable Playwright browser implementation."""
+    from .browser import PortableBrowserTool
+
+    return PortableBrowserTool
 
 
 # Directory names never descended into or enumerated by list_directory/
@@ -259,6 +268,7 @@ class MCPServer:
         transaction_id: Optional[str] = None,
         attachment_paths: Optional[List[str]] = None,
         allowed_workspace_roots: Optional[List[str]] = None,
+        sandbox_policy: Optional[SandboxPolicy] = None,
     ):
         # workspace_root/session_id are optional so existing callers that
         # construct MCPServer() with no arguments (tests, the `tools`/
@@ -299,6 +309,10 @@ class MCPServer:
         self._console = console
         self._renderer = renderer
         self._interactive = interactive
+        # None preserves the low-level MCPServer test/debug API. The real
+        # agent runtime always supplies the configured policy.
+        self.sandbox_policy = sandbox_policy
+        self._external_mcp = _get_shared_mcp_bridge(workspace_root)
         # Per-server, per-root temporary indexes keep find_references
         # incremental across repeated calls without writing cache files into
         # either the user's repository or home directory. TemporaryDirectory
@@ -306,6 +320,8 @@ class MCPServer:
         self._symbol_index_dirs: Dict[str, tempfile.TemporaryDirectory] = {}
         self.tools: Dict[str, ToolDefinition] = {}
         self._register_default_tools()
+        from .plugins import register_plugin_tools
+        self.plugins = register_plugin_tools(self)
     
     def _register_default_tools(self):
         """Register default tools"""
@@ -441,6 +457,47 @@ class MCPServer:
         )
 
         self.register_tool(
+            name="create_artifact",
+            description=(
+                "Create a real DOCX, XLSX, PPTX, or PDF file inside the workspace. "
+                "Use this for reports, spreadsheets, presentations, proposals, manuals, "
+                "and other deliverables instead of writing fake text with an Office extension."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Output path ending in .docx, .xlsx, .pptx, or .pdf"},
+                    "format": {"type": "string", "enum": ["docx", "xlsx", "pptx", "pdf"]},
+                    "content": {
+                        "type": "object",
+                        "description": (
+                            "Structured content. DOCX/PDF: title + sections[{heading,content}]. "
+                            "XLSX: sheets[{name,rows,header,freeze_panes}]. PPTX: title/subtitle + "
+                            "slides[{title,body or bullets}]."
+                        ),
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["path", "format", "content"],
+            },
+            handler=self._create_artifact,
+        )
+
+        self.register_tool(
+            name="inspect_artifact",
+            description="Extract structured text and metadata from a DOCX, XLSX, PPTX, or PDF artifact.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Artifact path in the workspace or an exact attachment path"},
+                    "max_chars": {"type": "integer", "description": "Maximum extracted text characters (default 30000)"},
+                },
+                "required": ["path"],
+            },
+            handler=self._inspect_artifact,
+        )
+
+        self.register_tool(
             name="execute_command",
             description=(
                 "Execute a shell command. To run it in a subdirectory, pass cwd -- "
@@ -467,6 +524,14 @@ class MCPServer:
                         "type": "string",
                         "enum": ["bash", "sh"],
                         "description": "Shell used to execute the command"
+                    },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"],
+                        "description": (
+                            "Use the configured sandbox, or request explicit human approval "
+                            "to run without it. Never escalate silently."
+                        ),
                     },
                     "approval_metadata": {"type": "object", "description": "Caller approval/audit metadata"}
                 },
@@ -646,9 +711,7 @@ class MCPServer:
         bridge = None
         owns_bridge = False
         try:
-            bridge = _get_shared_mcp_bridge()
-            if bridge is None:
-                raise RuntimeError("Shared MCP bridge unavailable outside a monorepo checkout")
+            bridge = self._external_mcp
             if not bridge.available:
                 owns_bridge = True
                 await bridge.initialize(background=False)
@@ -657,7 +720,7 @@ class MCPServer:
         except Exception as exc:
             tools.append({
                 "name": "shared_mcp",
-                "description": f"Shared MCP registry unavailable: {exc}",
+                "description": f"External MCP registry unavailable: {exc}",
                 "parameters": {},
                 "available": False,
             })
@@ -668,6 +731,27 @@ class MCPServer:
             if owns_bridge and bridge is not None:
                 await bridge.shutdown()
         return tools
+
+    async def external_tool_schemas_openai(self) -> List[Dict[str, Any]]:
+        """Discover configured external MCP tools and keep sessions alive for this turn."""
+        if not self._external_mcp.servers:
+            return []
+        if not self._external_mcp.available:
+            await self._external_mcp.initialize(background=False)
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                },
+            }
+            for tool in await self._external_mcp.list_tools()
+        ]
+
+    async def shutdown(self) -> None:
+        await self._external_mcp.shutdown()
     
     async def call_tool(
         self, name: str, parameters: Dict[str, Any], *, extra_kwargs: Optional[Dict[str, Any]] = None,
@@ -685,9 +769,7 @@ class MCPServer:
             bridge = None
             owns_bridge = False
             try:
-                bridge = _get_shared_mcp_bridge()
-                if bridge is None:
-                    raise RuntimeError("Shared MCP bridge unavailable outside a monorepo checkout")
+                bridge = self._external_mcp
                 if not bridge.available:
                     owns_bridge = True
                     await bridge.initialize(background=False)
@@ -703,7 +785,7 @@ class MCPServer:
                 }
             except Exception as exc:
                 return {
-                    "error": f"Shared MCP tool unavailable: {exc}",
+                    "error": f"External MCP tool unavailable: {exc}",
                     "tool": name,
                     "source": "shared_mcp",
                     "success": False,
@@ -1186,6 +1268,30 @@ class MCPServer:
             "path": str(output), "filename": output.name, "size_bytes": output.stat().st_size,
             "file_count": len(files), "artifact_type": "archive",
         }
+
+    async def _create_artifact(self, path: str, format: str, content: Dict[str, Any]) -> Dict[str, Any]:
+        from .artifacts import create_artifact
+        target = self._resolve_in_workspace(path)
+        existed = target.exists()
+        result = create_artifact(target, format, content if isinstance(content, dict) else {})
+        if self.session_id is not None:
+            from .safety import record_mutation
+            record_mutation(
+                self.session_id, path=str(target), operation="update" if existed else "create",
+                original_content=None, new_content=None, transaction_id=self.transaction_id,
+            )
+        return result
+
+    async def _inspect_artifact(self, path: str, max_chars: int = 30_000) -> Dict[str, Any]:
+        from .artifacts import inspect_artifact
+        source = self._resolve_readable_input(path)
+        if not source.is_file():
+            return {"success": False, "error": f"Artifact not found: {path}"}
+        try:
+            limit = min(max(int(max_chars), 1_000), 100_000)
+        except (TypeError, ValueError):
+            limit = 30_000
+        return inspect_artifact(source, max_chars=limit)
     
     async def _kill_process_group(self, proc: "asyncio.subprocess.Process") -> None:
         # Kill the whole process group (the shell was started with
@@ -1205,6 +1311,7 @@ class MCPServer:
     async def _execute_command(
         self, command: str, cwd: Optional[str] = None, timeout: int = 60,
         environment: Optional[Dict[str, str]] = None, shell: str = "bash",
+        sandbox_permissions: str = "use_default",
         approval_metadata: Optional[Dict[str, Any]] = None,
         background_signal: Optional[asyncio.Event] = None,
     ) -> Dict[str, Any]:
@@ -1260,6 +1367,8 @@ class MCPServer:
             }
         if shell not in {"bash", "sh"}:
             return {"error": f"Unsupported shell: {shell}", "success": False}
+        if sandbox_permissions not in {"use_default", "require_escalated"}:
+            return {"error": f"Unsupported sandbox permission: {sandbox_permissions}", "success": False}
         env = os.environ.copy()
         # Same bug class as the timeout fix above: `environment: Optional[
         # Dict[str, str]]` is only a type hint. Live-reported crash --
@@ -1271,8 +1380,18 @@ class MCPServer:
         if isinstance(environment, dict):
             env.update({str(k): str(v) for k, v in environment.items()})
         try:
+            sandbox_command = None
+            argv = (shell, "-lc", command)
+            if self.sandbox_policy is not None and self.workspace_root:
+                sandbox_command = build_sandbox_command(
+                    command=command, shell=shell, cwd=run_dir,
+                    workspace_root=Path(self.workspace_root).expanduser().resolve(),
+                    policy=self.sandbox_policy,
+                    require_escalated=sandbox_permissions == "require_escalated",
+                )
+                argv = sandbox_command.argv
             proc = await asyncio.create_subprocess_exec(
-                shell, "-lc", command,
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 cwd=str(run_dir), env=env,
@@ -1289,7 +1408,8 @@ class MCPServer:
                         "stdout": stdout.decode('utf-8', errors='ignore'),
                         "stderr": stderr.decode('utf-8', errors='ignore'),
                         "return_code": proc.returncode,
-                        "success": proc.returncode == 0
+                        "success": proc.returncode == 0,
+                        "sandbox": _sandbox_result(sandbox_command),
                     }
                 except asyncio.TimeoutError:
                     # asyncio.wait_for only cancels the communicate() task on
@@ -1318,7 +1438,8 @@ class MCPServer:
                     "stdout": stdout.decode('utf-8', errors='ignore'),
                     "stderr": stderr.decode('utf-8', errors='ignore'),
                     "return_code": proc.returncode,
-                    "success": proc.returncode == 0
+                    "success": proc.returncode == 0,
+                    "sandbox": _sandbox_result(sandbox_command),
                 }
             if background_wait in done:
                 job_id = uuid.uuid4().hex[:12]
@@ -1331,6 +1452,7 @@ class MCPServer:
                 asyncio.ensure_future(_watch_background_job(job))
                 return {
                     "success": True, "backgrounded": True, "job_id": job_id,
+                    "sandbox": _sandbox_result(sandbox_command),
                     "message": (
                         f"Moved to the background as job {job_id} -- it keeps running. "
                         "Continue with other work now; call read_background_job with this "
@@ -1421,7 +1543,7 @@ class MCPServer:
         """
         browser_tool = get_browser_tool_class()
         if browser_tool is None:
-            raise RuntimeError("BrowserTool unavailable outside a monorepo checkout")
+            raise RuntimeError("Portable browser support is unavailable")
         result = await browser_tool().execute_async(**parameters)
         if not result.get("success"):
             raise RuntimeError(str(result.get("error") or "Browser action failed"))

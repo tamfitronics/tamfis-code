@@ -154,9 +154,9 @@ class LoadConfigTests(unittest.TestCase):
             del os.environ["TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION"]
         self.assertTrue(cfg.enable_subagent_delegation)
 
-    def test_default_backend_defaults_to_auto(self):
+    def test_default_backend_defaults_to_standalone(self):
         cfg = config_module.load_config()
-        self.assertEqual(cfg.default_backend, "auto")
+        self.assertEqual(cfg.default_backend, "standalone")
 
     def test_default_backend_set_via_config_file(self):
         config_module.USER_CONFIG_PATH.write_text('default_backend = "remote"\n')
@@ -167,7 +167,7 @@ class LoadConfigTests(unittest.TestCase):
     def test_default_backend_invalid_value_in_config_file_is_ignored(self):
         config_module.USER_CONFIG_PATH.write_text('default_backend = "cloud"\n')
         cfg = config_module.load_config()
-        self.assertEqual(cfg.default_backend, "auto")
+        self.assertEqual(cfg.default_backend, "standalone")
 
     def test_default_backend_set_via_env_var(self):
         os.environ["TAMFIS_CODE_DEFAULT_BACKEND"] = "remote"

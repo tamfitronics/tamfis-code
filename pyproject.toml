@@ -1,8 +1,10 @@
 [project]
 name = "tamfis-code"
-version = "1.4.2"
+version = "1.5.0"
 description = "TamfisGPT Code -- portable subscription-backed terminal coding agent with local tools, PTY, plans, queues, and approvals"
 readme = "README.md"
+license = "LicenseRef-Proprietary"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = [
     "click>=8.1",
@@ -21,7 +23,17 @@ dependencies = [
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "websockets>=13",
+    "playwright>=1.50",
+    "python-docx>=1.1",
+    "openpyxl>=3.1",
+    "python-pptx>=1.0",
+    "reportlab>=4.2",
+    "pypdf>=5.0",
 ]
+
+[project.entry-points."tamfis_code.plugins"]
+# Third-party packages may register plugin factory callables in this group.
+# The runtime discovers them without importing a TamfisGPT server checkout.
 
 [project.scripts]
 tamfis-code = "tamfis_code.cli:main"

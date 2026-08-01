@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 from .api_client import RemoteAPIClient
 from . import state as local_state
-from .config import load_config
+from .config import CONFIG_DIR, load_config
 
 REUSABLE_STATUSES = {"idle", "active"}
 
@@ -40,7 +40,7 @@ def scratch_root(session_id: int) -> Path:
     root.mkdir(parents=True, exist_ok=True)
     return root
 INSTRUCTION_NAMES = {
-    "AGENTS.md", "CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis",
+    "AGENTS.override.md", "AGENTS.md", "CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis",
     "CONTRIBUTING.md", "README.md",
 }
 REPORT_RE = re.compile(
@@ -58,6 +58,65 @@ DISPOSABLE_UNTRACKED_PARTS = {
     ".tox", ".nox", ".coverage", "htmlcov", ".DS_Store",
 }
 MAX_INDEX_FILES = 20_000
+
+
+def _instruction_chain(repository_root: Path, working_directory: Path) -> list[Path]:
+    """Return applicable instructions in broad-to-specific precedence order.
+
+    AGENTS files follow Codex semantics: an override wins over AGENTS.md in
+    the same directory, and only directories from the repository root down
+    to the active working directory participate. Tamfis/Claude compatibility
+    files are layered over that same path. Repository overview documents are
+    root-scoped so a README in an unrelated package is never treated as an
+    instruction for the current task.
+    """
+    root = repository_root.resolve()
+    cwd = working_directory.resolve()
+    try:
+        relative = cwd.relative_to(root)
+    except ValueError:
+        relative = Path()
+
+    directories = [root]
+    cursor = root
+    for part in relative.parts:
+        cursor /= part
+        directories.append(cursor)
+
+    result: list[Path] = []
+
+    # Installation-wide guidance uses Tamfis' platform-native config home.
+    global_override = CONFIG_DIR / "AGENTS.override.md"
+    global_agents = CONFIG_DIR / "AGENTS.md"
+    global_choice = global_override if global_override.is_file() else global_agents
+    if global_choice.is_file():
+        result.append(global_choice)
+
+    for directory in directories:
+        override = directory / "AGENTS.override.md"
+        agents = directory / "AGENTS.md"
+        chosen = override if override.is_file() else agents
+        if chosen.is_file():
+            result.append(chosen)
+        for name in ("CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis"):
+            candidate = directory / name
+            if candidate.is_file():
+                result.append(candidate)
+        if directory == root:
+            for name in ("CONTRIBUTING.md", "README.md"):
+                candidate = directory / name
+                if candidate.is_file():
+                    result.append(candidate)
+
+    # Resolve aliases without changing precedence.
+    deduplicated: list[Path] = []
+    seen: set[Path] = set()
+    for path in result:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            deduplicated.append(resolved)
+    return deduplicated
 
 MANIFEST_LANGUAGE_MAP = {
     "package.json": ("JavaScript/TypeScript", "npm"),
@@ -997,24 +1056,27 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
     head = _git(root, "rev-parse", "HEAD") or "no-head"
     dirty_lines = _git(root, "status", "--short").splitlines()
     fingerprint_inputs = [str(root), head, *dirty_lines]
-    for name in sorted(set(MANIFEST_LANGUAGE_MAP) | INSTRUCTION_NAMES):
+    for name in sorted(MANIFEST_LANGUAGE_MAP):
         path = root / name
         if path.is_file():
             try:
                 fingerprint_inputs.append(f"{name}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
             except OSError:
                 pass
+    instruction_paths = _instruction_chain(root, workspace_root)
+    for path in instruction_paths:
+        try:
+            fingerprint_inputs.append(f"instruction:{path}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+        except OSError:
+            pass
     fingerprint = hashlib.sha256("|".join(fingerprint_inputs).encode()).hexdigest()
     current = local_state.get_session_state(session_id)
     if not force and current.discovery_fingerprint == fingerprint and current.repository_context:
         return current.repository_context
 
     files = _indexable_files(root)
-    instructions: list[str] = []
     reports: list[dict[str, Any]] = []
     for path in files:
-        if path.name in INSTRUCTION_NAMES:
-            instructions.append(str(path))
         if path.suffix.lower() in REPORT_SUFFIXES and REPORT_RE.search(path.name):
             try:
                 modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
@@ -1030,7 +1092,7 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
         "branch": branch, "head": None if head == "no-head" else head,
         "dirty": bool(dirty_lines), "dirty_files": dirty_lines[:100],
         "blocking_dirty_files": blocking_dirty_files(dirty_lines)[:100],
-        "instruction_files": sorted(instructions), "indexed_file_count": len(files),
+        "instruction_files": [str(path) for path in instruction_paths], "indexed_file_count": len(files),
         "indexed_at": datetime.now(timezone.utc).isoformat(),
         **_project_metadata(root, files),
     }
@@ -1046,7 +1108,7 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
 # Total instruction-file content budget for the system prompt -- generous
 # enough for a real AGENTS.md/CLAUDE.md, bounded so a huge README doesn't
 # blow the context window before the actual objective is even sent.
-MAX_INSTRUCTION_CHARS = 12_000
+MAX_INSTRUCTION_CHARS = 32 * 1024
 
 
 def build_system_prompt(session_id: int, workspace_root: Path, *, force_discovery: bool = False) -> str:

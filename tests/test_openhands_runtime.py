@@ -9,7 +9,7 @@ from tamfis_code.openhands.conversation import ConversationManager, Conversation
 from tamfis_code.openhands.events import EventKind, EventStore
 from tamfis_code.openhands.leases import LeaseManager
 from tamfis_code.openhands.security import SecretVault, SecurityAnalyzer
-from tamfis_code.openhands.skills import SkillRegistry
+from tamfis_code.openhands.skills import SkillRegistry, skill_prompt, workspace_skill_registry
 from tamfis_code.openhands.tools import default_registry
 from tamfis_code.openhands.workspace import LocalWorkspace, WorkspaceError
 
@@ -65,6 +65,25 @@ def test_skills_load_from_project_tree(tmp_path: Path):
     skills = registry.load()
     assert skills["debug-ci"].required_tools == ("terminal", "read_file")
     assert registry.match("fix the CI tests")[0].name == "debug-ci"
+
+
+def test_workspace_skills_support_claude_codex_and_tamfis_precedence(tmp_path: Path):
+    for directory, text in (
+        (tmp_path / ".claude" / "skills" / "review", "Claude instructions"),
+        (tmp_path / ".codex" / "skills" / "review", "Codex instructions"),
+        (tmp_path / ".tamfis" / "skills" / "review", "Tamfis project instructions"),
+    ):
+        directory.mkdir(parents=True)
+        (directory / "SKILL.md").write_text(
+            f"---\nname: review\ndescription: Review code safely\ntags: review, security\n---\n{text}"
+        )
+    registry = workspace_skill_registry(tmp_path)
+    registry.load()
+    assert registry.get("review").instructions == "Tamfis project instructions"
+    prompt = skill_prompt(tmp_path, "please review security")
+    assert "Matched skill instructions" in prompt
+    assert "Tamfis project instructions" in prompt
+    assert "Claude instructions" not in prompt
 
 
 def test_conversation_lifecycle_and_events(tmp_path: Path):

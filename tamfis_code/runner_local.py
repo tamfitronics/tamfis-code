@@ -56,11 +56,13 @@ from .orchestrator import (
     parse_reasoning_plan,
     should_plan,
 )
+from .orchestrator.validator import verified_no_change_completion
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
+from .sandbox import SandboxPolicy
 from .workspace import classify_root, detect_validation_commands, scratch_root
 from .workspace_access import ensure_workspace_access
 from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
@@ -319,6 +321,8 @@ _SCOPE_PATH_TOOLS = {
     "list_directory",
     "search_code",
     "get_git_info",
+    "create_artifact",
+    "inspect_artifact",
 }
 
 
@@ -3898,12 +3902,19 @@ async def _run_local_agent_turn_impl(
     # later be reverted together (safety.revert_transaction) instead of
     # one mutation_id at a time with no way to discover which ids
     # belonged to the same turn.
+    effective_config = cli_config or Config()
     mcp_server = MCPServer(
         workspace_root=workspace_root, session_id=session_id,
         console=console, renderer=renderer, interactive=interactive,
         transaction_id=f"turn_{uuid.uuid4().hex[:12]}",
         attachment_paths=list(attachment_paths),
         allowed_workspace_roots=list(prior_state.allowed_workspaces or [workspace_root]),
+        sandbox_policy=SandboxPolicy(
+            mode=effective_config.sandbox_mode,
+            network_access=effective_config.sandbox_network_access,
+            writable_roots=tuple(effective_config.sandbox_writable_roots),
+            fail_if_unavailable=effective_config.sandbox_fail_if_unavailable,
+        ),
     )
     # Read fresh once per turn (not cached across turns/process lifetime) so
     # editing hooks.toml takes effect on the next turn without a restart.
@@ -3933,7 +3944,7 @@ async def _run_local_agent_turn_impl(
             if recovered_objective else incoming_objective
         )
     )
-    _turn_budget_config = cli_config or Config()
+    _turn_budget_config = effective_config
     orchestrator = AgentOrchestrator(
         session_id=session_id, workspace_root=workspace_root, emit=renderer.handle_event,
         budgets=RuntimeBudgets(
@@ -3949,6 +3960,13 @@ async def _run_local_agent_turn_impl(
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
     )
+    if tools:
+        plugin_tool_names = [
+            str(tool.get("name")) for plugin in mcp_server.plugins for tool in plugin.tools
+            if tool.get("name") in mcp_server.tools
+        ]
+        tools.extend(mcp_server.tool_schemas_openai(names=plugin_tool_names))
+        tools.extend(await mcp_server.external_tool_schemas_openai())
     # retrieve_evidence and read_background_job are both always safe (local,
     # read-only lookups by id) and only useful once a rollover/backgrounded
     # command has actually happened; offering them whenever any other tool
@@ -4362,7 +4380,15 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
-        elif not read_only and not any_mutation and _looks_like_change_request(_latest_user_text(messages)):
+        elif (
+            not read_only
+            and not any_mutation
+            and _looks_like_change_request(_latest_user_text(messages))
+            and not verified_no_change_completion(
+                tool_records=[item.to_dict() for item in (orchestrator.run.tool_records if orchestrator.run else [])],
+                final_text=content,
+            )
+        ):
             caveat = (
                 "\n\n⚠ No files were changed during this task, despite the request "
                 "asking for a fix/change. The response above may describe an edit "
@@ -5961,7 +5987,7 @@ async def _run_local_agent_turn_impl(
                         "content": f"Hook feedback after {tc.name}: {hook_result.message}",
                     })
 
-            if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive"} and result.get("success"):
+            if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"} and result.get("success"):
                 any_mutation = True
                 # A further edit after a clean verify run invalidates that
                 # result -- require re-verifying against the latest code,

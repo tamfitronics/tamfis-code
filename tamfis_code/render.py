@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import sys
 import re
 import textwrap
 import time
@@ -298,6 +299,8 @@ _TOOL_CATEGORY = {
     "edit_file": ("Editing", "file", "files"),
     "extract_archive": ("Extracting", "archive", "archives"),
     "repackage_archive": ("Repackaging", "archive", "archives"),
+    "create_artifact": ("Creating", "artifact", "artifacts"),
+    "inspect_artifact": ("Inspecting", "artifact", "artifacts"),
     "get_git_info": ("Reading", "Git repository", "Git repositories"),
     "web_search": ("Searching", "web query", "web queries"),
 }
@@ -1372,6 +1375,43 @@ class StreamRenderer:
         if self._live is not None:
             self._live.stop()
             self._live = None
+
+
+class StructuredRenderer:
+    """Machine-readable event renderer for CI, editors, and orchestration."""
+
+    def __init__(self, *, mode: str = "jsonl", stream: Any = None):
+        self.mode = mode
+        self.stream = stream or sys.stdout
+        self.events: list[dict[str, Any]] = []
+        self.background_requested = asyncio.Event()
+        self.streamed_final_text = False
+
+    def handle_event(self, event: dict[str, Any]) -> None:
+        event_type = event.get("event_type") or event.get("event") or event.get("type")
+        if event_type == "assistant_delta" and (event.get("payload") or {}).get("content"):
+            self.streamed_final_text = True
+        clean = json.loads(json.dumps(event, default=str, ensure_ascii=False))
+        if self.mode == "jsonl":
+            self.stream.write(json.dumps(clean, ensure_ascii=False) + "\n")
+            self.stream.flush()
+        else:
+            self.events.append(clean)
+
+    def record_outcome(self, outcome: Any) -> None:
+        self.handle_event({
+            "event_type": "outcome",
+            "payload": {
+                "status": getattr(outcome, "status", "unknown"),
+                "summary": getattr(outcome, "summary", None),
+                "error": getattr(outcome, "error", None),
+            },
+        })
+
+    def finish(self) -> None:
+        if self.mode == "json":
+            self.stream.write(json.dumps({"events": self.events}, ensure_ascii=False) + "\n")
+            self.stream.flush()
 
 
 def suspend_live_if_active(renderer: Any) -> None:

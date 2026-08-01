@@ -269,6 +269,7 @@ class AgentOrchestrator:
             profile=self.run.profile,
             tool_records=[item.to_dict() for item in self.run.tool_records],
             any_mutation=any_mutation, final_text=final_text,
+            objective=self.run.objective, workspace_root=self.workspace_root,
         )
         if (
             self.run.reasoning_plan

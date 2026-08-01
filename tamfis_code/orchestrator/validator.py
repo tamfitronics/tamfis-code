@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 import re
 from typing import Any
+from pathlib import Path
 
 from ..routing import TaskProfile, TaskType
 
@@ -39,6 +40,60 @@ _UNSUPPORTED_INSPECTION_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+_VERIFIED_NO_CHANGE_RE = re.compile(
+    r"\b(?:"
+    r"(?:issue|error|bug|failure|problem)\s+(?:is|was|has\s+been)\s+"
+    r"(?:now\s+)?(?:already\s+)?(?:fixed|resolved|working)|"
+    r"already\s+(?:fixed|resolved|implemented|correct|present|working)|"
+    r"no\s+(?:code|file|source)?\s*changes?\s+(?:were\s+)?(?:needed|required|necessary)|"
+    r"(?:fix|change|implementation|conflict\s+clause)\s+(?:is|was)\s+already\s+"
+    r"(?:present|applied|deployed|correct)|"
+    r"running\s+(?:server|service|deployment)\b[^.!?\n]{0,120}\b(?:correct|fixed|resolved)"
+    r")\b",
+    re.IGNORECASE,
+)
+
+_MUTATING_TOOLS = {
+    "write_file", "edit_file", "create_file", "patch_file",
+    "extract_archive", "repackage_archive",
+    "create_artifact",
+}
+
+_VALIDATION_EVIDENCE_TOOLS = {
+    "execute_command", "get_git_info", "read_file", "search_code", "list_directory",
+}
+
+
+def verified_no_change_completion(
+    *, tool_records: list[dict[str, Any]], final_text: str,
+) -> bool:
+    """Accept a genuine evidence-backed no-op, not a narrated fake edit.
+
+    Coding agents sometimes discover that the requested fix is already in
+    the checked-out code and deployed runtime. Requiring a fresh mutation in
+    that case encourages meaningless file touches and turns a truthful
+    verification into a false failure. The exception is deliberately narrow:
+    the report must explicitly say no change was needed/already resolved,
+    inspection or validation must have succeeded, no mutating tool may have
+    been attempted, and the latest command (if any) must be green.
+    """
+    if not _VERIFIED_NO_CHANGE_RE.search(final_text or ""):
+        return False
+    if any(item.get("tool_name") in _MUTATING_TOOLS for item in tool_records):
+        return False
+    if not any(
+        item.get("tool_name") in _VALIDATION_EVIDENCE_TOOLS
+        and item.get("success") is True
+        for item in tool_records
+    ):
+        return False
+    commands = [item for item in tool_records if item.get("tool_name") == "execute_command"]
+    if commands:
+        latest = commands[-1]
+        if latest.get("success") is not True or latest.get("exit_code") not in (None, 0):
+            return False
+    return True
+
 
 def _claims_completed_inspection(final_text: str) -> bool:
     """Return True only for prose that asserts a real inspection occurred.
@@ -53,26 +108,57 @@ def _claims_completed_inspection(final_text: str) -> bool:
 
 def validate_completion(
     *, profile: TaskProfile, tool_records: list[dict[str, Any]],
-    any_mutation: bool, final_text: str,
+    any_mutation: bool, final_text: str, objective: str = "", workspace_root: str = "",
 ) -> ValidationReport:
     checks: list[dict[str, Any]] = []
     unresolved: list[str] = []
     successful_tools = [item for item in tool_records if item.get("success") is True]
+    verified_no_change = verified_no_change_completion(
+        tool_records=tool_records, final_text=final_text,
+    )
     tool_evidence_passed = bool(successful_tools) or not profile.requires_tools
     checks.append({"name": "tool_evidence_recorded", "passed": tool_evidence_passed})
     if not tool_evidence_passed:
         unresolved.append("This task type requires tool evidence, but no successful tool call was recorded.")
 
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}:
-        checks.append({"name": "mutation_recorded", "passed": any_mutation})
-        if not any_mutation:
+        mutation_requirement_met = any_mutation or verified_no_change
+        checks.append({
+            "name": "mutation_recorded",
+            "passed": mutation_requirement_met,
+            "accepted_verified_no_change": verified_no_change,
+        })
+        if not mutation_requirement_met:
             unresolved.append("The request required a code change, but no successful file mutation was recorded.")
 
+        # A successful transport response is not enough for a project build:
+        # every explicitly requested output path must exist and be non-empty.
+        # This catches the common long-generation failure where a model builds
+        # the first few files in a supplied tree and then declares the whole
+        # theme/plugin complete.
+        expected_paths = _explicit_output_paths(objective)
+        if expected_paths and workspace_root:
+            root = Path(workspace_root).resolve()
+            missing: list[str] = []
+            for requested in expected_paths:
+                candidate = (root / requested).resolve()
+                if root not in candidate.parents and candidate != root:
+                    continue
+                try:
+                    valid = candidate.is_file() and candidate.stat().st_size > 0
+                except OSError:
+                    valid = False
+                if not valid:
+                    missing.append(requested)
+            checks.append({"name": "explicit_outputs_exist", "passed": not missing, "expected": expected_paths})
+            if missing:
+                unresolved.append("Explicitly requested output files are missing or empty: " + ", ".join(missing[:30]))
+
     if profile.requires_validation:
-        validation_tools = {
-            "execute_command", "get_git_info", "read_file", "search_code", "list_directory",
-        }
-        validated = any(item.get("tool_name") in validation_tools and item.get("success") for item in tool_records)
+        validated = any(
+            item.get("tool_name") in _VALIDATION_EVIDENCE_TOOLS and item.get("success")
+            for item in tool_records
+        )
 
         # Verification is ordered evidence.  A later failed check/build must
         # invalidate an earlier successful command; otherwise a model can run
@@ -119,7 +205,11 @@ def validate_completion(
             for check in checks
         ):
             severity = "error"
-        if profile.task_type in {TaskType.EDIT, TaskType.DEBUG} and not any_mutation:
+        if (
+            profile.task_type in {TaskType.EDIT, TaskType.DEBUG}
+            and not any_mutation
+            and not verified_no_change
+        ):
             # A requested edit/debug task without a recorded file mutation is
             # not a completed task. Warnings used to flow through
             # orchestrator.complete(), causing the CLI to claim success after
@@ -132,3 +222,20 @@ def validate_completion(
             )
 
     return ValidationReport(passed, checks, unresolved, severity=severity)
+
+
+_OUTPUT_PATH_RE = re.compile(
+    r"(?<![\w./-])([\w.-]+(?:/[\w.@+-]+)+\.(?:php|css|scss|sass|js|jsx|ts|tsx|json|xml|yaml|yml|toml|md|txt|pot|po|mo|py|go|rs|java|rb|sh|html|htm|svg|png|jpe?g|webp|docx|xlsx|pptx|pdf))\b",
+    re.IGNORECASE,
+)
+
+
+def _explicit_output_paths(objective: str) -> list[str]:
+    paths: list[str] = []
+    for match in _OUTPUT_PATH_RE.finditer(objective or ""):
+        value = match.group(1).strip().replace("\\", "/")
+        if value.startswith(("http://", "https://")) or ".." in Path(value).parts:
+            continue
+        if value not in paths:
+            paths.append(value)
+    return paths[:200]

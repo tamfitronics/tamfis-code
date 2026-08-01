@@ -27,8 +27,8 @@ RISK_READ_ONLY = "read_only"
 RISK_MEDIUM = "medium"
 RISK_DANGEROUS = "dangerous"
 
-READ_ONLY_TOOLS = {"read_file", "list_directory", "search_code", "find_references", "get_git_info", "ask_user_question"}
-MUTATING_FILE_TOOLS = {"write_file", "edit_file", "extract_archive", "repackage_archive"}
+READ_ONLY_TOOLS = {"read_file", "list_directory", "search_code", "find_references", "get_git_info", "ask_user_question", "inspect_artifact"}
+MUTATING_FILE_TOOLS = {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"}
 
 MAX_MUTATION_HISTORY = 200
 
@@ -213,6 +213,7 @@ def classify_tool_call_risk(name: str, arguments: dict[str, Any], *, workspace_r
         path_keys = {
             "extract_archive": ("destination", "path"),
             "repackage_archive": ("output_path", "source_dir"),
+            "create_artifact": ("path",),
         }.get(name, ("path",))
         paths = [str(arguments.get(key) or "") for key in path_keys]
         if not all(paths):
@@ -224,6 +225,8 @@ def classify_tool_call_risk(name: str, arguments: dict[str, Any], *, workspace_r
         risks = [classify_path_risk(path, workspace_root) for path in paths]
         return RISK_DANGEROUS if RISK_DANGEROUS in risks else RISK_MEDIUM
     if name == "execute_command":
+        if arguments.get("sandbox_permissions") == "require_escalated":
+            return RISK_DANGEROUS
         return classify_command_risk(str(arguments.get("command") or ""))
     if name == "browser":
         return RISK_MEDIUM
