@@ -522,8 +522,8 @@ class StandalonePtyAndDoctorTests(_StatePatchMixin, unittest.TestCase):
 
     def test_doctor_shows_provider_status_table(self):
         output = _run(["/doctor", EOFError()])
-        self.assertIn("PROVIDER", output)
-        self.assertIn("CONFIGURED", output)
+        self.assertIn("TamfisGPT model service", output)
+        self.assertNotIn("nvidia", output.lower())
 
 
 class StandaloneAiDispatchTests(_StatePatchMixin, unittest.TestCase):

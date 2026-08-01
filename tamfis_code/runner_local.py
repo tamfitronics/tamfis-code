@@ -1387,23 +1387,25 @@ async def _ask_provider_fallback_approval(
     explicit negative answer still preserves the failure for the user to
     inspect or resume later.
     """
+    from .public_identity import public_model_name
+
     choice_text = ""
     if choices:
-        choice_text = "\nAvailable routes:\n" + "\n".join(
-            f"  {index}. {provider.value} / {model}"
-            for index, (provider, model) in enumerate(choices, start=1)
+        choice_text = "\nAvailable TamfisGPT models:\n" + "\n".join(
+            f"  {index}. {public_model_name(model)}"
+            for index, (_provider, model) in enumerate(choices, start=1)
         ) + "\n"
     prompt = (
-        f"Ollama Cloud failed while it was the premium primary route. Switch "
-        f"from {failed_provider.value} to the best available coding provider? "
-        "[Y/n] or enter a route number/provider/model "
+        "The selected TamfisGPT model is temporarily unavailable. Switch "
+        "to the best available TamfisGPT model? "
+        "[Y/n] or enter a model number "
         f"(auto-switching in {PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS} seconds): "
     )
     if choice_text:
         console.print(choice_text, end="")
     console.print(
-        "[yellow]Ollama Cloud is unavailable for this turn.[/yellow] "
-        f"Provider fallback requires approval; no response after {PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS} seconds will continue automatically."
+        "[yellow]The selected TamfisGPT model is unavailable for this turn.[/yellow] "
+        f"Model fallback requires approval; no response after {PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS} seconds will continue automatically."
     )
     if not interactive:
         return "timeout"
@@ -1420,7 +1422,7 @@ async def _ask_provider_fallback_approval(
             timeout=PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        console.print("[dim]No response after 30 seconds; selecting the best available coding provider.[/dim]")
+        console.print("[dim]No response after 30 seconds; selecting the best available TamfisGPT model.[/dim]")
         return "timeout"
     except (EOFError, KeyboardInterrupt):
         return "deny"
@@ -4131,16 +4133,9 @@ async def _run_local_agent_turn_impl(
         resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
         config = manager.PROVIDERS.get(resolved_provider)
     client = manager.get_client(resolved_provider)
-    if provider == ProviderType.AUTO and not _paid_provider_fallback_enabled(manager):
-        renderer.handle_event({
-            "event_type": "diagnostics",
-            "payload": {
-                "content": (
-                    f"Automatic routing selected {resolved_provider.value}; "
-                    "safe/free fallback only is enabled. Paid routes require an explicit --provider."
-                ),
-            },
-        })
+    # Automatic route policy is an internal deployment concern.  Do not emit
+    # backend names, billing topology, or provider-selection instructions to
+    # the user; the model_selected event exposes only the TamfisGPT alias.
     if not client or config is None:
         if (
             provider == ProviderType.AUTO
@@ -4186,7 +4181,14 @@ async def _run_local_agent_turn_impl(
         if provider == ProviderType.AUTO and not _paid_provider_fallback_enabled(manager)
         else _select_model(manager, config, task_profile)
     )
-    resolved_model = model or selected_default_model
+    from .public_identity import resolve_public_model_alias
+
+    resolved_model = resolve_public_model_alias(
+        model,
+        models=getattr(config, "models", ()),
+        default_model=selected_default_model,
+        free_model=getattr(config, "free_model", None),
+    ) or selected_default_model
     configured_models = set(getattr(config, "models", None) or [])
     if (resumed_from_checkpoint or resumed_from_legacy) and model and configured_models and model not in configured_models:
         renderer.handle_event({

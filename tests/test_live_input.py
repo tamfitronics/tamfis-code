@@ -81,7 +81,8 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         rendered = "".join(text for _style, text in fragments)
 
         self.assertIn("ready", rendered)
-        self.assertIn("ollama_cloud/kimi", rendered)
+        self.assertIn("TamfisGPT Code", rendered)
+        self.assertNotIn("ollama", rendered.lower())
         self.assertIn("⏵⏵ manual", rendered)
         self.assertIn("shift+tab", rendered)
 

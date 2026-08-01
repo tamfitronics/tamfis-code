@@ -20,6 +20,7 @@ from . import state as local_state
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .config import Config, load_credentials
 from .providers import get_provider_status
+from .public_identity import redact_routing_text
 from .workspace import resolve_local_workspace
 from .runtime.journal import JOURNAL_PATH, recent_failures
 
@@ -128,17 +129,12 @@ def _diagnose_local_providers() -> list[CheckResult]:
     for name, info in status["config"].items():
         configured = bool(info.get("api_key_set")) or name == "tier_iv"
         any_configured = any_configured or configured
-        results.append(CheckResult(
-            f"Local provider: {name}",
-            "PASS" if configured else "WARNING",
-            info.get("key_preview") or ("not configured" if not configured else ""),
-        ))
     if any_configured:
-        results.append(CheckResult("Local automatic routing", "PASS", f"would select: {status['default']}"))
+        results.append(CheckResult("TamfisGPT model service", "PASS", "automatic model selection is ready"))
     else:
         results.append(CheckResult(
-            "Local automatic routing", "FAIL",
-            "no provider configured -- set HF_TOKEN / NVIDIA_API_KEY / OPENROUTER_API_KEY",
+            "TamfisGPT model service", "FAIL",
+            "not configured on this installation; contact the administrator",
         ))
     return results
 
@@ -278,7 +274,7 @@ async def run_doctor(
         # actually proves the whole chain, which `doctor` deliberately does
         # not do (it would create session/task rows as a side effect of a
         # health check).
-        results.append(CheckResult("Tier IV (agent runtime)", "WARNING", "not directly probed -- verified indirectly via a real `tamfis-code ask`"))
+        results.append(CheckResult("TamfisGPT agent runtime", "WARNING", "verified when a real `tamfis-code ask` is run"))
 
         if session_id is not None:
             results.extend(await _diagnose_session(client, session_id, workspace_root))
@@ -288,6 +284,9 @@ async def run_doctor(
 
     for result in results:
         style = _STATUS_STYLE[result.status]
-        console.print(f"[{style}]{result.status:8}[/{style}] {result.name}  [dim]{result.detail}[/dim]")
+        console.print(
+            f"[{style}]{result.status:8}[/{style}] {result.name}  "
+            f"[dim]{redact_routing_text(result.detail)}[/dim]"
+        )
 
     return all(r.status != "FAIL" for r in results)

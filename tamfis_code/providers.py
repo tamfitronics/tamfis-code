@@ -1137,7 +1137,14 @@ class ProviderManager:
         if client is None:
             raise ValueError(f"Provider {resolved.value} is not available")
 
-        selected_model = model or (
+        from .public_identity import resolve_public_model_alias
+
+        selected_model = resolve_public_model_alias(
+            model,
+            models=config.models,
+            default_model=config.default_model,
+            free_model=config.free_model,
+        ) or (
             self.select_model(config, task_profile)
             if resolved == ProviderType.OLLAMA_CLOUD
             else (

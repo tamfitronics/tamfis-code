@@ -12,7 +12,7 @@ is installed. Admin subscriptions are an account/billing policy, not a
 requirement for installing or running the CLI.
 
 After `tamfis-code login`, the saved TamfisGPT credential unlocks
-subscription-backed inference in the standalone runtime. Provider routing,
+subscription-backed inference in the standalone runtime. Model routing,
 tools, approvals, shell execution, memory, and repository state stay inside
 the local `tamfis-code` process. Remote Workspace is a separate legacy mode
 that is selected only with `--remote` or `default_backend = "remote"`.
@@ -20,8 +20,9 @@ Login also applies a newer version already present in the configured Tamfis
 Code source checkout after credentials are saved; set
 `TAMFIS_CODE_AUTO_UPDATE=0` for centrally managed installations.
 
-The standalone runtime can also call Ollama Cloud, NVIDIA NIM, OpenRouter,
-or Hugging Face directly. `standalone` is the default runtime boundary.
+The standalone runtime uses TamfisGPT models. `standalone` is the default
+runtime boundary; model origins and routing topology are private deployment
+details and are never part of the CLI's public output contract.
 
 ## Install
 
@@ -35,8 +36,8 @@ from source, using a TamfisGPT tenancy, and the release process.
 ## Quick start
 
 ```
-export NVIDIA_API_KEY=...                          # or set OPENROUTER_API_KEY / HF_TOKEN
-tamfis-code doctor                                  # check provider connectivity
+tamfis-code login                                   # activate TamfisGPT models
+tamfis-code doctor                                  # check model-service connectivity
 tamfis-code ask "explain what this repo does"
 tamfis-code agent "add a health-check endpoint"     # full read/write/execute loop
 tamfis-code                                         # interactive REPL
@@ -65,21 +66,14 @@ The bridge reconnects automatically, replays unacknowledged results after a
 network interruption, and exposes only the selected workspace. Admin access
 is not required for ordinary entitled subscribers.
 
-## Providers
+## TamfisGPT models
 
-| Provider | Env var | Notes |
-|---|---|---|
-| NVIDIA NIM | `NVIDIA_API_KEY` | |
-| OpenRouter | `OPENROUTER_API_KEY` | |
-| Hugging Face | `HF_TOKEN` | |
-| TamfisGPT subscription API | `TAMFIS_API_KEY` | Optional standalone provider route; not needed for the logged-in Remote Workspace |
+Users select stable product aliases: **TamfisGPT Auto**, **TamfisGPT Fast**,
+**TamfisGPT Code**, **TamfisGPT Pro**, and **TamfisGPT Vision**. Use
+`/model list` in the interactive REPL, or pass `--model auto|fast|code|pro|vision`.
+TamfisGPT Auto is the default and chooses the appropriate model for the task.
 
-Select one explicitly with `--provider tamfis|hf|nvidia|openrouter`, or leave it
-as `auto` (default). Auto routes through eligible providers in
-capability-ranked order. The selected provider/model is printed at the
-start of every turn.
-
-Interrupted provider streams remain attached to the same task: clean partial
+Interrupted model streams remain attached to the same task: clean partial
 text is checkpointed to `.memory`, reconnects use visible 5/15/30-second
 backoff, and continuation output is de-duplicated. If all configured routes
 remain unavailable, the CLI reports an actionable error and retains the exact
@@ -197,7 +191,7 @@ or `--output-mode jsonl` for streaming events suitable for CI and editors.
 ## Declarative subagent types
 
 Give a delegated sub-task its own specialised system prompt (and,
-optionally, its own model/provider) instead of every `/delegate`/`/swarm`
+optionally, its own TamfisGPT model) instead of every `/delegate`/`/swarm`
 sub-objective sharing the same generic coding agent — Claude Code's
 `.claude/agents/*.md` equivalent. `~/.config/tamfis-code/agents/<name>.md`
 (every session) or `<project>/.tamfis/agents/<name>.md` (one project, and
@@ -207,14 +201,13 @@ it replaces a same-named user definition outright) becomes a `/delegate
 ```markdown
 ---
 description: Reviews code for bugs and security issues
-model: qwen/qwen3-coder
-provider: openrouter
+model: TamfisGPT Code
 ---
 You are a strict, terse code reviewer. Point out real bugs, security
 issues, and correctness problems only — skip style nits.
 ```
 
-`model`/`provider` are optional; omit either to use whatever the
+`model` is optional; omit it to use whatever the
 delegating call was already using. Run `/agent-types` to list what's
 loaded. The model itself can also pick a subagent type per sub-task when
 it calls `delegate_parallel_tasks` (each task entry may be `{"objective":
@@ -256,9 +249,8 @@ Tamfis-Code includes an integrated event-driven agent runtime under
 `tamfis_code.openhands`. It provides conversations, immutable event replay,
 local/SSH/remote workspaces, terminal/file/browser/Git tools, skills, security,
 secrets, snapshots, leases, multi-agent delegation, automations and a REST /
-WebSocket agent server. It runs without Docker and preserves the standalone
-provider order NVIDIA → OpenRouter → Hugging Face. Ollama is intentionally not
-included.
+WebSocket agent server. It runs without Docker and uses the same private
+TamfisGPT model-routing layer as the terminal client.
 
 Start the agent server:
 

@@ -621,7 +621,16 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
             with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
                 result = self.runner.invoke(cli, ["--cwd", tmp, "doctor"])
             fake_client.assert_not_called()
-        self.assertIn("PROVIDER", result.output)
+        self.assertIn("TamfisGPT model service", result.output)
+        self.assertNotIn("nvidia", result.output.lower())
+
+    def test_providers_table_has_one_status_column(self):
+        status = {"available": [{"name": "private-route"}]}
+        with patch("tamfis_code.providers.get_provider_status", return_value=status):
+            result = self.runner.invoke(cli, ["providers"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output.count("Status"), 1)
+        self.assertIn("TamfisGPT Auto", result.output)
 
     def test_doctor_reports_local_session_diagnostics_by_default(self):
         # `doctor` (no --remote) used to stop at the provider connectivity

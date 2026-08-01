@@ -19,6 +19,7 @@ from rich.console import Console
 
 from .local_tools import READ_ONLY_TOOL_SCHEMAS, LocalReadOnlyTools
 from .providers import ProviderManager, ProviderType
+from .public_identity import resolve_public_model_alias
 
 MAX_TOOL_ROUNDS = 5
 
@@ -70,7 +71,12 @@ async def _run_local_turn_impl(
         # concept) -- select_model(..., None) treats that as "not a
         # demanding task", which for OpenRouter means its free-tier model,
         # matching the same credit-saving default as the standalone loop.
-        resolved_model = model or manager.select_model(config, None)
+        resolved_model = resolve_public_model_alias(
+            model,
+            models=config.models,
+            default_model=config.default_model,
+            free_model=config.free_model,
+        ) or manager.select_model(config, None)
 
         kwargs: Dict[str, Any] = {}
         if tools_client is not None:

@@ -29,6 +29,13 @@ from rich.text import Text
 
 from . import __version__
 from .metrics import MetricsTracker
+from .public_identity import (
+    PUBLIC_PROVIDER_NAME,
+    public_model_name,
+    public_route_name,
+    redact_routing_text,
+    sanitize_public_event,
+)
 from .safety import redact_secrets
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
@@ -37,7 +44,7 @@ _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 # NVIDIA NIM, a raw model id like "glm-5.2:cloud"...) is internal routing
 # detail. TamfisGPT is the product; every place that would otherwise print
 # a raw provider/model id to the user prints this branded label instead.
-BRANDED_PROVIDER_LABEL = "TamfisGPT Cloud"
+BRANDED_PROVIDER_LABEL = PUBLIC_PROVIDER_NAME
 
 # Single source of truth for plan-step glyph/colour, shared by the transient
 # live spinner (_build_status) and the durable scrollback snapshot
@@ -459,7 +466,7 @@ def _format_diagnostics_line(payload: dict[str, Any]) -> str:
     elif reused is False:
         parts.append(f"context rescanned ({payload.get('rescan_reason') or 'unknown'})")
     if payload.get("provider") or payload.get("model"):
-        parts.append(BRANDED_PROVIDER_LABEL)
+        parts.append(public_route_name(payload.get("provider"), payload.get("model")))
     tool_calls = payload.get("tool_calls") or []
     if tool_calls:
         failed = sum(1 for tc in tool_calls if tc.get("success") is False)
@@ -1013,6 +1020,7 @@ class StreamRenderer:
         self.console.print(Panel(Group(*body), title="Task failed", border_style="red", expand=False))
 
     def handle_event(self, event: dict[str, Any]) -> None:
+        event = sanitize_public_event(event)
         event_type = event.get("event_type") or event.get("event") or event.get("type")
         payload = event.get("payload") or {}
 
@@ -1345,7 +1353,10 @@ class StreamRenderer:
             model = payload.get("model") or "(provider default)"
             reason = payload.get("selection_reason") or "explicit selection or orchestration routing"
             if self.debug:
-                self.console.print(f"[dim]· Provider: {escape(str(provider))} · Model: {escape(str(model))} · {escape(str(reason))}[/dim]")
+                self.console.print(
+                    f"[dim]· Model: {escape(public_model_name(model))} · "
+                    f"{escape(redact_routing_text(reason))}[/dim]"
+                )
             else:
                 # Persist the authoritative route in the scrollback -- users
                 # need to know a route was resolved -- but never the raw
@@ -1388,6 +1399,7 @@ class StructuredRenderer:
         self.streamed_final_text = False
 
     def handle_event(self, event: dict[str, Any]) -> None:
+        event = sanitize_public_event(event)
         event_type = event.get("event_type") or event.get("event") or event.get("type")
         if event_type == "assistant_delta" and (event.get("payload") or {}).get("content"):
             self.streamed_final_text = True
@@ -1439,17 +1451,17 @@ def print_banner(console: Console, *, host: str, workspace_root: str, mode: str,
     console.print(f"[dim]Workspace:[/dim] {escape(workspace_root)}")
     if host.startswith("local:"):
         route = host.split(":", 1)[1] or "auto"
-        route_label = "auto (ollama_cloud, nvidia, hf, openrouter, in authoritative priority order)" if route == "auto" else route
+        route_label = public_route_name(route)
         console.print(
             f"[dim]Mode:[/dim] {mode}   [dim]Approval:[/dim] {approval_policy}   "
-            f"[dim]Runtime:[/dim] standalone   [dim]Provider:[/dim] {route_label}"
+            f"[dim]Runtime:[/dim] standalone   [dim]Model:[/dim] {route_label}"
         )
     else:
         console.print(f"[dim]Mode:[/dim] {escape(mode)}   [dim]Approval:[/dim] {escape(approval_policy)}   [dim]Host:[/dim] {escape(host)}")
 
 
 def print_error(console: Console, message: str) -> None:
-    console.print(f"[bold red]Error:[/bold red] {escape(message)}")
+    console.print(f"[bold red]Error:[/bold red] {escape(redact_routing_text(message))}")
 
 
 def print_recent_thread(console: Console, messages: list[dict[str, Any]], limit: int = 6) -> None:

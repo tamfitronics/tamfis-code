@@ -390,7 +390,7 @@ class StreamRendererTests(unittest.TestCase):
         # ("nvidia · x") must never reach the user.
         self.assertIn(f"Using {BRANDED_PROVIDER_LABEL}", output)
         self.assertNotIn("nvidia", output)
-        self.assertEqual(renderer._selected_provider, "nvidia")
+        self.assertEqual(renderer._selected_provider, "TamfisGPT")
 
     def test_standalone_banner_does_not_call_auto_provider_a_local_host(self):
         console = _console()
@@ -403,7 +403,8 @@ class StreamRendererTests(unittest.TestCase):
         )
         output = console.file.getvalue()
         self.assertIn("Runtime: standalone", output)
-        self.assertIn("Provider: auto (ollama_cloud, nvidia, hf, openrouter, in authoritative priority order)", output)
+        self.assertIn("Model: TamfisGPT Auto", output)
+        self.assertNotIn("ollama", output.lower())
         self.assertNotIn("Host: local:auto", output)
 
     def test_routine_per_turn_setup_lines_show_in_debug_mode(self):
@@ -416,7 +417,7 @@ class StreamRendererTests(unittest.TestCase):
         output = console.file.getvalue()
         self.assertIn("Focused workspace scope", output)
         self.assertIn("Reusing workspace context", output)
-        self.assertIn("Provider:", output)
+        self.assertIn("Model: TamfisGPT Code", output)
 
     def test_model_selected_with_empty_model_shows_provider_default_not_unknown(self):
         # Tier IV/NIM routes leave the resolved model blank by design
@@ -429,7 +430,7 @@ class StreamRendererTests(unittest.TestCase):
         renderer.handle_event({"event_type": "model_selected", "payload": {"provider": "nvidia_nim", "model": "", "selection_reason": "r"}})
         output = console.file.getvalue()
         self.assertNotIn("unknown", output)
-        self.assertIn("(provider default)", output)
+        self.assertIn("TamfisGPT Auto", output)
 
     def test_approval_required_uses_top_level_command_text_not_nested_object(self):
         # Regression guard: the real backend payload for approval_required

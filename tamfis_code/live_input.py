@@ -145,8 +145,10 @@ def idle_bottom_toolbar(
         " <ansigray>· tab to use next suggestion</ansigray>"
         if has_suggestion else ""
     )
+    from .public_identity import public_model_name
+
     left = (
-        f" <ansigray>ready · {provider}/{model or 'auto'} ·</ansigray> "
+        f" <ansigray>ready · {public_model_name(model)} ·</ansigray> "
         f"{_mode_and_agents_html(cli_config, session_id, active_agents=active_agents)}"
         f"{suggestion_hint}"
     )
@@ -556,17 +558,18 @@ class LiveInputListener:
         arg = text[len("/model"):].strip()
         state = local_state.get_session_state(self.session_id)
         if not arg:
-            _report(f"model={state.selected_model}  provider={state.selected_provider or 'auto'}")
+            from .public_identity import public_model_name
+            _report(f"model={public_model_name(state.selected_model)}")
             return True
 
         parts = arg.split()
         if parts[0].lower() == "auto":
             local_state.save_session_state(self.session_id, selected_model="auto", selected_provider=None)
-            _report("Provider routing set to automatic -- takes effect on the next turn.")
+            _report("Model set to TamfisGPT Auto -- takes effect on the next turn.")
             return True
 
         if parts[0].lower() == "list":
-            _report("Use the top-level `/model list` (outside a running task) to browse full model tables.")
+            _report("Use the top-level `/model list` (outside a running task) to view TamfisGPT models.")
             return True
 
         from .local_chat import resolve_provider_type as _resolve_provider_type
@@ -574,7 +577,7 @@ class LiveInputListener:
         try:
             provider_type = _resolve_provider_type(parts[0])
         except ValueError as exc:
-            _report(f"{exc} Usage: /model auto | /model <tamfis|hf|nvidia|openrouter> [model-id]")
+            _report("Unknown model. Use /model list to view TamfisGPT models.")
             return True
         del provider_type  # only validated here; resolve_route re-resolves it per call
 
@@ -586,7 +589,8 @@ class LiveInputListener:
         local_state.save_session_state(
             self.session_id, selected_model=model_id, selected_provider=parts[0].lower(),
         )
-        _report(f"Pinned {parts[0].lower()} route, model={model_id} -- takes effect on the next turn.")
+        from .public_identity import public_model_name
+        _report(f"Model set to {public_model_name(model_id)} -- takes effect on the next turn.")
         return True
 
     def _enqueue(self, text: str) -> None:

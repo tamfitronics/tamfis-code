@@ -220,9 +220,9 @@ Shift+Tab            cycle mode without typing a command (shown in the prompt as
                      also works while a task is already running, not just at this prompt
 message>             while a task is running: type a message and press Enter
 /model               show the active model route
-/model list [route]  list coding models (route: hf or openrouter)
-/model auto          restore Hugging Face -> OpenRouter automatic routing
-/model <route> [id]  pin a provider, optionally with a catalog model id
+/model list          list TamfisGPT model aliases
+/model auto          restore TamfisGPT automatic model selection
+/model <alias>       select Auto, Fast, Code, Pro, or Vision
 /tools               show the tools exposed to tamfis-code tasks
 /pty start [command]  start a persistent background terminal (default: bash)
 /pty list             list this session's background terminals
@@ -974,45 +974,42 @@ async def run_interactive(
             arg = text[len("/model"):].strip()
             state = local_state.get_session_state(workspace.session_id)
             if not arg:
-                console.print(
-                    f"model={state.selected_model}  "
-                    f"provider={state.selected_provider or 'auto (hf -> openrouter)'}"
-                )
+                from .public_identity import public_model_name
+                console.print(f"model={public_model_name(state.selected_model)}")
                 continue
             parts = arg.split()
+
+            from .public_identity import PUBLIC_MODEL_ALIASES, parse_public_model_alias
+            if parts[0].lower() == "list":
+                table = Table(show_header=True, header_style="bold")
+                table.add_column("TAMFISGPT MODEL")
+                table.add_column("USE")
+                uses = ("Automatic selection", "Low-latency tasks", "Coding and agent tasks", "Deep reasoning", "Image-aware tasks")
+                for alias, use in zip(PUBLIC_MODEL_ALIASES, uses):
+                    table.add_row(alias, use)
+                console.print(table)
+                continue
+            public_alias = parse_public_model_alias(parts[0])
+            if public_alias:
+                local_state.save_session_state(
+                    workspace.session_id, selected_model=public_alias, selected_provider=None,
+                )
+                console.print(f"[green]Model set to[/green] {public_alias}")
+                continue
 
             if standalone:
                 from .local_chat import resolve_provider_type as _resolve_provider_type
                 from .providers import ProviderManager as _ProviderManager, ProviderType
 
-                if parts[0].lower() == "list":
-                    route_arg = parts[1].lower() if len(parts) > 1 else None
-                    manager = _ProviderManager()
-                    routes = [route_arg] if route_arg else [p.value for p in manager.PROVIDERS]
-                    table = Table(show_header=True, header_style="bold")
-                    for column in ("PROVIDER", "MODELS"):
-                        table.add_column(column)
-                    shown = False
-                    for route_name in routes:
-                        try:
-                            route_type = _resolve_provider_type(route_name)
-                        except ValueError:
-                            continue
-                        pcfg = manager.PROVIDERS.get(route_type)
-                        if pcfg:
-                            table.add_row(pcfg.name, ", ".join(pcfg.models) or pcfg.default_model)
-                            shown = True
-                    console.print(table if shown else "[dim]Unknown provider. Use hf, nvidia, or openrouter.[/dim]")
-                    continue
                 if parts[0].lower() == "auto":
                     provider_type = ProviderType.AUTO
                     local_state.save_session_state(workspace.session_id, selected_model="auto", selected_provider=None)
-                    console.print("[green]Provider routing set to automatic.[/green]")
+                    console.print("[green]Model set to TamfisGPT Auto.[/green]")
                     continue
                 try:
                     provider_type = _resolve_provider_type(parts[0])
                 except ValueError as exc:
-                    print_error(console, f"{exc} Usage: /model auto | /model <tamfis|hf|nvidia|openrouter> [model-id]")
+                    print_error(console, "Unknown model. Use /model list to view TamfisGPT models.")
                     continue
                 model_id = parts[1] if len(parts) > 1 else "auto"
                 if len(parts) > 2:
@@ -1022,40 +1019,19 @@ async def run_interactive(
                 local_state.save_session_state(
                     workspace.session_id, selected_model=model_id, selected_provider=parts[0].lower(),
                 )
-                console.print(f"[green]Pinned {parts[0].lower()} route[/green]  model={model_id}")
+                from .public_identity import public_model_name
+                console.print(f"[green]Model set to[/green] {public_model_name(model_id)}")
                 continue
 
-            if parts[0].lower() == "list":
-                route = parts[1].lower() if len(parts) > 1 else None
-                if route not in (None, "hf", "openrouter"):
-                    print_error(console, "Usage: /model list [hf|openrouter]")
-                    continue
-                api_provider = "huggingface" if route == "hf" else route
-                try:
-                    result = await client.list_models(api_provider)
-                except (AuthRequiredError, RemoteAPIError) as e:
-                    print_error(console, str(e))
-                    continue
-                rows = [m for m in (result.get("models") or []) if "coding" in [str(c).lower() for c in (m.get("categories") or [])]]
-                table = Table(show_header=True, header_style="bold")
-                for column in ("ID", "PROVIDER", "REASONING", "MAX TOKENS"):
-                    table.add_column(column)
-                for item in rows[:40]:
-                    table.add_row(
-                        str(item.get("id")), str(item.get("provider") or item.get("backend") or ""),
-                        str(item.get("reasoning") or "-"), str(item.get("maxTokens") or "-"),
-                    )
-                console.print(table if rows else "[dim]No coding models found for that route.[/dim]")
-                continue
             if parts[0].lower() == "auto":
                 local_state.save_session_state(
                     workspace.session_id, selected_model="auto", selected_provider=None,
                 )
-                console.print("[green]Model routing set to automatic: Hugging Face, then OpenRouter.[/green]")
+                console.print("[green]Model set to TamfisGPT Auto.[/green]")
                 continue
             route = parts[0].lower()
             if route not in ("hf", "openrouter", "ollama_cloud", "ollama_gpu", "nvidia", "nvidia_nim", "gemini", "apiframe"):
-                print_error(console, "Usage: /model auto | /model <provider> [catalog-model-id]")
+                print_error(console, "Unknown model. Use /model list to view TamfisGPT models.")
                 continue
             model_id = parts[1] if len(parts) > 1 else "auto"
             if len(parts) > 2:
@@ -1070,12 +1046,13 @@ async def run_interactive(
                     continue
                 ids = {str(item.get("id")) for item in (available.get("models") or [])}
                 if model_id not in ids:
-                    print_error(console, f"Unknown {route} model '{model_id}'. Use /model list {route}.")
+                    print_error(console, "Unknown TamfisGPT model. Use /model list.")
                     continue
             local_state.save_session_state(
                 workspace.session_id, selected_model=model_id, selected_provider=route,
             )
-            console.print(f"[green]Pinned {route} route[/green]  model={model_id}")
+            from .public_identity import public_model_name
+            console.print(f"[green]Model set to[/green] {public_model_name(model_id)}")
             continue
         if text == "/tools":
             # One real tool set regardless of standalone vs --remote: every
@@ -1320,17 +1297,17 @@ async def run_interactive(
                 from .providers import get_provider_status as _get_provider_status
 
                 status = _get_provider_status()
-                table = Table(show_header=True, header_style="bold")
-                for column in ("PROVIDER", "CONFIGURED", "KEY"):
-                    table.add_column(column)
-                for name, info in status["config"].items():
-                    configured = "[green]yes[/green]" if info["api_key_set"] or name == "tier_iv" else "[dim]no[/dim]"
-                    table.add_row(name, configured, info["key_preview"])
-                console.print(table)
-                console.print(
-                    f"[dim]Currently selected: {provider_type.value if provider_type else provider}  "
-                    f"· auto would pick: {status['default']}[/dim]"
+                ready = any(
+                    bool(info.get("api_key_set")) or name == "tier_iv"
+                    for name, info in status["config"].items()
                 )
+                state = local_state.get_session_state(workspace.session_id)
+                from .public_identity import public_model_name
+                console.print(
+                    "[green]TamfisGPT model service ready[/green]"
+                    if ready else "[yellow]TamfisGPT model service unavailable[/yellow]"
+                )
+                console.print(f"[dim]Currently selected: {public_model_name(state.selected_model)}[/dim]")
                 continue
             await run_doctor(config, console, Path(workspace.workspace_root), session_id=workspace.session_id)
             continue
