@@ -362,6 +362,19 @@ class TestMCPServerWorkspaceScoped:
         assert target.read_text() == "def foo():\n    return 1\n"  # unchanged
 
     @pytest.mark.asyncio
+    async def test_edit_file_zero_matches_hints_whitespace_drift(self):
+        target = Path(self.temp_dir) / "edit.py"
+        with target.open("wb") as fh:
+            fh.write(b"def foo():\r\n    return 1   \r\n")
+        before = target.read_bytes()
+        result = await self.server.call_tool('edit_file', {
+            'path': str(target), 'old_string': 'def foo():\n    return 1\n', 'new_string': 'x',
+        })
+        assert 'not found' in result['result']
+        assert 'whitespace' in result['result'].lower()
+        assert target.read_bytes() == before  # unchanged
+
+    @pytest.mark.asyncio
     async def test_edit_file_fails_on_multiple_matches(self):
         target = Path(self.temp_dir) / "edit.py"
         target.write_text("x = 1\nx = 1\n")

@@ -988,7 +988,25 @@ class MCPServer:
         original_content = p.read_text(encoding="utf-8", errors="ignore")
         occurrences = original_content.count(old_string)
         if occurrences == 0:
-            return f"❌ Error: old_string not found in '{path}' -- no changes made"
+            hint = ""
+            # The model just re-read this exact file yet still produced a
+            # non-matching old_string three rounds running (the transcript
+            # that prompted this fix showed identical retries) -- the most
+            # common real cause is whitespace/line-ending drift (CRLF vs LF,
+            # or reformatted indentation) rather than the text being truly
+            # absent. Normalize both sides and say so explicitly so the
+            # model stops re-issuing the identical failing call and instead
+            # copies whitespace verbatim from a fresh read.
+            def _normalize(text: str) -> str:
+                return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").split("\n"))
+            if _normalize(old_string) in _normalize(original_content):
+                hint = (
+                    " (a whitespace/line-ending-normalized version of old_string DOES match -- "
+                    "the mismatch is likely trailing whitespace, indentation, or CRLF vs LF; "
+                    "re-read the file and copy old_string verbatim from that fresh content instead "
+                    "of reusing this same old_string again)"
+                )
+            return f"❌ Error: old_string not found in '{path}' -- no changes made{hint}"
         if occurrences > 1:
             return (
                 f"❌ Error: old_string matches {occurrences} times in '{path}' -- it must be unique. "

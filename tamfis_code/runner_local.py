@@ -204,6 +204,17 @@ PERMISSION_BOUNDARY_CORRECTION = (
     "as a host permission-boundary blocker; the platform or operator handles that boundary."
 )
 
+PORT_CONFLICT_CORRECTION = (
+    "The last command failed with EADDRINUSE/address already in use. That is evidence "
+    "that another process already owns the requested listener, not evidence that the "
+    "process should be killed. Do not run kill/pkill/killall, fuser --kill/-k, or stop/"
+    "restart a service merely to make this validation command bind. First use read-only "
+    "checks to identify the listener and its service manager, then query the existing "
+    "application's health/readiness endpoint. If it is the expected healthy managed "
+    "service, treat that as successful runtime validation and leave it running. Only "
+    "disrupt it when the user's request explicitly asks to stop, restart, or replace it."
+)
+
 # Same one-chance-then-fallback shape as narrated tool intent, capitulation,
 # and fabricated results, for the distinct failure of writing out a fake
 # tool invocation (paren-call, JSON object, CLI-flag syntax, or malformed
@@ -2644,6 +2655,39 @@ def _looks_like_service_restart(command: str) -> bool:
     return bool(_SERVICE_RESTART_RE.search(command or ""))
 
 
+_PORT_CONFLICT_RE = re.compile(r"\bEADDRINUSE\b|address already in use", re.IGNORECASE)
+_FORCED_LISTENER_RECLAMATION_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:sudo\s+)?(?:kill(?:all)?|pkill)\b"
+    r"|\bfuser\b[^\n;&|]*(?:\s-k\b|--kill\b)"
+    r"|\bxargs\b[^\n;&|]*\bkill(?:all)?\b"
+    r"|\bsystemctl\s+(?:stop|restart)\b"
+    r"|\bservice\s+\S+\s+(?:stop|restart)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_SERVICE_DISRUPTION_RE = re.compile(
+    r"\b(?:stop|restart|replace|terminate|kill|shut\s*down)\b[^.!?\n]{0,100}"
+    r"\b(?:app|application|server|service|process|daemon|listener)\b"
+    r"|\b(?:app|application|server|service|process|daemon|listener)\b[^.!?\n]{0,100}"
+    r"\b(?:stop|restart|replace|terminate|kill|shut\s*down)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_port_conflict(result: dict[str, Any]) -> bool:
+    """Recognise Node and generic socket bind conflicts in any tool envelope."""
+    return bool(_PORT_CONFLICT_RE.search(json.dumps(result, default=str)))
+
+
+def _looks_like_forced_listener_reclamation(command: str) -> bool:
+    """True for commands that can disrupt the process owning a listener."""
+    return bool(_FORCED_LISTENER_RECLAMATION_RE.search(command or ""))
+
+
+def _user_authorized_service_disruption(text: str) -> bool:
+    """Require an explicit user request before reclaiming an occupied port."""
+    return bool(_EXPLICIT_SERVICE_DISRUPTION_RE.search(text or ""))
+
+
 def _preview_diff_for_tool_call(mcp_server: MCPServer, tool_name: str, arguments: dict[str, Any]) -> Optional[str]:
     """Best-effort unified-diff preview for write_file/edit_file, computed
     WITHOUT writing anything -- read-only preview of exactly what
@@ -4340,6 +4384,10 @@ async def _run_local_agent_turn_impl(
     # clear-on-mutation semantics, as a generic fallback requirement.
     any_execute_command_since_mutation = False
     generic_verify_retries = 0
+    # A bind conflict must change the validation strategy, not become a
+    # kill/start loop. Keep this turn-local evidence so a later destructive
+    # command can be refused even when its PID/arguments differ each round.
+    port_conflict_seen = False
 
     async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
         """Turn accumulated completion output into the turn's final
@@ -5887,6 +5935,32 @@ async def _run_local_agent_turn_impl(
 
             consecutive_scope_errors = 0
 
+            if (
+                port_conflict_seen
+                and tc.name == "execute_command"
+                and _looks_like_forced_listener_reclamation(str(arguments.get("command") or ""))
+                and not _user_authorized_service_disruption(_latest_user_text(messages))
+            ):
+                result = {
+                    "success": False,
+                    "runtime_blocked": True,
+                    "error": (
+                        "Refused blind listener reclamation after EADDRINUSE. The user did not "
+                        "ask to stop or restart the existing service. Identify the listener and "
+                        "check its health; if it is the expected healthy service, leave it running."
+                    ),
+                }
+                working_messages.append({
+                    "role": "tool", "tool_call_id": tc.call_id,
+                    "content": json.dumps(result),
+                })
+                working_messages.append({"role": "system", "content": PORT_CONFLICT_CORRECTION})
+                renderer.handle_event({
+                    "event_type": "tool_output",
+                    "payload": {"tool": tc.name, "result": result},
+                })
+                continue
+
             risk = classify_tool_call_risk(tc.name, arguments, workspace_root=workspace_root)
 
             if read_only and risk != "read_only":
@@ -6048,6 +6122,18 @@ async def _run_local_agent_turn_impl(
                 "tool_call_id": tc.call_id,
                 "content": json.dumps(result, default=str),
             })
+            if tc.name == "execute_command" and _has_port_conflict(result):
+                port_conflict_seen = True
+                working_messages.append({"role": "system", "content": PORT_CONFLICT_CORRECTION})
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "Port conflict detected -- preserving the existing listener and "
+                            "requesting ownership plus health checks instead of another start/kill cycle."
+                        ),
+                    },
+                })
             if (
                 result.get("success") is False
                 and "permission denied" in json.dumps(result, default=str).lower()
