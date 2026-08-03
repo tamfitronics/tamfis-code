@@ -750,6 +750,16 @@ async def mcp_server_command(ctx: click.Context):
     await run_stdio_server(str(workspace_root))
 
 
+@cli.command(name="acp")
+@click.pass_context
+@async_command
+async def acp_command(ctx: click.Context):
+    """Serve Tamfis Code over ACP v1 for Zed, JetBrains, and other IDE clients."""
+    from .acp import run_acp_server
+
+    await run_acp_server(ctx.obj["workspace_root"], ctx.obj["config"])
+
+
 @cli.command(name="config")
 @click.pass_context
 def config_command(ctx: click.Context):
@@ -2686,3 +2696,10 @@ def verify_release_command(ctx: click.Context, artifacts: tuple[Path, ...], outp
 # Familiar GitHub CLI command surface, delegated to the installed `gh` binary.
 from .github_commands import register_github_commands
 register_github_commands(cli)
+
+# Durable scheduled agent tasks (local store + foreground scheduler service).
+from .automation_commands import register_automation_commands
+register_automation_commands(cli)
+
+from .github_automation import register_github_automation
+register_github_automation(cli)

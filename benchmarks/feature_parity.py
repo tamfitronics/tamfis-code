@@ -48,10 +48,10 @@ FEATURES = (
     Feature("Parallel subagents / swarm", "tamfis_code/swarm.py", r"run_swarm"),
     Feature("Background jobs and PTY", "tamfis_code/mcp.py", r"read_background_job"),
     Feature("JSON and JSONL output", "tamfis_code/render.py", r"StructuredRenderer"),
-    Feature("IDE-native integration", "tamfis_code/cli.py", r"mcp-server", tamfis="partial"),
+    Feature("IDE-native integration", "tamfis_code/acp.py", r"class ACPAgent"),
     Feature("Remote/background tasks", "tamfis_code/runner.py", r"submit_ai_task_background", kimi="partial", claude="partial"),
-    Feature("GitHub workflow surface", "tamfis_code/github_commands.py", r"GITHUB_COMMANDS", kimi="partial", tamfis="partial"),
-    Feature("Scheduled automations", "tamfis_code/openhands/automation.py", r"AutomationScheduler", kimi="partial", claude="partial", tamfis="partial"),
+    Feature("GitHub workflow surface", "tamfis_code/github_automation.py", r"install_pr_review_workflow", kimi="partial"),
+    Feature("Scheduled automations", "tamfis_code/automation_commands.py", r"serve_automations", kimi="partial", claude="partial"),
     Feature("Worktree isolation", "tamfis_code/runtime/worktree.py", r"create_worktree", kimi="partial", claude="partial"),
     Feature("Diff ledger and revert", "tamfis_code/state.py", r"mutation", kimi="partial", codex="partial"),
 )
@@ -63,6 +63,9 @@ VERIFY_TESTS = (
     "tests/test_swarm.py",
     "tests/test_safety.py",
     "tests/test_tamfis_code_render.py",
+    "tests/test_acp.py",
+    "tests/test_automation_commands.py",
+    "tests/test_github_automation.py",
 )
 
 

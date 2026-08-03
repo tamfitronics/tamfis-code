@@ -446,6 +446,20 @@ class StreamRendererTests(unittest.TestCase):
         })
         self.assertIn("rm -rf build", console.file.getvalue())
 
+    def test_approval_required_masks_inline_program_password(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "approval_required",
+            "payload": {
+                "command": "node -e \"new Pool({password: 'example-only-secret'})\"",
+                "risk_level": "medium",
+            },
+        })
+        output = console.file.getvalue()
+        self.assertNotIn("example-only-secret", output)
+        self.assertIn("password: '***'", output)
+
     def test_approval_required_renders_a_diff_when_the_payload_carries_one(self):
         console = _console()
         renderer = StreamRenderer(console)

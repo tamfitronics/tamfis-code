@@ -103,7 +103,7 @@ def classify_command_risk(command: str) -> str:
 
 
 _READ_ONLY_COMMANDS = {
-    "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
+    "cat", "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
     "uniq", "wc", "stat", "file", "du", "tree", "realpath", "readlink",
 }
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
@@ -169,6 +169,20 @@ _SQL_CLIENT_RE = re.compile(r"\b(mysql|mariadb|mysqldump|mysqladmin|psql|pg_dump
 _INLINE_DASH_P_PASSWORD_RE = re.compile(r"(?<![\w-])-p(?!assword\b)\S+")
 _LONG_PASSWORD_FLAG_RE = re.compile(r"--password[= ]\S+")
 _URL_CREDENTIALS_RE = re.compile(r"://[^/\s:@]+:[^/\s@]+@")
+_QUOTED_SECRET_VALUE_RE = re.compile(
+    r'''(?ix)
+    (?P<prefix>
+        ["']?\b(?:password|passwd|passphrase|access_token|refresh_token|api[_-]?key|client[_-]?secret)\b["']?
+        \s*[:=]\s*
+    )
+    (?P<quote>["'])
+    .*?
+    (?P=quote)
+    ''',
+)
+_UNQUOTED_SECRET_VALUE_RE = re.compile(
+    r"(?i)(\b(?:password|passwd|passphrase|access_token|refresh_token|api[_-]?key|client[_-]?secret)\b\s*[:=]\s*)([^\"'\s,;})\]]+)",
+)
 
 
 def redact_secrets(command: str) -> str:
@@ -179,6 +193,15 @@ def redact_secrets(command: str) -> str:
         text = _INLINE_DASH_P_PASSWORD_RE.sub("-p***", text)
     text = _LONG_PASSWORD_FLAG_RE.sub("--password=***", text)
     text = _URL_CREDENTIALS_RE.sub("://***:***@", text)
+    # Tool calls are frequently small inline programs rather than native DB
+    # clients, e.g. `node -e "new Pool({password: 'live-secret'})"`.
+    # Preserve the surrounding program so an approval remains meaningful,
+    # but never echo the literal value in status lines, panels, or logs.
+    text = _QUOTED_SECRET_VALUE_RE.sub(
+        lambda match: f"{match.group('prefix')}{match.group('quote')}***{match.group('quote')}",
+        text,
+    )
+    text = _UNQUOTED_SECRET_VALUE_RE.sub(r"\1***", text)
     return text
 
 
@@ -207,6 +230,11 @@ def classify_tool_call_risk(name: str, arguments: dict[str, Any], *, workspace_r
     """Single entry point the standalone loop consults before executing any
     tool call -- feeds `runner.py`'s existing `resolve_approval_decision`
     exactly the way a server-supplied `risk_level` used to."""
+    # The scope resolver attaches this internal marker when a tool targets a
+    # path outside the turn's approved roots. Reading may be non-mutating,
+    # but crossing the workspace boundary still requires explicit consent.
+    if arguments.get("_tamfis_external_scope_paths"):
+        return RISK_DANGEROUS
     if name in READ_ONLY_TOOLS:
         return RISK_READ_ONLY
     if name in MUTATING_FILE_TOOLS:

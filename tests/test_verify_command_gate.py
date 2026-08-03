@@ -89,15 +89,57 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
             nudges = [d for d in diagnostics if "npm run check" in d and "hasn't been confirmed clean" in d]
             self.assertEqual(len(nudges), 2, f"expected exactly MAX_VERIFY_COMMAND_RETRIES nudges, got: {diagnostics}")
 
-    def test_no_verify_command_detected_never_gates_completion(self):
-        """A workspace with no package.json (or no recognised script) must
-        behave exactly as before this change -- no nudge, no extra rounds."""
+    def test_no_verify_command_detected_still_requires_a_real_execute_command(self):
+        """Superseded expectation: this workspace has no package.json (no
+        JS/TS check/build script), so the language-specific verify-command
+        gate above doesn't fire -- but a broader, generic gate now requires
+        ANY successful execute_command evidence before a DEBUG/EDIT task
+        with a real mutation can finish, regardless of language/framework
+        detection (see runner_local.py's any_execute_command_since_mutation
+        and its nudge block). This closes the exact gap the previous
+        version of this test asserted was fine: a mutation completing with
+        zero execute_command calls at all. Confirms the gate is
+        satisfiable -- a real command lets the turn complete."""
+        with tempfile.TemporaryDirectory() as tmp:
+            write_args = json.dumps({"path": str(Path(tmp) / "app.py"), "content": "x = 1\n"})
+            plan_response = json.dumps({"steps": ["Add app.py"]})
+            verify_args = json.dumps({"command": "python3 app.py"})
+            rounds = [
+                [_chunk(_delta(content=plan_response))],
+                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="write_file", arguments=write_args)]))],
+                # The first successful tool call triggers one automatic
+                # plan-revision round (see test_reasoning_plan.py's
+                # identical pattern); non-JSON here just falls back to the
+                # existing plan silently.
+                [_chunk(_delta(content="Added app.py."))],
+                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_2", name="execute_command", arguments=verify_args)]))],
+                [_chunk(_delta(content="Added app.py."))],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "fix the bug and add a small app.py file"}],
+                self._console(), renderer,
+                workspace_root=tmp, session_id=2, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+
+    def test_no_verify_command_detected_and_no_execute_command_call_fails(self):
+        """The actual new gate: without any execute_command evidence at
+        all, a mutating DEBUG/EDIT task must fail rather than silently
+        report completion -- the exact "claims fixed without ever
+        checking" gap this closes."""
         with tempfile.TemporaryDirectory() as tmp:
             write_args = json.dumps({"path": str(Path(tmp) / "app.py"), "content": "x = 1\n"})
             plan_response = json.dumps({"steps": ["Add app.py"]})
             rounds = [
                 [_chunk(_delta(content=plan_response))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="write_file", arguments=write_args)]))],
+                [_chunk(_delta(content="Added app.py."))],
                 [_chunk(_delta(content="Added app.py."))],
                 [_chunk(_delta(content="Added app.py."))],
             ]
@@ -107,18 +149,19 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
 
             outcome = asyncio.run(run_local_agent_turn(
                 manager, ProviderType.NVIDIA, None,
-                [{"role": "user", "content": "add a small app.py file"}],
+                [{"role": "user", "content": "fix the bug and add a small app.py file"}],
                 self._console(), renderer,
-                workspace_root=tmp, session_id=2, approval_policy="auto", interactive=False,
+                workspace_root=tmp, session_id=3, approval_policy="auto", interactive=False,
             ))
 
-            self.assertEqual(outcome.status, "completed")
+            self.assertEqual(outcome.status, "failed")
             diagnostics = [
                 str(e["payload"].get("content"))
                 for e in renderer.events
                 if e["event_type"] == "diagnostics"
             ]
-            self.assertFalse(any("hasn't been confirmed clean" in d for d in diagnostics))
+            nudges = [d for d in diagnostics if "no execute_command has verified the fix" in d]
+            self.assertEqual(len(nudges), 2, f"expected exactly MAX_VERIFY_COMMAND_RETRIES nudges, got: {diagnostics}")
 
 
 if __name__ == "__main__":

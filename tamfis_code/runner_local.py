@@ -61,7 +61,12 @@ from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
-from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
+from .safety import (
+    READ_ONLY_TOOLS,
+    _unified_diff,
+    classify_tool_call_risk,
+    redact_secrets,
+)
 from .sandbox import SandboxPolicy
 from .workspace import classify_root, detect_validation_commands, scratch_root
 from .workspace_access import ensure_workspace_access
@@ -328,6 +333,7 @@ _SCOPE_PATH_TOOLS = {
     "create_artifact",
     "inspect_artifact",
 }
+_EXTERNAL_SCOPE_PATHS_KEY = "_tamfis_external_scope_paths"
 
 
 def _is_project_root(path: Path) -> bool:
@@ -734,8 +740,10 @@ def _scope_instruction(workspace_root: str, scope_roots: list[Path], *, scratch_
         "WORKSPACE SCOPE (authoritative for this turn):\n"
         f"Workspace root: {Path(workspace_root).resolve()}\n"
         f"Target project roots:\n{roots}\n"
-        "Operate only inside these target roots unless the user explicitly names "
-        "another path. Do not recursively search the workspace parent. For a "
+        "Operate inside these target roots by default. If the task genuinely requires "
+        "another path, call the appropriate tool with that explicit path; the runtime "
+        "will request elevated approval instead of rejecting it as out of scope. Do not "
+        "recursively search the workspace parent unless that broader access is necessary. For a "
         "multi-project stack, inspect each listed root separately and use focused "
         "queries, bounded result counts, and project markers before reading files. "
         "Do not run repository-wide find/grep/rg from the parent directory. "
@@ -766,6 +774,18 @@ def _is_within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _mark_external_scope(scoped: dict[str, Any], paths: list[Path]) -> None:
+    """Record a boundary crossing for the approval gate and dispatcher.
+
+    The marker is internal: it is removed before invoking the actual tool.
+    Keeping it in the normalized arguments until then makes even read-only
+    file tools classify as dangerous and therefore require explicit consent.
+    """
+    unique = list(dict.fromkeys(str(path) for path in paths))
+    if unique:
+        scoped[_EXTERNAL_SCOPE_PATHS_KEY] = unique
 
 
 def _scope_tool_arguments(
@@ -815,15 +835,18 @@ def _scope_tool_arguments(
             ])
         failed = [label for label, allowed in checks if not allowed]
         if failed:
-            return scoped, (
-                f"{', '.join(failed)} is outside the resolved task scope. Allowed roots: "
-                + ", ".join(str(root) for root in scope_roots)
-            )
+            external_paths: list[Path] = []
+            for key in ("path", "destination", "source_dir", "output_path"):
+                candidate = _resolve_argument_path(scoped.get(key), workspace_root)
+                if candidate is not None and not any(_is_within(candidate, root) for root in scope_roots):
+                    external_paths.append(candidate)
+            _mark_external_scope(scoped, external_paths)
         return scoped, None
 
     if tool_name == "execute_command":
         cwd = _resolve_argument_path(scoped.get("cwd"), workspace_root) or workspace
         command = str(scoped.get("command") or "").strip()
+        external_paths: list[Path] = []
 
         # Heredoc bodies are source text, not command operands. Inspecting the
         # entire body with shlex makes literals such as `/` or URL fragments
@@ -880,15 +903,10 @@ def _scope_tool_arguments(
 
             cd_target = _resolve_argument_path(parsed_target[0], str(cwd))
 
-            if cd_target is None or not any(
-                _is_within(cd_target, root)
-                for root in scope_roots
-            ):
-                return scoped, (
-                    f"Command cd target is outside the resolved task scope: "
-                    f"{cd_target or parsed_target[0]}. Allowed roots: "
-                    + ", ".join(str(root) for root in scope_roots)
-                )
+            if cd_target is None:
+                return scoped, "Invalid leading cd target in command."
+            if not any(_is_within(cd_target, root) for root in scope_roots):
+                external_paths.append(cd_target)
 
             cwd = cd_target
             command = leading_cd.group("remainder").strip()
@@ -966,32 +984,22 @@ def _scope_tool_arguments(
                 scoped["cwd"] = str(target_root)
                 cwd = target_root
             else:
-                return scoped, (
-                    "Broad parent-directory scan blocked. Run the command "
-                    "separately in one of these project roots: "
-                    + ", ".join(str(root) for root in scope_roots)
-                )
+                external_paths.append(cwd)
 
         if not any(_is_within(cwd, root) for root in scope_roots):
-            return scoped, (
-                f"Command cwd is outside the resolved task scope: {cwd}. "
-                "Allowed roots: "
-                + ", ".join(str(root) for root in scope_roots)
-            )
+            external_paths.append(cwd)
 
         for candidate in absolute_operands:
-            if not any(
-                _is_within(candidate, root)
-                for root in scope_roots
-            ):
-                return scoped, (
-                    f"Command path is outside the resolved task scope: "
-                    f"{candidate}. Allowed roots: "
-                    + ", ".join(str(root) for root in scope_roots)
-                )
+            if not any(_is_within(candidate, root) for root in scope_roots):
+                external_paths.append(candidate)
 
         scoped["cwd"] = str(cwd)
         scoped["command"] = command
+        if external_paths:
+            _mark_external_scope(scoped, external_paths)
+            # Commands crossing scope run outside the workspace sandbox only
+            # after the dangerous-risk approval gate accepts the request.
+            scoped["sandbox_permissions"] = "require_escalated"
         return scoped, None
 
     if path_key is None:
@@ -1024,16 +1032,14 @@ def _scope_tool_arguments(
         if len(scope_roots) == 1:
             scoped[path_key] = str(scope_roots[0])
             return scoped, None
-        return scoped, (
-            "Parent-directory operation blocked for this multi-project stack. Use one "
-            "target root at a time: " + ", ".join(str(root) for root in scope_roots)
-        )
+        scoped[path_key] = str(requested)
+        _mark_external_scope(scoped, [requested])
+        return scoped, None
 
     if not any(_is_within(requested, root) for root in scope_roots):
-        return scoped, (
-            f"Path is outside the resolved task scope: {requested}. Allowed roots: "
-            + ", ".join(str(root) for root in scope_roots)
-        )
+        scoped[path_key] = str(requested)
+        _mark_external_scope(scoped, [requested])
+        return scoped, None
 
     scoped[path_key] = str(requested)
     return scoped, None
@@ -2023,6 +2029,26 @@ def _is_old_string_not_found(tool_name: str, result: dict[str, Any]) -> bool:
         return False
     error = str(result.get("error") or result.get("message") or "").lower()
     return "old_string not found" in error
+
+
+def _update_unresolved_edit_paths(
+    unresolved: set[str], *, path: str, workspace_root: str, failed: bool,
+) -> str:
+    """Track stale-edit recovery by canonical path.
+
+    A later successful write/edit to the same file resolves the earlier
+    old_string mismatch. Keeping the original failure forever makes the
+    finalizer falsely fail turns that recovered correctly.
+    """
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(workspace_root) / candidate
+    key = str(candidate.resolve())
+    if failed:
+        unresolved.add(key)
+    else:
+        unresolved.discard(key)
+    return key
 
 
 _AUDIT_PLAN_PATH_RE = re.compile(r"(?<![\w])/(?:[^\s,;()\[\]{}<>]+)")
@@ -4304,6 +4330,16 @@ async def _run_local_agent_turn_impl(
     validation_retries: dict[str, int] = {}
     validation_errors: dict[str, str] = {}
     unresolved_edit_paths: set[str] = set()
+    # FIX: when a project has no detectable test/lint/build fingerprint,
+    # validation_commands is empty, so next_validation below is always None
+    # and the verify-before-finish nudge never engages -- a DEBUG/EDIT task
+    # could mutate files and finish with zero execute_command calls at all,
+    # the exact "claims fixed without ever checking" gap this guards
+    # against everywhere else. Tracks whether ANY execute_command has
+    # succeeded since the last mutation, mirroring validation_confirmed's
+    # clear-on-mutation semantics, as a generic fallback requirement.
+    any_execute_command_since_mutation = False
+    generic_verify_retries = 0
 
     async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
         """Turn accumulated completion output into the turn's final
@@ -5514,6 +5550,52 @@ async def _run_local_agent_turn_impl(
                 _persist_turn_checkpoint()
                 continue
 
+            if (
+                tools and any_mutation and not validation_commands
+                and not any_execute_command_since_mutation
+                and getattr(task_profile.task_type, "value", "") in {"debug", "edit"}
+            ):
+                if generic_verify_retries >= MAX_VERIFY_COMMAND_RETRIES:
+                    message = (
+                        "Validation incomplete: files were changed but no execute_command call "
+                        "ever verified the fix, and no project test/lint/build command could be "
+                        "detected to require automatically."
+                    )
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    _persist_turn_checkpoint(status="failed", last_error=message)
+                    return TaskOutcome(status="failed", error=message)
+                generic_verify_retries += 1
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({
+                    "role": "system",
+                    "content": (
+                        "You changed files in this project, but never ran any command via "
+                        "execute_command to verify the fix -- this project has no detectable "
+                        "test/lint/build command, so you must verify by re-running the original "
+                        "failing command/reproduction steps from the request (or the most direct "
+                        "equivalent, e.g. re-invoking the affected script/function) via "
+                        "execute_command, and confirm the real output shows it's fixed, before "
+                        "finishing. Do not claim the fix works from reading the code alone."
+                    ),
+                })
+                orchestrator.mark_repair(
+                    f"Requiring a real execute_command verification before completion "
+                    f"(attempt {generic_verify_retries}/{MAX_VERIFY_COMMAND_RETRIES})"
+                )
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "Files changed but no execute_command has verified the fix, and no "
+                            "project validation command was detected; requesting a real "
+                            "verification run before finishing."
+                        )
+                    },
+                })
+                _persist_turn_checkpoint()
+                continue
+
             next_validation = next(
                 (item for item in validation_commands if item[1] not in validation_confirmed),
                 None,
@@ -5839,6 +5921,12 @@ async def _run_local_agent_turn_impl(
                 suspend_live_if_active(renderer)
                 orchestrator.waiting_for_approval(f"Approve {tc.name}")
                 reason = "The agent requested this command."
+                external_scope_paths = list(arguments.get(_EXTERNAL_SCOPE_PATHS_KEY) or [])
+                if external_scope_paths:
+                    reason = (
+                        "The agent needs access outside the resolved workspace scope: "
+                        + ", ".join(str(path) for path in external_scope_paths)
+                    )
                 if (
                     tc.name == "execute_command" and not any_mutation
                     and _looks_like_service_restart(str(arguments.get("command") or ""))
@@ -5853,9 +5941,15 @@ async def _run_local_agent_turn_impl(
                 # from a password the model just read out of wp-config.php)
                 # must still reach the actual tool call below -- only the
                 # human-facing/logged rendering gets the redacted copy.
-                display_arguments = arguments
+                display_arguments = {
+                    key: value for key, value in arguments.items()
+                    if key != _EXTERNAL_SCOPE_PATHS_KEY
+                }
                 if isinstance(arguments.get("command"), str):
-                    display_arguments = {**arguments, "command": redact_secrets(arguments["command"])}
+                    display_arguments = {
+                        **display_arguments,
+                        "command": redact_secrets(arguments["command"]),
+                    }
                 diff_preview = _preview_diff_for_tool_call(mcp_server, tc.name, arguments)
                 if diff_preview is not None:
                     # The diff panel (below) already shows the real change;
@@ -5891,6 +5985,15 @@ async def _run_local_agent_turn_impl(
                     working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
                     renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                     continue
+
+            # Approval has completed (or policy already allowed this risk).
+            # Grant only the requested path's nearest useful root for this
+            # turn, then remove the internal marker before tool dispatch.
+            external_scope_paths = list(arguments.pop(_EXTERNAL_SCOPE_PATHS_KEY, []) or [])
+            for raw_path in external_scope_paths:
+                candidate = Path(str(raw_path)).expanduser().resolve()
+                grant_root = candidate if candidate.is_dir() else candidate.parent
+                mcp_server.allowed_workspace_roots.add(grant_root)
 
             if configured_hooks:
                 pre_hook_results = await run_tool_hooks(
@@ -5958,7 +6061,12 @@ async def _run_local_agent_turn_impl(
             if _is_old_string_not_found(tc.name, result):
                 refresh_path = str(arguments.get("path") or "")
                 if refresh_path:
-                    unresolved_edit_paths.add(refresh_path)
+                    refresh_path = _update_unresolved_edit_paths(
+                        unresolved_edit_paths,
+                        path=refresh_path,
+                        workspace_root=workspace_root,
+                        failed=True,
+                    )
                     refresh_call_id = f"fresh_read_{_round}_{len(working_messages)}"
                     renderer.handle_event({"event_type": "tool_call_requested", "payload": {
                         "name": "read_file", "arguments": {"path": refresh_path},
@@ -6010,10 +6118,18 @@ async def _run_local_agent_turn_impl(
 
             if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"} and result.get("success"):
                 any_mutation = True
+                if tc.name in {"write_file", "edit_file"} and arguments.get("path"):
+                    _update_unresolved_edit_paths(
+                        unresolved_edit_paths,
+                        path=str(arguments["path"]),
+                        workspace_root=workspace_root,
+                        failed=False,
+                    )
                 # A further edit after a clean verify run invalidates that
                 # result -- require re-verifying against the latest code,
                 # not whatever was true before this change.
                 validation_confirmed.clear()
+                any_execute_command_since_mutation = False
                 state = local_state.get_session_state(session_id)
                 if state.modified_files:
                     mutation = state.modified_files[-1]
@@ -6023,6 +6139,7 @@ async def _run_local_agent_turn_impl(
                     }})
 
             if tc.name == "execute_command" and result.get("success"):
+                any_execute_command_since_mutation = True
                 executed_command = str(arguments.get("command") or "")
                 for _, validation_command in validation_commands:
                     if validation_command in executed_command:

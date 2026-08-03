@@ -53,6 +53,30 @@ _VERIFIED_NO_CHANGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+_MUTATION_CLAIM_RE = re.compile(
+    r"\b(?:i\s+(?:have\s+)?(?:updated|changed|edited|rewritten|replaced|implemented|fixed)|"
+    r"changes?\s+(?:made|applied)|(?:updated|rewritten|modified)\s+(?:the\s+)?(?:file|code|worker|configuration)|"
+    r"(?:file|code|worker|configuration)\s+(?:was|has\s+been)\s+(?:updated|rewritten|modified))\b",
+    re.IGNORECASE,
+)
+
+_SERVICE_RESTART_CLAIM_RE = re.compile(
+    r"\b(?:i\s+(?:have\s+)?(?:restarted|reloaded)|(?:system|service|server|worker|backend)\s+restart(?:ed)?|"
+    r"(?:service|server|worker|backend)\s+(?:is|was)\s+(?:now\s+)?live)\b",
+    re.IGNORECASE,
+)
+
+_LIVE_VERIFICATION_CLAIM_RE = re.compile(
+    r"\b(?:verified\s+(?:the\s+)?(?:live|running|production|frontend|endpoint|api)|"
+    r"(?:frontend|endpoint|api|integration|pipeline)\s+(?:is|was|has\s+been)\s+(?:now\s+)?(?:working|verified|healthy)|"
+    r"(?:will|does)\s+(?:now\s+)?(?:pull|return|load|display)\s+(?:data|results?)\s+successfully)\b",
+    re.IGNORECASE,
+)
+
+_CLAIMED_PATH_RE = re.compile(
+    r"`((?:/[^`\n]+|(?:[A-Za-z0-9_.@+-]+/)+[A-Za-z0-9_.@+-]+|\.env))`"
+)
+
 _MUTATING_TOOLS = {
     "write_file", "edit_file", "create_file", "patch_file",
     "extract_archive", "repackage_archive",
@@ -106,6 +130,32 @@ def _claims_completed_inspection(final_text: str) -> bool:
     return bool(_UNSUPPORTED_INSPECTION_CLAIM_RE.search(final_text or ""))
 
 
+def _successful_changed_paths(tool_records: list[dict[str, Any]], workspace_root: str) -> set[Path]:
+    root = Path(workspace_root or ".").resolve()
+    changed: set[Path] = set()
+    for item in tool_records:
+        if item.get("success") is not True or item.get("tool_name") not in _MUTATING_TOOLS:
+            continue
+        candidates = list(item.get("files_changed") or [])
+        argument_path = (item.get("arguments") or {}).get("path")
+        if argument_path:
+            candidates.append(argument_path)
+        for raw_path in candidates:
+            candidate = Path(str(raw_path)).expanduser()
+            changed.add((candidate if candidate.is_absolute() else root / candidate).resolve())
+    return changed
+
+
+def _successful_commands(tool_records: list[dict[str, Any]]) -> list[str]:
+    return [
+        str((item.get("arguments") or {}).get("command") or "").strip()
+        for item in tool_records
+        if item.get("tool_name") == "execute_command"
+        and item.get("success") is True
+        and item.get("exit_code") in (None, 0)
+    ]
+
+
 def validate_completion(
     *, profile: TaskProfile, tool_records: list[dict[str, Any]],
     any_mutation: bool, final_text: str, objective: str = "", workspace_root: str = "",
@@ -120,6 +170,56 @@ def validate_completion(
     checks.append({"name": "tool_evidence_recorded", "passed": tool_evidence_passed})
     if not tool_evidence_passed:
         unresolved.append("This task type requires tool evidence, but no successful tool call was recorded.")
+
+    # Completion-integrity gates apply to the words in the final report,
+    # independent of task classification. A malformed or vague objective can
+    # be classified as QUESTION, but that must never permit a model to claim
+    # files were updated, a service restarted, or production verified when
+    # its own tool ledger proves otherwise.
+    mutation_claimed = bool(_MUTATION_CLAIM_RE.search(final_text or ""))
+    if mutation_claimed:
+        changed_paths = _successful_changed_paths(tool_records, workspace_root)
+        mutation_supported = bool(changed_paths) and any_mutation
+        checks.append({"name": "reported_mutation_supported", "passed": mutation_supported})
+        if not mutation_supported:
+            unresolved.append("The response claims files or configuration were changed, but no successful file mutation supports that claim.")
+
+        if workspace_root:
+            root = Path(workspace_root).resolve()
+            claimed_paths = []
+            for raw_path in _CLAIMED_PATH_RE.findall(final_text or ""):
+                candidate = Path(raw_path).expanduser()
+                resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+                if resolved not in claimed_paths:
+                    claimed_paths.append(resolved)
+            missing_claimed_paths = [path for path in claimed_paths if path not in changed_paths]
+            if claimed_paths:
+                checks.append({
+                    "name": "reported_paths_changed",
+                    "passed": not missing_claimed_paths,
+                    "claimed": [str(path) for path in claimed_paths],
+                })
+                if missing_claimed_paths:
+                    unresolved.append(
+                        "The response claims these paths were changed without successful mutation evidence: "
+                        + ", ".join(str(path) for path in missing_claimed_paths[:20])
+                    )
+
+    successful_commands = _successful_commands(tool_records)
+    if _SERVICE_RESTART_CLAIM_RE.search(final_text or ""):
+        restart_supported = any(re.search(r"\b(?:systemctl|service|docker(?:\s+compose)?)\b.*\brestart\b", command, re.I) for command in successful_commands)
+        checks.append({"name": "reported_restart_supported", "passed": restart_supported})
+        if not restart_supported:
+            unresolved.append("The response claims a service restart, but no successful restart command supports that claim.")
+
+    if _LIVE_VERIFICATION_CLAIM_RE.search(final_text or ""):
+        live_check_supported = any(
+            re.search(r"\b(?:curl|wget|httpie|pytest|vitest|playwright|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test)\b", command, re.I)
+            for command in successful_commands
+        )
+        checks.append({"name": "reported_live_verification_supported", "passed": live_check_supported})
+        if not live_check_supported:
+            unresolved.append("The response claims live/frontend/API success, but no successful endpoint or behavioral test supports that claim.")
 
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}:
         mutation_requirement_met = any_mutation or verified_no_change
@@ -155,8 +255,20 @@ def validate_completion(
                 unresolved.append("Explicitly requested output files are missing or empty: " + ", ".join(missing[:30]))
 
     if profile.requires_validation:
+        # FIX: for EDIT/DEBUG specifically, a bare read_file/search_code/
+        # list_directory/get_git_info call used to count as "validation
+        # evidence" -- a model could report a bug fixed after only reading
+        # the file it edited, with zero execute_command calls, and this
+        # check passed. Narrowed to real execution evidence for exactly the
+        # task types where "I fixed it" is a testable claim; other
+        # requires_validation task types (e.g. INSPECT-like work, where a
+        # read/search genuinely is the deliverable) keep the broader set.
+        evidence_tools = (
+            {"execute_command"} if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}
+            else _VALIDATION_EVIDENCE_TOOLS
+        )
         validated = any(
-            item.get("tool_name") in _VALIDATION_EVIDENCE_TOOLS and item.get("success")
+            item.get("tool_name") in evidence_tools and item.get("success")
             for item in tool_records
         )
 
@@ -220,6 +332,8 @@ def validate_completion(
             unresolved.append(
                 "The response claims repository inspection or review, but no successful tool evidence supports that claim."
             )
+        if mutation_claimed or _SERVICE_RESTART_CLAIM_RE.search(final_text or "") or _LIVE_VERIFICATION_CLAIM_RE.search(final_text or ""):
+            severity = "error"
 
     return ValidationReport(passed, checks, unresolved, severity=severity)
 

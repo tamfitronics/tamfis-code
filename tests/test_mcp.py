@@ -131,6 +131,32 @@ class TestMCPServer:
         assert test_file.read_text() == 'Test content'
 
     @pytest.mark.asyncio
+    async def test_write_file_accepts_file_path_alias(self):
+        test_file = Path(self.temp_dir) / "alias.txt"
+        result = await self.server.call_tool("write_file", {
+            "file_path": str(test_file),
+            "text": "alias content",
+        })
+        assert result["success"] is True
+        assert test_file.read_text() == "alias content"
+
+    @pytest.mark.asyncio
+    async def test_write_file_missing_path_returns_recoverable_validation_error(self):
+        result = await self.server.call_tool("write_file", {"content": "orphaned content"})
+        assert result["success"] is False
+        assert result["error"] == "write_file requires path; retry with the missing argument(s)"
+        assert "missing 1 required positional argument" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_edit_file_missing_path_returns_recoverable_validation_error(self):
+        result = await self.server.call_tool("edit_file", {
+            "old_string": "before",
+            "new_string": "after",
+        })
+        assert result["success"] is False
+        assert result["error"] == "edit_file requires path; retry with the missing argument(s)"
+
+    @pytest.mark.asyncio
     async def test_list_directory(self):
         """Test listing a directory"""
         result = await self.server.call_tool('list_directory', {'path': self.temp_dir})

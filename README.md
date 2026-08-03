@@ -155,11 +155,15 @@ what's currently loaded. A custom command can never shadow a built-in one
 
 ## Skills
 
-Tamfis Code discovers `SKILL.md`, `skill.toml`, and `skill.json` from the
-personal config `skills/` directory and project-local `.tamfis/skills/`,
-`.claude/skills/`, and `.codex/skills/` trees. Skills whose name, description,
-or tags match the objective are injected with their instructions; project
-definitions override same-named personal definitions.
+Tamfis Code discovers `SKILL.md`, `skill.toml`, `skill.json`, and Kimi-style
+flat skill Markdown. It reads Tamfis personal skills plus installed user skills
+from `~/.kimi-code/skills/` (or `$KIMI_CODE_HOME/skills/`),
+`~/.claude/skills/`, `~/.codex/skills/`, and the shared `~/.agents/skills/`.
+Project-local `.kimi-code/skills/`, `.claude/skills/`, `.codex/skills/`,
+`.agents/skills/`, and `.tamfis/skills/` are layered on top. Skills whose name,
+description, or tags match the objective are injected with their instructions;
+project definitions override same-named personal definitions and Tamfis project
+definitions have final precedence.
 
 ## Complete projects and artifacts
 
@@ -187,6 +191,28 @@ and skill roots through the `tamfis_code.plugins` entry-point group. Use
 
 Pass global `--output-mode json` for a single machine-readable event document,
 or `--output-mode jsonl` for streaming events suitable for CI and editors.
+
+## IDE, GitHub, and scheduled automation
+
+Run `tamfis-code --cwd <project> acp` as an ACP v1 subprocess from Zed,
+JetBrains, or another ACP client. The adapter supports session creation/loading,
+streamed prompt results, cancellation, and the same workspace and approval
+policy used by the terminal agent.
+
+`tamfis-code --cwd <project> github-automation install-review` creates a
+least-privilege GitHub Actions workflow for automatic pull-request reviews.
+Add `TAMFIS_API_KEY` as a repository Actions secret before enabling it.
+
+Scheduled local tasks use the durable `automations` command group:
+
+```bash
+tamfis-code --cwd /path/to/project automations add nightly "Run tests and fix regressions" --every 1d
+tamfis-code automations list
+tamfis-code automations serve
+```
+
+The foreground service is suitable for systemd, launchd, or a container
+supervisor; individual tasks retain an explicit stored approval policy.
 
 ## Declarative subagent types
 

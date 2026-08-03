@@ -608,6 +608,14 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         fake_run.assert_called_once()
         self.assertEqual(fake_run.call_args.args[0], str(Path(tmp)))
 
+    def test_acp_command_runs_stdio_adapter_scoped_to_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.acp.run_acp_server", new=AsyncMock(return_value=None)) as fake_run:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "acp"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        fake_run.assert_awaited_once()
+        self.assertEqual(fake_run.call_args.args[0], Path(tmp))
+
     def test_run_executes_locally_without_remote_client(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:

@@ -259,6 +259,15 @@ class ToolDefinition:
     parameters: Dict[str, Any]  # JSON Schema
     handler: Optional[Callable] = None
 
+
+_TOOL_PARAMETER_ALIASES: Dict[str, tuple[str, ...]] = {
+    "path": ("file_path", "filepath", "target_path", "filename", "file"),
+    "content": ("text", "new_content", "file_content"),
+    "old_string": ("old_text", "old_content"),
+    "new_string": ("new_text", "replacement"),
+    "command": ("cmd", "shell_command"),
+}
+
 class MCPServer:
     """MCP server for tool execution"""
 
@@ -795,11 +804,71 @@ class MCPServer:
                     await bridge.shutdown()
         
         tool = self.tools[name]
+        if not isinstance(parameters, dict):
+            return {
+                "error": f"{name} requires an object of named arguments",
+                "tool": name,
+                "success": False,
+            }
+        parameters = self._normalise_tool_parameters(name, tool, parameters)
+        missing = self._missing_tool_parameters(name, tool, parameters)
+        if missing:
+            rendered = ", ".join(missing)
+            return {
+                "error": f"{name} requires {rendered}; retry with the missing argument(s)",
+                "tool": name,
+                "success": False,
+            }
         try:
             result = await tool.handler(**parameters, **(extra_kwargs or {}))
             return {"result": result, "tool": name, "success": True}
         except Exception as e:
             return {"error": str(e), "tool": name, "success": False}
+
+    @staticmethod
+    def _normalise_tool_parameters(
+        name: str, tool: ToolDefinition, parameters: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Canonicalise common model-generated argument aliases.
+
+        Providers occasionally emit ``file_path`` instead of the schema's
+        ``path`` (or ``text`` instead of ``content``). Normalising at the
+        dispatch edge keeps every handler and every runner path consistent.
+        Unknown arguments are preserved so handlers with compatibility
+        ``**aliases`` continue to work.
+        """
+        result = dict(parameters)
+        properties = set((tool.parameters.get("properties") or {}).keys())
+        supported = set(properties)
+        if name == "edit_file":
+            supported.add("content")
+        for canonical, aliases in _TOOL_PARAMETER_ALIASES.items():
+            if canonical not in supported:
+                continue
+            for alias in aliases:
+                if alias not in result:
+                    continue
+                if result.get(canonical) in (None, ""):
+                    result[canonical] = result[alias]
+                result.pop(alias, None)
+        return result
+
+    @staticmethod
+    def _missing_tool_parameters(
+        name: str, tool: ToolDefinition, parameters: Dict[str, Any],
+    ) -> List[str]:
+        def absent(key: str) -> bool:
+            return key not in parameters or parameters[key] is None or parameters[key] == ""
+
+        if name == "edit_file":
+            missing = ["path"] if absent("path") else []
+            if absent("content") and (absent("old_string") or absent("new_string")):
+                missing.append("old_string and new_string (or content)")
+            return missing
+        return [
+            str(key) for key in (tool.parameters.get("required") or [])
+            if absent(str(key))
+        ]
     
     async def _read_file(self, path: str) -> str:
         p = self._resolve_readable_input(path)

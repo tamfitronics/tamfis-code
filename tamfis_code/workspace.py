@@ -1129,6 +1129,15 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "changing a file, call the tool that changes it before you say you've changed it. "
         "If you're unsure which file actually defines something, use read_file or "
         "search_code to find it first; do not guess a file's contents from its name.",
+        "Treat deployment claims as an evidence chain, not as prose. Before saying a file or "
+        "configuration was updated, confirm the successful mutation record names that exact "
+        "canonical path. Before saying a build passed, run the real build/check after the last "
+        "mutation and inspect its zero exit status. Before saying a service restarted or is live, "
+        "identify its real service unit/working directory/compiled entrypoint, run the restart, "
+        "then verify the running process and a real health or behavioral endpoint. A restart "
+        "command by itself is never proof the feature works. If any link in that chain is missing "
+        "or fails, report the precise blocker and never use words such as fixed, live, verified, "
+        "working, or successful for that outcome.",
         "When calling write_file to create a new source file, the path's extension must "
         "match the real language of the content you're writing (.py, .js, .ts, .go, .php, "
         ".css, etc.) -- never fall back to a generic '.txt' (or any other wrong extension) "

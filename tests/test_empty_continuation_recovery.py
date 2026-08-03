@@ -9,6 +9,7 @@ from tamfis_code.runner_local import (
     _normalise_tool_result,
     _recover_empty_continuation,
     _same_provider_recovery_models,
+    _update_unresolved_edit_paths,
 )
 
 
@@ -124,3 +125,28 @@ def test_glyph_prefixed_edit_error_is_not_treated_as_a_success():
 
     assert result["success"] is False
     assert "old_string not found" in result["error"]
+
+
+def test_successful_retry_clears_prior_stale_edit_failure(tmp_path):
+    workspace = tmp_path / "workspace"
+    target = workspace / "api" / "router.ts"
+    target.parent.mkdir(parents=True)
+    target.write_text("current source", encoding="utf-8")
+    unresolved: set[str] = set()
+
+    failed_key = _update_unresolved_edit_paths(
+        unresolved,
+        path="api/router.ts",
+        workspace_root=str(workspace),
+        failed=True,
+    )
+    assert unresolved == {str(target.resolve())}
+
+    recovered_key = _update_unresolved_edit_paths(
+        unresolved,
+        path=str(target),
+        workspace_root=str(workspace),
+        failed=False,
+    )
+    assert recovered_key == failed_key
+    assert unresolved == set()

@@ -41,6 +41,19 @@ def test_describe_batch_numbers_only_risky_actions():
     assert lines[1].endswith("[dangerous]")
 
 
+def test_describe_batch_redacts_inline_program_passwords():
+    batch = ApprovalBatch()
+    batch.add(ApprovalAction(
+        "execute_command",
+        {"command": "node -e \"new Pool({password: 'example-only-secret'})\""},
+        "connect",
+        "medium",
+    ))
+    text = describe_batch(batch)
+    assert "example-only-secret" not in text
+    assert "***" in text
+
+
 def test_runner_local_batches_same_turn_approvals():
     text = Path("tamfis_code/runner_local.py").read_text(encoding="utf-8")
     assert "_turn_batch = ApprovalBatch()" in text

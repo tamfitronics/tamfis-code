@@ -1265,7 +1265,9 @@ class StreamRenderer:
             command_id = payload.get("command_id")
             cwd = str(payload.get('cwd') or payload.get('working_directory') or '?')
             reason = str(payload.get('reason') or 'The agent requested this command.')
-            command_text = _bounded_preview(str(text or ''))
+            # Final secrecy boundary: remote and grouped approval events may
+            # arrive without having passed through the local runner's copy.
+            command_text = _bounded_preview(redact_secrets(str(text or '')))
             # This is the one screen where display accuracy is a safety
             # property, not just cosmetics: a human approves/rejects based
             # on what's shown here. Panel's body/title are markup-parsed by
