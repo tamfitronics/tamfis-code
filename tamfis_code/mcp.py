@@ -1087,7 +1087,15 @@ class MCPServer:
             if file_pattern:
                 cmd.extend(['--glob', file_pattern])
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # Off the event loop: this blocks for however long ripgrep takes
+            # (up to the 30s timeout) on a large/slow tree, and search_code is
+            # one of the most frequently invoked tools -- running it inline
+            # here froze prompt_toolkit's live input loop (same event loop)
+            # for that whole span, making the message box unresponsive while
+            # a search was in flight.
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=30
+            )
             matches = []
 
             for line in result.stdout.split('\n'):
@@ -1574,28 +1582,27 @@ class MCPServer:
         
         info["is_git_repo"] = True
         
+        # Off the event loop for the same reason as _search_code above --
+        # git can be slow on a large repo (packed-refs, cold FS cache), and
+        # blocking here froze the live input loop while it ran.
+        async def _git(*args: str):
+            return await asyncio.to_thread(
+                subprocess.run, ['git', '-C', str(p), *args], capture_output=True, text=True
+            )
+
         try:
             # Get current branch
-            result = subprocess.run(
-                ['git', '-C', str(p), 'rev-parse', '--abbrev-ref', 'HEAD'],
-                capture_output=True, text=True
-            )
+            result = await _git('rev-parse', '--abbrev-ref', 'HEAD')
             if result.returncode == 0:
                 info["branch"] = result.stdout.strip()
-            
+
             # Get remote URL
-            result = subprocess.run(
-                ['git', '-C', str(p), 'config', '--get', 'remote.origin.url'],
-                capture_output=True, text=True
-            )
+            result = await _git('config', '--get', 'remote.origin.url')
             if result.returncode == 0:
                 info["remote_url"] = result.stdout.strip()
-            
+
             # Get latest commit
-            result = subprocess.run(
-                ['git', '-C', str(p), 'log', '-1', '--format=%H%n%s%n%an%n%ae%n%ad'],
-                capture_output=True, text=True
-            )
+            result = await _git('log', '-1', '--format=%H%n%s%n%an%n%ae%n%ad')
             if result.returncode == 0:
                 lines = result.stdout.split('\n')
                 if len(lines) >= 5:
@@ -1608,10 +1615,7 @@ class MCPServer:
                     }
             
             # Get status
-            result = subprocess.run(
-                ['git', '-C', str(p), 'status', '--porcelain'],
-                capture_output=True, text=True
-            )
+            result = await _git('status', '--porcelain')
             info["has_changes"] = bool(result.stdout.strip())
             info["changed_files"] = len([l for l in result.stdout.split('\n') if l.strip()])
             
