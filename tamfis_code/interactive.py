@@ -166,6 +166,12 @@ async def _run_remote_turn_with_live_ui(
         stop_result = live_input.stop()
         if inspect.isawaitable(stop_result):
             await stop_result
+        # execute_remote (runtime/unified.py) now runs turns through the
+        # local engine instead of runner._stream_task, which used to close
+        # the renderer itself in its own finally block. Without this, the
+        # assistant box's bottom border never prints and box state leaks
+        # into the next turn.
+        renderer.finish()
 
 
 HELP_TEXT = """\

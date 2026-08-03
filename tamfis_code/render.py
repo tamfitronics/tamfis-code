@@ -595,6 +595,26 @@ class StreamRenderer:
         self._mode_label = label
         self._refresh_live()
 
+    def live_input_activity_line(self) -> Optional[str]:
+        """Plain-text "Searching for N patterns, reading M files…" summary,
+        for prompt-toolkit's bottom toolbar (see live_input.py's
+        _bottom_toolbar). This is the same tally _build_status renders above
+        its Rich spinner, but that Live region is suspended for the whole
+        interactive REPL (Rich Live and prompt-toolkit fight over the same
+        rows -- see _flush_assistant's box-drawing fallback), so without this
+        the activity tally never reaches the ordinary interactive session at
+        all, only the no-listener path (`tamfis-code agent`/CI-style runs).
+        """
+        activity_summary = _round_activity_summary(self._round_tool_counts)
+        if self._running_command:
+            command_elapsed = _format_elapsed(
+                time.monotonic() - (self._running_command_started or time.monotonic())
+            )
+            preview = self._running_command[:120]
+            command_line = f"⎿  $ {preview} ({command_elapsed})"
+            return f"{activity_summary}  {command_line}" if activity_summary else command_line
+        return activity_summary or None
+
     def live_input_status(self, spinner_frame: str = "") -> str:
         """Compact status text for prompt-toolkit's persistent footer.
 

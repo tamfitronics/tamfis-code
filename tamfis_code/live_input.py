@@ -397,7 +397,13 @@ class LiveInputListener:
                 active_agents=self._active_agents,
             )}"
         )
-        return HTML(_right_align(left, _right_chip() + " "))
+        bottom_line = _right_align(left, _right_chip() + " ")
+        activity = self.renderer.live_input_activity_line()
+        if not activity:
+            return HTML(bottom_line)
+        from xml.sax.saxutils import escape as _xml_escape
+        activity_line = f" <ansigray>{_xml_escape(activity)}</ansigray>"
+        return HTML(f"{activity_line}\n{bottom_line}")
 
     async def _input_loop(self) -> None:
         from prompt_toolkit import PromptSession
