@@ -36,11 +36,11 @@ _PUBLIC_MODEL_INPUTS = {
 _PROVIDER_RE = re.compile(
     r"(?i)\b(?:ollama(?:[ _-]cloud|[ _-]gpu)?|hugging\s*face|hf|"
     r"openrouter|nvidia(?:\s*nim)?|nvidia_nim|tier[ _-]?iv|apiframe|"
-    r"moonshot(?:\s*ai)?|anthropic|openai|google(?:\s*genai)?)\b"
+    r"moonshot(?:\s*ai)?|anthropic|openai|google(?:\s*genai)?|x-ai|xai)\b"
 )
 _MODEL_HINT_RE = re.compile(
     r"(?i)(?:kimi|qwen|deepseek|nemotron|gemma|glm|minimax|gemini|llama|"
-    r"mistral|mixtral|claude|gpt|coder|"
+    r"mistral|mixtral|claude|gpt|coder|grok|"
     r":cloud|/.*(?:flash|pro|instruct|reasoning))"
 )
 

@@ -267,14 +267,21 @@ class ProviderManager:
                 # as an explicit Ollama Cloud priority without unexpectedly
                 # changing the automatic model for every task.
                 "glm-5.2:cloud",
-                "minimax-m2.7:cloud",
+                # Replaces the prior minimax-m2.7:cloud route outright
+                # (2026-08-03): same MiniMax family already routed via
+                # Ollama Cloud, now the latest generation with a 1M-token
+                # context window (vs. m2.7's 204800) -- see also
+                # minimaxai/minimax-m3 already selectable on NVIDIA NIM
+                # above. Not the default -- explicit-select route for
+                # long-context coding work.
+                "minimax-m3:cloud",
             ],
             priority=0,
             weight=10,
             reasoning_supported=True,
             vision_supported=True,
             # NOTE: this budget is shared by the whole provider bucket
-            # (gemma4:cloud, minimax-m2.7:cloud too, not just kimi-k3), and
+            # (gemma4:cloud, minimax-m3:cloud too, not just kimi-k3), and
             # gates real request-size/truncation logic in runner_local.py --
             # left at the existing conservative value rather than raised to
             # kimi-k3's real 1M window, since that would misrepresent the
@@ -504,6 +511,17 @@ class ProviderManager:
                 # entitlement gap, see providers.py's NVIDIA default_model
                 # comment).
                 "moonshotai/kimi-k2.6",
+                # Real xAI-hosted Grok, via OpenRouter -- same ids already
+                # live-verified against OpenRouter's /v1/models catalog for
+                # TamfisGPT's own Tier IV routing (see tamgpt6's
+                # orchestration.yaml grok-4.5-or/grok-4.3-or entries, added
+                # 2026-08-03). xAI does not distribute Grok weights for
+                # local/Ollama use, so OpenRouter is the only
+                # policy-permitted route to the genuine model (standing
+                # policy: never call a vendor's native API directly -- see
+                # providers.py module docstring / PRIORITY_ORDER comment).
+                "x-ai/grok-4.5",
+                "x-ai/grok-4.3",
             ],
             # OpenRouter is last in AUTO because paid coding routes can fail
             # with HTTP 402 when the account has no credits. It remains

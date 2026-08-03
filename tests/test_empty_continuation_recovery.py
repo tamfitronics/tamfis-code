@@ -34,13 +34,13 @@ def test_same_provider_recovery_uses_safe_alternate_without_k3(monkeypatch):
             "gemma4:cloud",
             "kimi-k3:cloud",
             "kimi-k2.7-code:cloud",
-            "minimax-m2.7:cloud",
+            "minimax-m3:cloud",
         ],
     )
 
     assert _same_provider_recovery_models(config, "kimi-k2.7-code:cloud") == [
         "gemma4:cloud",
-        "minimax-m2.7:cloud",
+        "minimax-m3:cloud",
     ]
 
 
