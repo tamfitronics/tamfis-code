@@ -298,15 +298,28 @@ class ConfigCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
 class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase):
     """ask/agent/exec/chat/audit/plan default to the standalone local loop
     (runner_local.py) now -- --remote is required to reach the legacy
-    RemoteAPIClient path, and --bg (server-side background execution) only
-    makes sense with --remote since a standalone process has no server to
-    keep a task alive after it exits."""
+    RemoteAPIClient path. --bg spawns a real detached background process for
+    standalone runs too (see background.py); execute-plan's --bg is still
+    remote-only (unchanged, separate flow)."""
 
-    def test_bg_without_remote_is_rejected(self):
+    def test_bg_without_remote_spawns_a_detached_background_job(self):
+        """--bg now works standalone too: it spawns a real detached OS
+        process (see background.py) instead of requiring the legacy Remote
+        Workspace backend to keep the task alive after this process exits."""
+        from tamfis_code.background import BackgroundJob
+
+        fake_job = BackgroundJob(
+            id="bg-test1234", pid=999999, session_id=1, workspace_root="/tmp",
+            mode="coding", objective_preview="do something", log_path="/tmp/x.log",
+            prompt_path="/tmp/x.prompt", started_at=0.0,
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            result = self.runner.invoke(cli, ["--cwd", tmp, "ask", "do something", "--bg"])
-        self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("--bg requires --remote", result.output)
+            with patch("tamfis_code.background.spawn_background_task", return_value=fake_job) as fake_spawn:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "ask", "do something", "--bg"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Started in background", result.output)
+        self.assertIn(fake_job.id, result.output)
+        fake_spawn.assert_called_once()
 
     def test_execute_plan_bg_without_remote_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:

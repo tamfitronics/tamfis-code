@@ -66,6 +66,27 @@ The bridge reconnects automatically, replays unacknowledged results after a
 network interruption, and exposes only the selected workspace. Admin access
 is not required for ordinary entitled subscribers.
 
+## Running tasks in the background
+
+Add `--bg` to `ask`/`chat`/`audit`/`agent`/`exec` to start a task and return
+immediately. The task runs in a detached process (its own OS session, not a
+child of your terminal), so it keeps running to completion even after you
+close the terminal or disconnect:
+
+```bash
+tamfis-code agent "add a health-check endpoint" --bg
+# Started in background · job bg-a1b2c3d4 (pid 12345)
+
+tamfis-code bg-list                     # every background job and its status
+tamfis-code bg-status bg-a1b2c3d4        # one job's detail
+tamfis-code bg-logs bg-a1b2c3d4 --follow # tail its output live
+tamfis-code bg-stop bg-a1b2c3d4          # terminate it
+```
+
+Job status is one of `running`, `completed`, `failed`, or `stopped`. `--bg`
+is not available for `plan` (the plan needs the invoking process attached to
+save it locally).
+
 ## TamfisGPT models
 
 Users select stable product aliases: **TamfisGPT Auto**, **TamfisGPT Fast**,

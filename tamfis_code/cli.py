@@ -18,6 +18,7 @@ import getpass
 import os
 import re
 import sys
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -1439,8 +1440,9 @@ def _ai_command(mode: str, help_text: str):
     @click.option("--mode", "mode_override", type=click.Choice(["auto", "coding", "chat", "audit", "plan", "agent", "execute"]), default=None, help="Override this command's task mode.")
     @click.option("--provider", type=click.Choice(_PROVIDER_CHOICES), default=None, hidden=True)
     @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend. Deprecated -- standalone (the default) is the supported path going forward.")
+    @click.option("--_bg-job-id", "bg_job_id", default=None, hidden=True, help="Internal: set by spawn_background_task on the detached child so it can report its own completion status.")
     @click.pass_context
-    def command(ctx: click.Context, objective: Optional[str], read_stdin: bool, prompt_file: Optional[Path], attachment_paths: tuple[str, ...], background: bool, model: str, mode_override: Optional[str], provider: Optional[str], remote: bool):
+    def command(ctx: click.Context, objective: Optional[str], read_stdin: bool, prompt_file: Optional[Path], attachment_paths: tuple[str, ...], background: bool, model: str, mode_override: Optional[str], provider: Optional[str], remote: bool, bg_job_id: Optional[str]):
         config: Config = ctx.obj["config"]
         workspace_root: Path = ctx.obj["workspace_root"]
         sources = int(bool(objective and objective != "-")) + int(read_stdin or objective == "-") + int(prompt_file is not None)
@@ -1453,11 +1455,6 @@ def _ai_command(mode: str, help_text: str):
             raise click.UsageError(
                 "Plan creation must stay attached so the completed plan can be saved locally; omit --bg."
             )
-        if background and not _use_remote(config, remote):
-            raise click.UsageError(
-                "--bg requires --remote (or default_backend = \"remote\" in config.toml): a standalone "
-                "local run has no server to keep the task alive once this process exits."
-            )
         if prompt_file is not None:
             objective_text = prompt_file.read_text(encoding="utf-8")
         elif read_stdin or objective == "-":
@@ -1466,14 +1463,40 @@ def _ai_command(mode: str, help_text: str):
             objective_text = objective or ""
         if len(objective_text) > 1_000_000:
             raise click.UsageError("Objective exceeds the 1,000,000 character safety limit.")
-        if _use_remote(config, remote):
-            exit_code = _run_async(_run_ai_command(
-                config, workspace_root, objective_text, effective_mode, background, model, provider, attachment_paths,
-            ))
-        else:
-            exit_code = _run_async(_run_local_ai_command(
-                config, workspace_root, objective_text, effective_mode, model, provider, attachment_paths,
-            ))
+        if background and not _use_remote(config, remote):
+            from .background import spawn_background_task
+            from .workspace import resolve_local_workspace
+
+            workspace = resolve_local_workspace(workspace_root, discover=effective_mode != "chat")
+            job = spawn_background_task(
+                session_id=workspace.session_id, workspace_root=Path(workspace.workspace_root),
+                mode=effective_mode, objective=objective_text, model=model, provider=provider,
+                approval_policy=config.approval_policy, attachment_paths=attachment_paths,
+            )
+            console = Console(no_color=not config.colour)
+            console.print(f"[green]Started in background[/green] · job {job.id} (pid {job.pid})")
+            console.print("[dim]Keeps running after this terminal closes.[/dim]")
+            console.print(f"  tamfis-code bg-logs {job.id} --follow")
+            console.print(f"  tamfis-code bg-list")
+            console.print(f"  tamfis-code bg-stop {job.id}")
+            return
+        try:
+            if _use_remote(config, remote):
+                exit_code = _run_async(_run_ai_command(
+                    config, workspace_root, objective_text, effective_mode, background, model, provider, attachment_paths,
+                ))
+            else:
+                exit_code = _run_async(_run_local_ai_command(
+                    config, workspace_root, objective_text, effective_mode, model, provider, attachment_paths,
+                ))
+        except BaseException:
+            if bg_job_id:
+                from .background import update_job_status
+                update_job_status(bg_job_id, "failed", exit_code=1)
+            raise
+        if bg_job_id:
+            from .background import update_job_status
+            update_job_status(bg_job_id, "completed" if exit_code == EXIT_OK else "failed", exit_code=exit_code)
         if exit_code != EXIT_OK:
             raise SystemExit(exit_code)
 
@@ -2133,6 +2156,97 @@ async def stop(ctx: click.Context, session_id: int):
         except (RemoteAPIError, httpx.HTTPError) as e:
             print_error(console, str(e))
             raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
+
+
+@cli.command(name="bg-list")
+@click.pass_context
+def bg_list(ctx: click.Context):
+    """List standalone tasks started with `--bg`, and their status (running/completed/failed/stopped)."""
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+    from .background import list_jobs
+
+    jobs = list_jobs()
+    if not jobs:
+        console.print("[dim]No background jobs. Start one with `tamfis-code ask \"...\" --bg`.[/dim]")
+        return
+    table = Table(show_header=True, header_style="bold")
+    for col in ("JOB", "STATUS", "PID", "MODE", "OBJECTIVE", "WORKSPACE"):
+        table.add_column(col)
+    for job in jobs:
+        table.add_row(
+            job["id"], job["status"], str(job["pid"]), job["mode"],
+            job["objective_preview"][:60], job["workspace_root"],
+        )
+    console.print(table)
+    console.print("[dim]tamfis-code bg-logs <job> --follow · tamfis-code bg-stop <job>[/dim]")
+
+
+@cli.command(name="bg-status")
+@click.argument("job_id")
+@click.pass_context
+def bg_status(ctx: click.Context, job_id: str):
+    """Show one background job's status."""
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+    from .background import read_job
+
+    job = read_job(job_id)
+    if job is None:
+        print_error(console, f"No background job '{job_id}'.")
+        raise SystemExit(EXIT_TASK_FAILED)
+    for key in ("id", "status", "pid", "mode", "objective_preview", "workspace_root", "log_path", "exit_code"):
+        console.print(f"[bold]{key}[/bold]: {job.get(key)}")
+
+
+@cli.command(name="bg-logs")
+@click.argument("job_id")
+@click.option("--follow", "follow", is_flag=True, default=False, help="Keep printing new output as the job produces it.")
+@click.pass_context
+def bg_logs(ctx: click.Context, job_id: str, follow: bool):
+    """Print (or follow) a background job's output log."""
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+    from .background import is_pid_alive, read_job
+
+    job = read_job(job_id)
+    if job is None:
+        print_error(console, f"No background job '{job_id}'.")
+        raise SystemExit(EXIT_TASK_FAILED)
+    log_path = Path(job["log_path"])
+    with open(log_path, "r", encoding="utf-8", errors="replace") as handle:
+        console.print(handle.read(), end="")
+        if not follow:
+            return
+        console.print(f"[dim]-- following job {job_id}; Ctrl+C to stop watching --[/dim]")
+        try:
+            while True:
+                chunk = handle.read()
+                if chunk:
+                    console.print(chunk, end="")
+                    continue
+                if not is_pid_alive(int(job["pid"])):
+                    console.print(f"[dim]-- job {job_id} finished --[/dim]")
+                    return
+                time.sleep(0.5)
+        except KeyboardInterrupt:
+            return
+
+
+@cli.command(name="bg-stop")
+@click.argument("job_id")
+@click.pass_context
+def bg_stop(ctx: click.Context, job_id: str):
+    """Terminate a running background job."""
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+    from .background import stop_job
+
+    if stop_job(job_id):
+        console.print(f"[green]Stopped[/green] job {job_id}.")
+    else:
+        print_error(console, f"Job '{job_id}' is not running (or doesn't exist).")
+        raise SystemExit(EXIT_TASK_FAILED)
 
 
 async def _decide_approval(ctx: click.Context, approval_id: int, decision: str) -> None:
