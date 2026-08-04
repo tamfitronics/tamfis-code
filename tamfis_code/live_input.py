@@ -493,6 +493,27 @@ class LiveInputListener:
                     return
                 except EOFError:
                     return
+                except Exception as exc:
+                    # prompt_toolkit's own built-in Ctrl+C key binding calls
+                    # Application.exit() unconditionally, with no way for it to
+                    # know this loop already exited the same Application for a
+                    # different reason a moment earlier (e.g. a cancel queued
+                    # from another terminal, handled via _cancel_running_turn /
+                    # _shutdown_prompt). When both land in the same input
+                    # cycle, the second exit() raises "Return value already
+                    # set" from inside prompt_toolkit's key processor. Left
+                    # uncaught here, that becomes an unhandled exception on
+                    # the event loop and the live UI appears to freeze with a
+                    # raw traceback until the user presses Enter -- live-
+                    # reported, triggered by a queued cancel racing a manual
+                    # Ctrl+C. Both signals already agree the turn is
+                    # cancelling, so treat this specific race as an ordinary
+                    # interrupt instead of crashing the input loop; anything
+                    # else re-raises unchanged.
+                    if "Return value already set" in str(exc) or "Application.exit()" in str(exc):
+                        self._request_interrupt("cancel")
+                        return
+                    raise
 
                 if self._paused:
                     break

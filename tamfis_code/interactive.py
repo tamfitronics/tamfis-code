@@ -23,6 +23,7 @@ from prompt_toolkit.keys import Keys
 from rich.console import Console
 from rich.markup import escape
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__
@@ -195,6 +196,9 @@ $ <command>            explicit shell command
 /queue               show queued instructions
 /queue <instruction> append a follow-up instruction
 /cwd                 show the current workspace root
+/cd <path>           change the working directory for this session (auto-approves the
+                      containing project root); every following turn's tools and
+                      repository context re-orient to it immediately
 /copy                copy the last assistant response to the clipboard (OSC 52 --
                       works over plain SSH, no X11/Wayland/xclip required)
 /doctor              run connectivity/auth checks
@@ -218,7 +222,10 @@ $ <command>            explicit shell command
                       nothing in this REPL ties a task's lifetime to this process; see
                       `tamfis-code attach <session_id>` in another terminal to reconnect)
 /clear               clear the screen
-/compact             save a durable checkpoint of the current task context
+/compact             compress the thread: fold older turns into the session summary and keep
+                      only the recent few turns in full, so a long REPL stays light in the
+                      terminal and the next turn's context (Claude Code/Codex-style compaction)
+/summary             show a structured recap of the conversation so far without compressing it
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
@@ -255,6 +262,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/reports", "show the repository report index"),
     ("/queue", "show or append queued instructions"),
     ("/cwd", "show the current workspace root"),
+    ("/cd", "change the working directory for this session"),
     ("/copy", "copy the last assistant response to the clipboard"),
     ("/doctor", "run connectivity/auth checks"),
     ("/resume", "switch to another session"),
@@ -267,7 +275,8 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/revert", "restore a file to its content before a mutation"),
     ("/detach", "exit without cancelling anything server-side"),
     ("/clear", "clear the screen"),
-    ("/compact", "save a durable checkpoint of the current task context"),
+    ("/compact", "compress the thread (fold older turns into the summary, keep recent turns)"),
+    ("/summary", "show a structured recap of the conversation so far"),
     ("/permissions", "show approval policy and immutable server safeguards"),
     ("/mode", "show or switch the active approval mode"),
     ("/model", "show or switch the active model route"),
@@ -878,6 +887,65 @@ async def run_interactive(
         if text == "/cwd":
             console.print(workspace.workspace_root)
             continue
+        if text == "/cd" or text.startswith("/cd "):
+            # Claude Code/Codex both let you just tell the agent to look
+            # somewhere else and it re-orients immediately -- this REPL had
+            # no equivalent at all: `tamfis-code cwd <path>` only existed as
+            # a *separate* CLI invocation (a new process, so it could never
+            # affect a session already running), and even then only updated
+            # a mostly-cosmetic `current_working_directory` field, not the
+            # `workspace_root` tools actually execute against. This updates
+            # `workspace.workspace_root` in place, which every subsequent
+            # turn's MCPServer/context discovery is built fresh from (see
+            # the `workspace_root=workspace.workspace_root` passed into each
+            # `_run_local_agent_turn_impl` call below), so the very next
+            # turn's file reads, edits, and repository context (branch,
+            # dirty files, project metadata) all reflect the new directory.
+            arg = text[len("/cd "):].strip() if text != "/cd" else ""
+            if not arg:
+                console.print(f"[dim]Current working directory: {workspace.workspace_root}[/dim]")
+                console.print("[dim]Usage: /cd <path>[/dim]")
+                continue
+            candidate = Path(arg).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(workspace.workspace_root) / candidate
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError as exc:
+                console.print(f"[red]Can't change directory: {exc}[/red]")
+                continue
+            if not resolved.is_dir():
+                console.print(f"[red]Not a directory: {resolved}[/red]")
+                continue
+            target = str(resolved)
+            state = local_state.get_session_state(workspace.session_id)
+            approved = any(
+                target == allowed or target.startswith(allowed.rstrip("/") + "/")
+                for allowed in state.allowed_workspaces
+            )
+            if not approved:
+                # Same auto-grant shape as an explicit absolute path in an
+                # objective (cli.py's _project_root_for_target): approve the
+                # containing git project root, not just the literal
+                # directory, so a subsequent `/cd` into a sibling
+                # subdirectory of the same project doesn't need its own
+                # approval prompt.
+                start = resolved
+                expansion_root = resolved
+                for candidate_root in (start, *start.parents):
+                    if (candidate_root / ".git").exists():
+                        expansion_root = candidate_root
+                        break
+                allowed_list = list(dict.fromkeys([*state.allowed_workspaces, str(expansion_root)]))
+                local_state.save_session_state(workspace.session_id, allowed_workspaces=allowed_list)
+                console.print(f"[dim]Workspace added: {expansion_root}[/dim]")
+            workspace.workspace_root = target
+            local_state.save_session_state(
+                workspace.session_id, workspace_root=target, current_working_directory=target,
+            )
+            discover_local_repository(workspace.session_id, resolved, force=True)
+            console.print(f"[green]Working directory:[/green] {target}")
+            continue
         if text == "/copy":
             if not last_response_text:
                 console.print("[dim]Nothing to copy yet.[/dim]")
@@ -1293,29 +1361,38 @@ async def run_interactive(
             console.print(f"[green]Mode set to[/green] {arg} [dim]({resolved})[/dim]")
             continue
         if text == "/compact":
-            state = local_state.get_session_state(workspace.session_id)
-            summary = (state.active_task or {}).get("objective") or state.conversation_summary or "Session checkpoint"
+            # Real thread compression (Claude Code/Codex parity): fold older
+            # turns into conversation_summary and keep only the recent few
+            # turns in conversation_history, so a long REPL thread stops
+            # dominating the terminal and the next turn's context. The
+            # durable checkpoint is still saved too, so resume is unaffected.
+            recap = local_state.compact_session_thread(workspace.session_id)
+            # Read the freshly-compacted state directly rather than reusing a
+            # `state` local that is only assigned inside the /status and
+            # /context blocks (both of which `continue`). Before this fix,
+            # running /compact as the very first command in a fresh REPL
+            # raised UnboundLocalError on `state` here.
+            compact_state = local_state.get_session_state(workspace.session_id)
+            summary = (compact_state.active_task or {}).get("objective") or compact_state.conversation_summary or "Session checkpoint"
             local_state.checkpoint(workspace.session_id, reason="user_compact", summary=summary)
-            console.print("[green]Context checkpoint saved.[/green]")
+            console.print("[green]Thread compressed.[/green] Older turns were folded into the session summary; recent turns are retained in full.")
+            console.print(f"[dim]~{len(recap)} char recap saved. Next turn starts from the compressed context.[/dim]")
+            continue
+        if text == "/summary":
+            recap = local_state.summarize_thread(workspace.session_id)
+            console.print(Panel(recap, title="Thread summary", border_style="cyan", expand=False))
             continue
         if text == "/doctor":
-            if standalone:
-                from .providers import get_provider_status as _get_provider_status
-
-                status = _get_provider_status()
-                ready = any(
-                    bool(info.get("api_key_set")) or name == "tier_iv"
-                    for name, info in status["config"].items()
-                )
-                state = local_state.get_session_state(workspace.session_id)
-                from .public_identity import public_model_name
-                console.print(
-                    "[green]TamfisGPT model service ready[/green]"
-                    if ready else "[yellow]TamfisGPT model service unavailable[/yellow]"
-                )
-                console.print(f"[dim]Currently selected: {public_model_name(state.selected_model)}[/dim]")
-                continue
-            await run_doctor(config, console, Path(workspace.workspace_root), session_id=workspace.session_id)
+            # Full self-health-check in both modes (Claude Code/Codex parity):
+            # standalone mode used to only print a one-line provider status,
+            # never running the real session/workspace/context/recent-failure
+            # diagnostics _diagnose_local_session already provides. Run the
+            # actual doctor so a standalone user gets the same PASS/WARNING/
+            # FAIL self-diagnosis the --remote path always had.
+            await run_doctor(
+                config, console, Path(workspace.workspace_root),
+                session_id=workspace.session_id,
+            )
             continue
         if text == "/agents" or text == "/agents --all":
             show_all = text.endswith("--all")

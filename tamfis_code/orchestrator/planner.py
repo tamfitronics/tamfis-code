@@ -253,13 +253,20 @@ def create_plan(
         workspace_summary=workspace_summary or {},
     )
 
+    # Step text is deliberately terse -- Claude Code/Codex-style single-line
+    # action items, not full sentences. This is the deterministic plan shown
+    # to the user immediately (before any reasoning-plan revision), so its
+    # verbosity was the first, most visible instance of the "plans are too
+    # long per item" complaint. Every constraint that matters (which root,
+    # which manifest, which verified command) is still named explicitly;
+    # only the connective, explanatory prose around it is trimmed.
     steps: list[PlanStep] = []
     if evidence.roots:
         for root in evidence.roots[:4]:
             steps.append(
                 PlanStep(
                     len(steps) + 1,
-                    f"Inventory the verified project structure under {root} and identify the components relevant to the objective.",
+                    f"Inventory `{root}` for objective-relevant components.",
                     evidence=[f"path:{root}"],
                 )
             )
@@ -267,7 +274,7 @@ def create_plan(
         steps.append(
             PlanStep(
                 1,
-                "Review the deterministic workspace inventory and identify objective-relevant components without assuming a project type.",
+                "Review the workspace inventory for objective-relevant components.",
             )
         )
 
@@ -277,7 +284,7 @@ def create_plan(
         steps.append(
             PlanStep(
                 len(steps) + 1,
-                f"Read the discovered project metadata at {rendered} and derive only the scripts and dependencies it actually defines.",
+                f"Read project metadata: {rendered}.",
                 evidence=[f"path:{path}" for path in paths],
             )
         )
@@ -285,7 +292,7 @@ def create_plan(
     steps.append(
         PlanStep(
             len(steps) + 1,
-            "Trace the objective-relevant code paths found during reconnaissance and record concrete findings before proposing changes.",
+            "Trace objective-relevant code paths from reconnaissance.",
         )
     )
 
@@ -293,7 +300,7 @@ def create_plan(
         steps.append(
             PlanStep(
                 len(steps) + 1,
-                "Apply the smallest evidence-backed changes while preserving unrelated behaviour and the authorised workspace boundary.",
+                "Apply the smallest evidence-backed change; preserve unrelated behaviour.",
             )
         )
 
@@ -303,7 +310,7 @@ def create_plan(
             steps.append(
                 PlanStep(
                     len(steps) + 1,
-                    f"Validate the result with the verified repository command `{command}` and investigate any observed failure.",
+                    f"Validate with `{command}`; investigate any failure.",
                     evidence=[f"command:{command}"],
                 )
             )
@@ -311,14 +318,14 @@ def create_plan(
             steps.append(
                 PlanStep(
                     len(steps) + 1,
-                    "Validate using only commands discovered from real repository metadata during execution; do not guess a test or build command.",
+                    "Validate using only commands discovered during execution.",
                 )
             )
 
     steps.append(
         PlanStep(
             len(steps) + 1,
-            "Report only findings, changes, validations, and remaining risks supported by recorded evidence.",
+            "Report evidence-backed findings, changes, validations, and risks.",
         )
     )
 
@@ -362,6 +369,10 @@ NON-NEGOTIABLE RULES
 6. Do not include provider selection, generic methodology, or vague steps such as
    'inspect the repository', 'look for bugs', 'ensure dependencies', or 'run
    tests'. Name the verified target and purpose.
+6a. Keep "action" a single short imperative line (roughly 12 words), the way a
+   terse engineering checklist reads -- not a full sentence explaining itself.
+   "purpose" is separate and is not shown next to the action, so do not repeat
+   it inside "action".
 7. When evidence is insufficient, plan a bounded read-only inventory of an
    authorised root or a verified path. Do not fill gaps with guesses.
 8. For multi-root work, keep each root explicit. Never collapse the common parent
@@ -780,12 +791,17 @@ def _parse_step_candidate(
         or raw_step.get("step")
         or ""
     ).strip()
-    purpose = str(raw_step.get("purpose") or "").strip()
-    name = (
-        f"{action.rstrip('.')} — {purpose.rstrip('.')}."
-        if purpose and purpose.lower() not in action.lower()
-        else action
-    )
+    # Every plan step used to render as "<action> — <purpose>.", stitching
+    # the model's full "why this step is needed" sentence onto every single
+    # line. Claude Code/Codex plans read as short, scannable action items --
+    # this made ours consistently two to three times longer per step for no
+    # added information (the model already grounds *why* in the objective/
+    # evidence surfaced elsewhere; validate_plan_step below still requires
+    # `action` alone to be a real, evidence-backed, specific step). `purpose`
+    # is still accepted from the model (kept for schema stability/backwards
+    # compatibility with any caller reading raw JSON) but no longer widens
+    # the rendered name.
+    name = action
     targets = [
         str(item).strip()
         for item in _iter_values(raw_step.get("targets"))

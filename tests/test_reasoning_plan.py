@@ -75,6 +75,22 @@ class ParseReasoningPlanTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertLessEqual(len(plan.steps), 8)
 
+    def test_purpose_is_not_appended_to_the_rendered_step_name(self):
+        # Regression: every step used to render as "<action> — <purpose>.",
+        # doubling (or tripling) the length of every single plan item. Claude
+        # Code/Codex-style plans are short, scannable action lines; `purpose`
+        # is accepted from the model but must not widen what's displayed.
+        raw = json.dumps({
+            "steps": [{
+                "action": "Read calc.py",
+                "purpose": "to find the off-by-one error causing the reported crash",
+            }],
+        })
+        plan = parse_reasoning_plan(raw, objective="x")
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan.steps[0].name, "Read calc.py")
+        self.assertNotIn("off-by-one", plan.steps[0].name)
+
 
 class BuildReasoningPlanPromptTests(unittest.TestCase):
     def _profile(self):

@@ -337,8 +337,8 @@ class StreamRendererTests(unittest.TestCase):
 
         real_commands = set(cli.commands.keys())
         real_repl_commands = {
-            "mode", "compact", "diffs", "diff", "revert", "resume", "retry",
-            "plan", "execute-plan", "queue", "model", "pty", "delegate",
+            "mode", "compact", "summary", "diffs", "diff", "revert", "resume", "retry",
+            "plan", "execute-plan", "queue", "model", "pty", "delegate", "cd",
             "status", "context", "clear", "exit", "quit", "detach", "help",
         }
         for tip in _TIPS:

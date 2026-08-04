@@ -24,7 +24,7 @@ import sys
 import tempfile
 import uuid
 from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
 
 from .config import CONFIG_DIR
@@ -44,6 +44,35 @@ MAX_TURN_CHECKPOINT_MESSAGES = 80
 # large tool result to turn every checkpoint into a multi-megabyte write.
 MAX_MEMORY_MESSAGE_CHARS = 12000
 MAX_MEMORY_TOTAL_CHARS = 180000
+
+# Defense-in-depth caps for the other per-session list/dict fields. Several
+# call sites already truncate what they pass in (e.g. validation_results to
+# the last 100), but that only helps if every call site remembers to -- a
+# single site that appends without slicing (this shipped for a while with
+# `modified_files`, see put_session_state below) turns one long-running,
+# file-touching audit into a session that grows forever. These are enforced
+# centrally in put_session_state so no call site can reintroduce the bug.
+MAX_MODIFIED_FILES = 300
+MAX_INSPECTED_FILES = 400
+MAX_VALIDATION_RESULTS = 150
+MAX_UNRESOLVED_ISSUES = 150
+MAX_PENDING_ACTIONS = 150
+MAX_DISCOVERED_SERVICES = 200
+MAX_DISCOVERED_REPORTS = 200
+MAX_DISCOVERED_SYMBOL_FILES = 400
+MAX_QUEUED_INSTRUCTIONS = 200
+
+# A long-lived install accumulates one state.json entry per session ever
+# created (80 sessions measured live at 15.7MB total, several individual
+# sessions multiple MB each) since nothing ever removed old ones. Every
+# `put_session_state` call -- which fires many times per turn during an
+# audit -- read-modify-wrote *all* of them, so the file kept growing and
+# every single write got slower right when a long session most needed a
+# responsive UI. Sessions untouched for this long are dropped from the hot
+# file; their human-readable mirror in `.memory/session-<id>.json` and any
+# `/compact` checkpoints are untouched, so nothing is actually lost -- it is
+# just no longer paid for on every unrelated session's write.
+STALE_SESSION_MAX_AGE = timedelta(days=21)
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)([^\s]+)"),
@@ -210,12 +239,38 @@ class SessionState:
     swarm_label: str = ""
 
 
+# In-process cache of the parsed state.json, keyed by the file's mtime. A
+# naive re-read-and-json.loads on every call cost ~150ms on a real 15.7MB/
+# 80-session install (measured live) -- and get_session_state/put_session_state
+# both call this, often several times per single turn event -- so a long
+# audit spent a growing fraction of every UI tick just re-parsing state it
+# had already parsed moments earlier. The mtime check still picks up writes
+# from another process (e.g. `tamfis-code queue`, a swarm child, `attach`)
+# since those change the file's mtime; only redundant same-process re-reads
+# of an unchanged file are skipped.
+_STATE_CACHE: Optional[dict[str, Any]] = None
+# Keyed by (path, mtime) rather than mtime alone so a process (or test
+# fixture) that repoints STATE_PATH at a different file mid-run can never
+# match a stale cache entry left over from the previous path by mtime
+# coincidence.
+_STATE_CACHE_KEY: Optional[tuple[str, float]] = None
+
+
 def _load_raw() -> dict[str, Any]:
+    global _STATE_CACHE, _STATE_CACHE_KEY
     if not STATE_PATH.is_file():
+        _STATE_CACHE, _STATE_CACHE_KEY = {}, None
         return {}
     try:
+        mtime = STATE_PATH.stat().st_mtime
+    except OSError:
+        mtime = None
+    cache_key = (str(STATE_PATH), mtime) if mtime is not None else None
+    if _STATE_CACHE is not None and cache_key is not None and cache_key == _STATE_CACHE_KEY:
+        return _STATE_CACHE
+    try:
         payload = json.loads(STATE_PATH.read_text(encoding="utf-8"))
-        return payload if isinstance(payload, dict) else {}
+        result = payload if isinstance(payload, dict) else {}
     except OSError as exc:
         # A permission/ownership mismatch here silently resets every session
         # to blank (no active_plan_id, no saved_plans, no conversation_summary)
@@ -229,13 +284,16 @@ def _load_raw() -> dict[str, Any]:
             f"{CONFIG_DIR}).",
             file=sys.stderr,
         )
-        return {}
+        return _STATE_CACHE if _STATE_CACHE is not None else {}
     except json.JSONDecodeError:
-        return {}
+        return _STATE_CACHE if _STATE_CACHE is not None else {}
+    _STATE_CACHE, _STATE_CACHE_KEY = result, cache_key
+    return result
 
 
 def _save_raw(data: dict[str, Any]) -> None:
     """Atomically replace state so a killed CLI cannot leave invalid JSON."""
+    global _STATE_CACHE, _STATE_CACHE_KEY
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     # Only chmod when it isn't already owner-only -- calling this unconditionally
     # on every save raises PermissionError (uncaught, all the way up) the moment
@@ -256,6 +314,14 @@ def _save_raw(data: dict[str, Any]) -> None:
             os.unlink(temp_name)
         except FileNotFoundError:
             pass
+    try:
+        # Record what we just wrote as the cache's ground truth, keyed by the
+        # replaced file's fresh mtime, so the next _load_raw() in this or any
+        # process sees it without a redundant re-parse of the file we just
+        # produced ourselves.
+        _STATE_CACHE, _STATE_CACHE_KEY = data, (str(STATE_PATH), STATE_PATH.stat().st_mtime)
+    except OSError:
+        pass
 
 
 def _save_memory_snapshot(state: SessionState) -> None:
@@ -313,6 +379,68 @@ def get_session_state(session_id: int) -> SessionState:
     return SessionState(session_id=session_id, **values)
 
 
+def _enforce_state_caps(state: SessionState) -> None:
+    """Trim every unbounded list/dict field to a hard cap, keeping the most
+    recent entries. This is the safety net for the UI-freeze bug: a long
+    audit that reads and edits many files grew `inspected_files` and
+    `modified_files` without limit (no call site ever sliced them), so a
+    session that ran for hours could make its own single entry in state.json
+    multiple megabytes -- and every subsequent event in that same session
+    then had to re-serialize and re-fsync that multi-megabyte blob on the
+    live UI thread. Called on every put_session_state so no call site can
+    reintroduce unbounded growth.
+    """
+    state.modified_files = state.modified_files[-MAX_MODIFIED_FILES:]
+    state.validation_results = state.validation_results[-MAX_VALIDATION_RESULTS:]
+    state.unresolved_issues = state.unresolved_issues[-MAX_UNRESOLVED_ISSUES:]
+    state.pending_actions = state.pending_actions[-MAX_PENDING_ACTIONS:]
+    state.completed_actions = state.completed_actions[-MAX_ACTION_HISTORY:]
+    state.context_checkpoints = state.context_checkpoints[-MAX_CHECKPOINTS:]
+    state.discovered_services = state.discovered_services[-MAX_DISCOVERED_SERVICES:]
+    state.discovered_reports = state.discovered_reports[-MAX_DISCOVERED_REPORTS:]
+    state.queued_user_instructions = state.queued_user_instructions[-MAX_QUEUED_INSTRUCTIONS:]
+    if len(state.inspected_files) > MAX_INSPECTED_FILES:
+        # dicts preserve insertion order; keep the most recently-touched
+        # entries by dropping the oldest keys rather than an arbitrary set.
+        overflow = len(state.inspected_files) - MAX_INSPECTED_FILES
+        for key in list(state.inspected_files)[:overflow]:
+            del state.inspected_files[key]
+    if len(state.discovered_symbols) > MAX_DISCOVERED_SYMBOL_FILES:
+        overflow = len(state.discovered_symbols) - MAX_DISCOVERED_SYMBOL_FILES
+        for key in list(state.discovered_symbols)[:overflow]:
+            del state.discovered_symbols[key]
+
+
+def _prune_stale_sessions(data: dict[str, Any], *, keep_session_id: int) -> None:
+    """Drop sessions untouched for STALE_SESSION_MAX_AGE from the hot,
+    shared state.json so an install with months of history doesn't force
+    every session's write to read-modify-write everyone else's data too (a
+    live install measured at 15.7MB/80 sessions, several MB each, before
+    this fix). The session being written right now is always kept regardless
+    of its own `updated_at` (about to be refreshed anyway). Nothing is lost:
+    each session's human-readable mirror in `.memory/session-<id>.json` and
+    any `/compact` checkpoints are untouched by this -- only the copy in the
+    single shared hot file is dropped.
+    """
+    cutoff = datetime.now(timezone.utc) - STALE_SESSION_MAX_AGE
+    keep_key = str(keep_session_id)
+    for key in list(data.keys()):
+        if key == keep_key:
+            continue
+        entry = data.get(key)
+        if not isinstance(entry, dict):
+            continue
+        updated_at = entry.get("updated_at")
+        if not updated_at:
+            continue
+        try:
+            when = datetime.fromisoformat(str(updated_at))
+        except ValueError:
+            continue
+        if when < cutoff:
+            del data[key]
+
+
 def put_session_state(state: SessionState) -> None:
     data = _load_raw()
     latest = data.get(str(state.session_id), {})
@@ -333,7 +461,18 @@ def put_session_state(state: SessionState) -> None:
             merged_plans.values(), key=lambda item: item.get("created_at", "")
         )[-MAX_SAVED_PLANS:]
     state.updated_at = _now()
+    # Defense-in-depth caps + eviction of long-stale sessions, applied before
+    # every write (see _enforce_state_caps/_prune_stale_sessions docstrings).
+    # This is what actually keeps the write below fast: a live install
+    # measured at 15.7MB/80 sessions (several individual sessions multiple
+    # MB each, from fields like modified_files/inspected_files that no call
+    # site ever bounded) turned every single event's write -- there can be
+    # dozens per turn during a long audit -- into a multi-hundred-millisecond
+    # synchronous json.dump+fsync on the same thread driving the live
+    # terminal UI, which is what actually presented as "the UI freezes".
+    _enforce_state_caps(state)
     data[str(state.session_id)] = asdict(state)
+    _prune_stale_sessions(data, keep_session_id=state.session_id)
     # Keep the live session usable when a container, sandbox, or ownership
     # mismatch makes the configured state directory unwritable. This is not a
     # substitute for durable recovery: the warning makes that limitation
@@ -661,6 +800,192 @@ def all_known_session_ids() -> list[int]:
         except ValueError:
             continue
     return sorted(ids)
+
+
+# --- Thread compression / summarization -------------------------------------
+#
+# Claude Code's `/compact` and Codex's context-rollover both replace a long
+# raw transcript with a structured, bounded summary the next turn can reason
+# from without re-reading every prior message. tamfis-code already had a
+# storage-only compaction pass (_compact_memory_messages) and a rolling
+# conversation_summary digest, but nothing the user could invoke to actually
+# *compress* the visible thread into a concise recap -- `/compact` only saved
+# a checkpoint. This produces that recap deterministically (no extra provider
+# call, no latency) from the durable session state already on disk, so a
+# long REPL thread stops dominating the terminal and the next turn's context.
+
+# How many recent turns to keep verbatim after compression; everything older
+# is folded into the structured summary. Matches Claude Code's own behaviour
+# of retaining the last few exchanges in full while summarizing the rest.
+COMPACT_KEEP_RECENT_TURNS = 4
+# Hard cap on the rendered summary so a pathological long thread can't make
+# the compressed recap itself unreadable.
+MAX_COMPACT_SUMMARY_CHARS = 4000
+
+
+def _bounded_text(value: str, *, head: int, tail: int, label: str) -> str:
+    """Return a compact, evidence-preserving representation of a large string.
+
+    This is the same helper runner_local.py uses to bound oversized tool
+    output. It is defined here (rather than imported from runner_local, which
+    would create a circular import -- runner_local imports this module) so
+    summarize_thread/compact_session_thread can bound a long prior
+    conversation_summary without raising NameError. Confirmed live: a session
+    that had been /compact-ed and then restarted in a fresh process had a long
+    conversation_summary but an empty conversation_history, so summarize_thread
+    took the ``prior_summary`` branch and crashed on the undefined name.
+    """
+    if len(value) <= head + tail:
+        return value
+    omitted = len(value) - head - tail
+    return (
+        f"{value[:head]}\n"
+        f"...[{label}: {omitted} characters omitted; original={len(value)}]...\n"
+        f"{value[-tail:] if tail else ''}"
+    )
+
+
+def _extract_turns(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
+    """Group a flat message list into (objective, answer) turns.
+
+    A turn is a user objective followed by zero or more assistant messages
+    (and the tool calls between them are summarized, not replayed). This is
+    the same grouping render.py's print_recent_thread uses for /resume, kept
+    here so the compression pass can reason about whole turns rather than
+    individual messages.
+    """
+    turns: list[dict[str, str]] = []
+    current: dict[str, str] = {"objective": "", "answer": ""}
+    for message in messages:
+        role = str(message.get("role") or "")
+        content = str(message.get("content") or "").strip()
+        if role == "user" and content:
+            if current["objective"] or current["answer"]:
+                turns.append(current)
+            current = {"objective": content, "answer": ""}
+        elif role == "assistant" and content:
+            if current["objective"]:
+                current["answer"] = (current["answer"] + "\n" + content).strip() if current["answer"] else content
+    if current["objective"] or current["answer"]:
+        turns.append(current)
+    return turns
+
+
+def summarize_thread(session_id: int, *, keep_recent: int = COMPACT_KEEP_RECENT_TURNS) -> str:
+    """Produce a structured, bounded recap of this session's conversation.
+
+    Draws only from durable SessionState (conversation_history,
+    conversation_summary, completed_actions, modified_files, saved_plans) --
+    no provider call, no network, no latency. Older turns are folded into a
+    compact bullet recap; the most recent `keep_recent` turns are preserved
+    verbatim so the user can still see exactly what just happened. This is
+    what `/compact` and `/summary` render, and what the next turn's context
+    can be seeded from instead of the full raw transcript.
+    """
+    state = get_session_state(session_id)
+    turns = _extract_turns(state.conversation_history)
+    if not turns:
+        prior_summary = (state.conversation_summary or "").strip()
+        if prior_summary:
+            return _bounded_text(prior_summary, head=MAX_COMPACT_SUMMARY_CHARS, tail=0, label="summary")
+        return "(No conversation recorded in this session yet.)"
+
+    recent = turns[-keep_recent:] if keep_recent > 0 else []
+    older = turns[:-keep_recent] if keep_recent > 0 else turns
+
+    lines: list[str] = []
+    if older:
+        lines.append(f"Summary of {len(older)} earlier turn(s):")
+        for index, turn in enumerate(older, start=1):
+            objective = turn["objective"]
+            answer = turn["answer"]
+            obj_preview = objective if len(objective) <= 200 else objective[:197] + "..."
+            if answer:
+                ans_preview = answer if len(answer) <= 200 else answer[:197] + "..."
+                lines.append(f"  {index}. You: {obj_preview}")
+                lines.append(f"     Assistant: {ans_preview}")
+            else:
+                lines.append(f"  {index}. You: {obj_preview} (no recorded answer)")
+        lines.append("")
+
+    # Durable progress facts that survive even when individual messages were
+    # compacted out of conversation_history by _compact_memory_messages.
+    if state.modified_files:
+        recent_paths = [str(m.get("path") or "") for m in state.modified_files[-10:] if m.get("path")]
+        if recent_paths:
+            lines.append("Files modified in this session: " + ", ".join(recent_paths))
+    if state.unresolved_issues:
+        lines.append(f"Unresolved issues: {len(state.unresolved_issues)} (run /doctor for detail)")
+    if state.saved_plans:
+        active = next((p for p in reversed(state.saved_plans) if p.get("id") == state.active_plan_id), None)
+        if active:
+            steps = active.get("steps") or []
+            done = sum(1 for s in steps if s.get("status") == "completed")
+            lines.append(f"Active plan: {active.get('id')} ({done}/{len(steps)} steps done)")
+
+    if recent:
+        lines.append("")
+        lines.append(f"Recent {len(recent)} turn(s) (full text):")
+        for turn in recent:
+            lines.append(f"  You: {turn['objective']}")
+            if turn["answer"]:
+                answer = turn["answer"]
+                if len(answer) > 1200:
+                    answer = answer[:600] + "\n     ...[truncated]...\n     " + answer[-400:]
+                lines.append(f"  Assistant: {answer}")
+            lines.append("")
+
+    summary = "\n".join(lines).strip()
+    if len(summary) > MAX_COMPACT_SUMMARY_CHARS:
+        summary = _bounded_text(summary, head=MAX_COMPACT_SUMMARY_CHARS // 2, tail=MAX_COMPACT_SUMMARY_CHARS // 2, label="thread summary")
+    return summary
+
+
+def compact_session_thread(session_id: int, *, keep_recent: int = COMPACT_KEEP_RECENT_TURNS) -> str:
+    """Compress the durable thread in place: fold older turns into
+    conversation_summary and keep only the recent `keep_recent` turns in
+    conversation_history. Returns the structured recap (same as
+    summarize_thread) so the caller can display it immediately.
+
+    This is the real `/compact` action: after it, the next turn's context is
+    seeded from the bounded summary + recent turns, not the full raw
+    transcript -- matching how Claude Code/Codex keep a long REPL usable
+    without the terminal UI/UX growing heavy.
+    """
+    state = get_session_state(session_id)
+    turns = _extract_turns(state.conversation_history)
+    if not turns or len(turns) <= keep_recent:
+        # Nothing to fold -- still return the recap so /compact gives useful
+        # feedback even on a short thread.
+        return summarize_thread(session_id, keep_recent=keep_recent)
+
+    older = turns[:-keep_recent] if keep_recent > 0 else turns
+    digest_parts: list[str] = []
+    for turn in older:
+        objective = turn["objective"]
+        answer = turn["answer"]
+        obj_preview = objective if len(objective) <= 300 else objective[:297] + "..."
+        if answer:
+            ans_preview = answer if len(answer) <= 300 else answer[:297] + "..."
+            digest_parts.append(f"- You: {obj_preview} -> Assistant: {ans_preview}")
+        else:
+            digest_parts.append(f"- You: {obj_preview} (no recorded answer)")
+    digest = "\n".join(digest_parts)
+    state.conversation_summary = (
+        (state.conversation_summary + "\n" if state.conversation_summary else "") + digest
+    )[-8000:]
+
+    # Rebuild conversation_history from only the retained recent turns,
+    # preserving role/content shape for the next turn's context seeding.
+    recent_turns = turns[-keep_recent:] if keep_recent > 0 else []
+    rebuilt: list[dict[str, Any]] = []
+    for turn in recent_turns:
+        rebuilt.append({"role": "user", "content": turn["objective"]})
+        if turn["answer"]:
+            rebuilt.append({"role": "assistant", "content": turn["answer"]})
+    state.conversation_history = _compact_memory_messages(rebuilt)
+    put_session_state(state)
+    return summarize_thread(session_id, keep_recent=keep_recent)
 
 
 def active_swarm_child_count(*, exclude_session_id: Optional[int] = None) -> int:
