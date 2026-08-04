@@ -101,6 +101,26 @@ def test_explicit_external_path_is_automatically_added_to_grant(tmp_path: Path):
     assert result.roots == (other.resolve(),)
 
 
+def test_pasted_api_routes_and_error_text_are_not_absolute_targets(tmp_path: Path):
+    # A user pasting an error message that quotes REST routes and a
+    # nonexistent multi-segment file path (copied from a backend log, not a
+    # real request to access it) used to be treated as an explicit
+    # filesystem target and fail the whole turn closed with "outside the
+    # active workspace grant". Only tokens that exist on disk are targets.
+    current = _project(tmp_path / "tamfisseo")
+    objective = (
+        "Validation failed: claims these paths were changed without mutation evidence: "
+        "/api/v1/chat/models, /home/tests/test_model_catalog_tier_enforcement.py, /health"
+    )
+    assert explicit_absolute_targets(objective) == ()
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective=objective,
+        allowed_roots=[current],
+    )
+    assert result.roots == (current.resolve(),)
+
+
 def test_runner_integrates_authority_and_freshness_rules():
     text = Path("tamfis_code/runner_local.py").read_text(encoding="utf-8")
     assert "resolve_workspace_targets(" in text

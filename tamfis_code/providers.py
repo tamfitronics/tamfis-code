@@ -275,6 +275,14 @@ class ProviderManager:
                 # above. Not the default -- explicit-select route for
                 # long-context coding work.
                 "minimax-m3:cloud",
+                # DeepSeek-V4-Flash-0731 (2026-08-04): Ollama's announced
+                # agentic-capability refresh of the DeepSeek V4 Flash line --
+                # reliable tool calling at long contexts, three selectable
+                # reasoning_effort tiers (low/high/max), hosted US+EU with
+                # zero data retention. Explicit-select route like glm-5.2 and
+                # minimax-m3 above, not the default, since it hasn't been
+                # live-verified against this CLI's own tool-calling loop yet.
+                "deepseek-v4-flash:0731-cloud",
             ],
             priority=0,
             weight=10,

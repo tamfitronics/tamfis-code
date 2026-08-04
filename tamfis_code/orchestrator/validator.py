@@ -77,6 +77,39 @@ _CLAIMED_PATH_RE = re.compile(
     r"`((?:/[^`\n]+|(?:[A-Za-z0-9_.@+-]+/)+[A-Za-z0-9_.@+-]+|\.env))`"
 )
 
+# How far around a mutation-claim phrase ("I updated `x`") to look for a
+# backticked path before treating it as claimed-changed. Restricting the
+# scan to this window -- instead of the whole report -- stops an unrelated
+# backticked mention elsewhere in a long report (an API route quoted for
+# context, a test file cited as pre-existing coverage, a product name) from
+# being pulled in as if the model had claimed to change it.
+_CLAIMED_PATH_WINDOW = 200
+
+_PATH_EXTENSION_RE = re.compile(
+    r"\.(?:php|css|scss|sass|less|js|jsx|mjs|cjs|ts|tsx|json|jsonc|xml|yaml|yml|toml|md|mdx|"
+    r"txt|pot|po|mo|py|pyi|go|rs|java|kt|kts|rb|sh|bash|zsh|html|htm|svg|png|jpe?g|gif|webp|"
+    r"ico|docx|xlsx|pptx|pdf|sql|env|ini|cfg|conf|lock|c|h|cpp|hpp|cs|swift|vue|graphql|proto)$",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_file_path(path: Path) -> bool:
+    """Filter out backticked tokens that read like a path but are not a file.
+
+    Pasted terminal output and error logs routinely contain absolute-looking
+    tokens in backticks that are REST/API routes (`/api/v1/chat/models`,
+    `/health`) or bare product/component names, not filesystem paths a
+    coding agent could plausibly mutate. Only a token that already exists as
+    a real file, or carries a recognizable source/config file extension, is
+    treated as a claimed changed path.
+    """
+    try:
+        if path.is_file():
+            return True
+    except OSError:
+        pass
+    return bool(_PATH_EXTENSION_RE.search(path.name))
+
 _MUTATING_TOOLS = {
     "write_file", "edit_file", "create_file", "patch_file",
     "extract_archive", "repackage_archive",
@@ -186,12 +219,19 @@ def validate_completion(
 
         if workspace_root:
             root = Path(workspace_root).resolve()
-            claimed_paths = []
-            for raw_path in _CLAIMED_PATH_RE.findall(final_text or ""):
-                candidate = Path(raw_path).expanduser()
-                resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
-                if resolved not in claimed_paths:
-                    claimed_paths.append(resolved)
+            text = final_text or ""
+            claimed_paths: list[Path] = []
+            for mutation_match in _MUTATION_CLAIM_RE.finditer(text):
+                window_start = max(0, mutation_match.start() - _CLAIMED_PATH_WINDOW)
+                window_end = min(len(text), mutation_match.end() + _CLAIMED_PATH_WINDOW)
+                window = text[window_start:window_end]
+                for raw_path in _CLAIMED_PATH_RE.findall(window):
+                    candidate = Path(raw_path).expanduser()
+                    resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+                    if not _looks_like_file_path(resolved):
+                        continue
+                    if resolved not in claimed_paths:
+                        claimed_paths.append(resolved)
             missing_claimed_paths = [path for path in claimed_paths if path not in changed_paths]
             if claimed_paths:
                 checks.append({

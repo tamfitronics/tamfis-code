@@ -85,11 +85,16 @@ def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
     scrubbed = _URL_RE.sub(" ", objective or "")
     for raw in _ABSOLUTE_PATH_RE.findall(scrubbed):
         candidate = Path(raw.rstrip(".,;:)]}")).expanduser()
-        # Terminal hints and pasted transcripts commonly contain standalone
-        # slash commands such as `/status` and `/model`. A nonexistent,
-        # single-component token is not useful as a filesystem target and
-        # must not become a fake root-level path that blocks the whole turn.
-        if raw.count("/") == 1 and not candidate.exists():
+        # Terminal hints, pasted transcripts, and pasted error logs commonly
+        # contain absolute-looking tokens that are not filesystem paths at
+        # all: slash commands (`/status`), REST/API routes copied from a
+        # backend error (`/api/v1/chat/models`, `/health`), or URL segments.
+        # None of these name a real target, and treating them as one used to
+        # fail the whole turn closed with "outside the active workspace
+        # grant" the moment a user pasted an error message containing one.
+        # A token only becomes an actionable workspace target once it
+        # resolves to something that actually exists on disk.
+        if not candidate.exists():
             continue
         try:
             candidate = _project_root(candidate)

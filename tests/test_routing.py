@@ -119,6 +119,11 @@ def test_ollama_exposes_glm_52_as_a_priority():
     )
 
 
+def test_ollama_exposes_deepseek_v4_flash_0731():
+    config = ProviderManager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
+    assert "deepseek-v4-flash:0731-cloud" in config.models
+
+
 def test_ollama_extra_usage_requires_operator_opt_in_and_heavy_task(monkeypatch):
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", "true")

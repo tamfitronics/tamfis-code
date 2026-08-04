@@ -39,6 +39,39 @@ def test_complete_project_cannot_finish_with_missing_tree_files(tmp_path: Path):
     assert any("theme/functions.php" in item for item in report.unresolved)
 
 
+def test_mutation_claim_ignores_api_routes_and_unrelated_backticked_mentions(tmp_path: Path):
+    # A model's report legitimately mentions a REST route, a product name,
+    # and a pre-existing test file in backticks near completion language.
+    # None of those are filesystem paths the agent claimed to change, so
+    # they must not trip the "claims files changed without mutation
+    # evidence" gate as long as the actually-edited file is supported.
+    edited = tmp_path / "catalog.py"
+    edited.write_text("x", encoding="utf-8")
+    objective = "fix the model catalog tier bug"
+    final_text = (
+        "I updated `catalog.py` to fix the tier filter. The endpoint `/api/v1/chat/models` "
+        "now reflects this, as covered by `TamfisGPT Code`. See `/health` for the readiness "
+        "probe and `/home/tests/test_model_catalog_tier_enforcement.py` for existing coverage."
+    )
+    report = validate_completion(
+        profile=classify_task(objective),
+        tool_records=[
+            {
+                "tool_name": "edit_file", "success": True,
+                "arguments": {"path": "catalog.py"}, "files_changed": ["catalog.py"],
+            },
+            {
+                "tool_name": "execute_command", "success": True, "exit_code": 0,
+                "arguments": {"command": "pytest"},
+            },
+        ],
+        any_mutation=True, final_text=final_text, objective=objective,
+        workspace_root=str(tmp_path),
+    )
+    assert report.passed is True
+    assert report.unresolved == []
+
+
 def test_complete_project_passes_output_contract_when_every_file_exists(tmp_path: Path):
     for relative in ("theme/style.css", "theme/functions.php"):
         path = tmp_path / relative
