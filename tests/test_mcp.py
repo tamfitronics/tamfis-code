@@ -148,6 +148,58 @@ class TestMCPServer:
         assert "missing 1 required positional argument" not in result["error"]
 
     @pytest.mark.asyncio
+    async def test_write_file_preserves_existing_file_permissions(self):
+        # FIX: _atomic_write_text's os.replace() swaps inodes -- the
+        # replacement file previously inherited mkstemp's restrictive 0600
+        # mode instead of the original file's, silently tightening
+        # permissions on every edit. Confirmed live: user-reported files
+        # ending up 0600 after write_file/edit_file.
+        import stat
+        test_file = Path(self.temp_dir) / "perms.txt"
+        test_file.write_text("original")
+        os.chmod(test_file, 0o644)
+
+        result = await self.server.call_tool("write_file", {
+            "path": str(test_file), "content": "updated content",
+        })
+
+        assert result["success"] is True
+        assert test_file.read_text() == "updated content"
+        assert stat.S_IMODE(test_file.stat().st_mode) == 0o644
+
+    @pytest.mark.asyncio
+    async def test_edit_file_preserves_existing_file_permissions(self):
+        import stat
+        test_file = Path(self.temp_dir) / "edit_perms.txt"
+        test_file.write_text("hello world")
+        os.chmod(test_file, 0o640)
+
+        result = await self.server.call_tool("edit_file", {
+            "path": str(test_file), "old_string": "world", "new_string": "there",
+        })
+
+        assert result["success"] is True
+        assert test_file.read_text() == "hello there"
+        assert stat.S_IMODE(test_file.stat().st_mode) == 0o640
+
+    @pytest.mark.asyncio
+    async def test_write_file_new_file_gets_ordinary_default_permissions(self):
+        # A brand-new file has no prior metadata to preserve -- it must not
+        # end up unexpectedly restrictive (0600) either, since there is no
+        # "original" to fall back to; the process's normal umask-derived
+        # default applies, same as any other tool creating a new file.
+        import stat
+        test_file = Path(self.temp_dir) / "brand_new.txt"
+
+        result = await self.server.call_tool("write_file", {
+            "path": str(test_file), "content": "fresh content",
+        })
+
+        assert result["success"] is True
+        mode = stat.S_IMODE(test_file.stat().st_mode)
+        assert mode != 0o600, f"new file unexpectedly restrictive: {oct(mode)}"
+
+    @pytest.mark.asyncio
     async def test_edit_file_missing_path_returns_recoverable_validation_error(self):
         result = await self.server.call_tool("edit_file", {
             "old_string": "before",

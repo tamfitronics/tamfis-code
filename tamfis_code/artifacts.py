@@ -36,6 +36,12 @@ def create_artifact(path: Path, kind: str, content: dict[str, Any]) -> dict[str,
             _create_pptx(temp_path, content)
         else:
             _create_pdf(temp_path, content)
+        # See fs_atomic.preserve_existing_metadata: os.replace() swaps
+        # inodes, so regenerating an existing artifact would otherwise
+        # silently drop its original mode/owner in favor of mkstemp's
+        # 0600 + the running process's uid/gid.
+        from .fs_atomic import preserve_existing_metadata
+        preserve_existing_metadata(temp_path, path)
         os.replace(temp_path, path)
     finally:
         temp_path.unlink(missing_ok=True)

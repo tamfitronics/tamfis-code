@@ -944,6 +944,13 @@ class MCPServer:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            # FIX: os.replace() swaps inodes -- without this, an edited
+            # file silently lost its original mode/owner and inherited
+            # mkstemp's restrictive 0600 + the running process's uid/gid
+            # (confirmed live: reported as files ending up 0600 owned by
+            # "nobody:nobody" after write_file/edit_file).
+            from .fs_atomic import preserve_existing_metadata
+            preserve_existing_metadata(temp_name, target)
             os.replace(temp_name, target)
         except BaseException:
             with contextlib.suppress(OSError):
