@@ -337,7 +337,17 @@ class MCPServer:
         
         self.register_tool(
             name="read_file",
-            description="Read contents of a file",
+            description=(
+                "Read the full text contents of one file. Returns the whole file every call -- "
+                "there is no offset/line-range/pagination support, so for a very large file, "
+                "prefer search_code (or find_references for a known symbol) to locate the "
+                "relevant region first rather than reading it whole speculatively. Fails with a "
+                "clear error on a binary file (detected by a null byte in the first 8000 bytes) "
+                "instead of returning corrupted text -- do not call this on an attached image; "
+                "its content is already visible directly in this conversation for vision-capable "
+                "models. Never guess a file's contents from its name or path; call this (or "
+                "search_code) before describing what a file contains."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -347,10 +357,15 @@ class MCPServer:
             },
             handler=self._read_file
         )
-        
+
         self.register_tool(
             name="write_file",
-            description="Write content to a file",
+            description=(
+                "Create a new file, or replace an existing file's ENTIRE contents. This is not "
+                "an append or partial update -- any existing content at `path` not included in "
+                "`content` is gone. To change only part of an existing file, use edit_file "
+                "instead so the rest of the file (and any concurrent, unrelated edits) survives."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -384,7 +399,15 @@ class MCPServer:
 
         self.register_tool(
             name="list_directory",
-            description="List contents of a directory",
+            description=(
+                "List the immediate children of one directory (not recursive -- subdirectory "
+                "contents are not included; call this again on a specific subdirectory to go "
+                "deeper). Common noise directories (.git, node_modules, __pycache__, and "
+                "similar) are always excluded. For a broad, unfocused request, list the top "
+                "level once and then act on what it actually returns -- read_file a specific "
+                "file it named, list_directory a specific subdirectory, or use search_code for "
+                "a concrete pattern -- rather than repeatedly listing while deciding what to do."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -394,10 +417,19 @@ class MCPServer:
             },
             handler=self._list_directory
         )
-        
+
         self.register_tool(
             name="search_code",
-            description="Search code using ripgrep",
+            description=(
+                "Search file contents recursively under `path` using ripgrep (regex, not a "
+                "literal substring match -- escape regex metacharacters if you want a literal "
+                "string). This is the fast way to find where something is used or defined across "
+                "many files; prefer it over read_file-ing files speculatively to look for a "
+                "pattern, and prefer find_references instead when you already have an exact "
+                "symbol name and want every definition and call site. `file_pattern` is a glob "
+                "(e.g. '*.py') to narrow which files are searched. Common noise directories "
+                "(.git, node_modules, __pycache__, and similar) are always excluded."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
