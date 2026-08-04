@@ -72,6 +72,72 @@ def test_mutation_claim_ignores_api_routes_and_unrelated_backticked_mentions(tmp
     assert report.unresolved == []
 
 
+def test_git_commit_of_preexisting_unedited_code_requires_authorship_disclosure(tmp_path: Path):
+    # FIX regression (2026-08-04, live incident): a turn found code already
+    # sitting uncommitted on disk -- written by a completely different
+    # session hours earlier -- ran `git commit` on it, and reported a
+    # file-by-file "Changes" summary describing that code as if it had just
+    # written it. The wording ("Committed the verified ... fixes") never
+    # matched _MUTATION_CLAIM_RE's first-person "I fixed/changed" patterns,
+    # so the existing mutation-claim check never fired even though the
+    # session's own tool ledger shows zero edit_file/write_file calls for
+    # the files being described. A real `git commit` is now its own
+    # authorship-claim trigger, independent of that wording.
+    target = tmp_path / "tool_registry.py"
+    target.write_text("class FileReaderTool: ...", encoding="utf-8")
+    objective = "commit the pending fix"
+    final_text = (
+        "Committed the verified file-extraction pipeline fixes as commit 6dd3513.\n\n"
+        "## Changes\n"
+        "- `tool_registry.py`: `FileReaderTool.execute_async` now accepts `file_id`.\n"
+    )
+    report = validate_completion(
+        profile=classify_task(objective),
+        tool_records=[
+            {
+                "tool_name": "execute_command", "success": True, "exit_code": 0,
+                "arguments": {"command": 'git commit -m "Fix file_reader tool"'},
+            },
+        ],
+        any_mutation=False, final_text=final_text, objective=objective,
+        workspace_root=str(tmp_path),
+    )
+    assert report.passed is False
+    assert report.severity == "error"
+    assert any("git commit" in item and "tool_registry.py" in item for item in report.unresolved)
+
+
+def test_git_commit_of_this_turns_own_edits_does_not_require_disclosure(tmp_path: Path):
+    # The counterpart: a turn that both edits a file itself AND commits it
+    # must not be flagged -- disclosure is only required for paths this
+    # session did not actually touch.
+    target = tmp_path / "tool_registry.py"
+    target.write_text("class FileReaderTool: ...", encoding="utf-8")
+    objective = "fix and commit"
+    final_text = (
+        "Committed the fix as commit abc1234.\n\n"
+        "## Changes\n"
+        "- `tool_registry.py`: `FileReaderTool.execute_async` now accepts `file_id`.\n"
+    )
+    report = validate_completion(
+        profile=classify_task(objective),
+        tool_records=[
+            {
+                "tool_name": "edit_file", "success": True,
+                "arguments": {"path": "tool_registry.py"}, "files_changed": ["tool_registry.py"],
+            },
+            {
+                "tool_name": "execute_command", "success": True, "exit_code": 0,
+                "arguments": {"command": 'git commit -m "Fix file_reader tool"'},
+            },
+        ],
+        any_mutation=True, final_text=final_text, objective=objective,
+        workspace_root=str(tmp_path),
+    )
+    assert report.passed is True
+    assert report.unresolved == []
+
+
 def test_complete_project_passes_output_contract_when_every_file_exists(tmp_path: Path):
     for relative in ("theme/style.css", "theme/functions.php"):
         path = tmp_path / relative

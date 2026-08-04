@@ -74,7 +74,15 @@ _LIVE_VERIFICATION_CLAIM_RE = re.compile(
 )
 
 _CLAIMED_PATH_RE = re.compile(
-    r"`((?:/[^`\n]+|(?:[A-Za-z0-9_.@+-]+/)+[A-Za-z0-9_.@+-]+|\.env))`"
+    r"`((?:/[^`\n]+|(?:[A-Za-z0-9_.@+-]+/)+[A-Za-z0-9_.@+-]+|"
+    # Bare single-segment filename with an extension (e.g. `tool_registry.py`,
+    # no directory component) -- a commit/changes summary listing files by
+    # basename alone used to never match here at all, since every other
+    # alternative requires a "/". _looks_like_file_path's extension
+    # whitelist + existence check already guards this against false
+    # positives (a version string like `v1.2` has no recognized extension
+    # and doesn't exist on disk, so it's filtered out downstream).
+    r"[A-Za-z0-9_-]+\.[A-Za-z0-9]{1,8}|\.env))`"
 )
 
 # How far around a mutation-claim phrase ("I updated `x`") to look for a
@@ -261,6 +269,53 @@ def validate_completion(
         if not live_check_supported:
             unresolved.append("The response claims live/frontend/API success, but no successful endpoint or behavioral test supports that claim.")
 
+    # A real, successful `git commit` this turn is an unambiguous authorship-
+    # claim trigger on its own: describing what a commit contains implicitly
+    # presents those changes as this turn's own work, even when the report's
+    # wording carefully avoids first-person mutation language ("Committed
+    # the verified ... fixes" never matches _MUTATION_CLAIM_RE's "I fixed/
+    # changed" patterns). Confirmed live: a turn found code already sitting
+    # uncommitted on disk -- written by a completely different session
+    # hours earlier -- ran `git commit` on it, and reported a file-by-file
+    # "Changes" summary describing that code's behavior as if it had just
+    # written it, with no disclosure that the work predated this turn.
+    # Scoped strictly to turns with a real successful `git commit` (not just
+    # any mutation claim) so this doesn't reintroduce the false-positive
+    # class the windowed/file-path-filtered _CLAIMED_PATH_RE scan above was
+    # built to avoid -- a bare `git commit` having actually happened is a
+    # much stronger, rarer signal than generic mutation wording.
+    committed_this_turn = any(
+        re.search(r"\bgit\s+commit\b", command, re.I) for command in successful_commands
+    )
+    if committed_this_turn and workspace_root:
+        root = Path(workspace_root).resolve()
+        text = final_text or ""
+        changed_paths = _successful_changed_paths(tool_records, workspace_root)
+        claimed_paths: list[Path] = []
+        for raw_path in _CLAIMED_PATH_RE.findall(text):
+            candidate = Path(raw_path).expanduser()
+            resolved = (candidate if candidate.is_absolute() else root / candidate).resolve()
+            if not _looks_like_file_path(resolved):
+                continue
+            if resolved not in claimed_paths:
+                claimed_paths.append(resolved)
+        unattributed_paths = [path for path in claimed_paths if path not in changed_paths]
+        if claimed_paths:
+            checks.append({
+                "name": "commit_authorship_disclosed",
+                "passed": not unattributed_paths,
+                "claimed": [str(path) for path in claimed_paths],
+            })
+            if unattributed_paths:
+                unresolved.append(
+                    "This turn ran `git commit`, but the response describes these paths' changes without "
+                    "any successful edit tool call for them in this session: "
+                    + ", ".join(str(path) for path in unattributed_paths[:20])
+                    + ". If this code was already present (written by a prior/other session) rather than "
+                    "authored this turn, the report must say so explicitly instead of presenting it as this "
+                    "turn's own work."
+                )
+
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}:
         mutation_requirement_met = any_mutation or verified_no_change
         checks.append({
@@ -373,6 +428,8 @@ def validate_completion(
                 "The response claims repository inspection or review, but no successful tool evidence supports that claim."
             )
         if mutation_claimed or _SERVICE_RESTART_CLAIM_RE.search(final_text or "") or _LIVE_VERIFICATION_CLAIM_RE.search(final_text or ""):
+            severity = "error"
+        if any(check["name"] == "commit_authorship_disclosed" and not check["passed"] for check in checks):
             severity = "error"
 
     return ValidationReport(passed, checks, unresolved, severity=severity)
