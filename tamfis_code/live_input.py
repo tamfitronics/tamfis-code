@@ -227,6 +227,7 @@ class LiveInputListener:
         self._input_task: Optional[asyncio.Task] = None
         self._interject_task: Optional[asyncio.Task] = None
         self._prompt_session = None
+        self._previous_loop_exception_handler: Optional[Callable[[asyncio.AbstractEventLoop, dict[str, Any]], None]] = None
         self._paused = False
         self._active = False
         self._last_invalidate = 0.0
@@ -477,6 +478,31 @@ class LiveInputListener:
         )
         force_bottom_toolbar_visible(session)
         self._prompt_session = session
+
+        # prompt_toolkit's own built-in Ctrl+C key binding calls
+        # Application.exit() unconditionally, with no way for it to know this
+        # loop already exited the same Application for a different reason a
+        # moment earlier (e.g. a cancel queued from another terminal, handled
+        # via _cancel_running_turn / _shutdown_prompt). When both land in the
+        # same input cycle, the second exit() raises "Return value already
+        # set" -- but critically, that raise happens *inside a key-processor
+        # callback*, not inside the coroutine `await session.prompt_async()`
+        # is suspended on, so an ordinary try/except around that await never
+        # sees it. `Application.run_async()` instead hands it to
+        # `loop.set_exception_handler(self._handle_exception)` (installed for
+        # the duration of the run, see prompt_toolkit's application.py), whose
+        # handler prints the raw traceback and blocks on "Press ENTER to
+        # continue" -- live-reported as the live UI appearing to freeze mid-
+        # audit. Passing `set_exception_handler=False` below stops
+        # prompt_toolkit installing that handler and leaves our own in place
+        # for the duration of the prompt instead, so this specific known race
+        # is resolved as an ordinary interrupt with no blocking prompt; any
+        # other exception still falls through to asyncio's own default
+        # handling (a plain logged error, not a blocking one) rather than
+        # being silently hidden.
+        loop = asyncio.get_running_loop()
+        self._previous_loop_exception_handler = loop.get_exception_handler()
+        loop.set_exception_handler(self._handle_prompt_loop_exception)
         try:
             while self._active and not self._paused:
                 try:
@@ -485,6 +511,7 @@ class LiveInputListener:
                             "message› ",
                             bottom_toolbar=self._bottom_toolbar,
                             show_frame=True,
+                            set_exception_handler=False,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -494,22 +521,10 @@ class LiveInputListener:
                 except EOFError:
                     return
                 except Exception as exc:
-                    # prompt_toolkit's own built-in Ctrl+C key binding calls
-                    # Application.exit() unconditionally, with no way for it to
-                    # know this loop already exited the same Application for a
-                    # different reason a moment earlier (e.g. a cancel queued
-                    # from another terminal, handled via _cancel_running_turn /
-                    # _shutdown_prompt). When both land in the same input
-                    # cycle, the second exit() raises "Return value already
-                    # set" from inside prompt_toolkit's key processor. Left
-                    # uncaught here, that becomes an unhandled exception on
-                    # the event loop and the live UI appears to freeze with a
-                    # raw traceback until the user presses Enter -- live-
-                    # reported, triggered by a queued cancel racing a manual
-                    # Ctrl+C. Both signals already agree the turn is
-                    # cancelling, so treat this specific race as an ordinary
-                    # interrupt instead of crashing the input loop; anything
-                    # else re-raises unchanged.
+                    # Defense in depth: if a future prompt_toolkit version
+                    # ever does propagate this race through the coroutine
+                    # instead of the loop exception handler above, still
+                    # treat it as an ordinary interrupt rather than crashing.
                     if "Return value already set" in str(exc) or "Application.exit()" in str(exc):
                         self._request_interrupt("cancel")
                         return
@@ -521,11 +536,42 @@ class LiveInputListener:
                 if not self._active:
                     break
         finally:
+            loop.set_exception_handler(self._previous_loop_exception_handler)
+            self._previous_loop_exception_handler = None
             if self._prompt_session is session:
                 self._prompt_session = None
             current = asyncio.current_task()
             if self._input_task is current:
                 self._input_task = None
+
+    def _handle_prompt_loop_exception(self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        """Loop-level exception handler installed for the duration of each
+        `session.prompt_async(set_exception_handler=False, ...)` call in
+        `_input_loop` (see the comment there for why this has to be a loop
+        exception handler rather than an ordinary try/except).
+
+        Recognizes the one specific, benign race this exists for -- a queued
+        cancel from another terminal and prompt_toolkit's own built-in
+        Ctrl+C handler both calling `Application.exit()` in the same input
+        cycle, where the second call raises "Return value already set" -- and
+        resolves it as an ordinary interrupt. Anything else is handed to
+        whatever handler was on the loop before this one (or asyncio's own
+        default) so a genuine bug stays visible instead of being swallowed.
+        """
+        exc = context.get("exception")
+        message = str(exc) if exc is not None else str(context.get("message") or "")
+        if "Return value already set" in message or "Application.exit()" in message:
+            self._request_interrupt("cancel")
+            app = getattr(self._prompt_session, "app", None)
+            if app is not None and not getattr(app, "is_done", False):
+                with contextlib.suppress(Exception):
+                    app.exit(result="")
+            return
+        previous_handler = self._previous_loop_exception_handler
+        if previous_handler is not None:
+            previous_handler(loop, context)
+        else:
+            loop.default_exception_handler(context)
 
     @property
     def interrupt_classification(self) -> Optional[str]:

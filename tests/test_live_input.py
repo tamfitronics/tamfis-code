@@ -1,7 +1,9 @@
+import asyncio
 import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
@@ -382,6 +384,76 @@ class SimpleNamespaceListener:
 
     def resume(self):
         self._calls.append("resume")
+
+
+class HandlePromptLoopExceptionTests(_StatePatchMixin, unittest.TestCase):
+    """Regression test for a live-reported crash: a cancel queued from
+    another terminal and prompt_toolkit's own built-in Ctrl+C handler both
+    call Application.exit() in the same input cycle. The second call raises
+    "Return value already set" from *inside prompt_toolkit's own key
+    processor*, which prompt_toolkit hands to a loop-level exception handler
+    (not an ordinary raised exception an `await`-side try/except can catch --
+    see the docstring on _handle_prompt_loop_exception). Left unhandled, this
+    showed up live as a raw traceback and a blocking "Press ENTER to
+    continue", i.e. the whole live UI appearing to freeze mid-audit.
+    """
+
+    def _listener(self):
+        renderer = StreamRenderer(_console())
+        cfg = _config("ask")
+        return LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+
+    def test_double_exit_race_is_treated_as_an_ordinary_interrupt(self):
+        listener = self._listener()
+        exit_calls = []
+        fake_app = SimpleNamespace(is_done=False, exit=lambda result="": exit_calls.append(result))
+        listener._prompt_session = SimpleNamespace(app=fake_app)
+
+        listener._handle_prompt_loop_exception(
+            SimpleNamespace(),
+            {"exception": Exception("Return value already set. Application.exit() failed.")},
+        )
+
+        self.assertEqual(listener.interrupt_classification, "cancel")
+        self.assertEqual(exit_calls, [""])
+
+    def test_already_done_app_is_not_re_exited(self):
+        listener = self._listener()
+        exit_calls = []
+        fake_app = SimpleNamespace(is_done=True, exit=lambda result="": exit_calls.append(result))
+        listener._prompt_session = SimpleNamespace(app=fake_app)
+
+        listener._handle_prompt_loop_exception(
+            SimpleNamespace(),
+            {"exception": Exception("Return value already set. Application.exit() failed.")},
+        )
+
+        self.assertEqual(listener.interrupt_classification, "cancel")
+        self.assertEqual(exit_calls, [])
+
+    def test_unrelated_exception_falls_through_to_the_previous_handler(self):
+        listener = self._listener()
+        received = []
+        listener._previous_loop_exception_handler = lambda loop, context: received.append(context)
+
+        loop = SimpleNamespace()
+        context = {"exception": ValueError("something else entirely")}
+        listener._handle_prompt_loop_exception(loop, context)
+
+        self.assertIsNone(listener.interrupt_classification)
+        self.assertEqual(received, [context])
+
+    def test_unrelated_exception_uses_asyncio_default_when_no_previous_handler(self):
+        listener = self._listener()
+        listener._previous_loop_exception_handler = None
+        seen = []
+        loop = SimpleNamespace(default_exception_handler=lambda context: seen.append(context))
+
+        context = {"exception": ValueError("boom")}
+        listener._handle_prompt_loop_exception(loop, context)
+
+        self.assertIsNone(listener.interrupt_classification)
+        self.assertEqual(seen, [context])
 
 
 if __name__ == "__main__":
