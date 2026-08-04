@@ -447,3 +447,55 @@ class OrchestratorTests(unittest.TestCase):
             third = engine.guard_tool_call("read_file", {"path": "c"})
             self.assertFalse(third.allowed)
             self.assertTrue(third.terminal)
+
+    def test_replace_plan_auto_extends_the_revision_budget(self):
+        # Regression: record_plan_revision() was the one budget (of rounds,
+        # wall-clock, tool-calls, repair, plan revisions) with no extension
+        # at all -- replace_plan() unconditionally killed the whole task the
+        # moment the model wanted to revise its plan past max_plan_revisions,
+        # punishing exactly the "learn more, adapt the plan" behaviour a
+        # long, evolving task needs. It must now grant a fresh window
+        # automatically instead, the same way mark_repair already does for
+        # the repair budget.
+        from tamfis_code.runtime.budgets import RuntimeBudgets
+        from tamfis_code.orchestrator import ExecutionPlan
+        from tamfis_code.orchestrator.planner import PlanStep
+
+        with tempfile.TemporaryDirectory() as root:
+            events = []
+            engine = AgentOrchestrator(
+                session_id=90023, workspace_root=root, emit=events.append,
+                budgets=RuntimeBudgets(max_plan_revisions=1, max_plan_revision_extensions=1, max_runtime_seconds=60),
+            )
+            engine.begin(
+                objective="fix the login bug", messages=[{"role": "user", "content": "fix the login bug"}],
+                read_only=False,
+            )
+
+            def _plan(name: str) -> ExecutionPlan:
+                return ExecutionPlan(
+                    objective="fix the login bug", assumptions=[], components=[],
+                    steps=[PlanStep(1, name)], validation_criteria=[], risks=[],
+                )
+
+            # Revision 1 is within budget (max_plan_revisions=1).
+            engine.replace_plan(_plan("first revision"))
+            self.assertEqual(engine.run.plan.steps[0].name, "first revision")
+            self.assertNotEqual(engine.run.phase.value, "failed")
+
+            # Revision 2 is over budget -- must auto-extend and still apply,
+            # not silently ignore the new plan or fail the task.
+            engine.replace_plan(_plan("second revision"))
+            self.assertEqual(engine.run.plan.steps[0].name, "second revision")
+            self.assertNotEqual(engine.run.phase.value, "failed")
+            self.assertEqual(engine.run.runtime.snapshot.plan_revision_extensions, 1)
+            self.assertTrue(any(
+                e.get("event_type") == "diagnostics"
+                and "Plan revision budget reached" in e.get("payload", {}).get("content", "")
+                for e in events
+            ))
+
+            # The single configured extension is now used -- the next
+            # revision over budget is a real, final failure.
+            engine.replace_plan(_plan("third revision"))
+            self.assertEqual(engine.run.phase.value, "failed")

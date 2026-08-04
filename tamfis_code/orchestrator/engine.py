@@ -98,8 +98,28 @@ class AgentOrchestrator:
         """
         assert self.run is not None
         if not self.run.runtime.record_plan_revision():
-            self.fail(self.run.runtime.snapshot.failure_reason)
-            return
+            # Same reasoning as mark_repair's extension below: a genuinely
+            # evolving task can legitimately need more than
+            # max_plan_revisions replans as it learns more about the real
+            # codebase. Grant a fresh window instead of ending the task on
+            # this accounting ceiling.
+            if self.run.runtime.extend_plan_revision_budget():
+                extensions = self.run.runtime.snapshot.plan_revision_extensions
+                limit = self.run.runtime.budgets.max_plan_revision_extensions
+                self.emit({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Plan revision budget reached -- granting another "
+                            f"{self.run.runtime.budgets.max_plan_revisions} revisions "
+                            f"(extension {extensions}/{limit}) instead of ending the task."
+                        ),
+                    },
+                })
+                self.run.runtime.record_plan_revision()
+            else:
+                self.fail(self.run.runtime.snapshot.failure_reason)
+                return
         saved = local_state.save_plan(
             self.session_id, objective=self.run.objective,
             content="\n".join(f"{s.index}. {s.name}" for s in plan.steps),

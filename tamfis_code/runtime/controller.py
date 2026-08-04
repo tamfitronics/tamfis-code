@@ -237,6 +237,31 @@ class ExecutionController:
             return False
         return True
 
+    def extend_plan_revision_budget(self) -> bool:
+        """Grant a fresh max_plan_revisions window instead of ending the
+        task, when record_plan_revision() just ran out.
+
+        This was the one budget of the five (rounds, wall-clock, tool-calls,
+        repair, plan revisions) with no extension at all: replace_plan()
+        unconditionally killed the whole task the moment the model wanted to
+        revise its plan a 5th time -- punishing exactly the kind of "learn
+        more, adapt the plan" behaviour a long, evolving task needs, and
+        that Claude Code/Codex never hard-cap. Bounded by
+        max_plan_revision_extensions; like extend_repair_budget(), reverses
+        a FAILED phase that was set purely by this exhaustion so execution
+        can resume.
+        """
+        if self.snapshot.plan_revision_extensions >= self.budgets.max_plan_revision_extensions:
+            return False
+        self.snapshot.plan_revision_extensions += 1
+        self.snapshot.plan_revisions = 0
+        if self.snapshot.phase == RuntimePhase.FAILED and self.snapshot.failure_reason.startswith(
+            "Plan revision budget exhausted"
+        ):
+            self.snapshot.phase = RuntimePhase.EXECUTE
+            self.snapshot.failure_reason = ""
+        return True
+
     def complete(self) -> None:
         self.begin_validation()
         if self.snapshot.phase == RuntimePhase.VALIDATE:

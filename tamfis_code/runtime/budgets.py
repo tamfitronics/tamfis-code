@@ -23,6 +23,14 @@ class RuntimeBudgets:
     max_identical_actions: int = 2
     max_consecutive_empty_observations: int = 3
     max_plan_revisions: int = 4
+    # Without an extension, replace_plan() unconditionally killed the whole
+    # task the moment the model wanted to revise its plan for the 5th time --
+    # the one budget (of rounds/wall-clock/tool-calls/repair/plan-revisions)
+    # that had none at all, even though "learn more, update the plan" is
+    # exactly the adaptive behaviour a long, evolving task needs and Claude
+    # Code/Codex never hard-cap. See extend_plan_revision_budget on
+    # ExecutionController.
+    max_plan_revision_extensions: int = 2
     max_repair_rounds: int = 3
     max_runtime_seconds: int = 900
     # How many times a turn may reset its wall-clock budget and keep going

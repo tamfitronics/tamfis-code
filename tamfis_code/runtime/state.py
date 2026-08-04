@@ -43,6 +43,7 @@ class RuntimeSnapshot:
     runtime_extensions: int = 0
     repair_extensions: int = 0
     tool_call_extensions: int = 0
+    plan_revision_extensions: int = 0
     failure_reason: str = ""
     action_counts: dict[str, int] = field(default_factory=dict)
     observation_counts: dict[str, int] = field(default_factory=dict)
