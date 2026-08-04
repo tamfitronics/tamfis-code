@@ -404,3 +404,46 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertEqual(report.severity, "error")
         self.assertTrue(any("no successful file mutation" in item for item in report.unresolved))
+
+    def test_guard_tool_call_auto_extends_the_tool_call_budget(self):
+        # Regression: a "round" can contain several tool calls, so the raw
+        # tool-call ceiling was reachable before the round budget's own
+        # separate extension logic (runner_local.py) ever got a chance to
+        # run -- and unlike the wall-clock budget, it had no extension at
+        # all, hard-failing the whole task and telling the user to go edit
+        # config.toml. guard_tool_call must now grant a fresh window
+        # automatically, the same way it already does for the wall-clock
+        # budget, and only report the final, real failure once the bounded
+        # number of extensions is also exhausted.
+        from tamfis_code.runtime.budgets import RuntimeBudgets
+
+        with tempfile.TemporaryDirectory() as root:
+            events = []
+            engine = AgentOrchestrator(
+                session_id=90022, workspace_root=root, emit=events.append,
+                budgets=RuntimeBudgets(max_tool_calls=1, max_tool_call_extensions=1, max_runtime_seconds=60),
+            )
+            engine.begin(
+                objective="inspect repository", messages=[{"role": "user", "content": "inspect repository"}],
+                read_only=True,
+            )
+            first = engine.guard_tool_call("read_file", {"path": "a"})
+            self.assertTrue(first.allowed)
+            engine.record_tool(ToolEnvelope("c1", "read_file", {"path": "a"}, "inspect"))
+
+            # This call is over the base budget of 1 -- it must auto-extend
+            # and succeed rather than fail outright.
+            second = engine.guard_tool_call("read_file", {"path": "b"})
+            self.assertTrue(second.allowed)
+            self.assertEqual(engine.run.runtime.snapshot.tool_call_extensions, 1)
+            self.assertTrue(any(
+                e.get("event_type") == "diagnostics" and "Tool-call budget reached" in e.get("payload", {}).get("content", "")
+                for e in events
+            ))
+            engine.record_tool(ToolEnvelope("c2", "read_file", {"path": "b"}, "inspect"))
+
+            # The single configured extension is now used -- the next call
+            # over budget is a real, final failure.
+            third = engine.guard_tool_call("read_file", {"path": "c"})
+            self.assertFalse(third.allowed)
+            self.assertTrue(third.terminal)

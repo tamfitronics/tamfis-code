@@ -177,6 +177,25 @@ class AgentOrchestrator:
                     },
                 })
                 decision = self.run.runtime.guard_action(tool_name, arguments)
+        elif not decision.allowed and decision.tool_call_budget_exhausted:
+            # Same reasoning as the wall-clock extension above, for the raw
+            # tool-call count: a genuine stall is still caught independently
+            # by the repeated-action/empty-observation guards, so a large
+            # but genuinely productive audit shouldn't hard-fail here and
+            # force the user to go edit config.toml before it can finish.
+            if self.run.runtime.extend_tool_call_budget():
+                extensions = self.run.runtime.snapshot.tool_call_extensions
+                limit = self.run.runtime.budgets.max_tool_call_extensions
+                self.emit({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Tool-call budget reached -- granting more headroom "
+                            f"(extension {extensions}/{limit}) instead of ending the task."
+                        ),
+                    },
+                })
+                decision = self.run.runtime.guard_action(tool_name, arguments)
         if not decision.allowed:
             self.emit({"event_type": "diagnostics", "payload": {"content": decision.reason}})
         return decision

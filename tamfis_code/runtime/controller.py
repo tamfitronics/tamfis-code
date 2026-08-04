@@ -17,11 +17,16 @@ class GuardDecision:
     reason: str = ""
     fingerprint: str = ""
     # True only when `terminal` was caused by the wall-clock budget running
-    # out -- the one failure mode a caller may recover from by granting a
-    # fresh turn (extend_runtime) instead of ending the task. Every other
-    # terminal reason (repeated actions, stalls, tool-call ceiling) reflects
-    # the agent making no real progress and must stay a hard failure.
+    # out -- one of two failure modes a caller may recover from by granting a
+    # fresh window (extend_runtime/extend_tool_call_budget) instead of ending
+    # the task. Every other terminal reason (repeated actions, stalls)
+    # reflects the agent making no real progress and must stay a hard
+    # failure.
     time_budget_exhausted: bool = False
+    # True only when `terminal` was caused by the raw tool-call count ceiling
+    # (see max_tool_call_extensions on RuntimeBudgets for why this needed its
+    # own extension, separate from the wall-clock one).
+    tool_call_budget_exhausted: bool = False
 
 
 @dataclass(frozen=True)
@@ -68,6 +73,30 @@ class ExecutionController:
             self.snapshot.failure_reason = ""
         return True
 
+    def extend_tool_call_budget(self) -> bool:
+        """Grant one more window of tool calls instead of ending the task,
+        when the only reason execution stopped is the raw tool-call count.
+
+        Mirrors extend_runtime(). Safe to grant unconditionally (bounded by
+        max_tool_call_extensions) the same way the wall-clock extension is:
+        a genuinely stalled or looping agent is still caught by the
+        repeated-action and empty-observation guards regardless of this
+        extension, so more tool-call headroom on its own cannot turn a real
+        stall into an indefinite loop -- it only lets a task that is a
+        legitimate large audit, but not a stalled one, keep working past the
+        raw count instead of hard-failing and asking the user to go edit
+        config.toml.
+        """
+        if self.snapshot.tool_call_extensions >= self.budgets.max_tool_call_extensions:
+            return False
+        self.snapshot.tool_call_extensions += 1
+        if self.snapshot.phase == RuntimePhase.FAILED and self.snapshot.failure_reason.startswith(
+            "Tool-call budget exhausted"
+        ):
+            self.snapshot.phase = RuntimePhase.EXECUTE
+            self.snapshot.failure_reason = ""
+        return True
+
     def _check_time(self) -> str:
         elapsed = time.monotonic() - self.started_at
         if elapsed >= self.budgets.max_runtime_seconds:
@@ -89,14 +118,15 @@ class ExecutionController:
             return GuardDecision(False, True, timeout, time_budget_exhausted=True)
         if self.snapshot.terminal:
             return GuardDecision(False, True, self.snapshot.failure_reason or "Runtime is terminal.")
-        if self.snapshot.tool_calls >= self.budgets.max_tool_calls:
+        effective_tool_call_budget = self.budgets.max_tool_calls * (1 + self.snapshot.tool_call_extensions)
+        if self.snapshot.tool_calls >= effective_tool_call_budget:
             reason = (
-                f"Tool-call budget exhausted ({self.budgets.max_tool_calls}). "
+                f"Tool-call budget exhausted ({effective_tool_call_budget}). "
                 "Set max_tool_calls in config.toml or TAMFIS_CODE_MAX_TOOL_CALLS "
-                "to raise it for larger tasks."
+                "to raise the base budget for larger tasks."
             )
             self._fail(reason)
-            return GuardDecision(False, True, reason)
+            return GuardDecision(False, True, reason, tool_call_budget_exhausted=True)
 
         fingerprint = action_fingerprint(tool_name, arguments)
         count = self.snapshot.action_counts.get(fingerprint, 0) + 1
