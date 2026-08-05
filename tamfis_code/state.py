@@ -237,6 +237,15 @@ class SessionState:
     parent_session_id: Optional[int] = None
     is_swarm_child: bool = False
     swarm_label: str = ""
+    # Set only for a mutating swarm child that actually got worktree
+    # isolation (workspace.resolve_swarm_subtask_workspace's isolate=True
+    # path) -- None for every read-only child and for any child where
+    # isolation fell back to the shared root (non-git workspace, or worktree
+    # creation failed). Recorded so a leftover isolated worktree is
+    # discoverable/cleanable after the fact instead of only living in the
+    # child process's own memory for the duration of the swarm run.
+    swarm_worktree_path: Optional[str] = None
+    swarm_worktree_branch: Optional[str] = None
 
 
 # In-process cache of the parsed state.json, keyed by the file's mtime. A

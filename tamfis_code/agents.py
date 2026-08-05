@@ -415,6 +415,13 @@ class AgentManager:
                 try:
                     workspace = resolve_swarm_subtask_workspace(
                         Path(workspace_root), parent_session_id=parent_session_id, label=description[:80],
+                        # Only a mutating sub-task (mode="agent", set by
+                        # run_swarm when mutate=True) needs its own worktree
+                        # -- a read-only/"chat" sub-task never issues a
+                        # mutating tool call, so there's nothing a worktree
+                        # would protect against and creating one would just
+                        # be wasted git overhead.
+                        isolate=(mode == "agent"),
                     )
                     task_provider, task_model, extra_system_prompt = provider, model, None
                     definition = definitions.get(agent_type) if agent_type else None

@@ -450,6 +450,7 @@ def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True
 
 def resolve_swarm_subtask_workspace(
     workspace_root: Path, *, parent_session_id: Optional[int] = None, label: str = "",
+    isolate: bool = False,
 ) -> WorkspaceContext:
     """Like resolve_local_workspace, but for a concurrent swarm sub-task:
     always mints a fresh session id instead of reusing the same-
@@ -458,11 +459,26 @@ def resolve_swarm_subtask_workspace(
     Concurrent sub-tasks sharing one session_id would race on state.json's
     single-value fields (current_phase/running_action/active_task/...) --
     only queued_user_instructions/saved_plans are merge-safe there. Giving
-    each concurrent sub-task its own child session (same real filesystem
-    workspace_root, distinct state.json row, tagged is_swarm_child=True so
-    it can be filtered out of default session listings) sidesteps that
-    without adding locking to state.py's persistence layer, which every
-    other command in this codebase also depends on.
+    each concurrent sub-task its own child session (distinct state.json
+    row, tagged is_swarm_child=True so it can be filtered out of default
+    session listings) sidesteps that without adding locking to state.py's
+    persistence layer, which every other command in this codebase also
+    depends on.
+
+    `isolate=True` (the mutating-swarm case -- see run_swarm's mutate flag)
+    additionally gives the child its own git worktree instead of the same
+    real filesystem workspace_root the parent and every sibling share.
+    Before this, a "mutate" swarm child ran tool calls -- including
+    execute_command git invocations the model itself constructs -- directly
+    against the live checkout the parent session (and the user) were also
+    working in: a destructive command from one concurrent sub-task (a hard
+    reset, a forced checkout, a branch delete) landed on the SAME working
+    tree as every other sub-task and the parent, with no isolation at all.
+    Falls back to the shared root (today's behaviour) when the workspace
+    isn't a git repo, or worktree creation fails for any reason -- isolation
+    is a hardening measure, not a hard requirement to run a swarm at all.
+    read-only swarm children (`isolate=False`) keep sharing the real root:
+    they never mutate, so there is nothing for a worktree to protect against.
 
     parent_session_id is best-effort context (None when there's no
     pre-existing session to record -- e.g. `agent-cmd delegate` is a
@@ -475,9 +491,28 @@ def resolve_swarm_subtask_workspace(
     """
     resolved_root = str(Path(workspace_root).resolve())
     session_id = _next_local_session_id()
+    worktree_path: Optional[str] = None
+    worktree_branch: Optional[str] = None
+    if isolate:
+        from .runtime.worktree import WorktreeError, create_worktree
+
+        try:
+            handle = create_worktree(
+                resolved_root, branch=f"tamfis/swarm/{session_id}",
+            )
+        except WorktreeError:
+            # Not a git repo, or worktree creation otherwise failed -- run
+            # this sub-task against the shared root rather than failing the
+            # whole swarm over an isolation nicety.
+            pass
+        else:
+            resolved_root = str(handle.path)
+            worktree_path = str(handle.path)
+            worktree_branch = handle.branch
     local_state.save_session_state(
         session_id, workspace_root=resolved_root,
         parent_session_id=parent_session_id, is_swarm_child=True, swarm_label=label,
+        swarm_worktree_path=worktree_path, swarm_worktree_branch=worktree_branch,
     )
     return WorkspaceContext(session_id=session_id, workspace_root=resolved_root)
 

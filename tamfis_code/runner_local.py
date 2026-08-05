@@ -1357,8 +1357,37 @@ def _novel_continuation(existing: str, continuation: str, *, overlap_window: int
     return continuation
 
 
+# Anchored at the start (not a free-text search) so an unrelated new
+# request that merely mentions one of these words mid-sentence ("the build
+# should continue to support Python 3.9") never falsely triggers a resume.
+# The filler group absorbs common lead-ins ("yes", "ok", "please", "can/
+# could/would you", "let's") before the actual resume verb/phrase so those
+# don't have to be repeated in every alternative below; a message that
+# consumes filler but then isn't followed by a real resume verb still
+# correctly fails to match (e.g. "please check the auth file").
+#
+# Before this, only five exact lead words (yes-prefixed proceed/continue/
+# resume/carry on/go ahead) were recognised -- "please continue", "keep
+# going", "try again", "retry", "go on", and "let's continue" all missed,
+# silently falling through to the ordinary (non-checkpoint) turn path and
+# losing the interrupted turn's in-flight tool state -- see
+# _run_local_agent_turn_impl's resume handling and _close_interrupted_
+# tool_calls, which only run when this matches.
+_RESUME_FILLER_RE = (
+    r"(?:(?:yes|yeah|yep|yup|sure|ok|okay|alright)[,.\s]+)?"
+    r"(?:let'?s\s+|please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
+)
 _RESUME_REQUEST_RE = re.compile(
-    r"^(?:yes[,. ]+)?(?:proceed|continue|resume|carry\s+on|go\s+ahead)\b",
+    r"^" + _RESUME_FILLER_RE + r"(?:"
+    r"proceed|resume|"
+    r"continue(?:\s+(?:on|with|from)\b)?|"
+    r"carry\s+on|"
+    r"keep\s+(?:going|on|working)|"
+    r"go\s+(?:ahead|on)|"
+    r"pick\s+up(?:\s+where\s+(?:you|it)\s+left\s+off)?|"
+    r"try\s+again|retry|"
+    r"don'?t\s+stop"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -2101,6 +2130,9 @@ async def _recover_audit_plan_file(
     scope_roots: list[Path],
     objective: str,
     round_number: int,
+    configured_hooks: list[Any],
+    session_id: int,
+    workspace_root: str,
 ) -> bool:
     """Execute one concrete pending audit read after a malformed completion."""
     path = _next_audit_plan_file(plan, scope_roots)
@@ -2120,6 +2152,21 @@ async def _recover_audit_plan_file(
             "function": {"name": "read_file", "arguments": json.dumps(arguments)},
         }],
     })
+    # This is a runtime-synthesized tool call (the model itself never
+    # requested it), executed directly against mcp_server rather than
+    # through the round loop's generic dispatch branch below -- which means
+    # it would otherwise never reach PreToolUse at all. Run it explicitly so
+    # a configured hook still observes/can block this read the same as any
+    # model-requested one; read_file is non-mutating today, but the bypass
+    # was in the dispatch shape, not in what this particular tool happens to do.
+    blocked = await _run_pre_tool_use_hooks(
+        configured_hooks, tool_name="read_file", arguments=arguments,
+        session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+    )
+    if blocked is not None:
+        working_messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(blocked)})
+        renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "read_file", "result": blocked}})
+        return True
     envelope = ToolEnvelope(
         tool_call_id=call_id,
         tool_name="read_file",
@@ -3871,6 +3918,49 @@ def _perform_context_rollover(
     return [leading_system, scope_message, continuation, latest_user]
 
 
+async def _run_pre_tool_use_hooks(
+    configured_hooks: list[Any],
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    session_id: int,
+    workspace_root: str,
+    renderer: StreamRenderer,
+) -> Optional[dict[str, Any]]:
+    """Run configured pre_tool_use hooks for one call and, if a hook blocks
+    it, return the tool-result payload the caller should hand back instead
+    of executing anything. Returns None when the call is allowed to proceed.
+
+    Extracted so every tool dispatch path -- not just the generic
+    filesystem/shell branch further down this loop -- actually goes through
+    PreToolUse. retrieve_evidence/read_background_job/delegate_parallel_tasks
+    are dispatched from early `continue` branches ahead of the generic
+    branch's own inline hook call (they skip its approval gate on purpose,
+    since none of them are a filesystem/shell command an approval policy
+    was ever meant to gate) -- but a hook with an empty matcher, or one
+    written specifically to observe/gate delegate_parallel_tasks (the actual
+    background/parallel-subagent dispatch point), must still see the event.
+    Before this, those three tool names were invisible to every configured
+    hook regardless of matcher -- a hook that assumed PreToolUse fires for
+    "every tool call" (the documented contract) silently never ran for them.
+    """
+    if not configured_hooks:
+        return None
+    pre_hook_results = await run_tool_hooks(
+        configured_hooks, "pre_tool_use", tool_name=tool_name, tool_input=arguments,
+        session_id=session_id, workspace_root=workspace_root,
+    )
+    for hook_result in pre_hook_results:
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
+        })
+    blocking = next((r for r in pre_hook_results if r.blocked), None)
+    if blocking is None:
+        return None
+    return {"error": f"Blocked by hook: {blocking.message}", "success": False}
+
+
 async def _run_local_agent_turn_impl(
     manager: ProviderManager,
     provider: ProviderType,
@@ -4181,6 +4271,33 @@ async def _run_local_agent_turn_impl(
             "event_type": "diagnostics",
             "payload": {"content": "User authorised automatic approval for ordinary permitted operations in this turn."},
         })
+
+    def _effective_approval_policy() -> str:
+        """The policy actually enforced for the NEXT approval decision.
+
+        `turn_approval_policy` above is a one-time snapshot -- either the
+        turn's starting policy or the objective-text auto-escalation just
+        above. Before this, every approval decision for the rest of the
+        turn kept using that frozen snapshot even after the user changed
+        mode mid-task (shift-tab / live_input.py's live listener, or the
+        `/mode` command reaching this same running turn) -- the toolbar and
+        the "auto mode on"/"plan mode on" banner updated immediately
+        (cli_config.approval_policy IS mutated live), but the actual
+        approval gate below silently kept enforcing whatever policy was
+        active when the turn started until the NEXT turn. A user watching a
+        long-running task, switching to manual mid-task expecting the very
+        next risky call to prompt them, would instead have it silently
+        auto-approved -- the opposite of what the switch was for.
+
+        Live-config takes priority the moment it actually differs from the
+        turn's starting value (the user made a deliberate change since this
+        turn began); otherwise this still returns the auto-escalated value
+        so the objective-text heuristic above isn't clobbered by a
+        `cli_config` that simply hasn't moved.
+        """
+        if cli_config is not None and cli_config.approval_policy != approval_policy:
+            return cli_config.approval_policy
+        return turn_approval_policy
     renderer.handle_event({
         "event_type": "context_reused" if orchestration.context and orchestration.context.reused else "context_rescanned",
         "payload": {"workspace_root": workspace_root},
@@ -5099,6 +5216,9 @@ async def _run_local_agent_turn_impl(
                     scope_roots=scope_roots,
                     objective=objective,
                     round_number=_round,
+                    configured_hooks=configured_hooks,
+                    session_id=session_id,
+                    workspace_root=workspace_root,
                 )
             ):
                 audit_recovery_reads += 1
@@ -5263,6 +5383,9 @@ async def _run_local_agent_turn_impl(
                     scope_roots=scope_roots,
                     objective=objective,
                     round_number=_round,
+                    configured_hooks=configured_hooks,
+                    session_id=session_id,
+                    workspace_root=workspace_root,
                 )
             ):
                 audit_recovery_reads += 1
@@ -5781,7 +5904,7 @@ async def _run_local_agent_turn_impl(
             })
             try:
                 _batch_decision = await resolve_approval_decision_async(
-                    console, combined_text, _turn_batch.highest_risk, turn_approval_policy, interactive,
+                    console, combined_text, _turn_batch.highest_risk, _effective_approval_policy(), interactive,
                     display_preview=False, config=cli_config,
                 )
             finally:
@@ -5831,8 +5954,19 @@ async def _run_local_agent_turn_impl(
             if tc.name == "retrieve_evidence":
                 # A pure local lookup by id -- read-only, no workspace scope
                 # or approval gate applies (it isn't a filesystem/shell tool
-                # at all), so it's dispatched before either.
+                # at all), so it's dispatched before either. Still runs
+                # through PreToolUse (see _run_pre_tool_use_hooks) -- a
+                # configured hook must see every tool call, not just the
+                # ones that also need approval/scope enforcement.
                 renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+                blocked = await _run_pre_tool_use_hooks(
+                    configured_hooks, tool_name=tc.name, arguments=arguments,
+                    session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+                )
+                if blocked is not None:
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(blocked)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": blocked}})
+                    continue
                 segment = evidence_store.load_segment(session_id, str(arguments.get("evidence_id") or ""))
                 if segment is None:
                     result: dict[str, Any] = {
@@ -5860,23 +5994,45 @@ async def _run_local_agent_turn_impl(
             if tc.name == "read_background_job":
                 # Same shape as retrieve_evidence above: a pure local lookup
                 # by id, not a filesystem/shell tool -- no workspace scope or
-                # approval gate applies.
+                # approval gate applies. Still runs through PreToolUse.
                 from .mcp import read_background_job_status
 
                 renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+                blocked = await _run_pre_tool_use_hooks(
+                    configured_hooks, tool_name=tc.name, arguments=arguments,
+                    session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+                )
+                if blocked is not None:
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(blocked)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": blocked}})
+                    continue
                 result = read_background_job_status(str(arguments.get("job_id") or ""))
                 working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result, default=str)})
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                 continue
 
             if tc.name == "delegate_parallel_tasks":
-                # Not a filesystem/shell tool either -- no workspace scope
-                # or per-call approval gate applies to the call itself
+                # Not a filesystem/shell tool either -- no per-call workspace
+                # scope or approval gate applies to the call itself
                 # (mutation_policy_allows_swarm is the gate here, checked
                 # once up front by run_swarm rather than per file/command).
+                # It IS the actual background/parallel-subagent dispatch
+                # point, though, so PreToolUse still runs for it -- a hook
+                # meant to observe or block subagent fan-out must see this
+                # call; every mutating tool call each spawned sub-task makes
+                # is separately hooked inside its own turn (load_hooks runs
+                # again per sub-task turn), this is only the dispatch itself.
                 from .swarm import run_swarm
 
                 renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+                blocked = await _run_pre_tool_use_hooks(
+                    configured_hooks, tool_name=tc.name, arguments=arguments,
+                    session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+                )
+                if blocked is not None:
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(blocked)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": blocked}})
+                    continue
                 sub_tasks, sub_agent_types = _parse_swarm_tasks(arguments.get("tasks") or [])
                 mutate = bool(arguments.get("mutate", False))
                 if len(sub_tasks) < 2:
@@ -5887,7 +6043,7 @@ async def _run_local_agent_turn_impl(
                         swarm_results = await run_swarm(
                             sub_tasks, manager=manager, provider=provider, model=model, console=console,
                             workspace_root=workspace_root, session_id=session_id,
-                            approval_policy=turn_approval_policy, mutate=mutate,
+                            approval_policy=_effective_approval_policy(), mutate=mutate,
                             agent_types=sub_agent_types if any(sub_agent_types) else None,
                         )
                         result = {"success": True, "result": swarm_results}
@@ -6047,7 +6203,7 @@ async def _run_local_agent_turn_impl(
                 # (matches runner.py's remote-path fix for the same trap).
                 try:
                     decision = await resolve_approval_decision_async(
-                        console, display_command, risk, turn_approval_policy, interactive,
+                        console, display_command, risk, _effective_approval_policy(), interactive,
                         display_preview=False, config=cli_config,
                     )
                 finally:
