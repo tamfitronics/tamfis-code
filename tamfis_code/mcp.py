@@ -1528,6 +1528,25 @@ class MCPServer:
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # FIX: no stdin= here meant the child inherited the real
+                # terminal's stdin fd unmodified. Nothing in this tool can
+                # ever supply interactive input to a running command (the
+                # model has no channel to answer a prompt), so any command
+                # that waits on stdin -- a credential prompt, a pager, a
+                # confirmation, an interactive subcommand invoked by
+                # mistake -- blocked forever on a real TTY read that would
+                # never be satisfied, while tamfis-code's own prompt_toolkit
+                # input loop was concurrently trying to read raw bytes from
+                # that same terminal. Live-reported: total input freeze
+                # ("no response to input until I close the terminal") with
+                # no way to Ctrl+C past it, since the hang was in the child
+                # process's own blocking read, not anywhere this process's
+                # asyncio loop could intercept. DEVNULL gives any such
+                # prompt an immediate EOF instead of an indefinite wait, so
+                # it fails fast (or the command handles EOF gracefully) and
+                # this tool's own `timeout`/kill-on-timeout path (below)
+                # actually gets a chance to run.
+                stdin=asyncio.subprocess.DEVNULL,
                 cwd=str(run_dir), env=env,
                 # New session/process group so a kill on timeout can reach
                 # any children the command spawns (e.g. `npm run dev`),

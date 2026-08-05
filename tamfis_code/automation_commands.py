@@ -50,7 +50,15 @@ def automation_command(item: Automation) -> list[str]:
 
 
 async def run_automation(item: Automation) -> None:
-    process = await asyncio.create_subprocess_exec(*automation_command(item))
+    # Scheduled/background automations must never share the real terminal's
+    # stdin -- see mcp.py's _execute_command for the full mechanism this
+    # mirrors: an inherited TTY fd lets a child put the terminal into raw
+    # mode and never restore it if force-killed, corrupting the terminal
+    # for good. Nothing here can supply this process interactive input
+    # either way.
+    process = await asyncio.create_subprocess_exec(
+        *automation_command(item), stdin=asyncio.subprocess.DEVNULL,
+    )
     return_code = await process.wait()
     if return_code:
         raise RuntimeError(f"automation {item.name!r} exited with status {return_code}")

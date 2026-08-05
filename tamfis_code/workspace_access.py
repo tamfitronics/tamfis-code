@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
 from pathlib import Path
 
@@ -43,9 +44,19 @@ async def ensure_workspace_access(path: str, *, read_only: bool) -> tuple[bool, 
             *command,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # See mcp.py's _execute_command for the full rationale -- same
+            # fix, same reason: never give a spawned child a real TTY fd.
+            stdin=asyncio.subprocess.DEVNULL,
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
-    except (OSError, asyncio.TimeoutError) as exc:
+    except asyncio.TimeoutError:
+        # FIX: this previously left the process running -- sudo -n fails
+        # fast so this path is rare, but a genuine hang here leaked a
+        # process forever with nothing ever killing it.
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        return False, f"Workspace ACL provisioning for {workspace} timed out after 120s"
+    except OSError as exc:
         return False, f"Workspace ACL provisioning failed for {workspace}: {exc}"
     if proc.returncode != 0:
         detail = stderr.decode("utf-8", errors="ignore").strip()
