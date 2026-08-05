@@ -304,6 +304,28 @@ def _requests_no_confirmation(text: str) -> bool:
 # window, not meant to match a real tokenizer exactly.
 _CHARS_PER_TOKEN_ESTIMATE = 4
 MAX_TOKENS_PER_REQUEST = 4096
+
+# FIX: _stream_one_completion's chunk loop had no bound on the gap between
+# two consecutive stream chunks -- a provider connection that stalls
+# mid-response (server hangs without closing, a proxy silently drops the
+# connection state, a network blip that never sends RST/FIN) left the
+# await parked in a genuine epoll wait on a real socket forever, with
+# nothing to ever raise past it: no CPU spin, no child process, no timer,
+# just an event loop correctly waiting for data that will never arrive.
+# Live-reported: total input freeze during the "respond" phase requiring
+# the terminal to be closed, no way to Ctrl+C past it (same mechanism
+# runner.py's STREAM_IDLE_TIMEOUT_SECONDS already fixed once for the
+# Remote-mode runner -- "500+ minutes in one report" -- that fix never
+# carried over to this, the local/standalone runner). Same env var name
+# so one setting covers both modes. This bounds the GAP between chunks,
+# not the total response time, so a long but actively-streaming answer
+# is never cut off.
+try:
+    STREAM_IDLE_TIMEOUT_SECONDS = max(
+        10.0, float(os.getenv("TAMFIS_CODE_STREAM_IDLE_TIMEOUT", "90"))
+    )
+except (TypeError, ValueError):
+    STREAM_IDLE_TIMEOUT_SECONDS = 90.0
 # Leave headroom below the provider's stated context_window: it's a
 # conservative estimate already (see providers.py), and this estimate's own
 # char/token ratio is approximate too.
@@ -3183,7 +3205,17 @@ async def _stream_one_completion(
     stream_iterator = stream.__aiter__()
     while True:
         try:
-            chunk = await stream_iterator.__anext__()
+            # FIX: bounds the gap between two consecutive chunks, not the
+            # total response time -- see STREAM_IDLE_TIMEOUT_SECONDS above
+            # for the full incident this responds to. asyncio.TimeoutError
+            # is a plain Exception subclass (aliased to the builtin
+            # TimeoutError since Python 3.11), so it falls straight into
+            # the existing `except Exception` below and gets the same
+            # stream-error/reconnect-or-fail treatment as any other
+            # mid-stream provider failure -- no separate handling needed.
+            chunk = await asyncio.wait_for(
+                stream_iterator.__anext__(), timeout=STREAM_IDLE_TIMEOUT_SECONDS,
+            )
         except StopAsyncIteration:
             break
         except Exception as exc:
