@@ -853,6 +853,27 @@ class StreamRenderer:
         if self.live_input_listener is not None:
             self.live_input_listener.pause()
 
+    async def suspend_live_async(self) -> None:
+        """Like `suspend_live`, but awaits the live-input listener's prompt
+        actually releasing the terminal before returning.
+
+        Every approval-gate call site suspends the live UI and then, a few
+        synchronous statements later, opens its own PromptSession for the
+        y/n decision. `suspend_live`'s `pause()` only *requests* the old
+        prompt exit (fire-and-forget) -- if the new PromptSession starts
+        before that request is actually processed by the event loop, two
+        prompt_toolkit Applications race for the same stdin fd and the new
+        one can be starved of keystrokes entirely (the gate renders but
+        never responds). Callers that will immediately open a new prompt
+        (i.e. every approval gate) must use this instead of `suspend_live`.
+        """
+        self._stop_live()
+        if self._assistant_live is not None:
+            self._assistant_live.stop()
+            self._assistant_live = None
+        if self.live_input_listener is not None:
+            await self.live_input_listener.pause_async()
+
     def resume_live(self) -> None:
         """Restore the active terminal status owner after suspension.
 
@@ -1467,6 +1488,23 @@ def resume_live_if_active(renderer: Any) -> None:
     method = getattr(renderer, "resume_live", None)
     if callable(method):
         method()
+
+
+async def suspend_live_async_if_active(renderer: Any) -> None:
+    """Async counterpart of `suspend_live_if_active` -- use this at every
+    approval-gate call site (a new PromptSession opens right after), so the
+    just-paused live-input listener has actually released the terminal
+    before that new prompt starts reading stdin. See
+    `StreamRenderer.suspend_live_async` for why this matters."""
+    method = getattr(renderer, "suspend_live_async", None)
+    if callable(method):
+        await method()
+        return
+    # Test doubles / renderers without the async protocol: fall back to the
+    # sync one so approval flow still works, just without the stronger
+    # ordering guarantee (matches suspend_live_if_active's existing
+    # best-effort behaviour for such doubles).
+    suspend_live_if_active(renderer)
 
 
 def print_banner(console: Console, *, host: str, workspace_root: str, mode: str, approval_policy: str) -> None:

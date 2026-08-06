@@ -1104,7 +1104,7 @@ async def run_interactive(
                 console.print("[green]Model set to TamfisGPT Auto.[/green]")
                 continue
             route = parts[0].lower()
-            if route not in ("hf", "openrouter", "ollama_cloud", "ollama_gpu", "nvidia", "nvidia_nim", "gemini", "apiframe"):
+            if route not in ("hf", "openrouter", "ollama_cloud", "nvidia", "nvidia_nim", "gemini", "apiframe"):
                 print_error(console, "Unknown model. Use /model list to view TamfisGPT models.")
                 continue
             model_id = parts[1] if len(parts) > 1 else "auto"

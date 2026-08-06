@@ -19,7 +19,12 @@ from rich.panel import Panel
 
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .config import Config, mode_label_for_policy, next_mode_in_cycle
-from .render import BRANDED_PROVIDER_LABEL, StreamRenderer, resume_live_if_active, suspend_live_if_active
+from .render import (
+    BRANDED_PROVIDER_LABEL,
+    StreamRenderer,
+    resume_live_if_active,
+    suspend_live_async_if_active,
+)
 from . import state as local_state
 from .providers import ProviderManager, ProviderType
 
@@ -52,7 +57,7 @@ except (TypeError, ValueError):
 
 # Allowed providers - expanded from just hf/openrouter
 ALLOWED_PROVIDERS = [
-    "hf", "huggingface", "or", "openrouter", "ollama", "ollama_cloud", "ollama_gpu",
+    "hf", "huggingface", "or", "openrouter", "ollama", "ollama_cloud",
     "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None,
 ]
 PROVIDER_ALIASES = {
@@ -66,7 +71,6 @@ PROVIDER_NAME_MAP = {
     "huggingface": "Hugging Face",
     "openrouter": "OpenRouter",
     "ollama_cloud": "Ollama Cloud",
-    "ollama_gpu": "Ollama GPU",
     "nvidia": "NVIDIA NIM",
     "nvidia_nim": "NVIDIA NIM",
     "gemini": "Google Gemini",
@@ -717,7 +721,7 @@ async def _stream_task(
                 # a pty capture of the equivalent local-loop path).
                 if is_new_prompt:
                     prompted_command_ids.add(command_id)
-                    suspend_live_if_active(renderer)
+                    await suspend_live_async_if_active(renderer)
                 renderer.handle_event(event)
                 if is_new_prompt:
                     try:

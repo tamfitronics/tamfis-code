@@ -44,7 +44,12 @@ from .config import Config
 from .hooks import load_hooks, run_tool_hooks
 from .mcp import MCPServer
 from .providers import ProviderManager, ProviderType, reasoning_effort_capable
-from .render import StreamRenderer, resume_live_if_active, suspend_live_if_active
+from .render import (
+    StreamRenderer,
+    resume_live_if_active,
+    suspend_live_async_if_active,
+    suspend_live_if_active,
+)
 from .routing import classify_task
 from .orchestrator import (
     AgentOrchestrator,
@@ -5050,9 +5055,23 @@ async def _run_local_agent_turn_impl(
             # providers.py's routing logic in isolation, not this function),
             # which is how it went uncaught.
             failed_provider = resolved_provider
+            # Infra/account failures (rate limits, quota exhaustion, 5xx,
+            # connection errors) must trigger cross-provider fallback even
+            # when the user (or session default) explicitly pinned a
+            # non-AUTO provider -- an explicit pin is a quality/preference
+            # choice, not consent to a hard failure the moment that
+            # provider's account hits a cap. Unlike the AUTO-only
+            # quality-based fallbacks elsewhere in this loop (degenerate
+            # output, fake tool calls, etc. -- those genuinely second-guess
+            # an explicit choice and stay AUTO-gated), this is the exact
+            # path that previously surfaced "Provider streaming failed on
+            # <provider> ... type `continue` to resume" for a plain HTTP 429
+            # on an explicitly-selected provider with configured fallback
+            # routes (Ollama Cloud / NVIDIA NIM / HF / OpenRouter) sitting
+            # unused. `_auto_provider_fallback_enabled` remains the master
+            # kill switch (TAMFIS_CODE_DISABLE_PROVIDER_FALLBACK).
             can_fallback = (
-                provider == ProviderType.AUTO
-                and _auto_provider_fallback_enabled(manager)
+                _auto_provider_fallback_enabled(manager)
                 and hasattr(manager, "is_retryable_provider_error")
                 and manager.is_retryable_provider_error(root_exc)
                 and hasattr(manager, "fallback_candidates")
@@ -5923,7 +5942,7 @@ async def _run_local_agent_turn_impl(
             and _turn_batch.highest_risk not in session_approved_risks
         ):
             combined_text = describe_batch(_turn_batch)
-            suspend_live_if_active(renderer)
+            await suspend_live_async_if_active(renderer)
             orchestrator.waiting_for_approval(f"Approve {len(_risky_batch_actions)} actions")
             renderer.handle_event({
                 "event_type": "approval_required",
@@ -6180,7 +6199,7 @@ async def _run_local_agent_turn_impl(
                 # approval panel (not just before the prompt) so nothing can
                 # race the card's visibility, then restore it once a
                 # decision is made.
-                suspend_live_if_active(renderer)
+                await suspend_live_async_if_active(renderer)
                 orchestrator.waiting_for_approval(f"Approve {tc.name}")
                 reason = "The agent requested this command."
                 external_scope_paths = list(arguments.get(_EXTERNAL_SCOPE_PATHS_KEY) or [])

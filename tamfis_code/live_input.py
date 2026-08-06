@@ -304,10 +304,35 @@ class LiveInputListener:
             raise
 
     def pause(self) -> None:
-        """Synchronously request prompt shutdown before another UI reads stdin."""
+        """Synchronously request prompt shutdown before another UI reads stdin.
+
+        This only *requests* the exit -- ``app.exit()``/``task.cancel()`` are
+        both fire-and-forget, so the underlying prompt_toolkit Application
+        may not have actually released the terminal by the time this
+        returns. A caller that is about to open its own PromptSession right
+        away (an approval gate, most notably -- see resolve_approval_decision_async
+        called from a live in-task context) must use `pause_async` instead,
+        or risk two Applications racing for the same stdin fd: the new
+        prompt renders but silently never receives keystrokes, reported live
+        as the y/n approval gate "not responding"/"freezing" in manual mode,
+        the mode that actually stops to ask.
+        """
         self._paused = True
         self._request_prompt_exit()
         self._cancel_prompt()
+
+    async def pause_async(self) -> None:
+        """Like `pause`, but waits until the old prompt has actually released
+        the terminal before returning. Use this (not `pause`) whenever a new
+        PromptSession/Application is about to be opened right after -- e.g.
+        immediately before an approval gate prompt."""
+        self._paused = True
+        self._request_prompt_exit()
+        self._cancel_prompt()
+        task = self._input_task
+        if task is not None:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await task
 
     def resume(self) -> None:
         self._paused = False

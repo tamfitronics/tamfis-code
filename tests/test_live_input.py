@@ -386,6 +386,93 @@ class SimpleNamespaceListener:
         self._calls.append("resume")
 
 
+class PauseAsyncActuallyWaitsForShutdownTests(unittest.TestCase):
+    """Regression test for the manual-mode approval-gate freeze: `pause()`
+    only requests the old prompt exit and returns immediately, so a caller
+    that opens a brand new PromptSession right after (every approval gate)
+    could start it before the old one had actually released the terminal --
+    two prompt_toolkit Applications then raced for the same stdin fd, and
+    the new one could be starved of keystrokes entirely (the y/n prompt
+    renders but never responds). `pause_async` must not return until the
+    old input task has actually finished."""
+
+    def test_pause_async_waits_for_the_input_task_to_actually_finish(self):
+        async def _run():
+            renderer = StreamRenderer(_console())
+            cfg = _config("ask")
+            listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+            finished = False
+
+            async def _fake_input_loop():
+                # Mirrors the real _input_loop's shape: cleanup happens in a
+                # `finally` so it runs whether the coroutine exits normally
+                # (app.exit()) or is cancelled (the fallback _cancel_prompt()
+                # path) -- pause_async must still not return until either
+                # way, this has actually happened.
+                nonlocal finished
+                try:
+                    await asyncio.sleep(0.05)
+                finally:
+                    finished = True
+
+            listener._input_task = asyncio.create_task(_fake_input_loop())
+            await asyncio.sleep(0)  # let the fake task actually start running first
+            await listener.pause_async()
+            self.assertTrue(finished, "pause_async returned before the old prompt task finished")
+            self.assertTrue(listener._paused)
+
+        asyncio.run(_run())
+
+    def test_pause_async_is_a_no_op_when_no_input_task_is_running(self):
+        async def _run():
+            renderer = StreamRenderer(_console())
+            cfg = _config("ask")
+            listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+            await listener.pause_async()  # must not raise
+            self.assertTrue(listener._paused)
+
+        asyncio.run(_run())
+
+
+class RendererSuspendLiveAsyncTests(unittest.TestCase):
+    def test_suspend_live_async_awaits_the_listener_pause_async(self):
+        async def _run():
+            renderer = StreamRenderer(_console())
+            calls = []
+
+            class _AsyncListener:
+                async def pause_async(self):
+                    calls.append("pause_async")
+
+            renderer.live_input_listener = _AsyncListener()
+            await renderer.suspend_live_async()
+            self.assertEqual(calls, ["pause_async"])
+
+        asyncio.run(_run())
+
+    def test_suspend_live_async_is_safe_when_no_listener_attached(self):
+        async def _run():
+            renderer = StreamRenderer(_console())
+            await renderer.suspend_live_async()  # must not raise
+
+        asyncio.run(_run())
+
+    def test_suspend_live_async_if_active_falls_back_to_sync_for_doubles(self):
+        from tamfis_code.render import suspend_live_async_if_active
+
+        async def _run():
+            calls = []
+
+            class _SyncOnlyRendererDouble:
+                def suspend_live(self):
+                    calls.append("suspend_live")
+
+            await suspend_live_async_if_active(_SyncOnlyRendererDouble())
+            self.assertEqual(calls, ["suspend_live"])
+
+        asyncio.run(_run())
+
+
 class HandlePromptLoopExceptionTests(_StatePatchMixin, unittest.TestCase):
     """Regression test for a live-reported crash: a cancel queued from
     another terminal and prompt_toolkit's own built-in Ctrl+C handler both

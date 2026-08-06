@@ -2542,20 +2542,39 @@ def index_cmd(path: str, search: str, kind: str, stats: bool):
 def main() -> None:
     try:
         cli()
-    except PermissionError as exc:
+    except OSError as exc:
         # Without this, a permission/ownership mismatch on CONFIG_DIR (e.g. it
-        # was created by a different user) surfaces as a raw traceback on the
-        # very first local state write of every single invocation -- the CLI
-        # "dies on the same step every time" with no actionable message, and
-        # since nothing ever got persisted, the next invocation looks like a
-        # fresh start and re-proposes the same plan instead of progressing.
-        click.echo(
-            f"✗ Permission denied writing local session state: {exc}\n"
-            f"  {CONFIG_DIR} (or a file inside it) is likely owned by a different "
-            "user than the one running tamfis-code. Check `ls -la "
-            f"{CONFIG_DIR}` and fix its ownership, then retry.",
-            err=True,
-        )
+        # was created by a different user) -- or CONFIG_DIR living on a
+        # read-only filesystem (errno EROFS, a plain OSError and NOT a
+        # PermissionError subclass, e.g. a read-only container mount) --
+        # surfaces as a raw traceback on the very first local state write of
+        # every single invocation -- the CLI "dies on the same step every
+        # time" with no actionable message, and since nothing ever got
+        # persisted, the next invocation looks like a fresh start and
+        # re-proposes the same plan instead of progressing. This also covers
+        # background.py's JOBS_DIR.mkdir/write (--bg jobs cannot degrade to
+        # the "volatile state, keep going" fallback state.py uses, since a
+        # detached background job has nothing left to report progress to if
+        # its own job file can't be written).
+        if isinstance(exc, PermissionError):
+            click.echo(
+                f"✗ Permission denied writing local session state: {exc}\n"
+                f"  {CONFIG_DIR} (or a file inside it) is likely owned by a "
+                "different user than the one running tamfis-code. Check `ls -la "
+                f"{CONFIG_DIR}` and fix its ownership, then retry.",
+                err=True,
+            )
+        else:
+            click.echo(
+                f"✗ Could not write local session state: {exc}\n"
+                f"  {CONFIG_DIR} is likely read-only or otherwise unwritable. "
+                "Check `ls -la "
+                f"{CONFIG_DIR}` / `mount | grep $(df --output=target "
+                f"{CONFIG_DIR} | tail -1)` and point tamfis-code at a writable "
+                "directory (e.g. `export TAMFIS_CODE_CONFIG_HOME=/some/writable/path`), "
+                "then retry.",
+                err=True,
+            )
         raise SystemExit(EXIT_LOCAL_STATE_ERROR)
 
 
