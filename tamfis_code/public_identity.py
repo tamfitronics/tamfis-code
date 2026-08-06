@@ -112,16 +112,24 @@ def redact_routing_text(value: Any) -> str:
     user's actual subject matter.
     """
     text = str(value or "")
-    text = _PROVIDER_RE.sub(PUBLIC_PROVIDER_NAME, text)
-    # Common raw catalog ids contain a namespace, a model-family hint, or a
-    # cloud suffix.  Replace token-sized occurrences while retaining the rest
-    # of an actionable error message.
+    # Model-hint pass runs FIRST, on whole tokens, before the provider-name
+    # pass below. Raw catalog ids are frequently a single "namespace/model"
+    # token (e.g. "nvidia/nemotron-3-super", "moonshotai/Kimi-K2.6"). Running
+    # the provider pass first left a "TamfisGPT/nemotron-3-super"-shaped
+    # token whose model half then survived: the old "not
+    # clean.startswith('TamfisGPT')" guard -- meant to avoid re-redacting an
+    # already-public token -- also skipped these partially-redacted
+    # compound tokens, so the model name leaked. Redacting the whole token
+    # to a single public alias here, before the provider substitution ever
+    # runs, closes that gap.
     tokens = re.split(r"(\s+)", text)
     for index, token in enumerate(tokens):
         clean = token.strip("'\"`()[]{}.,;:")
         if clean and _MODEL_HINT_RE.search(clean) and not clean.startswith("TamfisGPT"):
             tokens[index] = token.replace(clean, public_model_name(clean))
-    return "".join(tokens)
+    text = "".join(tokens)
+    text = _PROVIDER_RE.sub(PUBLIC_PROVIDER_NAME, text)
+    return text
 
 
 def sanitize_public_event(event: dict[str, Any]) -> dict[str, Any]:

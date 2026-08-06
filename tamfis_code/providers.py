@@ -1,17 +1,25 @@
 """Provider integrations for Tamfis-Code.
 
-Supports Ollama Cloud, NVIDIA NIM, Hugging Face, OpenRouter, the TamfisGPT
-subscription API, and the internal Tier IV orchestration service through a
-canonical OpenAI-compatible client interface.
+Supports Ollama Cloud, xAI Grok, NVIDIA NIM, Hugging Face, OpenRouter, the
+TamfisGPT subscription API, and the internal Tier IV orchestration service
+through a canonical OpenAI-compatible client interface.
 
 Automatic standalone routing:
     1. Ollama Cloud
        - Current/default: gemma4:cloud
        - Priority coding/agent: kimi-k2.7-code:cloud
-       - Extra-usage heavy jobs (explicit opt-in): kimi-k3:cloud
+       - Free/included-plan alternates: glm-5.2:cloud, kimi-k3:cloud (opt-in),
+         minimax-m3:cloud
     2. NVIDIA NIM
     3. Hugging Face
     4. OpenRouter
+    5. xAI Grok (direct native endpoint, api.x.ai/v1) -- last resort, on cost
+       grounds. Enabled by setting GROK_API_KEY in .env. Deliberately placed
+       behind every other paid provider (2026-08-06, operator request: xAI
+       usage was running real billed spend within the first week) so Ollama
+       Cloud's included models get first crack at everything, then the
+       cheaper/free-tier NIM, HF, and OpenRouter routes, before Grok is ever
+       touched. Still directly selectable by name at any time.
 
 Ollama Cloud is accessed through the signed-in local Ollama daemon at
 ``http://127.0.0.1:11434/v1``. The daemon forwards ``:cloud`` models to
@@ -96,6 +104,7 @@ class ProviderType(str, Enum):
     TIER_IV = "tier_iv"
     TAMFIS = "tamfis"
     OLLAMA_CLOUD = "ollama_cloud"
+    GROK = "grok"
     HF = "hf"
     NVIDIA = "nvidia"
     OPENROUTER = "openrouter"
@@ -232,6 +241,10 @@ class ProviderManager:
         ProviderType.NVIDIA,
         ProviderType.HF,
         ProviderType.OPENROUTER,
+        # Grok last: real billed xAI spend showed up within the first week
+        # of enabling it (2026-08-06). Ollama Cloud's included models and
+        # the free/cheap NIM+HF+OpenRouter tiers now all get tried first.
+        ProviderType.GROK,
         ProviderType.TAMFIS,
         ProviderType.TIER_IV,
     )
@@ -300,6 +313,53 @@ class ProviderManager:
             structured_output=True,
             long_context=True,
             local_only=False,
+        ),
+        # xAI Grok -- direct native endpoint (api.x.ai/v1). Last-resort
+        # provider for Tamfis-Code, tried only after Ollama Cloud, NVIDIA
+        # NIM, Hugging Face, and OpenRouter have all been exhausted or ruled
+        # out (2026-08-06: demoted from priority 2 after real billed xAI
+        # spend showed up within the first week of enabling it -- see the
+        # PRIORITY_ORDER comment above). Enabled by the operator setting
+        # GROK_API_KEY in .env; when unset, the provider is simply not
+        # initialised and routing falls through the remaining chain (which
+        # still carries the x-ai/grok-4.5 OpenRouter relay as a selectable
+        # model, ahead of this direct route). Grok's native API accepts bare
+        # model names (grok-4.5, grok-4.3, grok-4-fast) and is
+        # OpenAI-compatible for chat, tools, streaming, and structured
+        # outputs. Image (grok-imagine) and video (grok-imagine-video)
+        # generation are exposed through the same endpoint. Still directly
+        # selectable by name at any time, regardless of automatic order.
+        ProviderType.GROK: ProviderConfig(
+            name="xAI Grok",
+            base_url=os.environ.get(
+                "GROK_BASE_URL",
+                "https://api.x.ai/v1",
+            ).rstrip("/"),
+            api_key_env="GROK_API_KEY",
+            default_model=os.environ.get("TAMFIS_CODE_GROK_MODEL", "grok-4.5"),
+            models=[
+                "grok-4.5",
+                "grok-4.3",
+                "grok-4",
+                "grok-4-fast",
+                "grok-2-vision",
+                "grok-imagine",
+                "grok-imagine-video",
+            ],
+            # priority=6: last among the auto-routing chain (after
+            # OpenRouter's 5) -- see the class-level comment above `.priority`
+            # feeds provider selection directly via min(..., key=priority),
+            # so this number, not just PRIORITY_ORDER's tuple position, is
+            # what actually keeps Grok as the last-tried paid route.
+            priority=6,
+            weight=4,
+            reasoning_supported=True,
+            vision_supported=True,
+            context_window=256000,
+            coding_quality=5,
+            tool_calling=True,
+            structured_output=True,
+            long_context=True,
         ),
         # Public subscription API. Unlike TIER_IV this endpoint is intended
         # for portable installs and authenticates with a user-owned key.
@@ -430,7 +490,7 @@ class ProviderManager:
             # HF is the preferred external coding route: its automatic model
             # is the official Qwen 3.6 coding model. NVIDIA remains the first
             # mature fallback when HF is unavailable or its account is out.
-            priority=1,
+            priority=3,
             weight=4,
             reasoning_supported=True,
             vision_supported=False,
@@ -469,7 +529,7 @@ class ProviderManager:
                 # have to mean losing access to this model entirely.
                 "moonshotai/Kimi-K2.6",
             ],
-            priority=2,
+            priority=4,
             weight=3,
             reasoning_supported=False,
             vision_supported=True,
@@ -534,7 +594,7 @@ class ProviderManager:
             # OpenRouter is last in AUTO because paid coding routes can fail
             # with HTTP 402 when the account has no credits. It remains
             # explicitly selectable and is still tried after HF/NVIDIA.
-            priority=3,
+            priority=5,
             weight=2,
             reasoning_supported=True,
             vision_supported=True,
@@ -601,6 +661,7 @@ class ProviderManager:
         # fallback is explicitly enabled.
         if provider in {
             ProviderType.OLLAMA_CLOUD,
+            ProviderType.GROK,
             ProviderType.NVIDIA,
             ProviderType.HF,
         }:
@@ -1303,6 +1364,19 @@ async def chat_with_ollama_cloud(
     manager = ProviderManager()
     async for chunk in manager.chat_completion(
         ProviderType.OLLAMA_CLOUD,
+        messages,
+        **kwargs,
+    ):
+        yield chunk
+
+
+async def chat_with_grok(
+    messages: List[Dict[str, Any]],
+    **kwargs: Any,
+) -> AsyncIterator[str]:
+    manager = ProviderManager()
+    async for chunk in manager.chat_completion(
+        ProviderType.GROK,
         messages,
         **kwargs,
     ):

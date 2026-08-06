@@ -324,10 +324,15 @@ def test_standalone_provider_manager_excludes_tier_iv_from_routing_order():
     # everything, including automatic fallback candidates) and moved TAMFIS
     # to the back of PRIORITY_ORDER -- it no longer appears in NVIDIA's
     # automatic fallback chain unless a free/paid-fallback route applies.
+    # xAI Grok was added, then demoted to priority=6 / last in PRIORITY_ORDER
+    # (2026-08-06: real billed xAI spend within the first week of enabling
+    # it), so it now appears last in NVIDIA's automatic fallback chain
+    # instead of straight after Ollama Cloud.
     assert manager.fallback_chain_names(ProviderType.NVIDIA) == [
             ProviderType.OLLAMA_CLOUD.value,
             ProviderType.HF.value,
             ProviderType.OPENROUTER.value,
+            ProviderType.GROK.value,
     ]
 
 
