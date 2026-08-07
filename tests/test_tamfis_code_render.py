@@ -417,7 +417,7 @@ class StreamRendererTests(unittest.TestCase):
         output = console.file.getvalue()
         self.assertIn("Focused workspace scope", output)
         self.assertIn("Reusing workspace context", output)
-        self.assertIn("Model: TamfisGPT Code", output)
+        self.assertIn("Model: TamfisGPT Ultra", output)
 
     def test_model_selected_with_empty_model_shows_provider_default_not_unknown(self):
         # Tier IV/NIM routes leave the resolved model blank by design

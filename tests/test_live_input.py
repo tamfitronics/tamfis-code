@@ -83,7 +83,7 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         rendered = "".join(text for _style, text in fragments)
 
         self.assertIn("ready", rendered)
-        self.assertIn("TamfisGPT Code", rendered)
+        self.assertIn("TamfisGPT Ultra", rendered)
         self.assertNotIn("ollama", rendered.lower())
         self.assertIn("⏵⏵ manual", rendered)
         self.assertIn("shift+tab", rendered)
@@ -430,6 +430,71 @@ class PauseAsyncActuallyWaitsForShutdownTests(unittest.TestCase):
             listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
             await listener.pause_async()  # must not raise
             self.assertTrue(listener._paused)
+
+        asyncio.run(_run())
+
+
+class ShutdownPromptLetsExitFinalizeBeforeCancellingTests(unittest.TestCase):
+    """Regression test for a live-reported freeze: the busy bottom-toolbar
+    status line (e.g. "Summarizing… · auto · 11m9s · esc to interrupt")
+    stayed on screen forever after a turn finished, even though the CLI was
+    actually fine underneath it -- a new prompt worked right away. Root
+    cause: `_shutdown_prompt` called `app.exit(result="")` and then
+    immediately `task.cancel()`'d the input task on the very next line, with
+    no `await` in between to let the event loop actually resume
+    `prompt_async()` and run prompt_toolkit's own render finalization
+    (erasing the framed composer/toolbar). The cancel interrupted that
+    finalization mid-flight, leaving its last rendered frame stuck as
+    static scrollback. `_shutdown_prompt` must give the task a bounded
+    chance to finish on its own before falling back to cancel."""
+
+    def test_a_task_that_finishes_shortly_after_exit_is_not_cancelled(self):
+        async def _run():
+            renderer = StreamRenderer(_console())
+            cfg = _config("ask")
+            listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+            was_cancelled = False
+
+            async def _fake_input_loop():
+                nonlocal was_cancelled
+                try:
+                    # Mirrors prompt_toolkit actually resuming prompt_async()
+                    # after app.exit() and running its own finalization.
+                    await asyncio.sleep(0.05)
+                except asyncio.CancelledError:
+                    was_cancelled = True
+                    raise
+
+            listener._input_task = asyncio.create_task(_fake_input_loop())
+            listener._prompt_session = SimpleNamespace(
+                app=SimpleNamespace(is_done=False, exit=lambda result="": None)
+            )
+            await asyncio.sleep(0)  # let the fake task actually start running first
+            await listener._shutdown_prompt()
+            self.assertFalse(
+                was_cancelled,
+                "_shutdown_prompt cancelled the input task before its own "
+                "exit-triggered finalization could finish",
+            )
+
+        asyncio.run(_run())
+
+    def test_a_task_that_never_exits_is_still_cancelled_as_a_fallback(self):
+        async def _run():
+            renderer = StreamRenderer(_console())
+            cfg = _config("ask")
+            listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+
+            async def _stuck_input_loop():
+                await asyncio.sleep(10)
+
+            listener._input_task = asyncio.create_task(_stuck_input_loop())
+            listener._prompt_session = SimpleNamespace(
+                app=SimpleNamespace(is_done=False, exit=lambda result="": None)
+            )
+            await asyncio.sleep(0)
+            await asyncio.wait_for(listener._shutdown_prompt(), timeout=2)
+            self.assertIsNone(listener._input_task)
 
         asyncio.run(_run())
 

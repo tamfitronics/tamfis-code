@@ -391,7 +391,24 @@ class LiveInputListener:
         task = self._input_task
         self._input_task = None
         if task is not None and not task.done():
-            task.cancel()
+            # Give app.exit()'s own coroutine resumption (prompt_toolkit's
+            # render finalization -- erasing the framed composer/bottom
+            # toolbar, since result="" looks like a real submission rather
+            # than a forced teardown) a bounded chance to actually run on
+            # the event loop before force-cancelling it. Cancelling
+            # immediately after app.exit() -- the previous behaviour --
+            # interrupts that finalization mid-flight: the input task still
+            # tears down fine (caught below), but the terminal is left with
+            # the last busy-toolbar frame stuck as static scrollback.
+            # Live-reported as the status line staying frozen forever after
+            # a turn completes (cosmetic only -- a new prompt still works
+            # right underneath it). `shield` keeps the task itself running
+            # past the wait_for's own timeout so the explicit cancel below
+            # remains the one and only cancellation path.
+            with contextlib.suppress(asyncio.TimeoutError, asyncio.CancelledError, Exception):
+                await asyncio.wait_for(asyncio.shield(task), timeout=0.5)
+            if not task.done():
+                task.cancel()
         if task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task

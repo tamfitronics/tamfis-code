@@ -1105,6 +1105,36 @@ class ProviderManager:
         )
         return any(marker in message for marker in retryable_markers)
 
+    @classmethod
+    def is_quota_or_rate_limit_error(cls, exc: Exception) -> bool:
+        """True specifically for quota-exhaustion/rate-limit failures.
+
+        FIX 2026-08-07: narrower than is_retryable_provider_error, which also
+        returns True for daemon-unavailability-class errors (connection
+        refused, timeouts). ollama_cloud_is_premium_primary's fallback-block
+        in fallback_candidates() was written specifically for the
+        daemon-down case ("caller receives a concrete Ollama availability
+        error instead") -- a 429 weekly-quota exhaustion is a different
+        failure mode where that reasoning doesn't apply, and callers need to
+        distinguish the two to pass allow_premium_primary correctly.
+        """
+        status = cls.provider_error_status(exc)
+        if status is not None:
+            return status in {402, 429}
+
+        message = str(exc).lower()
+        quota_markers = (
+            "insufficient credits",
+            "payment required",
+            "quota",
+            "rate limit",
+            "weekly usage limit",
+            "resourceexhausted",
+            "resource_exhausted",
+            "total request limit reached",
+        )
+        return any(marker in message for marker in quota_markers)
+
     def fallback_candidates(
         self,
         current: ProviderType,
@@ -1295,10 +1325,22 @@ class ProviderManager:
             return
 
         except Exception as exc:
+            # FIX 2026-08-07: `provider != ProviderType.AUTO` used to block
+            # fallback entirely whenever a specific provider was resolved
+            # (including the app's ordinary configured default, not just an
+            # explicit --provider override) -- confirmed live 2026-08-06: a
+            # turn died with "Error code: 429 ... you (tamfitron) have
+            # reached your weekly usage limit" on the default provider, with
+            # zero attempt to retry on a different configured provider, even
+            # though is_retryable_provider_error already correctly classifies
+            # 429 as retryable. Standing expectation (this is the same class
+            # of issue as Remote-outage auto-fallback) is that infra-side
+            # failures degrade-and-continue regardless of how the provider
+            # was selected. auto_fallback_enabled() (TAMFIS_CODE_DISABLE_PROVIDER_FALLBACK)
+            # remains the one on/off switch for this behavior.
             if (
                 not allow_fallback
                 or not self.auto_fallback_enabled()
-                or provider != ProviderType.AUTO
                 or not self.is_retryable_provider_error(exc)
             ):
                 raise
@@ -1307,6 +1349,15 @@ class ProviderManager:
             for fallback in self.fallback_candidates(
                 resolved,
                 task_profile,
+                # FIX 2026-08-07: ollama_cloud_is_premium_primary's guard in
+                # fallback_candidates() was written for the LOCAL DAEMON
+                # UNAVAILABLE case, not quota exhaustion -- passing True
+                # unconditionally here would silently mask real daemon-down
+                # errors behind other providers instead of surfacing the
+                # concrete Ollama availability error that guard exists to
+                # produce. Only bypass it for the specific failure mode it
+                # was never meant to cover.
+                allow_premium_primary=self.is_quota_or_rate_limit_error(exc),
             ):
                 try:
                     # Do not carry a model identifier across providers.

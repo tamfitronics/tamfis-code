@@ -3,34 +3,62 @@
 Backend providers and catalog model ids are deployment details.  They may be
 used internally for routing, but must not become part of TamfisGPT Code's
 public CLI contract (including debug and machine-readable output).
+
+Public model names are four capability tiers -- Smart, Pro, Ultra, Ultima --
+that mirror the TamfisGPT subscription tiers, plus the "Auto" meta-selector.
+Tier membership is derived from each model's live-verified capability/cost
+attributes (`model_registry.py`'s `quality_tier`/`cost_tier`), never a
+hand-set field on an individual model: see the "no human should be managing
+individual models" principle this mirrors from the main TamfisGPT product's
+tier-gating design. Ultima is the frontier+high-cost bracket ("the super
+models") -- which subscription tiers can actually reach it is enforced
+server-side (only entitled models come back from `/models`), so the CLI
+never needs its own admin/plan flag to gate display.
 """
 from __future__ import annotations
 
 import re
 from typing import Any
 
+from .model_registry import MODELS as _MODEL_REGISTRY
+
 
 PUBLIC_PROVIDER_NAME = "TamfisGPT"
 PUBLIC_MODEL_AUTO = "TamfisGPT Auto"
-PUBLIC_MODEL_CODE = "TamfisGPT Code"
-PUBLIC_MODEL_FAST = "TamfisGPT Fast"
+PUBLIC_MODEL_SMART = "TamfisGPT Smart"
 PUBLIC_MODEL_PRO = "TamfisGPT Pro"
-PUBLIC_MODEL_VISION = "TamfisGPT Vision"
+PUBLIC_MODEL_ULTRA = "TamfisGPT Ultra"
+PUBLIC_MODEL_ULTIMA = "TamfisGPT Ultima"
 
 PUBLIC_MODEL_ALIASES = (
     PUBLIC_MODEL_AUTO,
-    PUBLIC_MODEL_FAST,
-    PUBLIC_MODEL_CODE,
+    PUBLIC_MODEL_SMART,
     PUBLIC_MODEL_PRO,
-    PUBLIC_MODEL_VISION,
+    PUBLIC_MODEL_ULTRA,
+    PUBLIC_MODEL_ULTIMA,
+)
+
+# Tiers a model can be gated behind, ordered lowest -> highest. Kept distinct
+# from PUBLIC_MODEL_ALIASES (which also contains the non-tier "Auto" entry).
+PUBLIC_MODEL_TIERS = (
+    PUBLIC_MODEL_SMART,
+    PUBLIC_MODEL_PRO,
+    PUBLIC_MODEL_ULTRA,
+    PUBLIC_MODEL_ULTIMA,
 )
 
 _PUBLIC_MODEL_INPUTS = {
     "auto": PUBLIC_MODEL_AUTO,
-    "fast": PUBLIC_MODEL_FAST,
-    "code": PUBLIC_MODEL_CODE,
+    "smart": PUBLIC_MODEL_SMART,
     "pro": PUBLIC_MODEL_PRO,
-    "vision": PUBLIC_MODEL_VISION,
+    "ultra": PUBLIC_MODEL_ULTRA,
+    "ultima": PUBLIC_MODEL_ULTIMA,
+    # Back-compat for the old five-alias scheme (Auto/Fast/Code/Pro/Vision):
+    # callers/scripts/history that still type the old words land on the
+    # closest new tier rather than erroring.
+    "fast": PUBLIC_MODEL_SMART,
+    "code": PUBLIC_MODEL_PRO,
+    "vision": PUBLIC_MODEL_ULTRA,
 }
 
 _PROVIDER_RE = re.compile(
@@ -44,9 +72,42 @@ _MODEL_HINT_RE = re.compile(
     r":cloud|/.*(?:flash|pro|instruct|reasoning))"
 )
 
+# (quality_tier, cost_tier) -> public tier, straight from model_registry.py's
+# capability/cost fields. This is the single source of truth for grouping;
+# nothing here is a per-model hand-set field.
+_QUALITY_COST_TO_TIER = {
+    ("frontier", "high"): PUBLIC_MODEL_ULTIMA,
+    ("frontier", "medium"): PUBLIC_MODEL_ULTRA,
+    ("frontier", "low"): PUBLIC_MODEL_ULTRA,
+    ("high", "high"): PUBLIC_MODEL_ULTRA,
+    ("high", "medium"): PUBLIC_MODEL_PRO,
+    ("high", "low"): PUBLIC_MODEL_PRO,
+    ("balanced", "medium"): PUBLIC_MODEL_PRO,
+    ("balanced", "low"): PUBLIC_MODEL_SMART,
+    ("balanced", "high"): PUBLIC_MODEL_PRO,
+}
+
+
+def _tier_from_registry(catalog_id: str) -> str | None:
+    record = _MODEL_REGISTRY.get(catalog_id)
+    if record is None:
+        # Registry keys are case-sensitive catalog ids (e.g. HF's
+        # "moonshotai/Kimi-K2.6" vs NVIDIA's lowercase alias); fall back to a
+        # case-insensitive lookup before giving up.
+        lowered = catalog_id.lower()
+        record = next(
+            (item for key, item in _MODEL_REGISTRY.items() if key.lower() == lowered),
+            None,
+        )
+    if record is None:
+        return None
+    return _QUALITY_COST_TO_TIER.get(
+        (record.quality_tier, record.cost_tier), PUBLIC_MODEL_PRO,
+    )
+
 
 def public_model_name(model: Any = None) -> str:
-    """Return a stable TamfisGPT alias without revealing a catalog id."""
+    """Return a stable TamfisGPT tier name without revealing a catalog id."""
     value = str(model or "").strip()
     lowered = value.lower()
     if not value or lowered in {"auto", "default", "(provider default)"}:
@@ -54,15 +115,22 @@ def public_model_name(model: Any = None) -> str:
     parsed = parse_public_model_alias(value)
     if parsed:
         return parsed
+    by_capability = _tier_from_registry(value)
+    if by_capability:
+        return by_capability
     if lowered.startswith("tamfisgpt "):
-        return PUBLIC_MODEL_CODE
-    if any(token in lowered for token in ("vision", "omni", "gemini", "gemma")):
-        return PUBLIC_MODEL_VISION
-    if any(token in lowered for token in ("flash", "nano", "mini", ":free")):
-        return PUBLIC_MODEL_FAST
-    if any(token in lowered for token in ("pro", "ultra", "k3", "480b", "550b")):
         return PUBLIC_MODEL_PRO
-    return PUBLIC_MODEL_CODE
+    # Unknown/raw id not in the local capability registry (e.g. a Remote
+    # catalog id this client build doesn't know about yet): fall back to a
+    # coarse keyword heuristic rather than silently defaulting everything
+    # into one bucket.
+    if any(token in lowered for token in ("480b", "550b", "ultra", ":thinking")):
+        return PUBLIC_MODEL_ULTIMA
+    if any(token in lowered for token in ("flash", "nano", "mini", ":free")):
+        return PUBLIC_MODEL_SMART
+    if any(token in lowered for token in ("pro", "k3", "reasoning", "vision", "omni", "gemini", "gemma")):
+        return PUBLIC_MODEL_PRO
+    return PUBLIC_MODEL_ULTRA
 
 
 def parse_public_model_alias(value: Any) -> str | None:

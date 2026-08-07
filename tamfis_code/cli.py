@@ -127,7 +127,7 @@ def _print_local_sessions(console: Console, *, show_all: bool) -> None:
 @click.option("--api-base", "api_base", default=None, help="Override the configured Remote API base URL.")
 @click.option("--cwd", "cwd_override", type=click.Path(exists=True, file_okay=False), default=None, help="Treat this directory as the workspace instead of the current directory.")
 @click.option("--provider", default="auto", hidden=True)
-@click.option("--model", default=None, help="TamfisGPT model alias: Auto, Fast, Code, Pro, or Vision.")
+@click.option("--model", default=None, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend for the bare interactive REPL.")
 @click.option("--output-mode", type=click.Choice(["text", "json", "jsonl"]), default=None, help="Render human text, one JSON document, or streaming JSON Lines.")
 @click.version_option(__version__, prog_name="tamfis-code")
@@ -1360,7 +1360,9 @@ async def _run_local_ai_command(
     if not _is_resume_request(objective):
         local_state.save_session_state(workspace.session_id, active_task={"objective": objective, "mode": mode})
     if config.output_mode == "text":
-        print_banner(console, host=f"local:{provider_type.value}", workspace_root=workspace.workspace_root, mode=mode, approval_policy=config.approval_policy)
+        from .public_identity import PUBLIC_PROVIDER_NAME
+
+        print_banner(console, host=f"local:{PUBLIC_PROVIDER_NAME}", workspace_root=workspace.workspace_root, mode=mode, approval_policy=config.approval_policy)
         renderer = StreamRenderer(console)
     else:
         renderer = StructuredRenderer(mode=config.output_mode)
@@ -1436,7 +1438,7 @@ def _ai_command(mode: str, help_text: str):
     @click.option("--prompt-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Read the objective from a UTF-8 text file.")
     @click.option("--attach", "attachment_paths", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach an image or document (repeatable; up to 10 files, 10 MB each).")
     @click.option("--bg", "background", is_flag=True, default=False, help="Submit and return immediately; the task keeps running server-side. Use `tamfis-code agents`/`attach`/`logs` to check on it.")
-    @click.option("--model", default="auto", show_default=True, help="TamfisGPT model alias: Auto, Fast, Code, Pro, or Vision.")
+    @click.option("--model", default="auto", show_default=True, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
     @click.option("--mode", "mode_override", type=click.Choice(["auto", "coding", "chat", "audit", "plan", "agent", "execute"]), default=None, help="Override this command's task mode.")
     @click.option("--provider", type=click.Choice(_PROVIDER_CHOICES), default=None, hidden=True)
     @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend. Deprecated -- standalone (the default) is the supported path going forward.")
@@ -1660,7 +1662,7 @@ async def bridge(ctx: click.Context):
 @cli.command()
 @click.argument("session_id", type=int, required=False, default=None)
 @click.option("--provider", default="auto", hidden=True)
-@click.option("--model", default=None, help="TamfisGPT model alias: Auto, Fast, Code, Pro, or Vision.")
+@click.option("--model", default=None, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
 @click.option("--remote", is_flag=True, default=False, help="Resume a session on the legacy TamfisGPT Remote Workspace backend instead of a local one.")
 @click.pass_context
 @async_command
@@ -1727,7 +1729,7 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
 @cli.command()
 @click.argument("task_id", required=False, default=None)
 @click.option("--provider", default="auto", hidden=True)
-@click.option("--model", default=None, help="TamfisGPT model alias: Auto, Fast, Code, Pro, or Vision.")
+@click.option("--model", default=None, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
 @click.option("--remote", is_flag=True, default=False, help="Retry a task on the legacy TamfisGPT Remote Workspace backend instead of resending locally.")
 @click.pass_context
 @async_command
@@ -2340,7 +2342,7 @@ def completion_cmd(shell: str):
 @click.option('--file', '-f', help='File to operate on')
 @click.option('--max-concurrency', default=1, show_default=True, help='Max concurrent delegated sub-tasks')
 @click.option('--provider', default="auto", hidden=True)
-@click.option('--model', default=None, help="TamfisGPT model alias: Auto, Fast, Code, Pro, or Vision.")
+@click.option('--model', default=None, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
 @click.pass_context
 def agent_cmd(ctx: click.Context, action: str, tasks: tuple[str, ...], file: str, max_concurrency: int, provider: str, model: Optional[str]):
     """Run subagents for various tasks (analyze/test/doc-gen, or delegate objectives to concurrent sub-tasks).
@@ -2609,7 +2611,7 @@ def providers_command(ctx: click.Context):
 @cli.command('local')
 @click.argument('objective', required=False)
 @click.option('--provider', default="auto", hidden=True)
-@click.option('--model', default=None, help="TamfisGPT model alias: Auto, Fast, Code, Pro, or Vision.")
+@click.option('--model', default=None, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
 @click.option('--no-tools', 'no_tools', is_flag=True, default=False, help="Disable read-only repo tools (read_file/list_directory/search_code/get_git_info) for this turn.")
 @click.option('--agent', 'full_agent', is_flag=True, default=False, help="Full read/write/execute tool access (write_file/edit_file/execute_command) via the local risk/approval/mutation-ledger layer, instead of read-only Q&A. Standalone -- no TamfisGPT backend involved.")
 @click.option('--repl', 'run_repl', is_flag=True, default=False, help="Start an interactive local chat loop instead of a single turn.")

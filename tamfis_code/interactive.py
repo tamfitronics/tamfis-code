@@ -960,8 +960,10 @@ async def run_interactive(
                 f"session_id={workspace.session_id}  (standalone, local session)"
                 if standalone else f"session_id={workspace.session_id}  server_id={workspace.server_id}"
             )
+            from .public_identity import PUBLIC_PROVIDER_NAME, public_model_name
+
             backend_line = (
-                f"approval_policy={config.approval_policy}  provider={provider_type.value if provider_type else provider}"
+                f"approval_policy={config.approval_policy}  provider={PUBLIC_PROVIDER_NAME}"
                 if standalone else f"approval_policy={config.approval_policy}  api_base={config.api_base}"
             )
             console.print(
@@ -973,7 +975,7 @@ async def run_interactive(
                 f"validations={len(state.validation_results)}  issues={len(state.unresolved_issues)}\n"
                 f"saved_plans={len(state.saved_plans)}  active_plan={state.active_plan_id or '-'}\n"
                 f"{backend_line}\n"
-                f"model={state.selected_model}  route={state.selected_provider or 'auto'}"
+                f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
             )
             continue
         if text == "/context":
@@ -1053,14 +1055,45 @@ async def run_interactive(
                 continue
             parts = arg.split()
 
-            from .public_identity import PUBLIC_MODEL_ALIASES, parse_public_model_alias
+            from .public_identity import (
+                PUBLIC_MODEL_ALIASES,
+                PUBLIC_MODEL_AUTO,
+                PUBLIC_MODEL_TIERS,
+                parse_public_model_alias,
+                public_model_name,
+            )
             if parts[0].lower() == "list":
                 table = Table(show_header=True, header_style="bold")
                 table.add_column("TAMFISGPT MODEL")
                 table.add_column("USE")
-                uses = ("Automatic selection", "Low-latency tasks", "Coding and agent tasks", "Deep reasoning", "Image-aware tasks")
-                for alias, use in zip(PUBLIC_MODEL_ALIASES, uses):
-                    table.add_row(alias, use)
+                table.add_column("STATUS")
+                uses = {
+                    PUBLIC_MODEL_AUTO: "Automatic selection",
+                    "TamfisGPT Smart": "Low-latency, low-cost tasks",
+                    "TamfisGPT Pro": "Everyday coding and agent tasks",
+                    "TamfisGPT Ultra": "Heavy multi-file / tool-heavy work",
+                    "TamfisGPT Ultima": "Frontier reasoning -- top subscription tier only",
+                }
+                if standalone:
+                    # No TamfisGPT subscription applies to a standalone (BYOK)
+                    # session -- list the tiers as reference labels only,
+                    # same as Claude Code/Codex listing their own model names.
+                    for alias in PUBLIC_MODEL_ALIASES:
+                        table.add_row(alias, uses[alias], "n/a (standalone)")
+                else:
+                    try:
+                        available = await client.list_models()
+                    except (AuthRequiredError, RemoteAPIError) as e:
+                        print_error(console, str(e))
+                        continue
+                    entitled_tiers = {
+                        public_model_name(item.get("id"))
+                        for item in (available.get("models") or [])
+                    }
+                    table.add_row(PUBLIC_MODEL_AUTO, uses[PUBLIC_MODEL_AUTO], "🟢 Available")
+                    for tier in PUBLIC_MODEL_TIERS:
+                        status = "🟢 Available" if tier in entitled_tiers else "🔒 Not on your plan"
+                        table.add_row(tier, uses[tier], status)
                 console.print(table)
                 continue
             public_alias = parse_public_model_alias(parts[0])
