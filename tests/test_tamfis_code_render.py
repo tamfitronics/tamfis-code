@@ -494,6 +494,29 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("✓", output)
         self.assertIn("✗", output)
 
+    def test_failed_read_shows_the_actual_reason_not_just_the_target(self):
+        # Live-caught bug: this used to print only "Read failed <target>"
+        # with the real error (not_found/permission_denied/etc.) silently
+        # discarded, leaving the user with no idea why the read failed.
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "read_file",
+                "arguments": {"path": "/etc/shadow"},
+                "result": {
+                    "success": False,
+                    "status": "permission_denied",
+                    "path": "/etc/shadow",
+                },
+            },
+        })
+        output = console.file.getvalue()
+        self.assertIn("Read failed", output)
+        self.assertIn("/etc/shadow", output)
+        self.assertIn("Permission denied", output)
+
     def test_failed_edit_is_never_labeled_edited(self):
         console = _console()
         renderer = StreamRenderer(console)

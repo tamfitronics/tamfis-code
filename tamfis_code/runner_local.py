@@ -4522,6 +4522,7 @@ async def _run_local_agent_turn_impl(
     recent_tool_signatures: list[tuple[tuple[str, str], ...]] = []
     any_mutation = False
     rollover_count = 0
+    compaction_count = 0
     replanned_after_evidence = False
     loop_nudge_count = 0
     narrated_retries: dict[ProviderType, int] = {}
@@ -4933,19 +4934,43 @@ async def _run_local_agent_turn_impl(
         local_state.save_session_state(session_id, estimated_context_tokens=input_tokens)
         if input_tokens > token_budget:
             before_compaction = input_tokens
-            compacted = _trim_tool_outputs(working_messages, token_budget)
+            # Compact well below the hard budget rather than right up to its
+            # edge -- confirmed live: trimming to exactly `token_budget`
+            # meant the very next tool result (a directory listing, a file
+            # read) pushed input_tokens back over the line immediately,
+            # triggering another compaction pass next round. On a long
+            # exploration turn this thrashed every single round, repeatedly
+            # discarding just-read tool output (the model then re-read the
+            # same paths, having lost the earlier detail) and spamming a
+            # "Context compacted" diagnostic on nearly every tool call.
+            # Trimming to 85% of budget instead gives several rounds of
+            # headroom before compaction has to run again.
+            compacted = _trim_tool_outputs(working_messages, int(token_budget * 0.85))
             input_tokens = _estimate_tokens(working_messages)
             if compacted:
-                renderer.handle_event({
-                    "event_type": "diagnostics",
-                    "payload": {
-                        "content": (
-                            f"Context compacted from ~{before_compaction} to "
-                            f"~{input_tokens} estimated tokens for "
-                            f"{resolved_provider.value}'s context window."
-                        )
-                    },
-                })
+                compaction_count += 1
+                # Throttle the diagnostic itself the same way: full detail
+                # for the first couple of occurrences, then a quieter
+                # one-liner so a long turn doesn't scroll the transcript
+                # full of near-identical "Context compacted" lines.
+                if compaction_count <= 2:
+                    content = (
+                        f"Context compacted from ~{before_compaction} to "
+                        f"~{input_tokens} estimated tokens for "
+                        f"{resolved_provider.value}'s context window."
+                    )
+                elif compaction_count % 5 == 0:
+                    content = (
+                        f"Context compacted again (~{input_tokens} estimated tokens) -- "
+                        f"{compaction_count} compactions so far this turn."
+                    )
+                else:
+                    content = None
+                if content is not None:
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": content},
+                    })
         if input_tokens > token_budget:
             # Compaction alone was not enough. Before ever failing the turn,
             # try (a) an internal context rollover -- persist the full

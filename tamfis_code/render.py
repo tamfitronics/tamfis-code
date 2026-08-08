@@ -1256,7 +1256,10 @@ class StreamRenderer:
                 success = result_envelope.get("success")
                 if success is False or result_envelope.get("status") in {"failed", "error"}:
                     args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else result_envelope
-                    self.console.print(f"[red]Read failed {escape(_read_target(args))}[/red]")
+                    reason, _failed = _tool_result_message(payload)
+                    self.console.print(
+                        f"[red]Read failed[/red] {escape(_read_target(args))}: {escape(reason)}"
+                    )
                 return
             # Command/file events already carry the useful result. Some
             # canonical tool-completion envelopes contain only a tool name
