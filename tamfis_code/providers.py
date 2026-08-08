@@ -879,6 +879,21 @@ class ProviderManager:
         ordinary chat/inspection turns don't spend credits at all.
         """
         if config.name == "Ollama Cloud":
+            # FIX 2026-08-08: TAMFIS_CODE_OLLAMA_PREMIUM used to gate BOTH
+            # (a) whether AUTO is allowed to force Ollama Cloud as its
+            # exclusive primary (resolve_route(), still gated on this flag
+            # -- that forcing is exactly what caused the weekly-quota 429s
+            # and must stay off by default), and (b) which model gets
+            # picked once Ollama Cloud IS being called. Those are unrelated
+            # concerns: kimi-k2.7-code:cloud is the included-plan coding
+            # route (confirmed not an extra-usage cost, unlike kimi-k3
+            # below), so there is no reason to withhold it just because
+            # Ollama isn't forced as AUTO's primary. It is now always the
+            # default model whenever Ollama Cloud is used -- via automatic
+            # fallback after NIM, or explicit --provider selection -- while
+            # the genuinely extra-cost kimi-k3 escalation stays gated
+            # behind TAMFIS_CODE_OLLAMA_PREMIUM + TAMFIS_CODE_OLLAMA_EXTRA_USAGE
+            # exactly as before.
             premium_enabled = os.environ.get(
                 "TAMFIS_CODE_OLLAMA_PREMIUM",
                 "false",
@@ -887,7 +902,7 @@ class ProviderManager:
             if premium_enabled:
                 # Kimi K3 consumes Ollama "extra usage" on accounts where it
                 # is not included in plan usage. Never select it merely
-                # because Ollama Cloud is the primary provider. A machine
+                # because Ollama Cloud is being used. A machine
                 # administrator must explicitly enable extra usage, and the
                 # task must independently qualify as heavy.
                 extra_usage_enabled = os.environ.get(
@@ -900,18 +915,14 @@ class ProviderManager:
                         "kimi-k3:cloud",
                     )
 
-                # The included-plan Kimi coding route is the all-round
-                # priority whenever Ollama Cloud is intentionally enabled as
-                # primary. It handles routine and heavy coding without
-                # silently escalating to an extra-usage-only model.
-                return os.environ.get(
-                    "TAMFIS_CODE_OLLAMA_CODING_MODEL",
-                    "kimi-k2.7-code:cloud",
-                )
-
+            # The included-plan Kimi coding route is the all-round default
+            # whenever Ollama Cloud handles the request, whether or not
+            # Ollama is AUTO's forced primary. It handles routine and heavy
+            # coding without silently escalating to an extra-usage-only
+            # model.
             return os.environ.get(
-                "TAMFIS_CODE_OLLAMA_GENERAL_MODEL",
-                config.default_model,
+                "TAMFIS_CODE_OLLAMA_CODING_MODEL",
+                "kimi-k2.7-code:cloud",
             )
 
         if config.free_model and not _task_needs_paid_tier(task_profile):

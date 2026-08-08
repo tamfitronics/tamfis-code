@@ -111,6 +111,36 @@ def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
         ) == "kimi-k2.7-code:cloud"
 
 
+def test_ollama_still_uses_kimi_k27_when_premium_is_off(monkeypatch):
+    # FIX 2026-08-08: TAMFIS_CODE_OLLAMA_PREMIUM used to gate the model
+    # choice too, so leaving it off (the correct setting -- it also gates
+    # AUTO force-primary, which caused the weekly-quota 429s) silently
+    # downgraded Ollama Cloud's default model from the included-plan
+    # kimi-k2.7-code:cloud to the much weaker gemma4:cloud any time Ollama
+    # Cloud was used (automatic fallback after NIM, or explicit
+    # --provider ollama_cloud). kimi-k2.7-code:cloud is not an extra-usage
+    # cost (unlike kimi-k3:cloud, still gated below), so there is no reason
+    # to withhold it just because AUTO isn't forced onto Ollama Cloud.
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_PREMIUM", raising=False)
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", raising=False)
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_CODING_MODEL", raising=False)
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD)
+
+    for prompt in ("hello", "fix the API", "audit the entire repository"):
+        profile = classify_task(prompt)
+        assert manager.select_model(
+            manager.PROVIDERS[ProviderType.OLLAMA_CLOUD], profile
+        ) == "kimi-k2.7-code:cloud"
+
+    # But AUTO still must not force Ollama Cloud as primary with the flag
+    # off -- when NVIDIA is also available, NIM (priority 0) wins, not
+    # Ollama Cloud (priority 3), confirming the AUTO-forcing behavior this
+    # flag also gates stays off.
+    manager_with_nim = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+    resolved, _ = manager_with_nim.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    assert resolved == ProviderType.NVIDIA
+
+
 def test_ollama_exposes_glm_52_as_a_priority():
     config = ProviderManager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
     assert "glm-5.2:cloud" in config.models
