@@ -12,6 +12,7 @@ from tamfis_code import state as state_module
 from tamfis_code.cli import (
     _apply_pending_update_after_login,
     _explicit_absolute_paths,
+    _offer_recent_session_picker,
     _print_bg_hint,
     _project_root_for_target,
     _session_for_primary,
@@ -19,6 +20,7 @@ from tamfis_code.cli import (
     cli,
 )
 from tamfis_code.config import Config, Credentials
+from rich.console import Console
 
 
 class ExplicitAbsolutePathsTests(unittest.TestCase):
@@ -104,6 +106,71 @@ class SessionForPrimaryTests(unittest.TestCase):
             state_module.save_session_state(1, workspace_root=str(root.resolve()))
             state_module.save_session_state(2, workspace_root=str(root.resolve()))
             self.assertEqual(_session_for_primary(root), 2)
+
+
+class OfferRecentSessionPickerTests(unittest.TestCase):
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        from io import StringIO
+
+        self._console = Console(no_color=True, file=StringIO())
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        self.tmp.cleanup()
+
+    def test_skips_entirely_when_not_an_interactive_tty(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            with patch("sys.stdin.isatty", return_value=False), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt") as prompt:
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
+        prompt.assert_not_called()
+
+    def test_returns_none_with_nothing_to_offer(self):
+        with tempfile.TemporaryDirectory() as proj:
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt") as prompt:
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
+        prompt.assert_not_called()
+
+    def test_default_choice_declines_and_starts_a_new_session(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt", return_value="n"):
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
+
+    def test_numeric_choice_returns_the_matching_session_id(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(1, workspace_root=root)
+            state_module.save_session_state(2, workspace_root=root)
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt", return_value="1"):
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        # Most-recently-updated session is listed first (session 2).
+        self.assertEqual(result, 2)
+
+    def test_out_of_range_choice_falls_back_to_a_new_session(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt", return_value="9"):
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
 
 
 class PrintBgHintTests(unittest.TestCase):

@@ -46,25 +46,44 @@ _MODE_ON_LABEL = {
 # (left-aligned status, one short hint flush right). Rotates on a slow clock
 # rather than every render -- the toolbar redraws several times a second
 # while a task streams, and a hint that changes that fast is just noise.
-_ROTATING_TIPS = (
-    "/plan to think before executing",
-    "/model to switch models",
-    "/diff to review pending changes",
-    "/agents to see what's running",
-    "/retry to rerun the last turn",
-    "/status for session, task, cwd",
+#
+# Every tip below is gated on the session state that would make it actually
+# actionable -- a fixed rotation advertised "/diff to review pending
+# changes" on a session with nothing modified and "/retry to rerun the last
+# turn" on a brand-new thread with no prior turn, which is just noise dressed
+# up as a hint. Each entry is (predicate, text); predicate takes the
+# SessionState plus the caller's already-known active-agent count so this
+# doesn't need its own duplicate agent-counting logic.
+_ALWAYS = lambda state, agents: True
+_ROTATING_TIPS: tuple[tuple[Callable[[Any, int], bool], str], ...] = (
+    (lambda state, agents: not state.active_plan_id, "/plan to think before executing"),
+    (_ALWAYS, "/model to switch models"),
+    (lambda state, agents: bool(state.modified_files), "/diff to review pending changes"),
+    (lambda state, agents: agents > 0, "/agents to see what's running"),
+    (lambda state, agents: bool(state.conversation_history), "/retry to rerun the last turn"),
+    (lambda state, agents: bool(state.unresolved_issues), "/doctor to check unresolved issues"),
+    (_ALWAYS, "/status for session, task, cwd"),
 )
 _TIP_ROTATE_SECONDS = 8.0
 
 
-def _right_chip() -> str:
+def _right_chip(session_id: Optional[int] = None, active_agents: int = 0) -> str:
     # ansibrightblack (the ghost-text/auto-suggestion color -- deliberately
     # dim) renders as unreadable-to-invisible against some terminal themes'
     # backgrounds for ordinary body text. ansigray is the same tone the rest
     # of this toolbar's left-side status already uses, so the chip stays
     # visually secondary without disappearing.
-    index = int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(_ROTATING_TIPS)
-    return f"<ansigray>{_ROTATING_TIPS[index]}</ansigray>"
+    if session_id is None:
+        applicable = [text for predicate, text in _ROTATING_TIPS if predicate is _ALWAYS]
+    else:
+        state = local_state.get_session_state(session_id)
+        applicable = [
+            text for predicate, text in _ROTATING_TIPS if predicate(state, active_agents)
+        ]
+    if not applicable:
+        applicable = [text for _, text in _ROTATING_TIPS]
+    index = int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(applicable)
+    return f"<ansigray>{applicable[index]}</ansigray>"
 
 
 def _right_align(left_html: str, right_html: str, *, min_gap: int = 2) -> str:
@@ -147,12 +166,16 @@ def idle_bottom_toolbar(
     )
     from .public_identity import public_model_name
 
+    resolved_agents = (
+        _active_agent_count(session_id) if active_agents is None else active_agents
+    )
     left = (
         f" <ansigray>ready · {public_model_name(model)} ·</ansigray> "
-        f"{_mode_and_agents_html(cli_config, session_id, active_agents=active_agents)}"
+        f"{_mode_and_agents_html(cli_config, session_id, active_agents=resolved_agents)}"
         f"{suggestion_hint}"
     )
-    return HTML(_right_align(left, _right_chip() + " "))
+    chip = _right_chip(session_id, resolved_agents)
+    return HTML(_right_align(left, chip + " "))
 
 
 @contextlib.contextmanager
@@ -440,7 +463,8 @@ class LiveInputListener:
                 active_agents=self._active_agents,
             )}"
         )
-        bottom_line = _right_align(left, _right_chip() + " ")
+        chip = _right_chip(self.session_id, self._active_agents)
+        bottom_line = _right_align(left, chip + " ")
         activity = self.renderer.live_input_activity_line()
         if not activity:
             return HTML(bottom_line)

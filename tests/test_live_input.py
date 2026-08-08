@@ -94,12 +94,12 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         ).__pt_formatted_text__()
         rendered = "".join(text for _style, text in fragments)
 
-        chip = _right_chip()
+        chip = _right_chip(1, 0)
         # _right_chip returns HTML markup; the plain tip text is what
         # actually lands in the rendered fragments.
         plain_tip = chip.split(">", 1)[1].rsplit("<", 1)[0]
         self.assertIn(plain_tip, rendered)
-        self.assertTrue(any(plain_tip in tip for tip in _ROTATING_TIPS) or plain_tip in _ROTATING_TIPS)
+        self.assertTrue(any(plain_tip == text for _predicate, text in _ROTATING_TIPS))
         # Right-aligned: the chip is the last thing on the line, after padding.
         self.assertTrue(rendered.rstrip().endswith(plain_tip))
 
@@ -214,6 +214,61 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
 
         self.assertEqual(bytes(listener._buf), b"")
         self.assertEqual(cfg.approval_policy, "ask")  # unchanged
+
+
+class RotatingChipIsSituationAwareTests(_StatePatchMixin, unittest.TestCase):
+    """The corner chip must not advertise a command that has nothing to act
+    on in the current session/thread -- e.g. "/diff" with no modified files,
+    or "/retry" on a thread that has no prior turn yet."""
+
+    def test_fresh_session_omits_diff_agents_and_retry_tips(self):
+        # A brand-new session has no modified files, no running agents, and
+        # no prior turn -- none of those situational tips should ever be
+        # eligible, regardless of which point in the rotation is sampled.
+        for offset in range(len(_ROTATING_TIPS)):
+            with patch("time.monotonic", return_value=offset * 8.0):
+                tip = _right_chip(1, 0).split(">", 1)[1].rsplit("<", 1)[0]
+                self.assertNotIn(tip, {
+                    "/diff to review pending changes",
+                    "/agents to see what's running",
+                    "/retry to rerun the last turn",
+                    "/doctor to check unresolved issues",
+                })
+
+    def test_agents_tip_only_eligible_when_agents_are_running(self):
+        eligible_without = any(
+            predicate(state_module.SessionState(session_id=1), 0)
+            for predicate, text in _ROTATING_TIPS
+            if text == "/agents to see what's running"
+        )
+        eligible_with = any(
+            predicate(state_module.SessionState(session_id=1), 3)
+            for predicate, text in _ROTATING_TIPS
+            if text == "/agents to see what's running"
+        )
+        self.assertFalse(eligible_without)
+        self.assertTrue(eligible_with)
+
+    def test_diff_and_retry_tips_become_eligible_once_thread_has_history(self):
+        state = state_module.get_session_state(2)
+        state.modified_files = [{"path": "foo.py"}]
+        state.conversation_history = [{"role": "user", "content": "hi"}]
+        state_module.put_session_state(state)
+
+        for offset in range(len(_ROTATING_TIPS)):
+            with patch("time.monotonic", return_value=offset * 8.0):
+                _right_chip(2, 0)  # exercised for side-effect-free coverage
+
+        diff_predicate = next(
+            predicate for predicate, text in _ROTATING_TIPS
+            if text == "/diff to review pending changes"
+        )
+        retry_predicate = next(
+            predicate for predicate, text in _ROTATING_TIPS
+            if text == "/retry to rerun the last turn"
+        )
+        self.assertTrue(diff_predicate(state, 0))
+        self.assertTrue(retry_predicate(state, 0))
 
 
 class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCase):

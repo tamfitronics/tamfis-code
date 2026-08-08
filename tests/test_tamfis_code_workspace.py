@@ -8,7 +8,7 @@ from tamfis_code import state as state_module
 from tamfis_code.workspace import (
     _indexable_files, _project_metadata, blocking_dirty_files, build_system_prompt, classify_root,
     context_from_session, discover_local_repository, find_resumable_session,
-    resolve_local_workspace, resolve_workspace, scratch_root,
+    recent_local_sessions_for_workspace, resolve_local_workspace, resolve_workspace, scratch_root,
 )
 
 
@@ -322,6 +322,160 @@ class ResolveLocalWorkspaceTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as proj:
             ctx = resolve_local_workspace(cwd=Path(proj), discover=False)
         self.assertEqual(ctx.session_id, 6)
+
+    def test_does_not_reuse_a_session_actively_running_right_now(self):
+        # A second terminal opened in the same directory while the first is
+        # mid-task must not land in the same state.json row -- that used to
+        # make both processes clobber each other's current_phase/
+        # running_action/active_task (cross-talk between unrelated terminals).
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id, execution_status="running",
+            )
+            second = resolve_local_workspace(cwd=Path(proj), discover=False)
+        self.assertNotEqual(first.session_id, second.session_id)
+
+    def test_reuses_a_running_session_once_its_updated_at_goes_stale(self):
+        # A crashed/killed process can leave execution_status stuck at
+        # "running" forever -- that must not permanently block reuse, or
+        # every future launch in the same directory loses conversation
+        # history/turn_checkpoint continuity (the "resume after crash" flow).
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id, execution_status="running",
+            )
+            # put_session_state always stamps updated_at with "now" on write,
+            # so backdating it to simulate a crashed process (no further
+            # writes since) has to bypass that and edit the raw record
+            # directly, the way a real stale entry would look on disk.
+            stale = datetime.now(timezone.utc) - timedelta(hours=1)
+            data = state_module._load_raw()
+            data[str(first.session_id)]["updated_at"] = stale.isoformat()
+            state_module._save_raw(data)
+            second = resolve_local_workspace(cwd=Path(proj), discover=False)
+        self.assertEqual(first.session_id, second.session_id)
+
+    def test_idle_session_is_still_reused(self):
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id, execution_status="idle",
+            )
+            second = resolve_local_workspace(cwd=Path(proj), discover=False)
+        self.assertEqual(first.session_id, second.session_id)
+
+    def test_explicit_session_id_is_pinned_and_bookkept(self):
+        # The startup picker (cli.py's _offer_recent_session_picker) already
+        # decided which row to land in -- resolve_local_workspace must not
+        # run its own match/reuse logic in that case, just apply the same
+        # workspace bookkeeping/discovery to the chosen id.
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(41, workspace_root="/some/unrelated/root")
+            ctx = resolve_local_workspace(
+                cwd=Path(proj), discover=False, session_id=41,
+            )
+        self.assertEqual(ctx.session_id, 41)
+        self.assertEqual(
+            state_module.get_session_state(41).workspace_root,
+            str(Path(proj).resolve()),
+        )
+
+
+class RecentLocalSessionsForWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        self.tmp.cleanup()
+
+    def test_empty_when_no_session_has_touched_this_root(self):
+        with tempfile.TemporaryDirectory() as proj:
+            self.assertEqual(recent_local_sessions_for_workspace(Path(proj)), [])
+
+    def test_excludes_swarm_children_and_other_roots(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(1, workspace_root=root)
+            state_module.save_session_state(2, workspace_root="/somewhere/else")
+            state_module.save_session_state(3, workspace_root=root, is_swarm_child=True)
+
+            infos = recent_local_sessions_for_workspace(Path(proj))
+
+        self.assertEqual([info.session_id for info in infos], [1])
+
+    def test_orders_most_recently_updated_first_and_respects_limit(self):
+        import time
+
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            for sid in (1, 2, 3, 4):
+                state_module.save_session_state(sid, workspace_root=root)
+                time.sleep(0.01)  # updated_at has second-level+ resolution gaps to sort by
+
+            infos = recent_local_sessions_for_workspace(Path(proj), limit=2)
+
+        self.assertEqual([info.session_id for info in infos], [4, 3])
+
+    def test_status_distinguishes_running_interrupted_and_idle(self):
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(1, workspace_root=root, execution_status="running")
+            state_module.save_session_state(2, workspace_root=root, execution_status="running")
+            stale = datetime.now(timezone.utc) - timedelta(hours=1)
+            data = state_module._load_raw()
+            data["2"]["updated_at"] = stale.isoformat()
+            state_module._save_raw(data)
+            state_module.save_session_state(3, workspace_root=root, execution_status="idle")
+
+            infos = {
+                info.session_id: info.status
+                for info in recent_local_sessions_for_workspace(Path(proj), limit=3)
+            }
+
+        self.assertEqual(infos[1], "running")
+        self.assertEqual(infos[2], "interrupted")
+        self.assertEqual(infos[3], "idle")
+
+    def test_description_prefers_active_task_objective(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(
+                1, workspace_root=root,
+                active_task={"objective": "Refactor the auth middleware"},
+                conversation_summary="stale summary that should be skipped",
+            )
+            infos = recent_local_sessions_for_workspace(Path(proj))
+        self.assertEqual(infos[0].description, "Refactor the auth middleware")
+
+    def test_description_falls_back_to_last_user_turn(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(
+                1, workspace_root=root,
+                conversation_history=[
+                    {"role": "user", "content": "Fix the flaky test"},
+                    {"role": "assistant", "content": "Done"},
+                ],
+            )
+            infos = recent_local_sessions_for_workspace(Path(proj))
+        self.assertEqual(infos[0].description, "Fix the flaky test")
+
+    def test_description_defaults_when_nothing_recorded(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            infos = recent_local_sessions_for_workspace(Path(proj))
+        self.assertEqual(infos[0].description, "no recent activity")
 
 
 class ResolveSwarmSubtaskWorkspaceTests(unittest.TestCase):

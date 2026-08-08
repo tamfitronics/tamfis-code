@@ -705,6 +705,54 @@ class StreamRenderer:
         elif event_type in {"ai_task_completed", "ai_task_failed"}:
             self._status_detail = "Finishing the response"
 
+    def _live_input_title(self) -> str:
+        """"Input", or "Input — session N" once other agents are running
+        concurrently (e.g. /delegate'd swarm children) -- otherwise a user
+        watching several panes has no way to tell which one this box
+        belongs to."""
+        listener = self.live_input_listener
+        if listener is not None and getattr(listener, "_active_agents", 0):
+            return f"Input — session {listener.session_id}"
+        return "Input"
+
+    def _live_input_hint(self) -> Text:
+        """Instructions for the in-task follow-up box, reflecting what Esc
+        and Enter actually do right now rather than a fixed caption --
+        before this, the text claimed "Esc stops the task" even after a
+        stop had already been requested (Esc/Ctrl+C do nothing once
+        `interrupt_classification` is set -- see live_input.py's
+        `_request_interrupt`), and never mentioned follow-ups already
+        queued behind the running turn."""
+        listener = self.live_input_listener
+        default = Text(
+            "Type a message and press Enter · Esc stops the task · Ctrl+C/Ctrl+D exits"
+        )
+        if listener is None:
+            return default
+        if getattr(listener, "interrupt_classification", None) is not None:
+            return Text("Stopping the task… · Ctrl+C/Ctrl+D exits")
+        session_id = getattr(listener, "session_id", None)
+        if session_id is None:
+            # Test doubles and other non-real listeners: fall back to the
+            # static caption rather than guessing at session state.
+            return default
+        from . import state as local_state
+
+        try:
+            session_state = local_state.get_session_state(session_id)
+            queued = sum(
+                1
+                for item in session_state.queued_user_instructions
+                if item.get("classification") == "follow_up"
+                and item.get("status") == "queued"
+            )
+        except Exception:
+            queued = 0
+        parts = ["Type a message and press Enter", "Esc stops the task", "Ctrl+C/Ctrl+D exits"]
+        if queued:
+            parts.insert(1, f"{queued} queued for after this turn")
+        return Text(" · ".join(parts))
+
     def _build_status(self) -> Any:
         elapsed = time.monotonic() - self._task_start
         tokens = self._metrics.metrics.tokens_used
@@ -760,10 +808,8 @@ class StreamRenderer:
             # terminal, with the editable follow-up line owned by
             # prompt_toolkit rather than a special control key.
             input_box = Panel(
-                Text(
-                    "Type a message and press Enter · Esc stops the task · Ctrl+C/Ctrl+D exits"
-                ),
-                title="Input",
+                self._live_input_hint(),
+                title=self._live_input_title(),
                 border_style="cyan",
                 padding=(0, 1),
             )

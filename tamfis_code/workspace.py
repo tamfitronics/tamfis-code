@@ -412,7 +412,10 @@ def _next_local_session_id() -> int:
     return (max(known) + 1) if known else 1
 
 
-def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True) -> WorkspaceContext:
+def resolve_local_workspace(
+    cwd: Optional[Path] = None, *, discover: bool = True,
+    session_id: Optional[int] = None,
+) -> WorkspaceContext:
     """Resolve a launch directory into a purely local session -- no network
     calls, no RemoteAPIClient, no remote-assigned session/server id.
 
@@ -426,15 +429,33 @@ def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True
     resolve_swarm_subtask_workspace) are deliberately excluded from this
     match -- they share the same workspace_root by design, but are not a
     session an ordinary caller should ever land back in.
+
+    A session that is actively running right now (see
+    local_state.is_session_actively_running) is excluded too -- opening a
+    second terminal in the same directory while the first is mid-task used
+    to hand both processes the identical state.json row, so the second
+    process's writes (current_phase/running_action/active_task/queued
+    instructions) clobbered the first's live status: cross-talk between two
+    otherwise-unrelated terminal sessions. A genuinely idle or crashed
+    session (execution_status stuck at "running" with a stale updated_at)
+    still matches, preserving the normal "resume after Ctrl+C/crash" flow.
+
+    `session_id`, when given, skips all of the above matching and pins the
+    session explicitly -- the caller (the startup recent-session picker in
+    cli.py) already decided which row to land in and just needs the same
+    workspace bookkeeping/discovery this function otherwise does for its
+    own match.
     """
     workspace_root = str((cwd or Path.cwd()).resolve())
 
-    local_match = next((
-        sid for sid in reversed(local_state.all_known_session_ids())
-        if local_state.get_session_state(sid).primary_workspace == workspace_root
-        and not local_state.get_session_state(sid).is_swarm_child
-    ), None)
-    session_id = local_match if local_match is not None else _next_local_session_id()
+    if session_id is None:
+        local_match = next((
+            sid for sid in reversed(local_state.all_known_session_ids())
+            if (candidate := local_state.get_session_state(sid)).primary_workspace == workspace_root
+            and not candidate.is_swarm_child
+            and not local_state.is_session_actively_running(candidate)
+        ), None)
+        session_id = local_match if local_match is not None else _next_local_session_id()
 
     configured_roots = load_config(project_root=Path(workspace_root)).workspace_roots
     allowed_roots = list(dict.fromkeys([workspace_root, *configured_roots]))
@@ -446,6 +467,78 @@ def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True
     if discover:
         discover_local_repository(session_id, Path(workspace_root))
     return WorkspaceContext(session_id=session_id, workspace_root=workspace_root)
+
+
+@dataclass
+class RecentSessionInfo:
+    session_id: int
+    workspace_root: str
+    description: str
+    # "running" (another live process actively mid-task right now, see
+    # local_state.is_session_actively_running), "interrupted" (a killed CLI/
+    # crashed process left execution_status stuck at "running" with a stale
+    # updated_at), or "idle" (nothing outstanding).
+    status: str
+    updated_at: str
+
+
+def _describe_session_activity(state: local_state.SessionState) -> str:
+    """One-line summary of what a session was/is doing, for the startup
+    picker -- the same information `/resume` already prints (active_task
+    objective, then conversation_summary, then the last user turn) but
+    trimmed to a single short line instead of a full recap block."""
+    objective = str((state.active_task or {}).get("objective") or "").strip()
+    if objective:
+        return objective[:100]
+    if state.conversation_summary:
+        last_line = state.conversation_summary.strip().splitlines()[-1]
+        if last_line:
+            return last_line[:100]
+    for entry in reversed(state.conversation_history):
+        if entry.get("role") == "user" and str(entry.get("content") or "").strip():
+            return str(entry["content"]).strip().splitlines()[0][:100]
+    return "no recent activity"
+
+
+def _session_status(state: local_state.SessionState) -> str:
+    if local_state.is_session_actively_running(state):
+        return "running"
+    if state.execution_status in ("running", "backgrounded"):
+        return "interrupted"
+    return "idle"
+
+
+def recent_local_sessions_for_workspace(
+    workspace_root: Path, *, limit: int = 3,
+) -> list[RecentSessionInfo]:
+    """The most recently touched local sessions already pointed at this
+    workspace root, most-recent first -- feeds the startup picker in cli.py
+    so a user opening tamfis-code in a directory with existing work sees
+    what's there (and whether it's still running elsewhere or was cut off)
+    instead of silently landing wherever resolve_local_workspace's own
+    single-match reuse rule happens to put them.
+
+    Excludes swarm children for the same reason resolve_local_workspace's
+    own match does -- not a session an ordinary caller should ever resume
+    into directly.
+    """
+    root = str(Path(workspace_root).resolve())
+    candidates = [
+        state for sid in local_state.all_known_session_ids()
+        if not (state := local_state.get_session_state(sid)).is_swarm_child
+        and (state.primary_workspace == root or state.workspace_root == root)
+    ]
+    candidates.sort(key=lambda state: state.updated_at or "", reverse=True)
+    return [
+        RecentSessionInfo(
+            session_id=state.session_id,
+            workspace_root=state.workspace_root or state.primary_workspace,
+            description=_describe_session_activity(state),
+            status=_session_status(state),
+            updated_at=state.updated_at,
+        )
+        for state in candidates[:limit]
+    ]
 
 
 def resolve_swarm_subtask_workspace(

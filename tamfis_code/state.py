@@ -74,6 +74,14 @@ MAX_QUEUED_INSTRUCTIONS = 200
 # just no longer paid for on every unrelated session's write.
 STALE_SESSION_MAX_AGE = timedelta(days=21)
 
+# How recently a "running" session's updated_at must have moved for it to
+# still count as a live process actively working. start_action/finish_action
+# and every save_session_state call refresh updated_at, so a genuinely busy
+# session touches this well inside the window; a crashed/killed process
+# leaves execution_status stuck at "running" with a stale updated_at, and
+# should be treated as dead rather than block reuse forever.
+SESSION_LIVENESS_WINDOW = timedelta(seconds=120)
+
 _SECRET_PATTERNS = (
     re.compile(r"(?i)\b(authorization\s*:\s*bearer\s+)([^\s]+)"),
     re.compile(r"(?i)\b(password|passwd|token|access_token|refresh_token|api[_-]?key|client_secret)\s*([=:])\s*([^\s&]+)"),
@@ -386,6 +394,32 @@ def get_session_state(session_id: int) -> SessionState:
     values = {key: value for key, value in raw.items() if key in allowed and key != "session_id"}
     values["last_event_id"] = int(values.get("last_event_id") or 0)
     return SessionState(session_id=session_id, **values)
+
+
+def is_session_actively_running(state: SessionState) -> bool:
+    """True if `state` looks like a live process working right now, as
+    opposed to a session that merely finished (or crashed) with
+    execution_status left at "running" from its last write.
+
+    Used to decide whether a same-workspace_root session can safely be
+    reused (see workspace.resolve_local_workspace) -- reusing the row of a
+    session that is genuinely mid-task hands two concurrent processes the
+    same state.json entry, so each one's current_phase/running_action/
+    active_task/queued_user_instructions overwrite the other's -- visible
+    live as one terminal's status flipping in sync with unrelated work
+    happening in a second terminal opened in the same directory.
+    """
+    if state.execution_status != "running":
+        return False
+    if not state.updated_at:
+        return False
+    try:
+        updated_at = datetime.fromisoformat(state.updated_at)
+    except ValueError:
+        return False
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return datetime.now(timezone.utc) - updated_at < SESSION_LIVENESS_WINDOW
 
 
 def _enforce_state_caps(state: SessionState) -> None:

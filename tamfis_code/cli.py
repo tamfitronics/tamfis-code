@@ -26,6 +26,7 @@ import click
 import httpx
 from rich.console import Console
 from rich.markdown import Markdown
+from rich.markup import escape
 from rich.table import Table
 
 from . import __version__, state as local_state
@@ -45,7 +46,7 @@ from .runner import (
     run_ai_task_and_stream, run_shell_command, submit_ai_task_background,
 )
 from .tasks import find_recent_task
-from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, resolve_workspace
+from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, recent_local_sessions_for_workspace, resolve_local_workspace, resolve_workspace
 from .local_chat import _PROVIDER_ALIASES
 from .public_identity import PUBLIC_MODEL_ALIASES, PUBLIC_MODEL_AUTO, public_model_name, redact_routing_text
 
@@ -173,6 +174,58 @@ def cli(
         _run_async(_interactive_entry(config, workspace_root, provider, model, remote))
 
 
+_SESSION_STATUS_LABEL = {
+    "running": ("cyan", "running in background"),
+    "interrupted": ("yellow", "interrupted"),
+    "idle": ("dim", "idle"),
+}
+
+
+def _offer_recent_session_picker(console: Console, workspace_root: Path) -> Optional[int]:
+    """On a bare `tamfis-code` launch, show up to 3 of the most recently
+    touched local sessions already pointed at this workspace and let the
+    user resume one instead of silently landing wherever
+    resolve_local_workspace's own single-match reuse rule would put them.
+
+    Each entry's status distinguishes a session actively running in another
+    terminal right now from one a killed process/crash left interrupted, so
+    the user isn't guessing which is safe to pick back up. Returns the
+    chosen session id, or None to fall through to the normal resolve/reuse
+    flow (a fresh session, or the one idle match if there is exactly one).
+
+    Skipped outright for non-interactive invocations (piped stdin/stdout,
+    CI, scripted `--output-mode json`) and when there is nothing to offer.
+    """
+    if not sys.stdin.isatty() or not sys.stdout.isatty():
+        return None
+    candidates = recent_local_sessions_for_workspace(workspace_root, limit=3)
+    if not candidates:
+        return None
+
+    console.print("[bold]Recent sessions in this workspace[/bold]")
+    for index, info in enumerate(candidates, 1):
+        style, label = _SESSION_STATUS_LABEL[info.status]
+        console.print(
+            f"  [bold]{index}[/bold]. session {info.session_id} "
+            f"[{style}]({label})[/{style}] -- {escape(info.description)}"
+        )
+    console.print("  [bold]n[/bold]. Start a new session")
+    choice = click.prompt(
+        "Resume which session?", default="n", show_default=False,
+    ).strip().lower()
+    if choice in ("", "n", "new"):
+        return None
+    try:
+        index = int(choice)
+    except ValueError:
+        console.print(f"[dim]'{choice}' not recognised -- starting a new session.[/dim]")
+        return None
+    if not (1 <= index <= len(candidates)):
+        console.print(f"[dim]No option {choice} -- starting a new session.[/dim]")
+        return None
+    return candidates[index - 1].session_id
+
+
 async def _interactive_entry(
     config: Config, workspace_root: Path, provider: str = "auto",
     model: Optional[str] = None, remote: bool = False,
@@ -182,9 +235,8 @@ async def _interactive_entry(
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
-        from .workspace import resolve_local_workspace
-
-        workspace = resolve_local_workspace(workspace_root)
+        chosen_session_id = _offer_recent_session_picker(console, workspace_root)
+        workspace = resolve_local_workspace(workspace_root, session_id=chosen_session_id)
         await run_interactive(None, config, workspace, provider=provider, model=model)
         return
 
