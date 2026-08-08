@@ -236,9 +236,15 @@ class ProviderConfig:
 class ProviderManager:
     """Initialise, inspect, rank, and access configured AI providers."""
 
+    # NIM first (2026-08-08, was Ollama Cloud first): Ollama Cloud's weekly
+    # usage limit is a real multi-day-reset HTTP 429, not transient -- being
+    # first here meant it absorbed the bulk of auto-routed traffic and
+    # burned that quota out repeatedly. This tuple, not the `.priority`
+    # field on each ProviderConfig, is what routing_order/fallback_chain_names
+    # actually iterate, so it has to move here, not just there.
     PRIORITY_ORDER: tuple[ProviderType, ...] = (
-        ProviderType.OLLAMA_CLOUD,
         ProviderType.NVIDIA,
+        ProviderType.OLLAMA_CLOUD,
         ProviderType.HF,
         ProviderType.OPENROUTER,
         # Grok last: real billed xAI spend showed up within the first week
@@ -297,7 +303,13 @@ class ProviderManager:
                 # live-verified against this CLI's own tool-calling loop yet.
                 "deepseek-v4-flash:0731-cloud",
             ],
-            priority=0,
+            # priority=3 (2026-08-08, was 0/first): Ollama Cloud's weekly
+            # usage limit is a real multi-day-reset 429, not a transient
+            # blip -- being priority 0 meant every auto-routed request hit
+            # that quota first and burned it out. NVIDIA NIM is now
+            # priority 0 (see ProviderType.NVIDIA below) as the reliable
+            # free-tier default across all subscription tiers/model groups.
+            priority=3,
             weight=10,
             reasoning_supported=True,
             vision_supported=True,
@@ -478,8 +490,10 @@ class ProviderManager:
                 # as mature coding/agent models. They remain selectable
                 # fallbacks; the verified Nemotron routes stay the default
                 # until an account-specific smoke test proves otherwise.
+                # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached
+                # NVIDIA NIM end-of-life 2026-08-07 (HTTP 410 confirmed live
+                # in tamgpt6's intent classifier), no longer callable.
                 "deepseek-ai/deepseek-v4-pro",
-                "deepseek-ai/deepseek-v4-flash",
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
                 "moonshotai/kimi-k2.6",
@@ -487,10 +501,11 @@ class ProviderManager:
                 "google/gemma-2-27b-it",
                 "microsoft/phi-3-medium-128k-instruct",
             ],
-            # HF is the preferred external coding route: its automatic model
-            # is the official Qwen 3.6 coding model. NVIDIA remains the first
-            # mature fallback when HF is unavailable or its account is out.
-            priority=3,
+            # priority=0 (2026-08-08, was 3): NIM made the top-priority
+            # auto-routed provider -- reliable free tier vs. Ollama Cloud's
+            # multi-day weekly-quota 429s. See ProviderType.OLLAMA_CLOUD's
+            # priority comment above for the incident this responds to.
+            priority=0,
             weight=4,
             reasoning_supported=True,
             vision_supported=False,

@@ -219,11 +219,14 @@ def test_hf_prefers_official_qwen36_coding_route_and_keeps_deepseek_fallbacks():
     assert config.context_window >= 262144
 
 
-def test_nvidia_exposes_deepseek_v4_routes_without_replacing_verified_default():
+def test_nvidia_exposes_deepseek_v4_pro_without_replacing_verified_default():
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
     assert config.default_model == "nvidia/nemotron-3-ultra-550b-a55b"
     assert "deepseek-ai/deepseek-v4-pro" in config.models
-    assert "deepseek-ai/deepseek-v4-flash" in config.models
+    # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached NVIDIA NIM
+    # end-of-life 2026-08-07 (HTTP 410 confirmed live in tamgpt6's intent
+    # classifier) -- must not silently reappear as a selectable NIM route.
+    assert "deepseek-ai/deepseek-v4-flash" not in config.models
 
 
 def test_nvidia_exposes_newly_added_coding_and_tool_calling_models():
@@ -339,11 +342,11 @@ def test_standalone_provider_manager_excludes_tier_iv_from_routing_order():
 def test_remote_provider_manager_may_include_tier_iv():
     manager = ProviderManager.__new__(ProviderManager)
     manager.runtime_mode = "remote"
-    # Ollama Cloud priority routing ranks OLLAMA_CLOUD (priority=0) ahead of
+    # NIM priority routing (2026-08-08) ranks NVIDIA (priority=0) ahead of
     # TIER_IV (priority=5) in PRIORITY_ORDER even in remote mode -- remote
     # mode's only remaining distinction from standalone is that it does not
     # exclude TIER_IV from the order entirely.
-    assert manager.routing_order[0] == ProviderType.OLLAMA_CLOUD
+    assert manager.routing_order[0] == ProviderType.NVIDIA
     assert ProviderType.TIER_IV in manager.routing_order
 
 

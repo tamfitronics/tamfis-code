@@ -15,8 +15,12 @@ from pathlib import Path
 from typing import Iterable
 
 AUTHORITATIVE_PROVIDER_ORDER = (
-    "ollama_cloud",
+    # NVIDIA NIM first (2026-08-08): Ollama Cloud's weekly usage limit is a
+    # real multi-day-reset HTTP 429, not transient. Keep this in sync with
+    # providers.py's ProviderManager.PRIORITY_ORDER, which is the tuple this
+    # release gate actually inspects in the built source.
     "nvidia",
+    "ollama_cloud",
     "hf",
     "openrouter",
 )
