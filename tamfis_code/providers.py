@@ -656,17 +656,16 @@ class ProviderManager:
         return os.environ.get("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false").strip().lower() == "true"
 
     def ollama_cloud_is_premium_primary(self) -> bool:
-        """Whether premium Ollama Cloud is an explicit primary route.
+        """Whether Ollama Cloud is explicitly forced as AUTO's primary.
 
-        Premium selection is a user/provider choice, not merely a quality
-        hint. When it is enabled, AUTO must not silently spend time or quota
-        on NVIDIA because the local Ollama daemon is temporarily unavailable.
-        The caller receives a concrete Ollama availability error instead.
+        Subscription entitlement and AUTO routing are independent.  The
+        premium flag keeps paid-plan features/models available; only the
+        dedicated AUTO-primary flag may bypass the normal provider order.
         """
         return (
             self.provider_allowed(ProviderType.OLLAMA_CLOUD)
             and os.environ.get("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true").strip().lower() == "true"
-            and os.environ.get("TAMFIS_CODE_OLLAMA_PREMIUM", "false").strip().lower()
+            and os.environ.get("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "false").strip().lower()
             in {"1", "true", "yes", "on"}
         )
 
@@ -881,9 +880,7 @@ class ProviderManager:
         if config.name == "Ollama Cloud":
             # FIX 2026-08-08: TAMFIS_CODE_OLLAMA_PREMIUM used to gate BOTH
             # (a) whether AUTO is allowed to force Ollama Cloud as its
-            # exclusive primary (resolve_route(), still gated on this flag
-            # -- that forcing is exactly what caused the weekly-quota 429s
-            # and must stay off by default), and (b) which model gets
+            # exclusive primary and (b) which model gets
             # picked once Ollama Cloud IS being called. Those are unrelated
             # concerns: kimi-k2.7-code:cloud is the included-plan coding
             # route (confirmed not an extra-usage cost, unlike kimi-k3
@@ -942,7 +939,7 @@ class ProviderManager:
             resolved = ProviderType.OLLAMA_CLOUD
             if resolved not in self.clients:
                 raise ValueError(
-                    "Ollama Cloud is enabled as the premium primary route, but its local daemon is unavailable "
+                    "Ollama Cloud is enabled as the AUTO primary route, but its local daemon is unavailable "
                     f"at {self.PROVIDERS[resolved].base_url}. Start/sign in to Ollama Cloud, or explicitly "
                     "select another provider with --provider."
                 )
