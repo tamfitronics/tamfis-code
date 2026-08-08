@@ -1297,6 +1297,17 @@ async def _stream_completion_with_reconnect(
     prefix and are kept internal until a clean response arrives.  Only the
     novel suffix is then rendered and checkpointed.  This makes provider or
     service restarts look like one continuous answer to the user.
+
+    A transient drop is retried silently (the live status spinner keeps
+    ticking throughout, driven by its own timer independent of this
+    function) -- it is not announced with a "Stream interrupted;
+    reconnecting" line on every attempt. That line used to print on EVERY
+    retry regardless of outcome, which worked against the whole point of
+    this function: reconnecting is supposed to make a dropped connection
+    invisible, and announcing the plumbing on each attempt (repeatedly, on
+    a long turn with a flaky route) made a working continuation look like a
+    recurring failure instead. Visible only under TAMFIS_CODE_DEBUG, where
+    seeing every retry attempt is exactly the point.
     """
     durable_partial = initial_partial
     last_error: Optional[Exception] = None
@@ -1351,16 +1362,17 @@ async def _stream_completion_with_reconnect(
                 raise _InterruptedCompletion(exc, durable_partial) from exc
 
             delay = STREAM_RECONNECT_BACKOFF_SECONDS[attempt]
-            renderer.handle_event({
-                "event_type": "diagnostics",
-                "payload": {
-                    "content": (
-                        f"Stream from {provider.value} was interrupted; keeping this task alive "
-                        f"and reconnecting in {int(delay)}s "
-                        f"({attempt + 1}/{len(STREAM_RECONNECT_BACKOFF_SECONDS)})."
-                    )
-                },
-            })
+            if getattr(renderer, "debug", False):
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Stream from {provider.value} was interrupted; keeping this task alive "
+                            f"and reconnecting in {int(delay)}s "
+                            f"({attempt + 1}/{len(STREAM_RECONNECT_BACKOFF_SECONDS)})."
+                        )
+                    },
+                })
             await asyncio.sleep(delay)
 
     # The loop always returns or raises; this protects type-checkers and any
