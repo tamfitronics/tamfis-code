@@ -62,6 +62,7 @@ from .orchestrator import (
     should_plan,
 )
 from .orchestrator.validator import verified_no_change_completion
+from .orchestrator.planner import create_plan
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
@@ -4466,20 +4467,44 @@ async def _run_local_agent_turn_impl(
             "event_type": "diagnostics",
             "payload": {"content": "Repository reconnaissance completed before plan generation."},
         })
+        # On a resumed turn ("continue"), ground the very first plan in real
+        # prior progress instead of proposing one from a blank slate. Without
+        # this, every resume re-planned as if nothing had happened yet --
+        # durable per-session progress (inspected/modified files, completed
+        # tool outcomes -- see _summarise_progress_for_rollover) already
+        # survives the interruption, but nothing carried it into the
+        # reasoning-plan prompt, so a resumed task could re-propose steps
+        # already done. Reuses the exact "REVISION: ... do not repeat
+        # completed work" grounding build_reasoning_plan_prompt already
+        # applies for a genuine mid-turn revision -- the same instruction is
+        # equally correct here: this is not the first attempt at the
+        # objective, only the first attempt in this process.
+        resumed_evidence_summary = (
+            _summarise_progress_for_rollover(session_id)
+            if (resumed_from_checkpoint or resumed_from_legacy) else None
+        )
+        repository_context = local_state.get_session_state(session_id).repository_context or {}
+        grounded_fallback = create_plan(
+            objective, task_profile,
+            reconnaissance_summary=planning_reconnaissance,
+            workspace_summary=repository_context,
+        )
         reasoning_plan = await _attempt_reasoning_plan(
             client, model=resolved_model, objective=objective, task_profile=task_profile,
             session_id=session_id, renderer=renderer,
             reconnaissance_summary=planning_reconnaissance,
+            evidence_summary=resumed_evidence_summary,
             reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
             scope_roots=scope_roots,
         )
-        if reasoning_plan is not None and orchestrator.run is not None:
-            orchestrator.replace_plan(reasoning_plan)
-            orchestrator.run.reasoning_plan = True
+        selected_plan = reasoning_plan or grounded_fallback
+        if selected_plan is not None and orchestrator.run is not None:
+            orchestrator.replace_plan(selected_plan)
+            orchestrator.run.reasoning_plan = reasoning_plan is not None
             plan_message = {
                 "role": "system",
                 "content": _plan_message_content(
-                    reasoning_plan,
+                    selected_plan,
                     heading=(
                         "TASK PLAN (grounded in the actual objective and real workspace facts -- "
                         "supersedes any generic plan mentioned above):"
@@ -4489,7 +4514,7 @@ async def _run_local_agent_turn_impl(
             working_messages.insert(working_messages.index(scope_message) + 1, plan_message)
             renderer.handle_event({
                 "event_type": "plan_created",
-                "payload": _plan_created_payload(reasoning_plan, title="Plan"),
+                "payload": _plan_created_payload(selected_plan, title="Plan"),
             })
 
     previous_tool_calls_signature: Optional[tuple[tuple[str, str], ...]] = None

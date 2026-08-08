@@ -20,6 +20,7 @@ from tamfis_code import state as state_module
 from tamfis_code.orchestrator.planner import (
     ExecutionPlan,
     build_reasoning_plan_prompt,
+    create_plan,
     parse_reasoning_plan,
 )
 from tamfis_code.providers import ProviderType
@@ -90,6 +91,141 @@ class ParseReasoningPlanTests(unittest.TestCase):
         self.assertIsNotNone(plan)
         self.assertEqual(plan.steps[0].name, "Read calc.py")
         self.assertNotIn("off-by-one", plan.steps[0].name)
+
+
+class ParseReasoningPlanStrictEvidenceTests(unittest.TestCase):
+    """parse_reasoning_plan's evidence-validated path (strict_evidence=True),
+    exercised via real filesystem paths under scope_roots -- the path
+    validation in orchestrator/planner.py's PlannerEvidence.path_was_discovered
+    had no direct test coverage at all before this. Regression coverage for
+    the "always the same generic plan" bug: a plan step naming a file a
+    create/add objective is about to bring into existence was silently
+    dropped because reconnaissance is read-only and runs before anything is
+    created, so it can never have seen a not-yet-existing path. When every
+    step in a plan named only such paths, the whole plan was rejected and the
+    turn fell back to the fixed template -- confirmed live against the
+    installed CLI with a real "create a new file" objective.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        (self.root / "main.py").write_text("print('hi')\n")
+        (self.root / "services").mkdir()
+        (self.root / "services" / "existing_service.py").write_text("x = 1\n")
+
+    def test_step_targeting_an_existing_file_is_accepted(self):
+        raw = json.dumps({"steps": [{
+            "action": "Read main.py to find the bug",
+            "targets": [str(self.root / "main.py")],
+        }]})
+        plan = parse_reasoning_plan(raw, objective="x", scope_roots=[self.root])
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.steps), 1)
+
+    def test_step_creating_a_new_file_directly_in_the_root_is_accepted(self):
+        # Regression: this is the exact shape confirmed live -- "Create
+        # utils.py" naming a file that does not exist yet, in a workspace
+        # with no manifests/graph evidence at all.
+        raw = json.dumps({"steps": [{
+            "action": "Create utils.py with a square(n) helper",
+            "targets": [str(self.root / "utils.py")],
+        }]})
+        plan = parse_reasoning_plan(raw, objective="x", scope_roots=[self.root])
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.steps), 1)
+        self.assertFalse((self.root / "utils.py").exists())  # planning never creates it
+
+    def test_step_naming_a_path_outside_any_authorised_root_is_still_rejected(self):
+        outside = Path(tempfile.gettempdir()) / "definitely-not-authorised-elsewhere.py"
+        raw = json.dumps({"steps": [{
+            "action": "Create a file outside the workspace",
+            "targets": [str(outside)],
+        }]})
+        plan = parse_reasoning_plan(raw, objective="x", scope_roots=[self.root])
+        self.assertIsNone(plan)
+
+
+class GroundedFallbackPlanTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        (self.root / "main.py").write_text("print('hi')\n")
+        (self.root / "services").mkdir()
+        (self.root / "services" / "existing_service.py").write_text("x = 1\n")
+
+    def test_fallback_names_objective_matching_files_instead_of_generic_trace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "services" / "mission_pipeline.py"
+            target.parent.mkdir()
+            target.write_text("pass\n")
+            manifest = root / "pyproject.toml"
+            manifest.write_text("[project]\nname='demo'\n")
+            profile = TaskProfile(
+                task_type=TaskType.DEBUG, complexity="high", requires_tools=True,
+                requires_validation=True, requires_repository_context=True,
+                requires_long_context=True, preferred_quality_tier="frontier",
+            )
+            reconnaissance = (
+                f"ROOT: {root}\n"
+                "  manifests: pyproject.toml\n"
+                "  objective_matching_paths: services/mission_pipeline.py\n"
+            )
+            plan = create_plan("fix the mission pipeline", profile, reconnaissance_summary=reconnaissance)
+
+        self.assertIsNotNone(plan)
+        rendered = "\n".join(step.name for step in plan.steps)
+        self.assertIn(str(target), rendered)
+        self.assertNotIn("Trace objective-relevant code paths from reconnaissance", rendered)
+
+    def test_deeply_fabricated_nonexistent_path_is_rejected_with_no_graph_evidence(self):
+        # Parent directory doesn't exist either -- not a plausible creation
+        # target, distinct from "new file in an existing directory".
+        fabricated = self.root / "made" / "up" / "nested" / "dirs" / "file.py"
+        raw = json.dumps({"steps": [{
+            "action": "Create a deeply nested new file",
+            "targets": [str(fabricated)],
+        }]})
+        plan = parse_reasoning_plan(raw, objective="x", scope_roots=[self.root])
+        self.assertIsNone(plan)
+
+    def test_new_file_sibling_to_a_connected_existing_file_is_accepted(self):
+        raw = json.dumps({"steps": [{
+            "action": "Create a new service module next to the existing one",
+            "targets": [str(self.root / "services" / "new_service.py")],
+        }]})
+        plan = parse_reasoning_plan(
+            raw, objective="x", scope_roots=[self.root],
+            workspace_summary={"objective_matching_paths": [str(self.root / "services" / "existing_service.py")]},
+        )
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.steps), 1)
+
+    def test_unrelated_existing_file_still_rejected_when_graph_evidence_present(self):
+        # Guards against the fix over-widening: an existing file that graph
+        # evidence never connected to the objective is still not evidence-backed.
+        (self.root / "unrelated.py").write_text("y = 2\n")
+        raw = json.dumps({"steps": [{
+            "action": "Edit unrelated.py",
+            "targets": [str(self.root / "unrelated.py")],
+        }]})
+        plan = parse_reasoning_plan(
+            raw, objective="x", scope_roots=[self.root],
+            workspace_summary={"objective_matching_paths": [str(self.root / "services" / "existing_service.py")]},
+        )
+        self.assertIsNone(plan)
+
+    def test_plan_survives_when_only_some_steps_are_creation_targets(self):
+        raw = json.dumps({"steps": [
+            {"action": "Read main.py to understand the current entrypoint", "targets": [str(self.root / "main.py")]},
+            {"action": "Create utils.py with a square(n) helper", "targets": [str(self.root / "utils.py")]},
+        ]})
+        plan = parse_reasoning_plan(raw, objective="x", scope_roots=[self.root])
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.steps), 2)
 
 
 class BuildReasoningPlanPromptTests(unittest.TestCase):

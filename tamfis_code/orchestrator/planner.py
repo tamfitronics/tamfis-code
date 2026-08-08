@@ -159,15 +159,36 @@ class PlannerEvidence:
         )
 
     def path_is_authorised(self, candidate: Path) -> bool:
+        """Security boundary only: is `candidate` inside an authorised root.
+
+        Deliberately does NOT require the path to exist. Confirmed live: a
+        plan step naming the file a create/add/scaffold objective is about
+        to bring into existence (e.g. "Create utils.py with square()") was
+        silently dropped by validate_plan_step because reconnaissance is
+        read-only and runs before anything is created, so it can never see
+        a not-yet-created path -- for an objective made up entirely of such
+        steps, every step was rejected, `parse_reasoning_plan` returned
+        None, and the turn fell all the way back to the generic template
+        plan. Requiring existence conflated "may this turn touch this
+        location" with "does this already exist"; only the former is
+        actually a security boundary. This only governs whether a plan
+        *step description* survives -- it does not authorise any actual
+        file write, which still goes through the tool layer's own
+        workspace-root/sandbox/approval gates regardless of what the plan
+        said.
+        """
         resolved = _safe_resolve(candidate)
         if resolved is None:
             return False
-        if self.roots and not any(_is_within(resolved, root) for root in self.roots):
-            return False
+        if self.roots:
+            return any(_is_within(resolved, root) for root in self.roots)
+        # No configured roots at all is not the normal live path (scope_roots
+        # always includes at least the workspace root) but keep the original,
+        # stricter existence-only behaviour for that unconfigured case.
         return resolved.exists()
 
     def path_was_discovered(self, candidate: Path) -> bool:
-        """Return whether a path is both real and relevant to this stack.
+        """Return whether a path is both authorised and relevant to this stack.
 
         Authorised-root membership is only the security boundary. When
         reconnaissance supplied an architecture graph, ordinary source files
@@ -177,7 +198,10 @@ class PlannerEvidence:
 
         Repository roots and verified manifests remain valid structural
         anchors. When no graph evidence exists, retain backwards-compatible
-        existence validation rather than pretending a graph was discovered.
+        validation rather than pretending a graph was discovered -- an
+        authorised, not-yet-existing path is accepted here (see
+        path_is_authorised) precisely so a legitimate creation target is not
+        rejected merely for not existing yet at read-only reconnaissance time.
         """
         resolved = _safe_resolve(candidate)
         if resolved is None or not self.path_is_authorised(resolved):
@@ -187,10 +211,15 @@ class PlannerEvidence:
             return True
 
         if not self.connected_paths:
-            return (
-                resolved in self.existing_paths
-                or self.path_is_authorised(resolved)
-            )
+            # No architecture graph to check relevance against -- the guard
+            # above already confirmed `resolved` is inside an authorised
+            # root, which is all this backwards-compatible fallback ever
+            # required for something that already exists. A not-yet-existing
+            # path additionally needs a real parent directory (the root
+            # itself counts) so a wholly fabricated, multi-level-deep path
+            # still isn't accepted just for naming an authorised root as an
+            # ancestor.
+            return resolved.exists() or resolved.parent.exists()
 
         if resolved in self.connected_paths:
             return True
@@ -208,6 +237,22 @@ class PlannerEvidence:
             for connected in self.connected_paths
         ):
             return True
+
+        # A not-yet-existing path sitting next to (or inside a directory
+        # that is itself inside/below) evidence reconnaissance already
+        # confirmed relevant is grounded the same way an existing sibling
+        # file would be -- e.g. a new test file proposed alongside an
+        # existing, objective-matched test module. Only the create/add
+        # case needs this: an existing-but-unconnected file is correctly
+        # still rejected above, on the theory that a real path the agent
+        # can already read is not evidence it's relevant on its own.
+        if not resolved.exists():
+            parent = resolved.parent
+            if parent.exists() and any(
+                _is_within(connected, parent) or _is_within(parent, connected)
+                for connected in self.connected_paths
+            ):
+                return True
 
         return False
 
@@ -289,12 +334,19 @@ def create_plan(
             )
         )
 
-    steps.append(
-        PlanStep(
+    if evidence.connected_paths:
+        paths = sorted(evidence.connected_paths, key=str)[:6]
+        rendered = ", ".join(str(path) for path in paths)
+        steps.append(PlanStep(
             len(steps) + 1,
-            "Trace objective-relevant code paths from reconnaissance.",
-        )
-    )
+            f"Trace objective-relevant paths: {rendered}.",
+            evidence=[f"path:{path}" for path in paths],
+        ))
+    else:
+        steps.append(PlanStep(
+            len(steps) + 1,
+            f"Trace the code paths governing: {objective.strip()[:140]}.",
+        ))
 
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG, TaskType.MIXED}:
         steps.append(
@@ -698,6 +750,7 @@ def build_planner_evidence(
         if path.is_file() and path.name.lower() in _KNOWN_MANIFEST_NAMES:
             evidence.manifest_paths.add(path)
 
+    current_summary_root: Path | None = None
     for line in summary.splitlines():
         stripped = line.strip()
         lowered = stripped.lower()
@@ -706,8 +759,24 @@ def build_planner_evidence(
             value = stripped.split(":", 1)[1].strip()
             path = _safe_resolve(Path(value).expanduser())
             if path is not None and path.is_dir():
+                current_summary_root = path
                 evidence.roots.append(path)
                 evidence.existing_paths.add(path)
+
+        if lowered.startswith("manifests:"):
+            value = stripped.split(":", 1)[1].strip()
+            if value.lower() not in {"", "none", "none found", "unknown"}:
+                for raw_item in re.split(r"[,;]", value):
+                    candidate_text = raw_item.strip()
+                    if not candidate_text:
+                        continue
+                    candidate_path = Path(candidate_text).expanduser()
+                    if not candidate_path.is_absolute() and current_summary_root is not None:
+                        candidate_path = current_summary_root / candidate_path
+                    candidate = _safe_resolve(candidate_path)
+                    if candidate is not None and candidate.exists():
+                        evidence.manifest_paths.add(candidate)
+                        evidence.existing_paths.add(candidate)
 
         if lowered.startswith((
             "connected_path:",
@@ -734,7 +803,10 @@ def build_planner_evidence(
                 raw_item = raw_item.strip()
                 if not raw_item:
                     continue
-                candidate = _safe_resolve(Path(raw_item).expanduser())
+                candidate_path = Path(raw_item).expanduser()
+                if not candidate_path.is_absolute() and current_summary_root is not None:
+                    candidate_path = current_summary_root / candidate_path
+                candidate = _safe_resolve(candidate_path)
                 if candidate is not None and candidate.exists():
                     evidence.connected_paths.add(candidate)
                     evidence.existing_paths.add(candidate)
