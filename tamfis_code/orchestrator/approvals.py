@@ -56,9 +56,10 @@ def describe_batch(batch: ApprovalBatch) -> str:
     policy handling (auto/safe/deny, session-scoped approval) is unchanged.
     """
     import json as _json
+    from ..safety import redact_secrets
 
     lines = []
     for index, action in enumerate(batch.risky_actions, start=1):
-        rendered_args = _json.dumps(action.arguments, default=str)
+        rendered_args = redact_secrets(_json.dumps(action.arguments, default=str))
         lines.append(f"{index}. {action.tool_name}({rendered_args})  [{action.risk}]")
     return "\n".join(lines)

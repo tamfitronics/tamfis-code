@@ -94,6 +94,7 @@ class ToolEnvelope:
         if success and self.tool_name in {
             "write_file", "edit_file", "create_file", "patch_file",
             "extract_archive", "repackage_archive",
+            "create_artifact",
         } and path:
             self.files_changed.append(str(path))
 

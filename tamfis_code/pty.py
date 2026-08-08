@@ -39,10 +39,19 @@ class LocalPtyBroker:
         self.sessions: dict[str, LocalPty] = {}
 
     def start(self, command: str = "bash", *, cols: int = 80, rows: int = 24) -> LocalPty:
+        # Keep an open directory handle across the fork.  Interactive tests,
+        # shells launched from a temporary worktree, and callers that close a
+        # workspace immediately after starting a command can otherwise race
+        # the child before it executes ``chdir(self.cwd)``.  fchdir() remains
+        # valid even if the directory is unlinked meanwhile, so the PTY starts
+        # in the requested workspace instead of failing with ENOENT.
+        cwd_fd = os.open(self.cwd, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         pid, fd = pty.fork()
         if pid == 0:  # pragma: no cover - executed in the forked child
-            os.chdir(self.cwd)
+            os.fchdir(cwd_fd)
+            os.close(cwd_fd)
             os.execvpe("/bin/bash", ["bash", "-lc", command], os.environ.copy())
+        os.close(cwd_fd)
         os.set_blocking(fd, False)
         session = LocalPty(uuid.uuid4().hex, pid, fd, command)
         self.sessions[session.id] = session

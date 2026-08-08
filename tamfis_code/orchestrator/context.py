@@ -8,6 +8,7 @@ from typing import Any
 from .. import state as local_state
 from ..routing import TaskProfile
 from ..workspace import build_system_prompt, discover_local_repository
+from ..openhands.skills import skill_prompt
 
 
 @dataclass
@@ -36,9 +37,13 @@ def build_context_bundle(
     state = local_state.get_session_state(session_id)
     reused = bool(previous_fingerprint and previous_fingerprint == state.discovery_fingerprint)
     system = build_system_prompt(session_id, Path(workspace_root))
+    skills = skill_prompt(workspace_root, objective)
+    if skills:
+        system += "\n\n" + skills
     recent_tools = state.completed_actions[-8:]
     layers = {
         "policy": system,
+        "skills": skills,
         "objective": objective,
         "workspace_summary": repository,
         "relevant_prior_turns": conversation_messages[-12:],

@@ -10,9 +10,12 @@ calls, no approval decisions -- see runner.py for that.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
+import sys
 import re
+import textwrap
 import time
 from typing import Any, Optional
 
@@ -26,9 +29,22 @@ from rich.text import Text
 
 from . import __version__
 from .metrics import MetricsTracker
+from .public_identity import (
+    PUBLIC_PROVIDER_NAME,
+    public_model_name,
+    public_route_name,
+    redact_routing_text,
+    sanitize_public_event,
+)
 from .safety import redact_secrets
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
+
+# Which backend actually served a Remote turn (Ollama Cloud, OpenRouter,
+# NVIDIA NIM, a raw model id like "glm-5.2:cloud"...) is internal routing
+# detail. TamfisGPT is the product; every place that would otherwise print
+# a raw provider/model id to the user prints this branded label instead.
+BRANDED_PROVIDER_LABEL = PUBLIC_PROVIDER_NAME
 
 # Single source of truth for plan-step glyph/colour, shared by the transient
 # live spinner (_build_status) and the durable scrollback snapshot
@@ -117,6 +133,24 @@ _VERB_BY_PHASE = {
     "report": "Wrapping up",
 }
 
+_ACTIVITY_VARIANTS_BY_PHASE = {
+    "idle": ("Working", "Razzmatazzing", "Smoothing"),
+    "submitting": ("Submitting", "Packing", "Dispatching"),
+    "queued": ("Queuing", "Lining up", "Preparing"),
+    "understand": ("Analyzing", "Orienting", "Evaluating"),
+    "inspect": ("Inspecting", "Tracing", "Rummaging"),
+    "route": ("Routing", "Selecting", "Calibrating"),
+    "reasoning": ("Reasoning", "Evaluating", "Synthesizing"),
+    "respond": ("Composing", "Smoothing", "Summarizing"),
+    "plan": ("Planning", "Sequencing", "Plotting"),
+    "execute": ("Coding", "Wiring", "Polishing"),
+    "observe": ("Observing", "Reviewing", "Measuring"),
+    "repair": ("Repairing", "Untangling", "Mending"),
+    "waiting_for_approval": ("Waiting", "Holding", "Standing by"),
+    "validate": ("Evaluating", "Checking", "Verifying"),
+    "report": ("Wrapping up", "Summarizing", "Finishing"),
+}
+
 
 # Rotating hints shown under the live status line during longer-running
 # turns -- every one names a real, working command/flag (verified against
@@ -132,9 +166,12 @@ _TIPS = [
     "Tip: `tamfis-code enforce` runs this workspace's own test suite.",
     "Tip: `tamfis-code providers` shows which AI providers are configured and healthy.",
     "Tip: Ctrl+C exits `tamfis-code` cleanly, mid-turn or not.",
-    "Tip: `/compact` in the REPL saves a context checkpoint you can return to later.",
+    "Tip: `/compact` in the REPL compresses the thread (folds older turns into the summary, keeps recent ones) so a long session stays light.",
+    "Tip: `/summary` in the REPL shows a structured recap of the conversation so far without compressing it.",
+    "Tip: `/cd <path>` in the REPL re-orients the session to a different directory without restarting.",
     "Tip: `tamfis-code tools list` shows every tool this agent knows how to call.",
     "Tip: `--approval` (or `/mode`) controls how much gets auto-approved: ask/safe/full-auto/never/...",
+    "Tip: While a task is running in `tamfis-code`, just type and press Enter -- it queues as a follow-up without interrupting the current work.",
 ]
 
 # Seconds of elapsed time before the first tip appears, and how long each
@@ -159,6 +196,11 @@ _ASSISTANT_REFRESH_MIN_CHARS = 96
 # is what lets the terminal auto-scroll the way Claude Code/Codex do.
 _ASSISTANT_LIVE_TAIL_CHARS = 2_000
 _ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|```\s*$)")
+# Enclosing box width for the non-Live rendering path (see
+# _print_box_top/_print_box_line): capped well below typical wide terminals
+# so a long reply still reads as one message card, not a border stretched
+# edge-to-edge.
+_ASSISTANT_BOX_MAX_WIDTH = 100
 _USER_MESSAGE_MAX_DISPLAY_CHARS = 20_000
 
 
@@ -196,6 +238,15 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
         target = redact_secrets(target)
     verbs = {
         "read_file": ("Reading", "Read"),
+        # search_code is the real, currently-registered local tool
+        # (mcp.py) -- glob_files/search_files/grep_files/remote_exec/
+        # run_command are kept here only because an external tool
+        # reachable through the shared MCP bridge's own naming convention
+        # (see mcp.py's call_tool fallback to _get_shared_mcp_bridge) might
+        # still use them; they are not names this codebase's own local
+        # engine emits.
+        "search_code": ("Searching repository contents", "Searched repository contents"),
+        "find_references": ("Finding references", "Found references"),
         "glob_files": ("Finding repository files", "Found repository files"),
         "search_files": ("Searching repository files", "Searched repository files"),
         "grep_files": ("Searching repository contents", "Searched repository contents"),
@@ -214,6 +265,87 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
         compact = target if len(target) <= 120 else target[:117] + "…"
         label += f" · {compact}"
     return label
+
+
+_READ_ONLY_TOOLS = {
+    "read_file", "search_code", "find_references", "get_git_info", "read_background_job",
+    "glob_files", "search_files", "grep_files", "list_directory",
+}
+_MUTATION_TOOLS = {"write_file", "edit_file", "file_edit", "create_file", "update_file"}
+
+
+def _normalized_tool_name(name: str) -> str:
+    return (name or "tool").strip().lower().replace("-", "_").rsplit("/", 1)[-1]
+
+
+def _is_read_only_tool(name: str) -> bool:
+    return _normalized_tool_name(name) in _READ_ONLY_TOOLS
+
+
+def _is_mutation_tool(name: str) -> bool:
+    return _normalized_tool_name(name) in _MUTATION_TOOLS
+
+
+# Category label (gerund, singular noun, plural noun) for the round-summary
+# line -- "Searching for 1 pattern, reading 2 files…" -- keyed by the same
+# normalized tool names as everything else in this module. Tools with no
+# entry here (retrieve_evidence, ask_user_question, ...) are simply not
+# counted; they're not the kind of visible repository action this line is
+# for.
+_TOOL_CATEGORY = {
+    "search_code": ("Searching for", "pattern", "patterns"),
+    "grep_files": ("Searching for", "pattern", "patterns"),
+    "search_files": ("Searching for", "pattern", "patterns"),
+    "find_references": ("Finding references for", "symbol", "symbols"),
+    "read_file": ("Reading", "file", "files"),
+    "list_directory": ("Listing", "directory", "directories"),
+    "glob_files": ("Finding", "file", "files"),
+    "execute_command": ("Running", "shell command", "shell commands"),
+    "remote_exec": ("Running", "shell command", "shell commands"),
+    "run_command": ("Running", "shell command", "shell commands"),
+    "read_background_job": ("Checking on", "background job", "background jobs"),
+    "write_file": ("Writing", "file", "files"),
+    "edit_file": ("Editing", "file", "files"),
+    "extract_archive": ("Extracting", "archive", "archives"),
+    "repackage_archive": ("Repackaging", "archive", "archives"),
+    "create_artifact": ("Creating", "artifact", "artifacts"),
+    "inspect_artifact": ("Inspecting", "artifact", "artifacts"),
+    "get_git_info": ("Reading", "Git repository", "Git repositories"),
+    "web_search": ("Searching", "web query", "web queries"),
+}
+
+
+def _round_activity_summary(counts: dict[str, int]) -> str:
+    """The aggregated "Searching for 1 pattern, reading 1 file, running 1
+    shell command…" line, built from a {normalized_tool_name: count} tally
+    -- see StreamRenderer._round_tool_counts. Renders in first-used order
+    (dict insertion order), not alphabetically, so the summary reads in the
+    same sequence the actions actually happened."""
+    parts = []
+    for name, count in counts.items():
+        if count <= 0:
+            continue
+        category = _TOOL_CATEGORY.get(name)
+        if category is None:
+            continue
+        verb, singular, plural = category
+        noun = singular if count == 1 else plural
+        parts.append(f"{verb} {count} {noun}")
+    if not parts:
+        return ""
+    # Lowercase every part after the first so they read as one sentence
+    # ("Searching for 1 pattern, reading 1 file…") rather than a list of
+    # separately-capitalized clauses.
+    parts = [parts[0], *(p[0].lower() + p[1:] for p in parts[1:])]
+    return ", ".join(parts) + "…"
+
+
+def _read_target(arguments: Optional[dict[str, Any]]) -> str:
+    arguments = arguments or {}
+    return str(
+        arguments.get("path") or arguments.get("file_path")
+        or arguments.get("pattern") or arguments.get("query") or "workspace"
+    ).strip()
 
 
 def _tool_result_message(payload: dict[str, Any]) -> tuple[str, bool]:
@@ -335,10 +467,8 @@ def _format_diagnostics_line(payload: dict[str, Any]) -> str:
         parts.append("context reused")
     elif reused is False:
         parts.append(f"context rescanned ({payload.get('rescan_reason') or 'unknown'})")
-    provider = payload.get("provider")
-    model = payload.get("model")
-    if provider or model:
-        parts.append(f"{provider or '?'}/{model or '?'}")
+    if payload.get("provider") or payload.get("model"):
+        parts.append(public_route_name(payload.get("provider"), payload.get("model")))
     tool_calls = payload.get("tool_calls") or []
     if tool_calls:
         failed = sum(1 for tc in tool_calls if tc.get("success") is False)
@@ -375,6 +505,11 @@ class StreamRenderer:
         # turn with two tool rounds read as two separate answers instead of
         # one continuous response with tool calls woven through it.
         self._assistant_header_shown = False
+        # Enclosing box state for the manual (non-Rich-Live) rendering path:
+        # a real TTY with live_input_listener active, where Rich Live can't
+        # be used (see _flush_assistant) so box lines are printed directly.
+        self._box_open = False
+        self._assistant_line_buffer = ""
         self._tool_names_by_call_id: dict[str, str] = {}
         self._selected_provider: Optional[str] = None
         # Model displayed in the persistent PTY/TTY footer. It must be
@@ -391,6 +526,31 @@ class StreamRenderer:
         # than a boxed multi-line status card.
         self._phase = "idle"
         self._status_detail = "Preparing the task"
+        # A shell command currently executing, shown as its own live line
+        # (see _build_status) with its own elapsed timer -- distinct from
+        # _status_detail (set but, before this, never actually rendered
+        # anywhere) and from the overall task elapsed time, since a single
+        # long-running command inside a multi-step turn needs its own clock.
+        self._running_command: Optional[str] = None
+        self._running_command_started: Optional[float] = None
+        # Tally of tool calls issued so far THIS TASK, for the aggregated
+        # "Searching for 1 pattern, reading 1 file…" summary line -- a
+        # cumulative running total across every round of the current turn,
+        # not just the latest round (a model that issues one tool call per
+        # round, the common case, would otherwise almost always show a
+        # single-item summary, defeating the point of aggregating at all).
+        # Reset on task_submitting/task_started (see _update_status_detail),
+        # not on completion, so it stays visible through _finalize's summary
+        # line rather than disappearing right before the task's own status.
+        # dict, not Counter, to preserve first-used insertion order for
+        # _round_activity_summary's rendering order.
+        self._round_tool_counts: dict[str, int] = {}
+        # Set by live_input.py's Ctrl+B keybinding, read by runner_local.py's
+        # tool-dispatch loop (see mcp.py's _execute_command background_signal
+        # param) -- an asyncio.Event rather than a plain bool since
+        # _execute_command actually awaits it (asyncio.wait alongside the
+        # command's own completion), not just polls it.
+        self.background_requested = asyncio.Event()
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
         self._metrics = MetricsTracker()
@@ -437,7 +597,27 @@ class StreamRenderer:
         self._mode_label = label
         self._refresh_live()
 
-    def live_input_status(self) -> str:
+    def live_input_activity_line(self) -> Optional[str]:
+        """Plain-text "Searching for N patterns, reading M files…" summary,
+        for prompt-toolkit's bottom toolbar (see live_input.py's
+        _bottom_toolbar). This is the same tally _build_status renders above
+        its Rich spinner, but that Live region is suspended for the whole
+        interactive REPL (Rich Live and prompt-toolkit fight over the same
+        rows -- see _flush_assistant's box-drawing fallback), so without this
+        the activity tally never reaches the ordinary interactive session at
+        all, only the no-listener path (`tamfis-code agent`/CI-style runs).
+        """
+        activity_summary = _round_activity_summary(self._round_tool_counts)
+        if self._running_command:
+            command_elapsed = _format_elapsed(
+                time.monotonic() - (self._running_command_started or time.monotonic())
+            )
+            preview = self._running_command[:120]
+            command_line = f"⎿  $ {preview} ({command_elapsed})"
+            return f"{activity_summary}  {command_line}" if activity_summary else command_line
+        return activity_summary or None
+
+    def live_input_status(self, spinner_frame: str = "") -> str:
         """Compact status text for prompt-toolkit's persistent footer.
 
         Rich's Live region is deliberately suspended while prompt-toolkit
@@ -450,9 +630,30 @@ class StreamRenderer:
         details = elapsed
         if tokens:
             details += f" · {_format_token_count(tokens)} tokens"
-        verb = _VERB_BY_PHASE.get(self._phase, self._phase).capitalize()
+        activities = _ACTIVITY_VARIANTS_BY_PHASE.get(
+            self._phase,
+            (_VERB_BY_PHASE.get(self._phase, self._phase).capitalize(),),
+        )
+        activity_index = int((time.monotonic() - self._task_start) // 2) % len(activities)
+        verb = activities[activity_index]
         model = self._model or "auto"
-        return f"{verb} · {self._status_detail}  │  {model}  │  {details}"
+        prefix = f"{spinner_frame} " if spinner_frame else ""
+        return f"{prefix}{verb}… · {model} · {details}"
+
+    def print_work_summary(self, status: str = "completed") -> None:
+        """Leave one Claude-style durable timing line after live UI exits."""
+        elapsed = _format_elapsed(time.monotonic() - self._task_start)
+        model = self._model or "auto"
+        if status == "completed":
+            marker, label, style = "✻", "Worked for", "dim"
+        elif status in {"cancelled", "exited"}:
+            marker, label, style = "■", "Stopped after", "yellow"
+        else:
+            marker, label, style = "✗", "Stopped after", "red"
+        self.console.print(
+            Text(f"{marker} {label} {elapsed} · {model}", style=style),
+            highlight=False,
+        )
 
     def _update_status_detail(self, event_type: str, payload: dict[str, Any]) -> None:
         """Turn structured stream events into human-readable footer detail."""
@@ -460,6 +661,12 @@ class StreamRenderer:
             self._status_detail = "Submitting the task"
         elif event_type in {"task_started", "context_loading"}:
             self._status_detail = "Loading workspace context"
+            # task_started fires once at the very start of a turn (see
+            # runner_local.py) -- task_submitting/task_submitted, checked
+            # above, are dead: only the retired Remote engine ever sent
+            # them. This is the real point at which a fresh tool-usage
+            # tally should begin.
+            self._round_tool_counts = {}
         elif event_type in {"context_reused", "context_rescanned"}:
             self._status_detail = "Preparing repository context"
         elif event_type in {"routing_started", "model_selected"}:
@@ -472,11 +679,22 @@ class StreamRenderer:
             name = str(payload.get("name") or payload.get("tool_name") or "tool")
             arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
             self._status_detail = _tool_action_label(name, arguments)
+            normalized_name = _normalized_tool_name(name)
+            if normalized_name in _TOOL_CATEGORY:
+                self._round_tool_counts[normalized_name] = self._round_tool_counts.get(normalized_name, 0) + 1
+            # execute_command gets its own live line with its own elapsed
+            # timer (see _build_status) -- the local engine's actual event
+            # vocabulary (this and tool_output below) never emits the
+            # separate command_started/command_completed/command_failed
+            # events this used to key off of, which only the retired Remote
+            # engine ever sent.
+            if _normalized_tool_name(name) == "execute_command":
+                self._running_command = str(arguments.get("command") or "the requested command")
+                self._running_command_started = time.monotonic()
         elif event_type == "tool_output":
             self._status_detail = "Reviewing the tool result"
-        elif event_type in {"command_started", "command_completed", "command_failed"}:
-            command = str(payload.get("command") or "the requested command")
-            self._status_detail = f"Running {command[:120]}"
+            self._running_command = None
+            self._running_command_started = None
         elif event_type == "file_mutation":
             path = str(payload.get("path") or payload.get("resolved_path") or "the requested file")
             self._status_detail = f"Applying the change to {path[:120]}"
@@ -486,6 +704,54 @@ class StreamRenderer:
             self._status_detail = "Checking the work and updating context"
         elif event_type in {"ai_task_completed", "ai_task_failed"}:
             self._status_detail = "Finishing the response"
+
+    def _live_input_title(self) -> str:
+        """"Input", or "Input — session N" once other agents are running
+        concurrently (e.g. /delegate'd swarm children) -- otherwise a user
+        watching several panes has no way to tell which one this box
+        belongs to."""
+        listener = self.live_input_listener
+        if listener is not None and getattr(listener, "_active_agents", 0):
+            return f"Input — session {listener.session_id}"
+        return "Input"
+
+    def _live_input_hint(self) -> Text:
+        """Instructions for the in-task follow-up box, reflecting what Esc
+        and Enter actually do right now rather than a fixed caption --
+        before this, the text claimed "Esc stops the task" even after a
+        stop had already been requested (Esc/Ctrl+C do nothing once
+        `interrupt_classification` is set -- see live_input.py's
+        `_request_interrupt`), and never mentioned follow-ups already
+        queued behind the running turn."""
+        listener = self.live_input_listener
+        default = Text(
+            "Type a message and press Enter · Esc stops the task · Ctrl+C/Ctrl+D exits"
+        )
+        if listener is None:
+            return default
+        if getattr(listener, "interrupt_classification", None) is not None:
+            return Text("Stopping the task… · Ctrl+C/Ctrl+D exits")
+        session_id = getattr(listener, "session_id", None)
+        if session_id is None:
+            # Test doubles and other non-real listeners: fall back to the
+            # static caption rather than guessing at session state.
+            return default
+        from . import state as local_state
+
+        try:
+            session_state = local_state.get_session_state(session_id)
+            queued = sum(
+                1
+                for item in session_state.queued_user_instructions
+                if item.get("classification") == "follow_up"
+                and item.get("status") == "queued"
+            )
+        except Exception:
+            queued = 0
+        parts = ["Type a message and press Enter", "Esc stops the task", "Ctrl+C/Ctrl+D exits"]
+        if queued:
+            parts.insert(1, f"{queued} queued for after this turn")
+        return Text(" · ".join(parts))
 
     def _build_status(self) -> Any:
         elapsed = time.monotonic() - self._task_start
@@ -507,8 +773,34 @@ class StreamRenderer:
         label = f"{mode_tag}[bold]{verb}…[/bold] [dim]({' · '.join(detail_parts)})[/dim]"
         self._spinner.update(text=Text.from_markup(label))
         tip = _current_tip(elapsed)
-        if not self._plan_steps and not tip and self.live_input_listener is None:
+        activity_summary = _round_activity_summary(self._round_tool_counts)
+        if (
+            not self._plan_steps and not tip and self.live_input_listener is None
+            and not self._running_command and not activity_summary
+        ):
             return self._spinner
+        # Above the spinner, not in `lines` below -- matches Claude Code's
+        # own layout: the aggregated tally of what's happened so far this
+        # turn, and the specific command currently running, both read as
+        # a heading above the live verb/elapsed spinner underneath them.
+        top_lines = []
+        if activity_summary:
+            top_lines.append(Text.from_markup(f"[bold]{escape(activity_summary)}[/bold]"))
+        if self._running_command:
+            command_elapsed = _format_elapsed(
+                time.monotonic() - (self._running_command_started or time.monotonic())
+            )
+            preview = self._running_command[:200]
+            top_lines.append(Text.from_markup(
+                f"  [dim]⎿  $ {escape(preview)} ({command_elapsed})[/dim]"
+            ))
+            # Only shown while the live REPL editor (live_input.py) actually
+            # owns a Ctrl+B binding that does something -- see
+            # LiveInputListener._input_loop -- never a hint for a keypress
+            # that would silently do nothing (e.g. a non-interactive `agent`
+            # run with no live_input_listener at all).
+            if self.live_input_listener is not None:
+                top_lines.append(Text.from_markup("     [dim](ctrl+b to run in background)[/dim]"))
         lines = []
         if self.live_input_listener is not None:
             # Keep a real, persistent input box in the live task display. The
@@ -516,10 +808,8 @@ class StreamRenderer:
             # terminal, with the editable follow-up line owned by
             # prompt_toolkit rather than a special control key.
             input_box = Panel(
-                Text(
-                    "Type a message and press Enter · Esc stops the task · Ctrl+C/Ctrl+D exits"
-                ),
-                title="Input",
+                self._live_input_hint(),
+                title=self._live_input_title(),
                 border_style="cyan",
                 padding=(0, 1),
             )
@@ -544,7 +834,7 @@ class StreamRenderer:
                 line.append("~ ", style=marker_style)
             line.append(str(step.get("step") or ""), style=text_style)
             lines.append(line)
-        return Group(self._spinner, *lines)
+        return Group(*top_lines, self._spinner, *lines)
 
     def _refresh_live(self) -> None:
         if self._live is not None:
@@ -609,6 +899,27 @@ class StreamRenderer:
         if self.live_input_listener is not None:
             self.live_input_listener.pause()
 
+    async def suspend_live_async(self) -> None:
+        """Like `suspend_live`, but awaits the live-input listener's prompt
+        actually releasing the terminal before returning.
+
+        Every approval-gate call site suspends the live UI and then, a few
+        synchronous statements later, opens its own PromptSession for the
+        y/n decision. `suspend_live`'s `pause()` only *requests* the old
+        prompt exit (fire-and-forget) -- if the new PromptSession starts
+        before that request is actually processed by the event loop, two
+        prompt_toolkit Applications race for the same stdin fd and the new
+        one can be starved of keystrokes entirely (the gate renders but
+        never responds). Callers that will immediately open a new prompt
+        (i.e. every approval gate) must use this instead of `suspend_live`.
+        """
+        self._stop_live()
+        if self._assistant_live is not None:
+            self._assistant_live.stop()
+            self._assistant_live = None
+        if self.live_input_listener is not None:
+            await self.live_input_listener.pause_async()
+
     def resume_live(self) -> None:
         """Restore the active terminal status owner after suspension.
 
@@ -629,6 +940,41 @@ class StreamRenderer:
                 transient=True,
             )
             self._live.start()
+
+    def _box_content_width(self) -> int:
+        try:
+            width = int(self.console.width)
+        except Exception:
+            width = 80
+        return max(20, min(width, _ASSISTANT_BOX_MAX_WIDTH))
+
+    def _print_box_top(self, *, title: Optional[str] = None) -> None:
+        width = self._box_content_width()
+        line = Text()
+        if title:
+            label = f" {title} "
+            right = max(1, width - 3 - len(label))
+            line.append("╭─", style="cyan")
+            line.append(label, style="bold cyan")
+            line.append("─" * right + "╮", style="cyan")
+        else:
+            line.append("╭" + "─" * (width - 2) + "╮", style="cyan")
+        self.console.print(line)
+
+    def _print_box_bottom(self) -> None:
+        width = self._box_content_width()
+        self.console.print(Text("╰" + "─" * (width - 2) + "╯", style="cyan"))
+
+    def _print_box_line(self, line: str) -> None:
+        width = self._box_content_width()
+        inner = width - 4
+        pieces = textwrap.wrap(line, inner, break_long_words=True, break_on_hyphens=False) if line.strip() else [""]
+        for piece in pieces:
+            row = Text()
+            row.append("│ ", style="cyan")
+            row.append(piece.ljust(inner))
+            row.append(" │", style="cyan")
+            self.console.print(row)
 
     def _record_tokens(self, content: str) -> None:
         if not content:
@@ -688,15 +1034,40 @@ class StreamRenderer:
             # terminal viewport optimization; the canonical response text
             # and checkpoint remain unchanged.
             self._assistant_live.update(Text(unscrolled), refresh=True)
-        else:
+        elif self._is_tty:
+            # A real terminal with live_input_listener active (the ordinary
+            # interactive path -- see the class docstring on
+            # live_input_listener): Rich Live can't be used here (it would
+            # fight the listener's prompt-toolkit bottom toolbar for the
+            # same rows), so the enclosing box is drawn as plain completed
+            # lines instead of one live-redrawn region. A trailing partial
+            # line is held back so a boxed line's right border is never
+            # printed before the line is actually finished.
             delta = self._assistant_buffer[self._assistant_rendered_length:]
             if delta:
-                self.console.print(delta, end="")
+                self._assistant_rendered_length = len(self._assistant_buffer)
+                self._assistant_line_buffer += delta
+                *complete_lines, self._assistant_line_buffer = self._assistant_line_buffer.split("\n")
+                for line in complete_lines:
+                    self._print_box_line(line)
+        else:
+            # Redirected/non-terminal output: keep the original unboxed
+            # plain-text stream -- box-drawing characters are noise in a
+            # log file or piped output, and there is no terminal to enclose.
+            delta = self._assistant_buffer[self._assistant_rendered_length:]
+            if delta:
+                self.console.print(Text(delta), end="")
                 self._assistant_rendered_length = len(self._assistant_buffer)
 
     def _close_assistant(self) -> None:
         if self._assistant_open:
             self._flush_assistant(force=True)
+            if self._box_open:
+                if self._assistant_line_buffer:
+                    self._print_box_line(self._assistant_line_buffer)
+                    self._assistant_line_buffer = ""
+                self._print_box_bottom()
+                self._box_open = False
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None
@@ -738,6 +1109,7 @@ class StreamRenderer:
         self.console.print(Panel(Group(*body), title="Task failed", border_style="red", expand=False))
 
     def handle_event(self, event: dict[str, Any]) -> None:
+        event = sanitize_public_event(event)
         event_type = event.get("event_type") or event.get("event") or event.get("type")
         payload = event.get("payload") or {}
 
@@ -786,9 +1158,11 @@ class StreamRenderer:
                 self._thought_seconds = (self._reasoning_last or self._reasoning_start) - self._reasoning_start
             if not self._assistant_open:
                 self._stop_live()
-                if not self._assistant_header_shown:
-                    self.console.print("[bold cyan]Assistant[/bold cyan]")
-                    self._assistant_header_shown = True
+                use_box = self._is_tty and self.live_input_listener is not None
+                if use_box:
+                    self._print_box_top(title="Assistant" if not self._assistant_header_shown else None)
+                    self._box_open = True
+                self._assistant_header_shown = True
                 self._assistant_open = True
             # Whitespace/reasoning-only provider frames are not a visible
             # final answer. Marking them as displayed suppresses cli.py's
@@ -839,6 +1213,9 @@ class StreamRenderer:
                 if call_id:
                     self._tool_names_by_call_id[str(call_id)] = tool
                 args = payload.get("arguments") or {}
+                if _is_read_only_tool(tool):
+                    self.console.print(f"[dim]Read {escape(_read_target(args))}[/dim]")
+                    return
                 arg_text = ", ".join(f"{k}={v}" for k, v in args.items() if v not in (None, "")) if isinstance(args, dict) else ""
                 label = f"[bold yellow]→ {_tool_action_label(tool, args)}[/bold yellow]"
                 if self.debug and arg_text:
@@ -851,7 +1228,7 @@ class StreamRenderer:
                 # authoritative model_selected event exists, never display a
                 # contradictory provider claim in progress output.
                 if self._selected_provider and content.lower().startswith("executing with "):
-                    content = f"Executing with {self._selected_provider}..."
+                    content = f"Executing with {BRANDED_PROVIDER_LABEL}..."
                 self.console.print(f"[dim]· {escape(content)}[/dim]")
             return
 
@@ -859,6 +1236,15 @@ class StreamRenderer:
             self._close_assistant()
             name = str(payload.get("name") or payload.get("tool") or "tool")
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+            if _is_read_only_tool(name):
+                self.console.print(f"[dim]Read {escape(_read_target(args))}[/dim]")
+                return
+            # On an interactive terminal the persistent live status line is
+            # the progress indicator.  Printing a second arrow line for an
+            # edit/write leaves duplicate history behind; the durable
+            # file_mutation event below is the single completed summary.
+            if _is_mutation_tool(name) and self._is_tty:
+                return
             self.console.print(f"[bold yellow]→ {escape(_tool_action_label(name, args))}[/bold yellow]")
             return
 
@@ -866,6 +1252,15 @@ class StreamRenderer:
             self._close_assistant()
             tool = str(payload.get("tool", "tool"))
             result_envelope = payload.get("result") if isinstance(payload.get("result"), dict) else payload
+            if _is_read_only_tool(tool):
+                success = result_envelope.get("success")
+                if success is False or result_envelope.get("status") in {"failed", "error"}:
+                    args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else result_envelope
+                    reason, _failed = _tool_result_message(payload)
+                    self.console.print(
+                        f"[red]Read failed[/red] {escape(_read_target(args))}: {escape(reason)}"
+                    )
+                return
             # Command/file events already carry the useful result. Some
             # canonical tool-completion envelopes contain only a tool name
             # and success flag; rendering those produced the misleading,
@@ -888,6 +1283,10 @@ class StreamRenderer:
                     "command": result.get("command"),
                 }
             label = _tool_action_label(tool, args, completed=True)
+            if failed and _normalized_tool_name(tool) in {"execute_command", "run_command", "remote_exec"}:
+                label = "Command failed"
+            if failed and _normalized_tool_name(tool) == "edit_file":
+                label = "Edit failed"
             _render_result_block(self.console, ok=not failed, label=label, content=content)
             return
 
@@ -958,7 +1357,9 @@ class StreamRenderer:
             command_id = payload.get("command_id")
             cwd = str(payload.get('cwd') or payload.get('working_directory') or '?')
             reason = str(payload.get('reason') or 'The agent requested this command.')
-            command_text = _bounded_preview(str(text or ''))
+            # Final secrecy boundary: remote and grouped approval events may
+            # arrive without having passed through the local runner's copy.
+            command_text = _bounded_preview(redact_secrets(str(text or '')))
             # This is the one screen where display accuracy is a safety
             # property, not just cosmetics: a human approves/rejects based
             # on what's shown here. Panel's body/title are markup-parsed by
@@ -1046,14 +1447,15 @@ class StreamRenderer:
             model = payload.get("model") or "(provider default)"
             reason = payload.get("selection_reason") or "explicit selection or orchestration routing"
             if self.debug:
-                self.console.print(f"[dim]· Provider: {escape(str(provider))} · Model: {escape(str(model))} · {escape(str(reason))}[/dim]")
+                self.console.print(
+                    f"[dim]· Model: {escape(public_model_name(model))} · "
+                    f"{escape(redact_routing_text(reason))}[/dim]"
+                )
             else:
-                # Persist the authoritative route in the scrollback. The
-                # previous debug-only display made "local:auto" in the
-                # banner look like local Ollama even when AUTO had selected
-                # NVIDIA/OpenRouter/HF; users could not tell which provider
-                # was actually responsible for a slow or bad response.
-                self.console.print(f"[dim]· Using {escape(str(provider))} · {escape(str(model))}[/dim]")
+                # Persist the authoritative route in the scrollback -- users
+                # need to know a route was resolved -- but never the raw
+                # backend/model id behind it; TamfisGPT owns that identity.
+                self.console.print(f"[dim]· Using {BRANDED_PROVIDER_LABEL}[/dim]")
             return
 
         if event_type == "ai_task_failed":
@@ -1080,6 +1482,44 @@ class StreamRenderer:
             self._live = None
 
 
+class StructuredRenderer:
+    """Machine-readable event renderer for CI, editors, and orchestration."""
+
+    def __init__(self, *, mode: str = "jsonl", stream: Any = None):
+        self.mode = mode
+        self.stream = stream or sys.stdout
+        self.events: list[dict[str, Any]] = []
+        self.background_requested = asyncio.Event()
+        self.streamed_final_text = False
+
+    def handle_event(self, event: dict[str, Any]) -> None:
+        event = sanitize_public_event(event)
+        event_type = event.get("event_type") or event.get("event") or event.get("type")
+        if event_type == "assistant_delta" and (event.get("payload") or {}).get("content"):
+            self.streamed_final_text = True
+        clean = json.loads(json.dumps(event, default=str, ensure_ascii=False))
+        if self.mode == "jsonl":
+            self.stream.write(json.dumps(clean, ensure_ascii=False) + "\n")
+            self.stream.flush()
+        else:
+            self.events.append(clean)
+
+    def record_outcome(self, outcome: Any) -> None:
+        self.handle_event({
+            "event_type": "outcome",
+            "payload": {
+                "status": getattr(outcome, "status", "unknown"),
+                "summary": getattr(outcome, "summary", None),
+                "error": getattr(outcome, "error", None),
+            },
+        })
+
+    def finish(self) -> None:
+        if self.mode == "json":
+            self.stream.write(json.dumps({"events": self.events}, ensure_ascii=False) + "\n")
+            self.stream.flush()
+
+
 def suspend_live_if_active(renderer: Any) -> None:
     """Call renderer.suspend_live() if the renderer supports it.
 
@@ -1099,23 +1539,40 @@ def resume_live_if_active(renderer: Any) -> None:
         method()
 
 
+async def suspend_live_async_if_active(renderer: Any) -> None:
+    """Async counterpart of `suspend_live_if_active` -- use this at every
+    approval-gate call site (a new PromptSession opens right after), so the
+    just-paused live-input listener has actually released the terminal
+    before that new prompt starts reading stdin. See
+    `StreamRenderer.suspend_live_async` for why this matters."""
+    method = getattr(renderer, "suspend_live_async", None)
+    if callable(method):
+        await method()
+        return
+    # Test doubles / renderers without the async protocol: fall back to the
+    # sync one so approval flow still works, just without the stronger
+    # ordering guarantee (matches suspend_live_if_active's existing
+    # best-effort behaviour for such doubles).
+    suspend_live_if_active(renderer)
+
+
 def print_banner(console: Console, *, host: str, workspace_root: str, mode: str, approval_policy: str) -> None:
     console.print(Text(f"TamfisGPT Code v{__version__}", style="bold cyan"))
     console.print(Text("by Tamfis Nig. Ltd", style="dim"))
     console.print(f"[dim]Workspace:[/dim] {escape(workspace_root)}")
     if host.startswith("local:"):
         route = host.split(":", 1)[1] or "auto"
-        route_label = "auto (ollama_cloud, nvidia, hf, openrouter, in authoritative priority order)" if route == "auto" else route
+        route_label = public_route_name(route)
         console.print(
             f"[dim]Mode:[/dim] {mode}   [dim]Approval:[/dim] {approval_policy}   "
-            f"[dim]Runtime:[/dim] standalone   [dim]Provider:[/dim] {route_label}"
+            f"[dim]Runtime:[/dim] standalone   [dim]Model:[/dim] {route_label}"
         )
     else:
         console.print(f"[dim]Mode:[/dim] {escape(mode)}   [dim]Approval:[/dim] {escape(approval_policy)}   [dim]Host:[/dim] {escape(host)}")
 
 
 def print_error(console: Console, message: str) -> None:
-    console.print(f"[bold red]Error:[/bold red] {escape(message)}")
+    console.print(f"[bold red]Error:[/bold red] {escape(redact_routing_text(message))}")
 
 
 def print_recent_thread(console: Console, messages: list[dict[str, Any]], limit: int = 6) -> None:

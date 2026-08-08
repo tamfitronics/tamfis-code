@@ -11,17 +11,18 @@ entitlement, and the CLI makes outbound API calls from the machine where it
 is installed. Admin subscriptions are an account/billing policy, not a
 requirement for installing or running the CLI.
 
-The current standalone runtime can also call NVIDIA NIM, OpenRouter, or
-Hugging Face directly. Every provider uses the same local-tool contract:
-model traffic may be remote, but workspace files, commands, PTYs, approvals,
-and mutation evidence remain local unless the user explicitly selects
-`--remote`.
+After `tamfis-code login`, the saved TamfisGPT credential unlocks
+subscription-backed inference in the standalone runtime. Model routing,
+tools, approvals, shell execution, memory, and repository state stay inside
+the local `tamfis-code` process. Remote Workspace is a separate legacy mode
+that is selected only with `--remote` or `default_backend = "remote"`.
+Login also applies a newer version already present in the configured Tamfis
+Code source checkout after credentials are saved; set
+`TAMFIS_CODE_AUTO_UPDATE=0` for centrally managed installations.
 
-`--remote` (or a persistent `default_backend = "remote"` config setting)
-switches to the original architecture: a thin client to the TamfisGPT
-Remote Workspace backend, for TamfisGPT tenants using their hosted account
-the same way Codex CLI uses a ChatGPT/OpenAI account, kimi-code uses a Kimi
-account, or Claude Code uses a Claude account.
+The standalone runtime uses TamfisGPT models. `standalone` is the default
+runtime boundary; model origins and routing topology are private deployment
+details and are never part of the CLI's public output contract.
 
 ## Install
 
@@ -35,8 +36,8 @@ from source, using a TamfisGPT tenancy, and the release process.
 ## Quick start
 
 ```
-export NVIDIA_API_KEY=...                          # or set OPENROUTER_API_KEY / HF_TOKEN
-tamfis-code doctor                                  # check provider connectivity
+tamfis-code login                                   # activate TamfisGPT models
+tamfis-code doctor                                  # check model-service connectivity
 tamfis-code ask "explain what this repo does"
 tamfis-code agent "add a health-check endpoint"     # full read/write/execute loop
 tamfis-code                                         # interactive REPL
@@ -44,38 +45,56 @@ tamfis-code                                         # interactive REPL
 
 ### TamfisGPT subscription access
 
-Create a developer API key from the TamfisGPT account connected to the iOS
-subscription, then configure the machine where Tamfis-Code is installed:
+Sign in with the TamfisGPT account whose subscription includes Tamfis-Code:
 
 ```bash
-export TAMFIS_API_KEY='tamfis_sk_live_...'
-# Optional for a private gateway or regional deployment:
-export TAMFIS_API_BASE='https://gpt.tamfitronics.com/api/v1/openai'
+tamfis-code login
+cd /path/to/your/repository
 tamfis-code doctor
 tamfis-code agent "inspect this repository and fix the failing tests"
 ```
 
-The key is checked against the account's active subscription and API scopes
-on every request. The CLI remains portable: the model request goes to the
-TamfisGPT API, while repository files, shell commands, PTY sessions,
-approvals, and mutation evidence stay on the local machine. Admin access is
-not required for ordinary subscription users.
+The normal interactive and one-shot commands keep the local-agent connection
+alive for their lifetime. To make the repository available for work started
+from TamfisGPT Web without keeping an interactive chat open, run:
 
-## Providers
+```bash
+tamfis-code bridge
+```
 
-| Provider | Env var | Notes |
-|---|---|---|
-| NVIDIA NIM | `NVIDIA_API_KEY` | |
-| OpenRouter | `OPENROUTER_API_KEY` | |
-| Hugging Face | `HF_TOKEN` | |
-| TamfisGPT subscription API | `TAMFIS_API_KEY` | Key issued for an active TamfisGPT plan |
+The bridge reconnects automatically, replays unacknowledged results after a
+network interruption, and exposes only the selected workspace. Admin access
+is not required for ordinary entitled subscribers.
 
-Select one explicitly with `--provider tamfis|hf|nvidia|openrouter`, or leave it
-as `auto` (default). Auto routes through eligible providers in
-capability-ranked order. The selected provider/model is printed at the
-start of every turn.
+## Running tasks in the background
 
-Interrupted provider streams remain attached to the same task: clean partial
+Add `--bg` to `ask`/`chat`/`audit`/`agent`/`exec` to start a task and return
+immediately. The task runs in a detached process (its own OS session, not a
+child of your terminal), so it keeps running to completion even after you
+close the terminal or disconnect:
+
+```bash
+tamfis-code agent "add a health-check endpoint" --bg
+# Started in background · job bg-a1b2c3d4 (pid 12345)
+
+tamfis-code bg-list                     # every background job and its status
+tamfis-code bg-status bg-a1b2c3d4        # one job's detail
+tamfis-code bg-logs bg-a1b2c3d4 --follow # tail its output live
+tamfis-code bg-stop bg-a1b2c3d4          # terminate it
+```
+
+Job status is one of `running`, `completed`, `failed`, or `stopped`. `--bg`
+is not available for `plan` (the plan needs the invoking process attached to
+save it locally).
+
+## TamfisGPT models
+
+Users select stable product aliases: **TamfisGPT Auto**, **TamfisGPT Fast**,
+**TamfisGPT Code**, **TamfisGPT Pro**, and **TamfisGPT Vision**. Use
+`/model list` in the interactive REPL, or pass `--model auto|fast|code|pro|vision`.
+TamfisGPT Auto is the default and chooses the appropriate model for the task.
+
+Interrupted model streams remain attached to the same task: clean partial
 text is checkpointed to `.memory`, reconnects use visible 5/15/30-second
 backoff, and continuation output is de-duplicated. If all configured routes
 remain unavailable, the CLI reports an actionable error and retains the exact
@@ -155,10 +174,71 @@ typed text appended on a new line. Run `/commands` in the REPL to list
 what's currently loaded. A custom command can never shadow a built-in one
 (`/plan`, `/agent`, etc. always win on a name collision).
 
+## Skills
+
+Tamfis Code discovers `SKILL.md`, `skill.toml`, `skill.json`, and Kimi-style
+flat skill Markdown. It reads Tamfis personal skills plus installed user skills
+from `~/.kimi-code/skills/` (or `$KIMI_CODE_HOME/skills/`),
+`~/.claude/skills/`, `~/.codex/skills/`, and the shared `~/.agents/skills/`.
+Project-local `.kimi-code/skills/`, `.claude/skills/`, `.codex/skills/`,
+`.agents/skills/`, and `.tamfis/skills/` are layered on top. Skills whose name,
+description, or tags match the objective are injected with their instructions;
+project definitions override same-named personal definitions and Tamfis project
+definitions have final precedence.
+
+## Complete projects and artifacts
+
+Large multi-file builds use the same long-running plan/checkpoint/repair loop as
+ordinary coding tasks. If an objective supplies an explicit project tree,
+Tamfis Code verifies that every requested file exists and is non-empty before
+allowing a completion claim. ZIP/TAR projects can be safely extracted, edited,
+validated, and repackaged.
+
+The `create_artifact` and `inspect_artifact` tools create and verify real binary
+DOCX, XLSX, PPTX, and PDF deliverables. XLSX cells that could trigger formula
+injection are escaped unless formulas are explicitly enabled. This supports
+mixed requests such as building a complete WordPress theme and delivering its
+proposal, content inventory, budget workbook, launch deck, PDF manual, and
+installable theme archive in one task.
+
+## MCP, plugins, and machine output
+
+External MCP servers stay under the local Tamfis Code runtime. Configure them
+in the personal `mcp.json`, project `.mcp.json`, or `.tamfis/mcp.json` using the
+standard `mcpServers` shape; discovered tools are namespaced and enter the same
+approval policy as native tools. Installed Python packages can contribute tools
+and skill roots through the `tamfis_code.plugins` entry-point group. Use
+`tamfis-code plugins` to inspect them.
+
+Pass global `--output-mode json` for a single machine-readable event document,
+or `--output-mode jsonl` for streaming events suitable for CI and editors.
+
+## IDE, GitHub, and scheduled automation
+
+Run `tamfis-code --cwd <project> acp` as an ACP v1 subprocess from Zed,
+JetBrains, or another ACP client. The adapter supports session creation/loading,
+streamed prompt results, cancellation, and the same workspace and approval
+policy used by the terminal agent.
+
+`tamfis-code --cwd <project> github-automation install-review` creates a
+least-privilege GitHub Actions workflow for automatic pull-request reviews.
+Add `TAMFIS_API_KEY` as a repository Actions secret before enabling it.
+
+Scheduled local tasks use the durable `automations` command group:
+
+```bash
+tamfis-code --cwd /path/to/project automations add nightly "Run tests and fix regressions" --every 1d
+tamfis-code automations list
+tamfis-code automations serve
+```
+
+The foreground service is suitable for systemd, launchd, or a container
+supervisor; individual tasks retain an explicit stored approval policy.
+
 ## Declarative subagent types
 
 Give a delegated sub-task its own specialised system prompt (and,
-optionally, its own model/provider) instead of every `/delegate`/`/swarm`
+optionally, its own TamfisGPT model) instead of every `/delegate`/`/swarm`
 sub-objective sharing the same generic coding agent — Claude Code's
 `.claude/agents/*.md` equivalent. `~/.config/tamfis-code/agents/<name>.md`
 (every session) or `<project>/.tamfis/agents/<name>.md` (one project, and
@@ -168,14 +248,13 @@ it replaces a same-named user definition outright) becomes a `/delegate
 ```markdown
 ---
 description: Reviews code for bugs and security issues
-model: qwen/qwen3-coder
-provider: openrouter
+model: TamfisGPT Code
 ---
 You are a strict, terse code reviewer. Point out real bugs, security
 issues, and correctness problems only — skip style nits.
 ```
 
-`model`/`provider` are optional; omit either to use whatever the
+`model` is optional; omit it to use whatever the
 delegating call was already using. Run `/agent-types` to list what's
 loaded. The model itself can also pick a subagent type per sub-task when
 it calls `delegate_parallel_tasks` (each task entry may be `{"objective":
@@ -202,15 +281,14 @@ Every mutating tool call (`write_file`, `edit_file`, `execute_command`) is
 risk-classified locally (`tamfis_code/safety.py`), gated by
 `--approval-policy` (or the `/mode` REPL command), and recorded in a local
 mutation ledger — see `tamfis-code diffs` / `tamfis-code diff` /
-`tamfis-code revert`. There is no sandboxing beyond risk classification;
-review dangerous commands yourself before approving them.
+`tamfis-code revert`. Shell commands additionally run under an OS-enforced
+read-only/workspace-write sandbox (bubblewrap on Linux) with network disabled
+by default. A tool may request `require_escalated`, but that request is always
+classified dangerous and enters the explicit approval flow.
 
 ## License
 
-TBD — decide before the first public PyPI release (a public package still
-needs a stated license; "all rights reserved"/proprietary is a valid choice
-if you don't want redistribution/modification, but it should be explicit
-rather than absent).
+Copyright © 2026 Tamfitronics. All rights reserved. See [LICENSE](./LICENSE).
 
 ## OpenHands-Class Runtime (0.6.1)
 
@@ -218,9 +296,8 @@ Tamfis-Code includes an integrated event-driven agent runtime under
 `tamfis_code.openhands`. It provides conversations, immutable event replay,
 local/SSH/remote workspaces, terminal/file/browser/Git tools, skills, security,
 secrets, snapshots, leases, multi-agent delegation, automations and a REST /
-WebSocket agent server. It runs without Docker and preserves the standalone
-provider order NVIDIA → OpenRouter → Hugging Face. Ollama is intentionally not
-included.
+WebSocket agent server. It runs without Docker and uses the same private
+TamfisGPT model-routing layer as the terminal client.
 
 Start the agent server:
 

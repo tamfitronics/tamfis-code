@@ -1,9 +1,9 @@
 """Fail-closed workspace grants and target resolution.
 
 The launch directory is the only implicit workspace. Additional roots are
-usable only when they are both named explicitly by absolute path in the user
-objective and already present in the durable session grant list. Product names
-or sibling directory names never expand scope by themselves.
+usable when they are named explicitly by absolute path in the user objective.
+The local runner persists those explicit roots in the session grant before
+tool execution; inferred product or sibling names never expand scope.
 """
 from __future__ import annotations
 
@@ -69,7 +69,14 @@ class WorkspaceResolution:
 
 def _project_root(path: Path) -> Path:
     candidate = path.resolve()
-    return candidate.parent if candidate.is_file() else candidate
+    start = candidate if candidate.is_dir() else candidate.parent
+    for root in (start, *start.parents):
+        if any(
+            (root / marker).exists()
+            for marker in (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
+        ):
+            return root
+    return start
 
 
 def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
@@ -78,6 +85,17 @@ def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
     scrubbed = _URL_RE.sub(" ", objective or "")
     for raw in _ABSOLUTE_PATH_RE.findall(scrubbed):
         candidate = Path(raw.rstrip(".,;:)]}")).expanduser()
+        # Terminal hints, pasted transcripts, and pasted error logs commonly
+        # contain absolute-looking tokens that are not filesystem paths at
+        # all: slash commands (`/status`), REST/API routes copied from a
+        # backend error (`/api/v1/chat/models`, `/health`), or URL segments.
+        # None of these name a real target, and treating them as one used to
+        # fail the whole turn closed with "outside the active workspace
+        # grant" the moment a user pasted an error message containing one.
+        # A token only becomes an actionable workspace target once it
+        # resolves to something that actually exists on disk.
+        if not candidate.exists():
+            continue
         try:
             candidate = _project_root(candidate)
         except OSError:
@@ -89,16 +107,49 @@ def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
     return tuple(targets)
 
 
+def auto_grant_explicit_targets(
+    *, launch_root: str | Path, objective: str, allowed_roots: Iterable[str | Path] = ()
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    """Add explicit, usable targets to a local session grant.
+
+    Naming an absolute path in the current user objective is direct scope
+    authorization. Only a resolved directory that already exists is added;
+    inferred names, pasted slash commands, and unresolved root-level tokens
+    cannot widen the grant.
+    """
+    grant = WorkspaceGrant.create(launch_root, allowed_roots)
+    roots = list(grant.allowed_roots)
+    added: list[Path] = []
+    for target in explicit_absolute_targets(objective):
+        if grant.contains(target) or not target.is_dir():
+            continue
+        roots.append(target)
+        added.append(target)
+        grant = WorkspaceGrant.create(launch_root, roots)
+    return tuple(roots), tuple(added)
+
+
 def infer_named_external_project(launch_root: Path, objective: str) -> tuple[Path, ...]:
     """Detect named sibling projects without granting access to them.
 
     This is diagnostic only. It catches requests such as "audit TamfisGPT"
     launched from /home/tamfisseo and forces the user to switch/add a workspace
     rather than silently inspecting the sibling.
+
+    A project name mentioned as background context (for example, "TamfisGPT
+    uses port 5173") is not a workspace target. Require a project-directed
+    action before applying this diagnostic, otherwise ordinary comparisons and
+    dependency notes are incorrectly rejected before the model sees them.
     """
-    lowered = re.sub(r"[^a-z0-9]+", "", (objective or "").lower())
+    text = objective or ""
+    lowered = re.sub(r"[^a-z0-9]+", "", text.lower())
     if not lowered or launch_root.parent == launch_root:
         return ()
+    target_action_re = re.compile(
+        r"\b(?:audit|inspect|review|read|edit|fix|update|modify|change|search|"
+        r"check|test|build|deploy|run|open|scan|work\s+on|look\s+(?:at|inside))\b",
+        re.IGNORECASE,
+    )
     matches: list[Path] = []
     try:
         siblings = list(launch_root.parent.iterdir())
@@ -114,8 +165,19 @@ def infer_named_external_project(launch_root: Path, objective: str) -> tuple[Pat
             aliases.update({"tamfisgptios", "tamfisaios"})
         if key == "tamfisseo":
             aliases.update({"tamfisseopro"})
-        if key and key != launch_key and any(alias in lowered for alias in aliases):
-            matches.append(sibling.resolve())
+        if not key or key == launch_key:
+            continue
+        # Only classify the named sibling as a target when an action verb
+        # occurs shortly before it. This preserves the safety check for
+        # "audit TamfisGPT" while allowing context such as "TamfisGPT uses
+        # port 5173" to remain an answer/implementation request in the
+        # current workspace.
+        alias_pattern = "|".join(re.escape(alias) for alias in sorted(aliases, key=len, reverse=True))
+        for alias_match in re.finditer(rf"\b(?:{alias_pattern})\b", text, re.IGNORECASE):
+            preceding_text = text[max(0, alias_match.start() - 100):alias_match.start()]
+            if target_action_re.search(preceding_text):
+                matches.append(sibling.resolve())
+                break
     return tuple(matches)
 
 
@@ -140,15 +202,13 @@ def resolve_workspace_targets(
             selected.append(path)
 
     if not selected:
-        named_external = infer_named_external_project(grant.launch_root, objective)
-        if named_external:
-            rendered = ", ".join(str(path) for path in named_external)
-            raise WorkspaceAuthorityError(
-                f"The request appears to target {rendered}, which is outside the current workspace "
-                f"{grant.launch_root}. No external files were inspected. Restart Tamfis-Code from that "
-                "project, or run `tamfis-code workspace add PATH` and retry with the explicit absolute path.",
-                denied=named_external, allowed=grant.allowed_roots,
-            )
+        # A sibling's product/repository name is context, not a filesystem
+        # target. Cross-workspace access is requested with an explicit
+        # absolute path (and handled by the normal grant/approval flow above);
+        # silently treating a name mention as a target rejects valid requests
+        # such as port or dependency comparisons before intent classification.
+        # No external files were inspected when a name is mentioned without
+        # an explicit path; the current launch root remains the only scope.
         selected = [grant.launch_root]
 
     return WorkspaceResolution(roots=tuple(selected), explicit_paths=explicit)

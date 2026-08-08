@@ -13,9 +13,9 @@ def test_required_github_command_surface_is_complete():
     assert len(GITHUB_COMMANDS) == 27
 
 
-def test_ollama_cloud_is_authoritative_priority_one():
+def test_nvidia_nim_is_authoritative_priority_one():
     assert AUTHORITATIVE_PROVIDER_ORDER == (
-        "ollama_cloud", "nvidia", "hf", "openrouter"
+        "nvidia", "ollama_cloud", "hf", "openrouter"
     )
 
 

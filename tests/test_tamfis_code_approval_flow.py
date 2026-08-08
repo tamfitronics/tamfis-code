@@ -17,6 +17,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 
+import httpx
 from rich.console import Console
 
 from tamfis_code.render import StreamRenderer
@@ -29,7 +30,7 @@ class FakeStreamClient:
         self._events = events
         self.approve_calls: list[tuple[int, str]] = []
 
-    async def stream_session(self, session_id, last_event_id):
+    async def stream_session(self, session_id, last_event_id, *, idle_timeout=None):
         for event in self._events:
             yield event
 
@@ -77,7 +78,7 @@ class StreamTaskApprovalTests(unittest.TestCase):
                 super().__init__([])
                 self.stream_calls = 0
 
-            async def stream_session(self, session_id, last_event_id):
+            async def stream_session(self, session_id, last_event_id, *, idle_timeout=None):
                 self.stream_calls += 1
                 if self.stream_calls == 1:
                     return
@@ -106,6 +107,53 @@ class StreamTaskApprovalTests(unittest.TestCase):
         self.assertEqual(client.stream_calls, 2)
         self.assertEqual(outcome.status, "completed")
         self.assertEqual(outcome.summary, "done after reconnect")
+
+    def test_stalled_stream_times_out_instead_of_hanging_forever(self):
+        # Regression: a task reattached from a previous CLI session whose
+        # event stream had gone permanently silent server-side (task
+        # orphaned, nothing left to ever emit another event) left the CLI
+        # parked in the network read forever -- not even Ctrl+C could reach
+        # it, since the interrupt watcher only runs between received
+        # events. `idle_timeout` bounds that read; a raised
+        # httpx.TimeoutException must be treated the same as the stream
+        # closing normally (reconnect-or-give-up), not left uncaught.
+        class StallThenRecoverClient(FakeStreamClient):
+            def __init__(self):
+                super().__init__([])
+                self.stream_calls = 0
+
+            async def stream_session(self, session_id, last_event_id, *, idle_timeout=None):
+                self.stream_calls += 1
+                if self.stream_calls == 1:
+                    raise httpx.ReadTimeout("simulated stall")
+                yield {
+                    "task_id": "t1", "sequence": 1,
+                    "event_type": "assistant_message",
+                    "payload": {"visible_content": "done after stall"},
+                }
+                yield {
+                    "task_id": "t1", "sequence": 2,
+                    "event_type": "ai_task_completed", "payload": {"status": "completed"},
+                }
+                return
+                yield  # pragma: no cover -- makes this an async generator
+
+            async def get_task(self, task_id):
+                return {"id": task_id, "status": "running"}
+
+        client = StallThenRecoverClient()
+        console = Console(file=StringIO(), no_color=True, width=200)
+        renderer = StreamRenderer(console)
+
+        outcome = asyncio.run(asyncio.wait_for(_stream_task(
+            client, renderer, console,
+            session_id=1, task_id="t1", approval_policy="ask", interactive=False,
+            idle_timeout=1.0,
+        ), timeout=10))
+
+        self.assertEqual(client.stream_calls, 2)
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(outcome.summary, "done after stall")
 
     def test_extracts_command_id_from_top_level_field_and_approves(self):
         events = [
@@ -197,7 +245,7 @@ class StreamTaskApprovalTests(unittest.TestCase):
                 super().__init__([])
                 self.cancelled = []
 
-            async def stream_session(self, session_id, last_event_id):
+            async def stream_session(self, session_id, last_event_id, *, idle_timeout=None):
                 await asyncio.sleep(5)
                 if False:
                     yield {}
@@ -223,6 +271,53 @@ class StreamTaskApprovalTests(unittest.TestCase):
                 self.assertEqual(queued["status"], "queued")
             finally:
                 state_module.CONFIG_DIR, state_module.STATE_PATH = original_dir, original_path
+
+
+class NoMutationValidatorTests(unittest.TestCase):
+    """Regression test: a `coding`-mode task that never reaches for a
+    mutating tool (write_file/edit_file/remote_exec) -- e.g. it just answers
+    a question, reports status, or decides nothing needs to change this
+    turn -- must not be hard-failed as "no file mutation was recorded".
+    That check exists to catch a *real* problem: the model attempted a
+    write/edit and it silently didn't stick. It must not fire just because
+    the model never attempted one, which made routine read-only or
+    status-update turns fail even though they behaved correctly."""
+
+    def _run(self, events, session_id):
+        client = FakeStreamClient(events)
+        console = Console(file=StringIO(), no_color=True, width=200)
+        with tempfile.TemporaryDirectory() as tmp:
+            original_dir, original_path = state_module.CONFIG_DIR, state_module.STATE_PATH
+            state_module.CONFIG_DIR, state_module.STATE_PATH = Path(tmp), Path(tmp) / "state.json"
+            try:
+                return asyncio.run(_stream_task(
+                    client, StreamRenderer(console), console,
+                    session_id=session_id, task_id="t1", approval_policy="ask", interactive=False,
+                    requested_mutation=True,
+                ))
+            finally:
+                state_module.CONFIG_DIR, state_module.STATE_PATH = original_dir, original_path
+
+    def test_read_only_turn_with_no_mutating_tool_call_completes(self):
+        events = [
+            {"task_id": "t1", "sequence": 1, "stream_sequence": 1, "event_type": "tool_call_requested",
+             "payload": {"name": "grep_files", "arguments": {"pattern": "foo"}}},
+            {"task_id": "t1", "sequence": 2, "stream_sequence": 2, "event_type": "ai_task_completed",
+             "payload": {"status": "completed"}},
+        ]
+        outcome = self._run(events, session_id=101)
+        self.assertEqual(outcome.status, "completed")
+
+    def test_attempted_mutation_with_no_recorded_change_still_fails(self):
+        events = [
+            {"task_id": "t1", "sequence": 1, "stream_sequence": 1, "event_type": "tool_call_requested",
+             "payload": {"name": "edit_file", "arguments": {"path": "a.py"}}},
+            {"task_id": "t1", "sequence": 2, "stream_sequence": 2, "event_type": "ai_task_completed",
+             "payload": {"status": "completed"}},
+        ]
+        outcome = self._run(events, session_id=102)
+        self.assertEqual(outcome.status, "failed")
+        self.assertIn("no file mutation was recorded", outcome.error)
 
 
 if __name__ == "__main__":

@@ -1,0 +1,28 @@
+#!/bin/sh
+set -eu
+
+PATH=/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
+
+if [ "$#" -ne 1 ]; then
+    echo "usage: tamfis-workspace-acl /home[/path]" >&2
+    exit 64
+fi
+
+target=$(realpath -e -- "$1") || exit 66
+case "$target" in
+    /home|/home/*) ;;
+    *)
+        echo "refusing unmanaged workspace outside /home: $target" >&2
+        exit 77
+        ;;
+esac
+
+if [ ! -d "$target" ]; then
+    echo "workspace is not a directory: $target" >&2
+    exit 66
+fi
+
+setfacl -R -m u:tamfisgpt:rwX,u:tamfis-code:rwX -- "$target"
+find "$target" -type d -exec \
+    setfacl -m d:u:tamfisgpt:rwX,d:u:tamfis-code:rwX -- {} +

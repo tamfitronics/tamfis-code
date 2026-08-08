@@ -9,8 +9,10 @@ repeated runs from the same directory.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -18,11 +20,27 @@ from typing import Any, Optional
 
 from .api_client import RemoteAPIClient
 from . import state as local_state
-from .config import load_config
+from .config import CONFIG_DIR, load_config
 
 REUSABLE_STATUSES = {"idle", "active"}
+
+
+def scratch_root(session_id: int) -> Path:
+    """A per-session scratch directory under the OS temp dir, always
+    available to run/write throwaway code -- the same role Claude Code's
+    own scratchpad convention plays, and always granted (see
+    runner_local.py's _apply_mcp_task_scope) alongside the workspace's own
+    scope roots rather than requiring an explicit grant like any other path
+    outside the launch workspace would.
+
+    Session-scoped (not a single shared directory) so two sessions running
+    concurrently never collide on the same filenames.
+    """
+    root = Path(tempfile.gettempdir()) / "tamfis-code" / str(session_id)
+    root.mkdir(parents=True, exist_ok=True)
+    return root
 INSTRUCTION_NAMES = {
-    "AGENTS.md", "CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis",
+    "AGENTS.override.md", "AGENTS.md", "CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis",
     "CONTRIBUTING.md", "README.md",
 }
 REPORT_RE = re.compile(
@@ -40,6 +58,65 @@ DISPOSABLE_UNTRACKED_PARTS = {
     ".tox", ".nox", ".coverage", "htmlcov", ".DS_Store",
 }
 MAX_INDEX_FILES = 20_000
+
+
+def _instruction_chain(repository_root: Path, working_directory: Path) -> list[Path]:
+    """Return applicable instructions in broad-to-specific precedence order.
+
+    AGENTS files follow Codex semantics: an override wins over AGENTS.md in
+    the same directory, and only directories from the repository root down
+    to the active working directory participate. Tamfis/Claude compatibility
+    files are layered over that same path. Repository overview documents are
+    root-scoped so a README in an unrelated package is never treated as an
+    instruction for the current task.
+    """
+    root = repository_root.resolve()
+    cwd = working_directory.resolve()
+    try:
+        relative = cwd.relative_to(root)
+    except ValueError:
+        relative = Path()
+
+    directories = [root]
+    cursor = root
+    for part in relative.parts:
+        cursor /= part
+        directories.append(cursor)
+
+    result: list[Path] = []
+
+    # Installation-wide guidance uses Tamfis' platform-native config home.
+    global_override = CONFIG_DIR / "AGENTS.override.md"
+    global_agents = CONFIG_DIR / "AGENTS.md"
+    global_choice = global_override if global_override.is_file() else global_agents
+    if global_choice.is_file():
+        result.append(global_choice)
+
+    for directory in directories:
+        override = directory / "AGENTS.override.md"
+        agents = directory / "AGENTS.md"
+        chosen = override if override.is_file() else agents
+        if chosen.is_file():
+            result.append(chosen)
+        for name in ("CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis"):
+            candidate = directory / name
+            if candidate.is_file():
+                result.append(candidate)
+        if directory == root:
+            for name in ("CONTRIBUTING.md", "README.md"):
+                candidate = directory / name
+                if candidate.is_file():
+                    result.append(candidate)
+
+    # Resolve aliases without changing precedence.
+    deduplicated: list[Path] = []
+    seen: set[Path] = set()
+    for path in result:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            deduplicated.append(resolved)
+    return deduplicated
 
 MANIFEST_LANGUAGE_MAP = {
     "package.json": ("JavaScript/TypeScript", "npm"),
@@ -335,7 +412,10 @@ def _next_local_session_id() -> int:
     return (max(known) + 1) if known else 1
 
 
-def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True) -> WorkspaceContext:
+def resolve_local_workspace(
+    cwd: Optional[Path] = None, *, discover: bool = True,
+    session_id: Optional[int] = None,
+) -> WorkspaceContext:
     """Resolve a launch directory into a purely local session -- no network
     calls, no RemoteAPIClient, no remote-assigned session/server id.
 
@@ -349,15 +429,33 @@ def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True
     resolve_swarm_subtask_workspace) are deliberately excluded from this
     match -- they share the same workspace_root by design, but are not a
     session an ordinary caller should ever land back in.
+
+    A session that is actively running right now (see
+    local_state.is_session_actively_running) is excluded too -- opening a
+    second terminal in the same directory while the first is mid-task used
+    to hand both processes the identical state.json row, so the second
+    process's writes (current_phase/running_action/active_task/queued
+    instructions) clobbered the first's live status: cross-talk between two
+    otherwise-unrelated terminal sessions. A genuinely idle or crashed
+    session (execution_status stuck at "running" with a stale updated_at)
+    still matches, preserving the normal "resume after Ctrl+C/crash" flow.
+
+    `session_id`, when given, skips all of the above matching and pins the
+    session explicitly -- the caller (the startup recent-session picker in
+    cli.py) already decided which row to land in and just needs the same
+    workspace bookkeeping/discovery this function otherwise does for its
+    own match.
     """
     workspace_root = str((cwd or Path.cwd()).resolve())
 
-    local_match = next((
-        sid for sid in reversed(local_state.all_known_session_ids())
-        if local_state.get_session_state(sid).primary_workspace == workspace_root
-        and not local_state.get_session_state(sid).is_swarm_child
-    ), None)
-    session_id = local_match if local_match is not None else _next_local_session_id()
+    if session_id is None:
+        local_match = next((
+            sid for sid in reversed(local_state.all_known_session_ids())
+            if (candidate := local_state.get_session_state(sid)).primary_workspace == workspace_root
+            and not candidate.is_swarm_child
+            and not local_state.is_session_actively_running(candidate)
+        ), None)
+        session_id = local_match if local_match is not None else _next_local_session_id()
 
     configured_roots = load_config(project_root=Path(workspace_root)).workspace_roots
     allowed_roots = list(dict.fromkeys([workspace_root, *configured_roots]))
@@ -371,8 +469,81 @@ def resolve_local_workspace(cwd: Optional[Path] = None, *, discover: bool = True
     return WorkspaceContext(session_id=session_id, workspace_root=workspace_root)
 
 
+@dataclass
+class RecentSessionInfo:
+    session_id: int
+    workspace_root: str
+    description: str
+    # "running" (another live process actively mid-task right now, see
+    # local_state.is_session_actively_running), "interrupted" (a killed CLI/
+    # crashed process left execution_status stuck at "running" with a stale
+    # updated_at), or "idle" (nothing outstanding).
+    status: str
+    updated_at: str
+
+
+def _describe_session_activity(state: local_state.SessionState) -> str:
+    """One-line summary of what a session was/is doing, for the startup
+    picker -- the same information `/resume` already prints (active_task
+    objective, then conversation_summary, then the last user turn) but
+    trimmed to a single short line instead of a full recap block."""
+    objective = str((state.active_task or {}).get("objective") or "").strip()
+    if objective:
+        return objective[:100]
+    if state.conversation_summary:
+        last_line = state.conversation_summary.strip().splitlines()[-1]
+        if last_line:
+            return last_line[:100]
+    for entry in reversed(state.conversation_history):
+        if entry.get("role") == "user" and str(entry.get("content") or "").strip():
+            return str(entry["content"]).strip().splitlines()[0][:100]
+    return "no recent activity"
+
+
+def _session_status(state: local_state.SessionState) -> str:
+    if local_state.is_session_actively_running(state):
+        return "running"
+    if state.execution_status in ("running", "backgrounded"):
+        return "interrupted"
+    return "idle"
+
+
+def recent_local_sessions_for_workspace(
+    workspace_root: Path, *, limit: int = 3,
+) -> list[RecentSessionInfo]:
+    """The most recently touched local sessions already pointed at this
+    workspace root, most-recent first -- feeds the startup picker in cli.py
+    so a user opening tamfis-code in a directory with existing work sees
+    what's there (and whether it's still running elsewhere or was cut off)
+    instead of silently landing wherever resolve_local_workspace's own
+    single-match reuse rule happens to put them.
+
+    Excludes swarm children for the same reason resolve_local_workspace's
+    own match does -- not a session an ordinary caller should ever resume
+    into directly.
+    """
+    root = str(Path(workspace_root).resolve())
+    candidates = [
+        state for sid in local_state.all_known_session_ids()
+        if not (state := local_state.get_session_state(sid)).is_swarm_child
+        and (state.primary_workspace == root or state.workspace_root == root)
+    ]
+    candidates.sort(key=lambda state: state.updated_at or "", reverse=True)
+    return [
+        RecentSessionInfo(
+            session_id=state.session_id,
+            workspace_root=state.workspace_root or state.primary_workspace,
+            description=_describe_session_activity(state),
+            status=_session_status(state),
+            updated_at=state.updated_at,
+        )
+        for state in candidates[:limit]
+    ]
+
+
 def resolve_swarm_subtask_workspace(
     workspace_root: Path, *, parent_session_id: Optional[int] = None, label: str = "",
+    isolate: bool = False,
 ) -> WorkspaceContext:
     """Like resolve_local_workspace, but for a concurrent swarm sub-task:
     always mints a fresh session id instead of reusing the same-
@@ -381,11 +552,26 @@ def resolve_swarm_subtask_workspace(
     Concurrent sub-tasks sharing one session_id would race on state.json's
     single-value fields (current_phase/running_action/active_task/...) --
     only queued_user_instructions/saved_plans are merge-safe there. Giving
-    each concurrent sub-task its own child session (same real filesystem
-    workspace_root, distinct state.json row, tagged is_swarm_child=True so
-    it can be filtered out of default session listings) sidesteps that
-    without adding locking to state.py's persistence layer, which every
-    other command in this codebase also depends on.
+    each concurrent sub-task its own child session (distinct state.json
+    row, tagged is_swarm_child=True so it can be filtered out of default
+    session listings) sidesteps that without adding locking to state.py's
+    persistence layer, which every other command in this codebase also
+    depends on.
+
+    `isolate=True` (the mutating-swarm case -- see run_swarm's mutate flag)
+    additionally gives the child its own git worktree instead of the same
+    real filesystem workspace_root the parent and every sibling share.
+    Before this, a "mutate" swarm child ran tool calls -- including
+    execute_command git invocations the model itself constructs -- directly
+    against the live checkout the parent session (and the user) were also
+    working in: a destructive command from one concurrent sub-task (a hard
+    reset, a forced checkout, a branch delete) landed on the SAME working
+    tree as every other sub-task and the parent, with no isolation at all.
+    Falls back to the shared root (today's behaviour) when the workspace
+    isn't a git repo, or worktree creation fails for any reason -- isolation
+    is a hardening measure, not a hard requirement to run a swarm at all.
+    read-only swarm children (`isolate=False`) keep sharing the real root:
+    they never mutate, so there is nothing for a worktree to protect against.
 
     parent_session_id is best-effort context (None when there's no
     pre-existing session to record -- e.g. `agent-cmd delegate` is a
@@ -398,9 +584,28 @@ def resolve_swarm_subtask_workspace(
     """
     resolved_root = str(Path(workspace_root).resolve())
     session_id = _next_local_session_id()
+    worktree_path: Optional[str] = None
+    worktree_branch: Optional[str] = None
+    if isolate:
+        from .runtime.worktree import WorktreeError, create_worktree
+
+        try:
+            handle = create_worktree(
+                resolved_root, branch=f"tamfis/swarm/{session_id}",
+            )
+        except WorktreeError:
+            # Not a git repo, or worktree creation otherwise failed -- run
+            # this sub-task against the shared root rather than failing the
+            # whole swarm over an isolation nicety.
+            pass
+        else:
+            resolved_root = str(handle.path)
+            worktree_path = str(handle.path)
+            worktree_branch = handle.branch
     local_state.save_session_state(
         session_id, workspace_root=resolved_root,
         parent_session_id=parent_session_id, is_swarm_child=True, swarm_label=label,
+        swarm_worktree_path=worktree_path, swarm_worktree_branch=worktree_branch,
     )
     return WorkspaceContext(session_id=session_id, workspace_root=resolved_root)
 
@@ -416,11 +621,23 @@ async def _get_or_create_local_server(client: RemoteAPIClient) -> dict:
 
 async def resolve_workspace(
     client: RemoteAPIClient, cwd: Optional[Path] = None, *, discover: bool = True,
+    server_id: Optional[int] = None, workspace_id: Optional[str] = None,
 ) -> WorkspaceContext:
     workspace_root = str((cwd or Path.cwd()).resolve())
 
-    server = await _get_or_create_local_server(client)
-    server_id = server["id"]
+    if server_id is None:
+        if hasattr(client, "ensure_agent_bridge"):
+            bridge = await client.ensure_agent_bridge(workspace_root)
+            server_id = int(bridge.server["id"])
+            workspace_id = bridge.workspace_id
+        else:
+            # Compatibility for embedding clients that implement the older
+            # Remote API surface but haven't adopted the local-agent bridge.
+            server = await _get_or_create_local_server(client)
+            server_id = int(server["id"])
+            bridge = None
+    else:
+        bridge = None
 
     # A session can move to an explicitly approved sibling workspace. Reuse
     # it by its durable primary root rather than creating a new conversation
@@ -443,6 +660,8 @@ async def resolve_workspace(
             )
             if discover:
                 discover_local_repository(local_match, Path(current))
+            if bridge is not None:
+                bridge.session_id = local_match
             return WorkspaceContext(session_id=local_match, server_id=server_id, workspace_root=current)
 
     sessions = await client.list_sessions()
@@ -450,7 +669,10 @@ async def resolve_workspace(
         (
             s for s in sessions
             if s.get("server_id") == server_id
-            and s.get("working_directory") == workspace_root
+            and (
+                (workspace_id and s.get("workspace_id") == workspace_id)
+                or (not workspace_id and s.get("working_directory") == workspace_root)
+            )
             and str(s.get("status", "")).lower() in REUSABLE_STATUSES
         ),
         None,
@@ -459,12 +681,21 @@ async def resolve_workspace(
         local_state.save_session_state(existing["id"], workspace_root=workspace_root)
         if discover:
             discover_local_repository(existing["id"], Path(workspace_root))
+        if bridge is not None:
+            bridge.session_id = existing["id"]
         return WorkspaceContext(session_id=existing["id"], server_id=server_id, workspace_root=workspace_root)
 
-    created = await client.create_session(server_id, workspace_root)
+    if workspace_id:
+        created = await client.create_session(
+            server_id, workspace_root, workspace_id=workspace_id,
+        )
+    else:
+        created = await client.create_session(server_id, workspace_root)
     local_state.save_session_state(created["id"], workspace_root=workspace_root)
     if discover:
         discover_local_repository(created["id"], Path(workspace_root))
+    if bridge is not None:
+        bridge.session_id = created["id"]
     return WorkspaceContext(session_id=created["id"], server_id=server_id, workspace_root=workspace_root)
 
 
@@ -784,6 +1015,162 @@ def _discover_project_type(workspace_root: Path) -> dict[str, Any]:
     return result("unknown", package_manager=None)
 
 
+# Preference order for a real type/build verification script in package.json.
+# "build" is deliberately last and weakest: bundlers like esbuild/vite catch
+# syntax errors (a genuinely truncated file) but not type errors -- a project
+# with a real truncated function body can still report a clean `npm run
+# build` while `npm run check`/`typecheck` (a real `tsc` invocation) fails on
+# the same code. Confirmed live: TamfisSEO Pro's package.json has "check":
+# "tsc -b" (not the generically-named "typecheck" enforcer.py's own script
+# list already looked for), so both this and that list needed the same fix.
+_JS_VERIFY_SCRIPT_PRIORITY = ("check", "typecheck", "type-check", "verify", "build")
+
+
+def detect_verify_command(workspace_root: Path) -> Optional[tuple[str, str]]:
+    """Best available "did this actually compile/typecheck" command for a
+    JS/TS project, as (script_name, full_shell_command), or None if this
+    isn't a JS/TS project or none of the known script names are present.
+
+    Deliberately narrow (JS/TS only, for now) rather than reusing the
+    broader test_commands detection in _project_metadata -- that list is
+    about running the test *suite*, not verifying the code actually builds,
+    and mixing the two would silently satisfy this check with `npm test`
+    passing while the project still fails to type-check or bundle.
+    """
+    root = Path(workspace_root).expanduser().resolve()
+    project_type = _discover_project_type(root)
+    if project_type.get("language") not in {"JavaScript", "TypeScript", "JavaScript/TypeScript"}:
+        return None
+
+    package_json = root / "package.json"
+    if not package_json.is_file():
+        return None
+
+    try:
+        pkg = json.loads(package_json.read_text(encoding="utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+
+    scripts = pkg.get("scripts") if isinstance(pkg, dict) else None
+    if not isinstance(scripts, dict):
+        return None
+
+    for name in _JS_VERIFY_SCRIPT_PRIORITY:
+        if name in scripts:
+            return name, f"npm run {name}"
+
+    return None
+
+
+def detect_validation_commands(workspace_root: Path) -> list[tuple[str, str]]:
+    """Return declared, language-aware checks required after an edit."""
+    root = Path(workspace_root).expanduser().resolve()
+    commands: list[tuple[str, str]] = []
+
+    def add(label: str, command: str) -> None:
+        if not any(existing == command for _, existing in commands):
+            commands.append((label, command))
+
+    if (root / ".git").exists():
+        add("git diff --check", "git diff --check")
+
+    project_type = _discover_project_type(root)
+    language = project_type.get("language")
+
+    if language in {"JavaScript", "TypeScript", "JavaScript/TypeScript"}:
+        try:
+            package = json.loads((root / "package.json").read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            package = {}
+        scripts = package.get("scripts") if isinstance(package, dict) else {}
+        if isinstance(scripts, dict):
+            for name in _JS_VERIFY_SCRIPT_PRIORITY:
+                if name in scripts:
+                    add(f"npm run {name}", f"npm run {name}")
+            if "test" in scripts:
+                add("npm test", "npm test")
+
+    elif language == "Python":
+        add("Python syntax check", "python -m compileall -q .")
+        manifest_text = ""
+        for manifest in (root / "pyproject.toml", root / "setup.cfg"):
+            if manifest.is_file():
+                try:
+                    manifest_text += manifest.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    pass
+        if (root / "ruff.toml").is_file() or "[tool.ruff" in manifest_text:
+            add("ruff check", "ruff check .")
+        if ((root / "pytest.ini").is_file() or (root / "tox.ini").is_file()
+                or "pytest" in manifest_text or (root / "tests").is_dir()):
+            add("pytest", "pytest -q")
+
+    elif language == "PHP":
+        add("PHP syntax check", "find . -type f -name '*.php' -not -path './vendor/*' -not -path './node_modules/*' -print0 | xargs -0 -r -n1 php -l")
+        if (root / "composer.json").is_file():
+            try:
+                composer = json.loads((root / "composer.json").read_text(encoding="utf-8", errors="replace"))
+            except (OSError, ValueError):
+                composer = {}
+            scripts = composer.get("scripts") if isinstance(composer, dict) else {}
+            if isinstance(scripts, dict):
+                for name in ("lint", "stan", "analyse", "test"):
+                    if name in scripts:
+                        add(f"composer {name}", f"composer run {name}")
+
+    elif language == "Go":
+        add("go vet", "go vet ./...")
+        add("go test", "go test ./...")
+        add("go build", "go build ./...")
+    elif language == "Rust":
+        add("cargo fmt", "cargo fmt --check")
+        add("cargo check", "cargo check")
+        add("cargo test", "cargo test")
+    elif language in {"C#", "F#"}:
+        add("dotnet build", "dotnet build")
+        if (root / "tests").is_dir() or any(root.glob("*.sln")):
+            add("dotnet test", "dotnet test")
+    elif language in {"Java", "Java/Kotlin", "Kotlin"}:
+        if (root / "mvnw").is_file():
+            add("Maven test", "./mvnw test")
+            add("Maven package", "./mvnw package -DskipTests")
+        elif (root / "pom.xml").is_file():
+            add("Maven test", "mvn test")
+            add("Maven package", "mvn package -DskipTests")
+        elif (root / "gradlew").is_file():
+            add("Gradle test", "./gradlew test")
+            add("Gradle build", "./gradlew build")
+    elif language == "Ruby":
+        if (root / "Rakefile").is_file():
+            add("Ruby tests", "bundle exec rake test")
+        else:
+            add("Ruby syntax check", "find . -type f -name '*.rb' -not -path './vendor/*' -print0 | xargs -0 -r -n1 ruby -c")
+    elif language == "Dart":
+        add("Dart analyze", "dart analyze")
+        add("Dart test", "dart test")
+    elif language == "Elixir":
+        add("Mix compile", "mix compile --warnings-as-errors")
+        add("Mix test", "mix test")
+    elif language in {"Haskell", "Scala", "Clojure", "Perl", "Swift"}:
+        commands_by_language = {
+            "Haskell": ("stack test", "stack build"), "Scala": ("sbt test", "sbt compile"),
+            "Clojure": ("clojure -M:test", "clojure -M:compile"), "Perl": ("prove -r t",),
+            "Swift": ("swift test", "swift build"),
+        }
+        for command in commands_by_language.get(language, ()):
+            add(command, command)
+
+    # Manifest-light native projects.
+    if (root / "CMakeLists.txt").is_file():
+        add("CMake build", "cmake -S . -B build && cmake --build build")
+    elif (root / "Makefile").is_file() or (root / "makefile").is_file():
+        add("Make build", "make")
+    if any(root.glob("*.sh")):
+        add("shell syntax check", "find . -type f -name '*.sh' -not -path './node_modules/*' -not -path './vendor/*' -print0 | xargs -0 -r -n1 bash -n")
+
+    return commands
+
+
 def discover_local_repository(session_id: int, workspace_root: Path, *, force: bool = False) -> dict[str, Any]:
     """Cache local CLI context until Git HEAD or dirty-file count changes.
 
@@ -797,24 +1184,27 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
     head = _git(root, "rev-parse", "HEAD") or "no-head"
     dirty_lines = _git(root, "status", "--short").splitlines()
     fingerprint_inputs = [str(root), head, *dirty_lines]
-    for name in sorted(set(MANIFEST_LANGUAGE_MAP) | INSTRUCTION_NAMES):
+    for name in sorted(MANIFEST_LANGUAGE_MAP):
         path = root / name
         if path.is_file():
             try:
                 fingerprint_inputs.append(f"{name}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
             except OSError:
                 pass
+    instruction_paths = _instruction_chain(root, workspace_root)
+    for path in instruction_paths:
+        try:
+            fingerprint_inputs.append(f"instruction:{path}:{path.stat().st_mtime_ns}:{path.stat().st_size}")
+        except OSError:
+            pass
     fingerprint = hashlib.sha256("|".join(fingerprint_inputs).encode()).hexdigest()
     current = local_state.get_session_state(session_id)
     if not force and current.discovery_fingerprint == fingerprint and current.repository_context:
         return current.repository_context
 
     files = _indexable_files(root)
-    instructions: list[str] = []
     reports: list[dict[str, Any]] = []
     for path in files:
-        if path.name in INSTRUCTION_NAMES:
-            instructions.append(str(path))
         if path.suffix.lower() in REPORT_SUFFIXES and REPORT_RE.search(path.name):
             try:
                 modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
@@ -830,7 +1220,7 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
         "branch": branch, "head": None if head == "no-head" else head,
         "dirty": bool(dirty_lines), "dirty_files": dirty_lines[:100],
         "blocking_dirty_files": blocking_dirty_files(dirty_lines)[:100],
-        "instruction_files": sorted(instructions), "indexed_file_count": len(files),
+        "instruction_files": [str(path) for path in instruction_paths], "indexed_file_count": len(files),
         "indexed_at": datetime.now(timezone.utc).isoformat(),
         **_project_metadata(root, files),
     }
@@ -846,7 +1236,7 @@ def discover_local_repository(session_id: int, workspace_root: Path, *, force: b
 # Total instruction-file content budget for the system prompt -- generous
 # enough for a real AGENTS.md/CLAUDE.md, bounded so a huge README doesn't
 # blow the context window before the actual objective is even sent.
-MAX_INSTRUCTION_CHARS = 12_000
+MAX_INSTRUCTION_CHARS = 32 * 1024
 
 
 def build_system_prompt(session_id: int, workspace_root: Path, *, force_discovery: bool = False) -> str:
@@ -867,6 +1257,15 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "changing a file, call the tool that changes it before you say you've changed it. "
         "If you're unsure which file actually defines something, use read_file or "
         "search_code to find it first; do not guess a file's contents from its name.",
+        "Treat deployment claims as an evidence chain, not as prose. Before saying a file or "
+        "configuration was updated, confirm the successful mutation record names that exact "
+        "canonical path. Before saying a build passed, run the real build/check after the last "
+        "mutation and inspect its zero exit status. Before saying a service restarted or is live, "
+        "identify its real service unit/working directory/compiled entrypoint, run the restart, "
+        "then verify the running process and a real health or behavioral endpoint. A restart "
+        "command by itself is never proof the feature works. If any link in that chain is missing "
+        "or fails, report the precise blocker and never use words such as fixed, live, verified, "
+        "working, or successful for that outcome.",
         "When calling write_file to create a new source file, the path's extension must "
         "match the real language of the content you're writing (.py, .js, .ts, .go, .php, "
         ".css, etc.) -- never fall back to a generic '.txt' (or any other wrong extension) "
@@ -884,6 +1283,14 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "do. If the request is too broad to make that concrete next choice at all, say so "
         "and ask the user to narrow it (a specific component, directory, or concern) instead "
         "of stalling on repeated top-level listings.",
+        "A real filesystem permission failure is a host execution-boundary problem, not a "
+        "reason to relocate the repository. Never copy or clone the project into another "
+        "home directory, recursively change its ownership/mode, try sudo, ask for a sudo "
+        "password, or narrate those possibilities. Keep the canonical workspace unchanged. "
+        "After one real denied tool result, identify the exact command and denied path "
+        "concisely and let the platform approval/host-permission boundary handle access; "
+        "do not repeat the same command or produce a running monologue about users, groups, "
+        "ownership, or hypothetical workarounds.",
         "Before checking whether any local service is 'healthy' or 'running', you must "
         "first find its REAL configured port -- do not use 8080/3000/5000/8000 or any "
         "other common default unless you have actually confirmed that's the real one. "
@@ -919,6 +1326,12 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
     # only None when that git call failed (see its `"no-head"` sentinel).
     if context.get("head"):
         lines.append(f"Git repository root: {context['repository_root']}  branch: {context.get('branch') or '(detached HEAD)'}")
+        lines.append(
+            "For Git publishing requests, inspect status, diff, remotes, and the current branch first. "
+            "Stage only files belonging to this task, commit with a concise message, and push the current "
+            "branch only after the normal approval gate. Never force-push or rewrite history unless the user "
+            "explicitly requests it."
+        )
         if context.get("dirty"):
             lines.append(
                 f"The working tree already has {len(context.get('dirty_files') or [])} uncommitted change(s) -- "

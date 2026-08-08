@@ -113,7 +113,7 @@ CREDENTIALS_PATH = CONFIG_DIR / "credentials.json"
 USER_CONFIG_PATH = CONFIG_DIR / "config.toml"
 PROJECT_CONFIG_RELATIVE = Path(".tamfis") / "config.toml"
 
-DEFAULT_API_BASE = "http://127.0.0.1:9500"
+DEFAULT_API_BASE = "https://gpt.tamfitronics.com"
 
 
 def _load_toml(path: Path) -> dict[str, Any]:
@@ -138,6 +138,11 @@ class Config:
     # raise it for slow cloud models; hitting it mid-generation discarded
     # the whole task instead of just ending the turn.
     turn_runtime_seconds: float = 900.0
+    # Raw tool calls permitted across one complete task. The outer agent loop
+    # already supports three 40-round windows for long, progressing work; the
+    # old inner default of 40 contradicted that extension and terminated the
+    # task first. Repetition/stall guards remain independently enforced.
+    max_tool_calls: int = 120
     # How many times a turn may auto-renew its runtime budget and continue
     # (rather than the task failing outright) when it runs out of time
     # mid-execution. Purely a safety cap on the continuation loop --
@@ -155,7 +160,10 @@ class Config:
     # prompts interleaving across sessions, concurrent state.json writers)
     # that need validating against a live backend before being on by default.
     enable_subagent_delegation: bool = False
-    # "standalone" (default): call a provider directly, no TamfisGPT backend.
+    # "auto" is retained as a compatibility spelling for the local runtime.
+    # Authentication controls subscription/model entitlement only; it must
+    # never transfer tool or workspace execution to a remote agent runtime.
+    # "standalone": call a provider directly, no TamfisGPT backend.
     # "remote": use the TamfisGPT Remote Workspace backend for every command
     # without needing --remote on each invocation -- set this once (via
     # `tamfis-code login` writing it, or manually in config.toml) for a paid
@@ -167,6 +175,12 @@ class Config:
     # multi-project service practical without granting access to the whole
     # filesystem.
     workspace_roots: list[str] = field(default_factory=list)
+    # Shell commands are kernel-isolated by default. File tools retain their
+    # existing workspace boundary independently of this setting.
+    sandbox_mode: str = "workspace-write"
+    sandbox_network_access: bool = False
+    sandbox_writable_roots: list[str] = field(default_factory=list)
+    sandbox_fail_if_unavailable: bool = False
     sources: dict[str, str] = field(default_factory=dict)  # field -> where it came from, for `doctor`/`config`
 
     def as_dict(self) -> dict[str, Any]:
@@ -177,12 +191,17 @@ class Config:
             "output_mode": self.output_mode,
             "timeout_seconds": self.timeout_seconds,
             "turn_runtime_seconds": self.turn_runtime_seconds,
+            "max_tool_calls": self.max_tool_calls,
             "max_runtime_extensions": self.max_runtime_extensions,
             "max_repair_extensions": self.max_repair_extensions,
             "debug": self.debug,
             "enable_subagent_delegation": self.enable_subagent_delegation,
             "default_backend": self.default_backend,
             "workspace_roots": self.workspace_roots,
+            "sandbox_mode": self.sandbox_mode,
+            "sandbox_network_access": self.sandbox_network_access,
+            "sandbox_writable_roots": self.sandbox_writable_roots,
+            "sandbox_fail_if_unavailable": self.sandbox_fail_if_unavailable,
         }
 
 
@@ -215,6 +234,9 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "turn_runtime_seconds" in data:
             cfg.turn_runtime_seconds = float(data["turn_runtime_seconds"])
             cfg.sources["turn_runtime_seconds"] = source_name
+        if "max_tool_calls" in data:
+            cfg.max_tool_calls = int(data["max_tool_calls"])
+            cfg.sources["max_tool_calls"] = source_name
         if "max_runtime_extensions" in data:
             cfg.max_runtime_extensions = int(data["max_runtime_extensions"])
             cfg.sources["max_runtime_extensions"] = source_name
@@ -224,7 +246,7 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "enable_subagent_delegation" in data:
             cfg.enable_subagent_delegation = bool(data["enable_subagent_delegation"])
             cfg.sources["enable_subagent_delegation"] = source_name
-        if data.get("default_backend") in ("standalone", "remote"):
+        if data.get("default_backend") in ("auto", "standalone", "remote"):
             cfg.default_backend = str(data["default_backend"])
             cfg.sources["default_backend"] = source_name
         configured_roots = data.get("workspace_roots")
@@ -235,6 +257,22 @@ def load_config(project_root: Optional[Path] = None) -> Config:
                 if isinstance(item, str) and item.strip()
             ]
             cfg.sources["workspace_roots"] = source_name
+        if data.get("sandbox_mode") in ("read-only", "workspace-write", "danger-full-access"):
+            cfg.sandbox_mode = str(data["sandbox_mode"])
+            cfg.sources["sandbox_mode"] = source_name
+        if "sandbox_network_access" in data:
+            cfg.sandbox_network_access = bool(data["sandbox_network_access"])
+            cfg.sources["sandbox_network_access"] = source_name
+        sandbox_roots = data.get("sandbox_writable_roots")
+        if isinstance(sandbox_roots, list):
+            cfg.sandbox_writable_roots = [
+                str(Path(item).expanduser().resolve()) for item in sandbox_roots
+                if isinstance(item, str) and item.strip()
+            ]
+            cfg.sources["sandbox_writable_roots"] = source_name
+        if "sandbox_fail_if_unavailable" in data:
+            cfg.sandbox_fail_if_unavailable = bool(data["sandbox_fail_if_unavailable"])
+            cfg.sources["sandbox_fail_if_unavailable"] = source_name
 
     env_api_base = os.environ.get("TAMFIS_CODE_API_BASE")
     if env_api_base:
@@ -252,7 +290,7 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         cfg.sources["enable_subagent_delegation"] = "env TAMFIS_CODE_ENABLE_SUBAGENT_DELEGATION"
 
     env_backend = os.environ.get("TAMFIS_CODE_DEFAULT_BACKEND")
-    if env_backend in ("standalone", "remote"):
+    if env_backend in ("auto", "standalone", "remote"):
         cfg.default_backend = env_backend
         cfg.sources["default_backend"] = "env TAMFIS_CODE_DEFAULT_BACKEND"
 
@@ -260,6 +298,11 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_turn_runtime:
         cfg.turn_runtime_seconds = float(env_turn_runtime)
         cfg.sources["turn_runtime_seconds"] = "env TAMFIS_CODE_TURN_RUNTIME_SECONDS"
+
+    env_max_tool_calls = os.environ.get("TAMFIS_CODE_MAX_TOOL_CALLS")
+    if env_max_tool_calls:
+        cfg.max_tool_calls = int(env_max_tool_calls)
+        cfg.sources["max_tool_calls"] = "env TAMFIS_CODE_MAX_TOOL_CALLS"
 
     env_runtime_extensions = os.environ.get("TAMFIS_CODE_MAX_RUNTIME_EXTENSIONS")
     if env_runtime_extensions:
@@ -279,6 +322,24 @@ def load_config(project_root: Optional[Path] = None) -> Config:
             if item.strip()
         ]
         cfg.sources["workspace_roots"] = "env TAMFIS_CODE_WORKSPACE_ROOTS"
+
+    env_sandbox = os.environ.get("TAMFIS_CODE_SANDBOX_MODE")
+    if env_sandbox in ("read-only", "workspace-write", "danger-full-access"):
+        cfg.sandbox_mode = env_sandbox
+        cfg.sources["sandbox_mode"] = "env TAMFIS_CODE_SANDBOX_MODE"
+
+    env_sandbox_network = os.environ.get("TAMFIS_CODE_SANDBOX_NETWORK_ACCESS")
+    if env_sandbox_network is not None:
+        cfg.sandbox_network_access = env_sandbox_network.lower() in {"1", "true", "yes"}
+        cfg.sources["sandbox_network_access"] = "env TAMFIS_CODE_SANDBOX_NETWORK_ACCESS"
+
+    env_sandbox_roots = os.environ.get("TAMFIS_CODE_SANDBOX_WRITABLE_ROOTS")
+    if env_sandbox_roots:
+        cfg.sandbox_writable_roots = [
+            str(Path(item.strip()).expanduser().resolve())
+            for item in env_sandbox_roots.split(os.pathsep) if item.strip()
+        ]
+        cfg.sources["sandbox_writable_roots"] = "env TAMFIS_CODE_SANDBOX_WRITABLE_ROOTS"
 
     return cfg
 

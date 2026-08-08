@@ -6,10 +6,16 @@ CLI or deterministic runtime from starting.
 """
 from __future__ import annotations
 
+import os
 from importlib import import_module
 from typing import Any
 
-__version__ = "1.3.0"
+# CPR probes make some terminals pause or leave the interactive UI looking
+# frozen.  The CLI uses prompt-toolkit, so disable the probe by default; users
+# with a terminal that implements CPR can explicitly opt back in.
+os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
+
+__version__ = "1.6.11"
 MIN_COMPATIBLE_API_VERSION = "remote-ai-v2"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {

@@ -6,6 +6,7 @@ from rich.console import Console
 from types import SimpleNamespace
 
 from tamfis_code.render import (
+    BRANDED_PROVIDER_LABEL,
     StreamRenderer,
     _tool_action_label,
     _tool_result_message,
@@ -75,6 +76,40 @@ class ToolActionLabelSecretRedactionTests(unittest.TestCase):
 
 
 class StreamRendererTests(unittest.TestCase):
+    def test_read_tools_show_only_a_compact_progress_line(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_call_requested",
+            "payload": {"name": "read_file", "arguments": {"path": "src/app.ts"}},
+        })
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {"tool": "read_file", "arguments": {"path": "src/app.ts"}, "content": "secret implementation\n"},
+        })
+        output = console.file.getvalue()
+        self.assertIn("Read src/app.ts", output)
+        self.assertNotIn("secret implementation", output)
+        self.assertNotIn("→", output)
+
+    def test_mutation_tool_announcement_is_live_only_on_a_tty(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_call_requested",
+            "payload": {"name": "edit_file", "arguments": {"path": "src/app.ts"}},
+        })
+        renderer.handle_event({
+            "event_type": "file_mutation",
+            "payload": {"path": "src/app.ts", "lines_added": 2, "lines_removed": 1, "mutation_id": "m1"},
+        })
+        output = console.file.getvalue()
+        self.assertNotIn("→ Editing", output)
+        self.assertIn("src/app.ts", output)
+        self.assertIn("2", output)
+        self.assertIn("-1", output)
+        renderer.finish()
+
     def test_assistant_delta_streams_and_sets_streamed_final_text(self):
         console = _console()
         renderer = StreamRenderer(console)
@@ -121,6 +156,32 @@ class StreamRendererTests(unittest.TestCase):
         label = str(status.text) if hasattr(status, "text") else str(status)
         self.assertIn("thought for", label)
         renderer.finish()
+
+    def test_live_footer_has_spinner_rotating_activity_model_and_elapsed(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer._phase = "execute"
+        renderer._model = "kimi-k2.7-code:cloud"
+        renderer._task_start -= 5
+
+        status = renderer.live_input_status("⠹")
+
+        self.assertTrue(status.startswith("⠹ "))
+        self.assertTrue(any(word in status for word in ("Coding", "Wiring", "Polishing")))
+        self.assertIn("kimi-k2.7-code:cloud", status)
+        self.assertIn("5s", status)
+
+    def test_completed_turn_leaves_worked_for_summary(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer._model = "kimi-k2.7-code:cloud"
+        renderer._task_start -= 65
+
+        renderer.print_work_summary("completed")
+        output = console.file.getvalue()
+
+        self.assertIn("✻ Worked for 1m 5s", output)
+        self.assertIn("kimi-k2.7-code:cloud", output)
 
     def test_status_line_shows_no_mode_tag_by_default(self):
         console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
@@ -196,6 +257,75 @@ class StreamRendererTests(unittest.TestCase):
         finally:
             renderer.finish()
 
+    def test_round_activity_summary_aggregates_across_the_whole_task(self):
+        from tamfis_code.render import _round_activity_summary
+
+        # First-used order, not alphabetical: search then read then a shell
+        # command, matching a real turn's actual sequence of actions.
+        summary = _round_activity_summary({"search_code": 1, "read_file": 1, "execute_command": 1})
+        self.assertEqual(
+            summary, "Searching for 1 pattern, reading 1 file, running 1 shell command…",
+        )
+        self.assertEqual(_round_activity_summary({"read_file": 2}), "Reading 2 files…")
+        self.assertEqual(_round_activity_summary({}), "")
+        # Tools with no category entry (e.g. retrieve_evidence) are simply
+        # not counted, not an error.
+        self.assertEqual(_round_activity_summary({"retrieve_evidence": 3}), "")
+
+    def test_activity_summary_survives_across_rounds_and_shows_above_the_spinner(self):
+        # Renders via StreamRenderer's own automatic Live region (force_terminal
+        # triggers it in __init__), so the console's captured text interleaves
+        # several async self-refreshes -- not reliable for an ordering check.
+        # Inspect the Group's renderables directly instead.
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.handle_event({"event_type": "task_started", "payload": {}})
+            renderer.handle_event({
+                "event_type": "tool_call_requested",
+                "payload": {"name": "search_code", "arguments": {"query": "foo"}},
+            })
+            renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "search_code"}})
+            # A second, later round's tool call must ADD to the tally, not
+            # replace it -- see _round_tool_counts only resetting on
+            # task_started/context_loading, never per round.
+            renderer.handle_event({
+                "event_type": "tool_call_requested",
+                "payload": {"name": "read_file", "arguments": {"path": "x.py"}},
+            })
+            group = renderer._build_status()
+            summary_index = next(
+                i for i, item in enumerate(group.renderables)
+                if "Searching for 1 pattern, reading 1 file" in getattr(item, "plain", "")
+            )
+            spinner_index = list(group.renderables).index(renderer._spinner)
+            self.assertLess(summary_index, spinner_index)
+        finally:
+            renderer.finish()
+
+    def test_running_shell_command_gets_its_own_live_line(self):
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.handle_event({
+                "event_type": "tool_call_requested",
+                "payload": {"name": "execute_command", "arguments": {"command": "pytest -q"}},
+            })
+            output_running = console.file.getvalue()
+            console.print(renderer._build_status())
+            output_running = console.file.getvalue()
+            self.assertIn("$ pytest -q", output_running)
+
+            renderer.handle_event({
+                "event_type": "tool_output",
+                "payload": {"tool": "execute_command", "result": {"success": True}},
+            })
+            console.print(renderer._build_status())
+            output_after = console.file.getvalue()[len(output_running):]
+            self.assertNotIn("$ pytest -q", output_after)
+        finally:
+            renderer.finish()
+
     def test_all_tips_reference_real_commands_only(self):
         # Every tip must name a command that actually exists in cli.py's
         # registered command set (or a real REPL slash command) -- this
@@ -207,8 +337,8 @@ class StreamRendererTests(unittest.TestCase):
 
         real_commands = set(cli.commands.keys())
         real_repl_commands = {
-            "mode", "compact", "diffs", "diff", "revert", "resume", "retry",
-            "plan", "execute-plan", "queue", "model", "pty", "delegate",
+            "mode", "compact", "summary", "diffs", "diff", "revert", "resume", "retry",
+            "plan", "execute-plan", "queue", "model", "pty", "delegate", "cd",
             "status", "context", "clear", "exit", "quit", "detach", "help",
         }
         for tip in _TIPS:
@@ -256,8 +386,11 @@ class StreamRendererTests(unittest.TestCase):
         self.assertNotIn("Focused workspace scope", output)
         self.assertNotIn("Reusing workspace context", output)
         self.assertNotIn("Workspace rescanned", output)
-        self.assertIn("Using nvidia · x", output)
-        self.assertEqual(renderer._selected_provider, "nvidia")
+        # The route is visible, but branded -- the raw backend/model id
+        # ("nvidia · x") must never reach the user.
+        self.assertIn(f"Using {BRANDED_PROVIDER_LABEL}", output)
+        self.assertNotIn("nvidia", output)
+        self.assertEqual(renderer._selected_provider, "TamfisGPT")
 
     def test_standalone_banner_does_not_call_auto_provider_a_local_host(self):
         console = _console()
@@ -270,7 +403,8 @@ class StreamRendererTests(unittest.TestCase):
         )
         output = console.file.getvalue()
         self.assertIn("Runtime: standalone", output)
-        self.assertIn("Provider: auto (ollama_cloud, nvidia, hf, openrouter, in authoritative priority order)", output)
+        self.assertIn("Model: TamfisGPT Auto", output)
+        self.assertNotIn("ollama", output.lower())
         self.assertNotIn("Host: local:auto", output)
 
     def test_routine_per_turn_setup_lines_show_in_debug_mode(self):
@@ -283,7 +417,7 @@ class StreamRendererTests(unittest.TestCase):
         output = console.file.getvalue()
         self.assertIn("Focused workspace scope", output)
         self.assertIn("Reusing workspace context", output)
-        self.assertIn("Provider:", output)
+        self.assertIn("Model: TamfisGPT Ultra", output)
 
     def test_model_selected_with_empty_model_shows_provider_default_not_unknown(self):
         # Tier IV/NIM routes leave the resolved model blank by design
@@ -296,7 +430,7 @@ class StreamRendererTests(unittest.TestCase):
         renderer.handle_event({"event_type": "model_selected", "payload": {"provider": "nvidia_nim", "model": "", "selection_reason": "r"}})
         output = console.file.getvalue()
         self.assertNotIn("unknown", output)
-        self.assertIn("(provider default)", output)
+        self.assertIn("TamfisGPT Auto", output)
 
     def test_approval_required_uses_top_level_command_text_not_nested_object(self):
         # Regression guard: the real backend payload for approval_required
@@ -311,6 +445,20 @@ class StreamRendererTests(unittest.TestCase):
             "payload": {"command_id": 42, "command": "rm -rf build", "risk_level": "medium"},
         })
         self.assertIn("rm -rf build", console.file.getvalue())
+
+    def test_approval_required_masks_inline_program_password(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "approval_required",
+            "payload": {
+                "command": "node -e \"new Pool({password: 'example-only-secret'})\"",
+                "risk_level": "medium",
+            },
+        })
+        output = console.file.getvalue()
+        self.assertNotIn("example-only-secret", output)
+        self.assertIn("password: '***'", output)
 
     def test_approval_required_renders_a_diff_when_the_payload_carries_one(self):
         console = _console()
@@ -345,6 +493,46 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("Ran command", output)
         self.assertIn("✓", output)
         self.assertIn("✗", output)
+
+    def test_failed_read_shows_the_actual_reason_not_just_the_target(self):
+        # Live-caught bug: this used to print only "Read failed <target>"
+        # with the real error (not_found/permission_denied/etc.) silently
+        # discarded, leaving the user with no idea why the read failed.
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "read_file",
+                "arguments": {"path": "/etc/shadow"},
+                "result": {
+                    "success": False,
+                    "status": "permission_denied",
+                    "path": "/etc/shadow",
+                },
+            },
+        })
+        output = console.file.getvalue()
+        self.assertIn("Read failed", output)
+        self.assertIn("/etc/shadow", output)
+        self.assertIn("Permission denied", output)
+
+    def test_failed_edit_is_never_labeled_edited(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "edit_file",
+                "result": {
+                    "content": "❌ Error: old_string not found -- no changes made",
+                    "success": False,
+                },
+            },
+        })
+        output = console.file.getvalue()
+        self.assertIn("✗ Edit failed", output)
+        self.assertNotIn("✓ Edited", output)
 
     def test_empty_tool_completion_envelope_is_not_rendered_as_fake_result(self):
         console = _console()

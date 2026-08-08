@@ -2,10 +2,12 @@
 
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass, field
+import contextlib
 import html
 import json
 import os
 import re
+import signal
 import subprocess
 import fnmatch
 import asyncio
@@ -15,6 +17,8 @@ import sys
 import shutil
 import tarfile
 import tempfile
+import time
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -22,11 +26,19 @@ import httpx
 from rich.panel import Panel
 
 from .render import resume_live_if_active, suspend_live_if_active
+from .sandbox import SandboxPolicy, build_sandbox_command
+# MCP commands can be invoked without constructing a ProviderManager (for
+# example, `tamfis-code tools list`). Reuse the canonical project `.env`
+# loader here so TAMGPT_MCP_CONFIG and TAMFIS_MONOREPO_ROOT are available in
+# that path too, while preserving already-exported environment variables.
+from .providers import _load_project_env
+
+_load_project_env()
 
 # web_search (see MCPServer._web_search) is self-contained rather than
 # reusing tamgpt6's WebSearchManager via _import_monorepo_attr, unlike
-# browser (which needs Playwright's real headless browser binary and is
-# only meaningful when co-located). A plain search-API HTTP call is cheap
+# browser. Both capabilities are implemented in this standalone package.
+# A plain search-API HTTP call is cheap
 # enough to implement natively, so tamfis-code keeps a working web_search
 # tool when installed standalone on a machine that never had tamgpt6 on it
 # at all -- confirmed as the right call by the user (portability over
@@ -45,6 +57,15 @@ _DDG_RESULT_RE = re.compile(
 )
 _DDG_SNIPPET_RE = re.compile(r'<a class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+
+def _sandbox_result(command: Any) -> Dict[str, Any]:
+    if command is None:
+        return {"active": False, "backend": "not-configured"}
+    result: Dict[str, Any] = {"active": command.active, "backend": command.backend}
+    if command.warning:
+        result["warning"] = command.warning
+    return result
 
 
 def _parse_duckduckgo_html(html_text: str, max_results: int) -> List[Dict[str, str]]:
@@ -113,18 +134,17 @@ def _import_monorepo_attr(module_path: str, attr: str):
     return None
 
 
-def _get_shared_mcp_bridge():
-    """Load the monorepo MCP bridge, if a tamgpt6 checkout is co-located.
-
-    Returns None otherwise -- see _import_monorepo_attr's docstring.
-    """
-    get_mcp_bridge = _import_monorepo_attr("tier_viii_infrastructure.mcp.orchestrator_bridge", "get_mcp_bridge")
-    return get_mcp_bridge() if get_mcp_bridge is not None else None
+def _get_shared_mcp_bridge(workspace_root: str | None = None):
+    """Return Tamfis Code's standalone MCP client bridge."""
+    from .mcp_client import StandaloneMCPBridge
+    return StandaloneMCPBridge(workspace_root)
 
 
 def get_browser_tool_class():
-    """Load BrowserTool, if a tamgpt6 checkout is co-located, else None."""
-    return _import_monorepo_attr("tier_iv_orchestration.tools.browser_tool", "BrowserTool")
+    """Return tamfis-code's portable Playwright browser implementation."""
+    from .browser import PortableBrowserTool
+
+    return PortableBrowserTool
 
 
 # Directory names never descended into or enumerated by list_directory/
@@ -149,6 +169,88 @@ MAX_SEARCH_RESULTS = 200
 MAX_SEARCH_FILE_SIZE_BYTES = 2_000_000
 MAX_SEARCH_MATCH_CHARS = 500
 
+# How much of a still-running (or already-finished) background job's own
+# output read_background_job returns per call -- same bounded-tail idea as
+# the rest of this module's output caps, so polling a chatty long-running
+# command repeatedly can't blow the context budget.
+MAX_BACKGROUND_OUTPUT_CHARS = 20_000
+
+
+@dataclass
+class BackgroundJob:
+    """A command detached from execute_command's normal blocking wait (see
+    _execute_command's background_signal) -- the real asyncio.subprocess.
+    Process keeps running exactly as it was, not restarted under a
+    different mechanism; only who's waiting on it changes.
+
+    Registered at module level, not per-MCPServer-instance: MCPServer is
+    recreated fresh every turn (see runner_local.py), but a backgrounded
+    job legitimately needs to survive past the turn that started it -- the
+    whole point is "keep working, check on this later," possibly several
+    turns later.
+    """
+    job_id: str
+    command: str
+    cwd: str
+    started_at: float
+    proc: "asyncio.subprocess.Process"
+    # The SAME communicate() call _execute_command already had in flight
+    # when it detached -- must be awaited here, not re-issued. A second,
+    # concurrent proc.communicate() call on top of the first would race it
+    # for the same stdout/stderr pipes, which asyncio explicitly forbids.
+    communicate_task: "asyncio.Task"
+    stdout: str = ""
+    stderr: str = ""
+    return_code: Optional[int] = None
+    finished: bool = False
+    error: str = ""
+
+
+_BACKGROUND_JOBS: Dict[str, BackgroundJob] = {}
+
+
+async def _watch_background_job(job: BackgroundJob) -> None:
+    """Keeps draining the detached process's already-in-flight communicate()
+    after _execute_command has returned -- if nothing awaited it at all, an
+    exited process becomes a zombie and stdout/stderr pipes can fill and
+    deadlock the child. Fills in the job record for read_background_job to
+    report once this completes."""
+    try:
+        stdout, stderr = await job.communicate_task
+        job.stdout = stdout.decode("utf-8", errors="ignore")
+        job.stderr = stderr.decode("utf-8", errors="ignore")
+        job.return_code = job.proc.returncode
+    except Exception as exc:
+        job.error = str(exc)
+    finally:
+        job.finished = True
+
+
+def read_background_job_status(job_id: str) -> Dict[str, Any]:
+    """Module-level (not an MCPServer method -- see BackgroundJob's
+    docstring on why the registry itself is module-level) lookup used by
+    runner_local.py's read_background_job tool dispatch."""
+    job = _BACKGROUND_JOBS.get(job_id)
+    if job is None:
+        return {"success": False, "error": f"No background job found with id {job_id!r}."}
+    elapsed = time.monotonic() - job.started_at
+    if not job.finished:
+        return {
+            "success": True, "job_id": job_id, "command": job.command,
+            "status": "running", "elapsed_seconds": round(elapsed, 1),
+        }
+    result: Dict[str, Any] = {
+        "success": True, "job_id": job_id, "command": job.command,
+        "status": "failed" if job.error else "finished",
+        "elapsed_seconds": round(elapsed, 1), "return_code": job.return_code,
+        "stdout": job.stdout[-MAX_BACKGROUND_OUTPUT_CHARS:],
+        "stderr": job.stderr[-MAX_BACKGROUND_OUTPUT_CHARS:],
+    }
+    if job.error:
+        result["error"] = job.error
+    return result
+
+
 @dataclass
 class ToolDefinition:
     """Definition of a tool for MCP"""
@@ -156,6 +258,15 @@ class ToolDefinition:
     description: str
     parameters: Dict[str, Any]  # JSON Schema
     handler: Optional[Callable] = None
+
+
+_TOOL_PARAMETER_ALIASES: Dict[str, tuple[str, ...]] = {
+    "path": ("file_path", "filepath", "target_path", "filename", "file"),
+    "content": ("text", "new_content", "file_content"),
+    "old_string": ("old_text", "old_content"),
+    "new_string": ("new_text", "replacement"),
+    "command": ("cmd", "shell_command"),
+}
 
 class MCPServer:
     """MCP server for tool execution"""
@@ -166,6 +277,7 @@ class MCPServer:
         transaction_id: Optional[str] = None,
         attachment_paths: Optional[List[str]] = None,
         allowed_workspace_roots: Optional[List[str]] = None,
+        sandbox_policy: Optional[SandboxPolicy] = None,
     ):
         # workspace_root/session_id are optional so existing callers that
         # construct MCPServer() with no arguments (tests, the `tools`/
@@ -206,6 +318,10 @@ class MCPServer:
         self._console = console
         self._renderer = renderer
         self._interactive = interactive
+        # None preserves the low-level MCPServer test/debug API. The real
+        # agent runtime always supplies the configured policy.
+        self.sandbox_policy = sandbox_policy
+        self._external_mcp = _get_shared_mcp_bridge(workspace_root)
         # Per-server, per-root temporary indexes keep find_references
         # incremental across repeated calls without writing cache files into
         # either the user's repository or home directory. TemporaryDirectory
@@ -213,13 +329,25 @@ class MCPServer:
         self._symbol_index_dirs: Dict[str, tempfile.TemporaryDirectory] = {}
         self.tools: Dict[str, ToolDefinition] = {}
         self._register_default_tools()
+        from .plugins import register_plugin_tools
+        self.plugins = register_plugin_tools(self)
     
     def _register_default_tools(self):
         """Register default tools"""
         
         self.register_tool(
             name="read_file",
-            description="Read contents of a file",
+            description=(
+                "Read the full text contents of one file. Returns the whole file every call -- "
+                "there is no offset/line-range/pagination support, so for a very large file, "
+                "prefer search_code (or find_references for a known symbol) to locate the "
+                "relevant region first rather than reading it whole speculatively. Fails with a "
+                "clear error on a binary file (detected by a null byte in the first 8000 bytes) "
+                "instead of returning corrupted text -- do not call this on an attached image; "
+                "its content is already visible directly in this conversation for vision-capable "
+                "models. Never guess a file's contents from its name or path; call this (or "
+                "search_code) before describing what a file contains."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -229,10 +357,15 @@ class MCPServer:
             },
             handler=self._read_file
         )
-        
+
         self.register_tool(
             name="write_file",
-            description="Write content to a file",
+            description=(
+                "Create a new file, or replace an existing file's ENTIRE contents. This is not "
+                "an append or partial update -- any existing content at `path` not included in "
+                "`content` is gone. To change only part of an existing file, use edit_file "
+                "instead so the rest of the file (and any concurrent, unrelated edits) survives."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -266,7 +399,15 @@ class MCPServer:
 
         self.register_tool(
             name="list_directory",
-            description="List contents of a directory",
+            description=(
+                "List the immediate children of one directory (not recursive -- subdirectory "
+                "contents are not included; call this again on a specific subdirectory to go "
+                "deeper). Common noise directories (.git, node_modules, __pycache__, and "
+                "similar) are always excluded. For a broad, unfocused request, list the top "
+                "level once and then act on what it actually returns -- read_file a specific "
+                "file it named, list_directory a specific subdirectory, or use search_code for "
+                "a concrete pattern -- rather than repeatedly listing while deciding what to do."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -276,10 +417,19 @@ class MCPServer:
             },
             handler=self._list_directory
         )
-        
+
         self.register_tool(
             name="search_code",
-            description="Search code using ripgrep",
+            description=(
+                "Search file contents recursively under `path` using ripgrep (regex, not a "
+                "literal substring match -- escape regex metacharacters if you want a literal "
+                "string). This is the fast way to find where something is used or defined across "
+                "many files; prefer it over read_file-ing files speculatively to look for a "
+                "pattern, and prefer find_references instead when you already have an exact "
+                "symbol name and want every definition and call site. `file_pattern` is a glob "
+                "(e.g. '*.py') to narrow which files are searched. Common noise directories "
+                "(.git, node_modules, __pycache__, and similar) are always excluded."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
@@ -348,6 +498,47 @@ class MCPServer:
         )
 
         self.register_tool(
+            name="create_artifact",
+            description=(
+                "Create a real DOCX, XLSX, PPTX, or PDF file inside the workspace. "
+                "Use this for reports, spreadsheets, presentations, proposals, manuals, "
+                "and other deliverables instead of writing fake text with an Office extension."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Output path ending in .docx, .xlsx, .pptx, or .pdf"},
+                    "format": {"type": "string", "enum": ["docx", "xlsx", "pptx", "pdf"]},
+                    "content": {
+                        "type": "object",
+                        "description": (
+                            "Structured content. DOCX/PDF: title + sections[{heading,content}]. "
+                            "XLSX: sheets[{name,rows,header,freeze_panes}]. PPTX: title/subtitle + "
+                            "slides[{title,body or bullets}]."
+                        ),
+                        "additionalProperties": True,
+                    },
+                },
+                "required": ["path", "format", "content"],
+            },
+            handler=self._create_artifact,
+        )
+
+        self.register_tool(
+            name="inspect_artifact",
+            description="Extract structured text and metadata from a DOCX, XLSX, PPTX, or PDF artifact.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Artifact path in the workspace or an exact attachment path"},
+                    "max_chars": {"type": "integer", "description": "Maximum extracted text characters (default 30000)"},
+                },
+                "required": ["path"],
+            },
+            handler=self._inspect_artifact,
+        )
+
+        self.register_tool(
             name="execute_command",
             description=(
                 "Execute a shell command. To run it in a subdirectory, pass cwd -- "
@@ -374,6 +565,14 @@ class MCPServer:
                         "type": "string",
                         "enum": ["bash", "sh"],
                         "description": "Shell used to execute the command"
+                    },
+                    "sandbox_permissions": {
+                        "type": "string",
+                        "enum": ["use_default", "require_escalated"],
+                        "description": (
+                            "Use the configured sandbox, or request explicit human approval "
+                            "to run without it. Never escalate silently."
+                        ),
                     },
                     "approval_metadata": {"type": "object", "description": "Caller approval/audit metadata"}
                 },
@@ -553,9 +752,7 @@ class MCPServer:
         bridge = None
         owns_bridge = False
         try:
-            bridge = _get_shared_mcp_bridge()
-            if bridge is None:
-                raise RuntimeError("Shared MCP bridge unavailable outside a monorepo checkout")
+            bridge = self._external_mcp
             if not bridge.available:
                 owns_bridge = True
                 await bridge.initialize(background=False)
@@ -564,7 +761,7 @@ class MCPServer:
         except Exception as exc:
             tools.append({
                 "name": "shared_mcp",
-                "description": f"Shared MCP registry unavailable: {exc}",
+                "description": f"External MCP registry unavailable: {exc}",
                 "parameters": {},
                 "available": False,
             })
@@ -575,16 +772,45 @@ class MCPServer:
             if owns_bridge and bridge is not None:
                 await bridge.shutdown()
         return tools
+
+    async def external_tool_schemas_openai(self) -> List[Dict[str, Any]]:
+        """Discover configured external MCP tools and keep sessions alive for this turn."""
+        if not self._external_mcp.servers:
+            return []
+        if not self._external_mcp.available:
+            await self._external_mcp.initialize(background=False)
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool["name"],
+                    "description": tool["description"],
+                    "parameters": tool["parameters"],
+                },
+            }
+            for tool in await self._external_mcp.list_tools()
+        ]
+
+    async def shutdown(self) -> None:
+        await self._external_mcp.shutdown()
     
-    async def call_tool(self, name: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
-        """Call a tool by name"""
+    async def call_tool(
+        self, name: str, parameters: Dict[str, Any], *, extra_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Call a tool by name.
+
+        `extra_kwargs` (e.g. execute_command's background_signal) is passed
+        straight to the handler alongside `parameters` but is never merged
+        into it -- `parameters` is the model's own tool-call arguments,
+        which get echoed back into working_messages and persisted (see
+        state.py's completed_actions); a live object like an asyncio.Event
+        in there would break json.dumps on the very next round.
+        """
         if name not in self.tools:
             bridge = None
             owns_bridge = False
             try:
-                bridge = _get_shared_mcp_bridge()
-                if bridge is None:
-                    raise RuntimeError("Shared MCP bridge unavailable outside a monorepo checkout")
+                bridge = self._external_mcp
                 if not bridge.available:
                     owns_bridge = True
                     await bridge.initialize(background=False)
@@ -600,7 +826,7 @@ class MCPServer:
                 }
             except Exception as exc:
                 return {
-                    "error": f"Shared MCP tool unavailable: {exc}",
+                    "error": f"External MCP tool unavailable: {exc}",
                     "tool": name,
                     "source": "shared_mcp",
                     "success": False,
@@ -610,11 +836,71 @@ class MCPServer:
                     await bridge.shutdown()
         
         tool = self.tools[name]
+        if not isinstance(parameters, dict):
+            return {
+                "error": f"{name} requires an object of named arguments",
+                "tool": name,
+                "success": False,
+            }
+        parameters = self._normalise_tool_parameters(name, tool, parameters)
+        missing = self._missing_tool_parameters(name, tool, parameters)
+        if missing:
+            rendered = ", ".join(missing)
+            return {
+                "error": f"{name} requires {rendered}; retry with the missing argument(s)",
+                "tool": name,
+                "success": False,
+            }
         try:
-            result = await tool.handler(**parameters)
+            result = await tool.handler(**parameters, **(extra_kwargs or {}))
             return {"result": result, "tool": name, "success": True}
         except Exception as e:
             return {"error": str(e), "tool": name, "success": False}
+
+    @staticmethod
+    def _normalise_tool_parameters(
+        name: str, tool: ToolDefinition, parameters: Dict[str, Any],
+    ) -> Dict[str, Any]:
+        """Canonicalise common model-generated argument aliases.
+
+        Providers occasionally emit ``file_path`` instead of the schema's
+        ``path`` (or ``text`` instead of ``content``). Normalising at the
+        dispatch edge keeps every handler and every runner path consistent.
+        Unknown arguments are preserved so handlers with compatibility
+        ``**aliases`` continue to work.
+        """
+        result = dict(parameters)
+        properties = set((tool.parameters.get("properties") or {}).keys())
+        supported = set(properties)
+        if name == "edit_file":
+            supported.add("content")
+        for canonical, aliases in _TOOL_PARAMETER_ALIASES.items():
+            if canonical not in supported:
+                continue
+            for alias in aliases:
+                if alias not in result:
+                    continue
+                if result.get(canonical) in (None, ""):
+                    result[canonical] = result[alias]
+                result.pop(alias, None)
+        return result
+
+    @staticmethod
+    def _missing_tool_parameters(
+        name: str, tool: ToolDefinition, parameters: Dict[str, Any],
+    ) -> List[str]:
+        def absent(key: str) -> bool:
+            return key not in parameters or parameters[key] is None or parameters[key] == ""
+
+        if name == "edit_file":
+            missing = ["path"] if absent("path") else []
+            if absent("content") and (absent("old_string") or absent("new_string")):
+                missing.append("old_string and new_string (or content)")
+            return missing
+        return [
+            str(key) for key in (tool.parameters.get("required") or [])
+            if absent(str(key))
+        ]
     
     async def _read_file(self, path: str) -> str:
         p = self._resolve_readable_input(path)
@@ -690,6 +976,13 @@ class MCPServer:
                 handle.write(content)
                 handle.flush()
                 os.fsync(handle.fileno())
+            # FIX: os.replace() swaps inodes -- without this, an edited
+            # file silently lost its original mode/owner and inherited
+            # mkstemp's restrictive 0600 + the running process's uid/gid
+            # (confirmed live: reported as files ending up 0600 owned by
+            # "nobody:nobody" after write_file/edit_file).
+            from .fs_atomic import preserve_existing_metadata
+            preserve_existing_metadata(temp_name, target)
             os.replace(temp_name, target)
         except BaseException:
             with contextlib.suppress(OSError):
@@ -734,7 +1027,25 @@ class MCPServer:
         original_content = p.read_text(encoding="utf-8", errors="ignore")
         occurrences = original_content.count(old_string)
         if occurrences == 0:
-            return f"❌ Error: old_string not found in '{path}' -- no changes made"
+            hint = ""
+            # The model just re-read this exact file yet still produced a
+            # non-matching old_string three rounds running (the transcript
+            # that prompted this fix showed identical retries) -- the most
+            # common real cause is whitespace/line-ending drift (CRLF vs LF,
+            # or reformatted indentation) rather than the text being truly
+            # absent. Normalize both sides and say so explicitly so the
+            # model stops re-issuing the identical failing call and instead
+            # copies whitespace verbatim from a fresh read.
+            def _normalize(text: str) -> str:
+                return "\n".join(line.rstrip() for line in text.replace("\r\n", "\n").split("\n"))
+            if _normalize(old_string) in _normalize(original_content):
+                hint = (
+                    " (a whitespace/line-ending-normalized version of old_string DOES match -- "
+                    "the mismatch is likely trailing whitespace, indentation, or CRLF vs LF; "
+                    "re-read the file and copy old_string verbatim from that fresh content instead "
+                    "of reusing this same old_string again)"
+                )
+            return f"❌ Error: old_string not found in '{path}' -- no changes made{hint}"
         if occurrences > 1:
             return (
                 f"❌ Error: old_string matches {occurrences} times in '{path}' -- it must be unique. "
@@ -815,7 +1126,15 @@ class MCPServer:
             if file_pattern:
                 cmd.extend(['--glob', file_pattern])
 
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+            # Off the event loop: this blocks for however long ripgrep takes
+            # (up to the 30s timeout) on a large/slow tree, and search_code is
+            # one of the most frequently invoked tools -- running it inline
+            # here froze prompt_toolkit's live input loop (same event loop)
+            # for that whole span, making the message box unresponsive while
+            # a search was in flight.
+            result = await asyncio.to_thread(
+                subprocess.run, cmd, capture_output=True, text=True, timeout=30
+            )
             matches = []
 
             for line in result.stdout.split('\n'):
@@ -1083,12 +1402,58 @@ class MCPServer:
             "path": str(output), "filename": output.name, "size_bytes": output.stat().st_size,
             "file_count": len(files), "artifact_type": "archive",
         }
+
+    async def _create_artifact(self, path: str, format: str, content: Dict[str, Any]) -> Dict[str, Any]:
+        from .artifacts import create_artifact
+        target = self._resolve_in_workspace(path)
+        existed = target.exists()
+        result = create_artifact(target, format, content if isinstance(content, dict) else {})
+        if self.session_id is not None:
+            from .safety import record_mutation
+            record_mutation(
+                self.session_id, path=str(target), operation="update" if existed else "create",
+                original_content=None, new_content=None, transaction_id=self.transaction_id,
+            )
+        return result
+
+    async def _inspect_artifact(self, path: str, max_chars: int = 30_000) -> Dict[str, Any]:
+        from .artifacts import inspect_artifact
+        source = self._resolve_readable_input(path)
+        if not source.is_file():
+            return {"success": False, "error": f"Artifact not found: {path}"}
+        try:
+            limit = min(max(int(max_chars), 1_000), 100_000)
+        except (TypeError, ValueError):
+            limit = 30_000
+        return inspect_artifact(source, max_chars=limit)
     
+    async def _kill_process_group(self, proc: "asyncio.subprocess.Process") -> None:
+        # Kill the whole process group (the shell was started with
+        # start_new_session=True) rather than just the immediate `sh -lc`
+        # process, so children the command spawned die too. Bound the
+        # follow-up wait() -- if the process is stuck (e.g. uninterruptible
+        # I/O) it must not block the caller forever; a prior version of this
+        # code awaited proc.wait() with no timeout at all and could hang a
+        # turn indefinitely once a command's own timeout had already fired.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(proc.pid, signal.SIGKILL)
+        with contextlib.suppress(ProcessLookupError):
+            proc.kill()
+        with contextlib.suppress(asyncio.TimeoutError):
+            await asyncio.wait_for(proc.wait(), timeout=10)
+
     async def _execute_command(
         self, command: str, cwd: Optional[str] = None, timeout: int = 60,
         environment: Optional[Dict[str, str]] = None, shell: str = "bash",
+        sandbox_permissions: str = "use_default",
         approval_metadata: Optional[Dict[str, Any]] = None,
+        background_signal: Optional[asyncio.Event] = None,
     ) -> Dict[str, Any]:
+        # `background_signal` is never part of this tool's schema and the
+        # model never sets it -- runner_local.py injects it into arguments
+        # right before dispatch, sourced from the live REPL's Ctrl+B
+        # keybinding (see live_input.py), so it can only ever be set by the
+        # human actually watching this specific command run.
         # `timeout: int` above is only a type hint -- the tool schema
         # declares it as an integer, but nothing coerces a model's actual
         # tool-call arguments to match it. Confirmed live: a real turn sent
@@ -1136,6 +1501,8 @@ class MCPServer:
             }
         if shell not in {"bash", "sh"}:
             return {"error": f"Unsupported shell: {shell}", "success": False}
+        if sandbox_permissions not in {"use_default", "require_escalated"}:
+            return {"error": f"Unsupported sandbox permission: {sandbox_permissions}", "success": False}
         env = os.environ.copy()
         # Same bug class as the timeout fix above: `environment: Optional[
         # Dict[str, str]]` is only a type hint. Live-reported crash --
@@ -1147,19 +1514,109 @@ class MCPServer:
         if isinstance(environment, dict):
             env.update({str(k): str(v) for k, v in environment.items()})
         try:
+            sandbox_command = None
+            argv = (shell, "-lc", command)
+            if self.sandbox_policy is not None and self.workspace_root:
+                sandbox_command = build_sandbox_command(
+                    command=command, shell=shell, cwd=run_dir,
+                    workspace_root=Path(self.workspace_root).expanduser().resolve(),
+                    policy=self.sandbox_policy,
+                    require_escalated=sandbox_permissions == "require_escalated",
+                )
+                argv = sandbox_command.argv
             proc = await asyncio.create_subprocess_exec(
-                shell, "-lc", command,
+                *argv,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                # FIX: no stdin= here meant the child inherited the real
+                # terminal's stdin fd unmodified. Nothing in this tool can
+                # ever supply interactive input to a running command (the
+                # model has no channel to answer a prompt), so any command
+                # that waits on stdin -- a credential prompt, a pager, a
+                # confirmation, an interactive subcommand invoked by
+                # mistake -- blocked forever on a real TTY read that would
+                # never be satisfied, while tamfis-code's own prompt_toolkit
+                # input loop was concurrently trying to read raw bytes from
+                # that same terminal. Live-reported: total input freeze
+                # ("no response to input until I close the terminal") with
+                # no way to Ctrl+C past it, since the hang was in the child
+                # process's own blocking read, not anywhere this process's
+                # asyncio loop could intercept. DEVNULL gives any such
+                # prompt an immediate EOF instead of an indefinite wait, so
+                # it fails fast (or the command handles EOF gracefully) and
+                # this tool's own `timeout`/kill-on-timeout path (below)
+                # actually gets a chance to run.
+                stdin=asyncio.subprocess.DEVNULL,
                 cwd=str(run_dir), env=env,
+                # New session/process group so a kill on timeout can reach
+                # any children the command spawns (e.g. `npm run dev`),
+                # not just the immediate shell -- see the kill/wait paths
+                # below, which target the group via os.killpg.
+                start_new_session=True,
             )
-            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            return {
-                "stdout": stdout.decode('utf-8', errors='ignore'),
-                "stderr": stderr.decode('utf-8', errors='ignore'),
-                "return_code": proc.returncode,
-                "success": proc.returncode == 0
-            }
+            if background_signal is None:
+                try:
+                    stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+                    return {
+                        "stdout": stdout.decode('utf-8', errors='ignore'),
+                        "stderr": stderr.decode('utf-8', errors='ignore'),
+                        "return_code": proc.returncode,
+                        "success": proc.returncode == 0,
+                        "sandbox": _sandbox_result(sandbox_command),
+                    }
+                except asyncio.TimeoutError:
+                    # asyncio.wait_for only cancels the communicate() task on
+                    # timeout, it never touches the subprocess -- without an
+                    # explicit kill here the process (and any children) leak
+                    # and keep running forever in the background.
+                    await self._kill_process_group(proc)
+                    return {"error": f"Command timed out after {timeout} seconds", "success": False}
+            # Race the ordinary completion wait against a possible mid-flight
+            # background request -- the SAME already-running proc either way;
+            # detaching never restarts it under a different mechanism, only
+            # who is waiting on it changes.
+            communicate_task = asyncio.ensure_future(proc.communicate())
+            background_wait = asyncio.ensure_future(background_signal.wait())
+            try:
+                done, _pending = await asyncio.wait(
+                    {communicate_task, background_wait},
+                    timeout=timeout, return_when=asyncio.FIRST_COMPLETED,
+                )
+            finally:
+                if not background_wait.done():
+                    background_wait.cancel()
+            if communicate_task in done:
+                stdout, stderr = communicate_task.result()
+                return {
+                    "stdout": stdout.decode('utf-8', errors='ignore'),
+                    "stderr": stderr.decode('utf-8', errors='ignore'),
+                    "return_code": proc.returncode,
+                    "success": proc.returncode == 0,
+                    "sandbox": _sandbox_result(sandbox_command),
+                }
+            if background_wait in done:
+                job_id = uuid.uuid4().hex[:12]
+                job = BackgroundJob(
+                    job_id=job_id, command=command, cwd=str(run_dir),
+                    started_at=time.monotonic(), proc=proc,
+                    communicate_task=communicate_task,
+                )
+                _BACKGROUND_JOBS[job_id] = job
+                asyncio.ensure_future(_watch_background_job(job))
+                return {
+                    "success": True, "backgrounded": True, "job_id": job_id,
+                    "sandbox": _sandbox_result(sandbox_command),
+                    "message": (
+                        f"Moved to the background as job {job_id} -- it keeps running. "
+                        "Continue with other work now; call read_background_job with this "
+                        "job_id later to check on it or collect its output."
+                    ),
+                }
+            # Neither finished in time: a genuine timeout, not a background
+            # request. Same outcome as the no-signal path above.
+            communicate_task.cancel()
+            await self._kill_process_group(proc)
+            return {"error": f"Command timed out after {timeout} seconds", "success": False}
         except asyncio.TimeoutError:
             return {"error": f"Command timed out after {timeout} seconds", "success": False}
         except Exception as e:
@@ -1183,28 +1640,27 @@ class MCPServer:
         
         info["is_git_repo"] = True
         
+        # Off the event loop for the same reason as _search_code above --
+        # git can be slow on a large repo (packed-refs, cold FS cache), and
+        # blocking here froze the live input loop while it ran.
+        async def _git(*args: str):
+            return await asyncio.to_thread(
+                subprocess.run, ['git', '-C', str(p), *args], capture_output=True, text=True
+            )
+
         try:
             # Get current branch
-            result = subprocess.run(
-                ['git', '-C', str(p), 'rev-parse', '--abbrev-ref', 'HEAD'],
-                capture_output=True, text=True
-            )
+            result = await _git('rev-parse', '--abbrev-ref', 'HEAD')
             if result.returncode == 0:
                 info["branch"] = result.stdout.strip()
-            
+
             # Get remote URL
-            result = subprocess.run(
-                ['git', '-C', str(p), 'config', '--get', 'remote.origin.url'],
-                capture_output=True, text=True
-            )
+            result = await _git('config', '--get', 'remote.origin.url')
             if result.returncode == 0:
                 info["remote_url"] = result.stdout.strip()
-            
+
             # Get latest commit
-            result = subprocess.run(
-                ['git', '-C', str(p), 'log', '-1', '--format=%H%n%s%n%an%n%ae%n%ad'],
-                capture_output=True, text=True
-            )
+            result = await _git('log', '-1', '--format=%H%n%s%n%an%n%ae%n%ad')
             if result.returncode == 0:
                 lines = result.stdout.split('\n')
                 if len(lines) >= 5:
@@ -1217,10 +1673,7 @@ class MCPServer:
                     }
             
             # Get status
-            result = subprocess.run(
-                ['git', '-C', str(p), 'status', '--porcelain'],
-                capture_output=True, text=True
-            )
+            result = await _git('status', '--porcelain')
             info["has_changes"] = bool(result.stdout.strip())
             info["changed_files"] = len([l for l in result.stdout.split('\n') if l.strip()])
             
@@ -1239,7 +1692,7 @@ class MCPServer:
         """
         browser_tool = get_browser_tool_class()
         if browser_tool is None:
-            raise RuntimeError("BrowserTool unavailable outside a monorepo checkout")
+            raise RuntimeError("Portable browser support is unavailable")
         result = await browser_tool().execute_async(**parameters)
         if not result.get("success"):
             raise RuntimeError(str(result.get("error") or "Browser action failed"))

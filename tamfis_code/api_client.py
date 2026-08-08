@@ -110,9 +110,24 @@ class RemoteAPIClient:
         self.config = config
         self.credentials = credentials or load_secure_credentials()
         self._client = httpx.AsyncClient(timeout=config.timeout_seconds)
+        self._agent_bridges: dict[str, Any] = {}
 
     async def aclose(self) -> None:
+        for bridge in list(self._agent_bridges.values()):
+            await bridge.stop()
+        self._agent_bridges.clear()
         await self._client.aclose()
+
+    async def ensure_agent_bridge(self, workspace_root: str):
+        from .remote_agent import RemoteAgentBridge
+
+        root = str(Path(workspace_root).expanduser().resolve())
+        bridge = self._agent_bridges.get(root)
+        if bridge is None:
+            bridge = RemoteAgentBridge(self, root)
+            await bridge.start()
+            self._agent_bridges[root] = bridge
+        return bridge
 
     async def __aenter__(self) -> "RemoteAPIClient":
         return self
@@ -250,15 +265,29 @@ class RemoteAPIClient:
             "POST", "/remote/servers", json_body={"name": name, "transport_type": "local"}
         )
 
+    async def register_agent_device(
+        self, *, name: str, device_id: str, os_family: str,
+    ) -> dict[str, Any]:
+        data = await self.request("POST", "/remote/servers", json_body={
+            "name": name, "transport_type": "agent",
+            "device_id": device_id, "os_family": os_family,
+        })
+        return data.get("server") or data
+
     # -- sessions -----------------------------------------------------
 
     async def list_sessions(self) -> list[dict[str, Any]]:
         return await self.request("GET", "/remote/sessions")
 
-    async def create_session(self, server_id: int, working_directory: Optional[str] = None) -> dict[str, Any]:
+    async def create_session(
+        self, server_id: int, working_directory: Optional[str] = None,
+        workspace_id: Optional[str] = None,
+    ) -> dict[str, Any]:
         body: dict[str, Any] = {"server_id": server_id}
         if working_directory:
             body["working_directory"] = working_directory
+        if workspace_id:
+            body["workspace_id"] = workspace_id
         return await self.request("POST", "/remote/sessions", json_body=body)
 
     async def get_session(self, session_id: int) -> dict[str, Any]:
@@ -381,7 +410,9 @@ class RemoteAPIClient:
 
     # -- streaming ---------------------------------------------------------
 
-    async def stream_session(self, session_id: int, last_event_id: int = 0) -> AsyncIterator[dict[str, Any]]:
+    async def stream_session(
+        self, session_id: int, last_event_id: int = 0, *, idle_timeout: Optional[float] = None,
+    ) -> AsyncIterator[dict[str, Any]]:
         """Yields parsed event envelopes from GET /sessions/{id}/stream.
 
         Mirrors remoteStore.ts's connectSessionStream: an authenticated raw
@@ -389,11 +420,26 @@ class RemoteAPIClient:
         header), reconnecting the caller's responsibility -- this generator
         ends when the server closes the stream or on a connection error, and
         does not retry itself, so `interactive.py`/non-interactive callers
-        control reconnect-with-last-event-id explicitly."""
+        control reconnect-with-last-event-id explicitly.
+
+        `idle_timeout` bounds how long a read may block waiting for the NEXT
+        byte (httpx.ReadTimeout on expiry) -- default None preserves the
+        original unbounded behaviour for a normal live turn. Reattaching to
+        a task from a previous CLI session (see cli.py's
+        `_resume_interrupted_task_if_any` / `attach` command) needs a bound:
+        confirmed live -- a task that had already gone stale server-side
+        (nothing left to ever emit another event) left the CLI parked in
+        `select()` forever with no way to Ctrl+C out, since the interrupt
+        watcher only gets a chance to run between received events.
+        """
         url = f"{_api_root(self.config.api_base)}/remote/sessions/{session_id}/stream"
         params = {"last_event_id": max(0, last_event_id)}
+        stream_timeout = (
+            httpx.Timeout(connect=10.0, read=idle_timeout, write=10.0, pool=10.0)
+            if idle_timeout is not None else None
+        )
         async with self._client.stream(
-            "GET", url, params=params, headers=self._headers(), timeout=None
+            "GET", url, params=params, headers=self._headers(), timeout=stream_timeout
         ) as resp:
             if resp.status_code == 401:
                 if await self._refresh():

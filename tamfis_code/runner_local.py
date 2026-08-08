@@ -28,6 +28,7 @@ import json
 import os
 import re
 import shlex
+import tempfile
 import time
 import uuid
 from collections import Counter
@@ -43,7 +44,12 @@ from .config import Config
 from .hooks import load_hooks, run_tool_hooks
 from .mcp import MCPServer
 from .providers import ProviderManager, ProviderType, reasoning_effort_capable
-from .render import StreamRenderer, resume_live_if_active, suspend_live_if_active
+from .render import (
+    StreamRenderer,
+    resume_live_if_active,
+    suspend_live_async_if_active,
+    suspend_live_if_active,
+)
 from .routing import classify_task
 from .orchestrator import (
     AgentOrchestrator,
@@ -55,13 +61,26 @@ from .orchestrator import (
     parse_reasoning_plan,
     should_plan,
 )
+from .orchestrator.validator import verified_no_change_completion
+from .orchestrator.planner import create_plan
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
 from .runner import TaskOutcome, resolve_approval_decision_async
-from .safety import READ_ONLY_TOOLS, _unified_diff, classify_tool_call_risk, redact_secrets
-from .workspace import classify_root
-from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_workspace_targets
+from .safety import (
+    READ_ONLY_TOOLS,
+    _unified_diff,
+    classify_tool_call_risk,
+    redact_secrets,
+)
+from .sandbox import SandboxPolicy
+from .workspace import classify_root, detect_validation_commands, scratch_root
+from .workspace_access import ensure_workspace_access
+from .runtime.workspace_authority import (
+    WorkspaceAuthorityError,
+    auto_grant_explicit_targets,
+    resolve_workspace_targets,
+)
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
 # was appropriate for a read-only Q&A loop; a real coding-agent task
@@ -69,6 +88,24 @@ from .runtime.workspace_authority import WorkspaceAuthorityError, resolve_worksp
 # edits, run tests, iterate). This exists only to guarantee termination if
 # something is genuinely stuck in a loop, not to cap normal work.
 MAX_AGENT_ROUNDS = 40
+
+# Live-reported: a genuinely large, multi-feature objective ("implement AI
+# content generation, competitor cloning, mass submission, audit reports --
+# all in one turn, actually wire it") ran 40 rounds of real, varied tool
+# calls -- never tripping MAX_CONSECUTIVE_IDENTICAL_ROUNDS or any of the
+# narrated-intent/capitulation/fabricated-result guards, all of which exist
+# specifically to catch a genuinely stuck model -- and then hard-failed
+# anyway, discarding real completed work, exactly like the wall-clock
+# runtime budget used to before extend_runtime() (orchestrator/engine.py's
+# guard_tool_call). Reaching MAX_AGENT_ROUNDS *without* any stall guard
+# tripping is evidence of an oversized task, not a stuck one, so it gets
+# the same bounded-extension treatment: grant one more full round window at
+# a time, up to this many extensions, instead of failing outright. Kept
+# separate from RuntimeBudgets/ExecutionController's own max_tool_calls
+# extension (that one is scoped to time-only exhaustion) since this guards
+# a different, coarser dimension (rounds, not raw tool calls) in the plain
+# loop below, not the orchestrator's internal budget.
+MAX_AGENT_ROUND_EXTENSIONS = 2
 
 # High reasoning is valuable for deliberate architecture work but makes the
 # interactive terminal feel stalled on ordinary audits/edits. Medium is the
@@ -152,6 +189,95 @@ FABRICATED_RESULT_CORRECTION = (
     "and report only what it actually returns."
 )
 
+# Threshold for _round_tool_outcome's failure-streak guard, above.
+CONSECUTIVE_FAILED_ROUNDS_BEFORE_DIAGNOSIS_NUDGE = 3
+FAILURE_DIAGNOSIS_CORRECTION = (
+    f"Every tool call has failed for {{count}} rounds in a row, each with a different attempt "
+    "that still didn't work. Stop trying another fix blind. Before changing anything else: "
+    "re-read the exact error/output text already returned by the last failed call(s) -- the "
+    "real cause is usually stated there -- and, if relevant, inspect actual evidence (a log "
+    "file, the command's real exit code and stderr, the current state of the file you edited) "
+    "instead of assuming what went wrong. Only attempt a fix once you can state, from that "
+    "evidence, specifically why the previous attempts failed."
+)
+
+PERMISSION_BOUNDARY_CORRECTION = (
+    "The last registered tool returned a real permission failure. Keep working in the "
+    "canonical workspace. Do not copy or clone the project elsewhere, change ownership "
+    "or permissions recursively, invoke sudo, ask for a password, or narrate speculative "
+    "permission workarounds. Do not retry the identical failing command. If no other "
+    "in-scope tool action can progress the task, report only the exact denied command/path "
+    "as a host permission-boundary blocker; the platform or operator handles that boundary."
+)
+
+PORT_CONFLICT_CORRECTION = (
+    "The last command failed with EADDRINUSE/address already in use. That is evidence "
+    "that another process already owns the requested listener, not evidence that the "
+    "process should be killed. Do not run kill/pkill/killall, fuser --kill/-k, or stop/"
+    "restart a service merely to make this validation command bind. First use read-only "
+    "checks to identify the listener and its service manager, then query the existing "
+    "application's health/readiness endpoint. If it is the expected healthy managed "
+    "service, treat that as successful runtime validation and leave it running. Only "
+    "disrupt it when the user's request explicitly asks to stop, restart, or replace it."
+)
+
+# Same one-chance-then-fallback shape as narrated tool intent, capitulation,
+# and fabricated results, for the distinct failure of writing out a fake
+# tool invocation (paren-call, JSON object, CLI-flag syntax, or malformed
+# `<tool_call>` XML) as plain text instead of issuing a real, registered
+# tool call.
+MAX_FAKE_TOOL_CALL_RETRIES_PER_PROVIDER = 1
+FAKE_TOOL_CALL_CORRECTION = (
+    "Your previous response wrote out what looks like a tool invocation in plain text or "
+    "markup (a function-call-style line, a JSON object naming a tool, CLI-style flags, or "
+    "`<tool_call>` markup), but no registered tool call was actually issued this turn -- "
+    "writing the call as text does not run it. Use the real tool-calling mechanism this "
+    "turn instead of describing or formatting one yourself, then continue based on its "
+    "actual result."
+)
+
+# Live-reported ("So why can't tamfis-code be efficient at least?"): a
+# coding task could edit files and report success while the project didn't
+# actually compile -- npm run build (bundling) passed while the real
+# type-check (npm run check / tsc -b, a differently-named script) was never
+# run, because nothing in the completion path required it. `npm run build`
+# alone is not sufficient evidence either: bundlers catch syntax errors but
+# not type errors, so a real truncated function can still "build" cleanly
+# -- see workspace.py's detect_verify_command for why "build" is the
+# weakest, last-resort entry in that priority list. This is a *system*
+# gap, not a model one: even a fully capable model only verifies what the
+# harness actually requires before letting it finish.
+MAX_VERIFY_COMMAND_RETRIES = 2
+VERIFY_COMMAND_CORRECTION = (
+    "You changed files in this project, but never successfully ran `{command}` (this "
+    "project's real validation command) since the last change. Run `{command}` now via "
+    "execute_command, inspect the real output, fix any errors, and re-run it until it passes "
+    "cleanly before finishing. If the failure says a project dependency or validator is "
+    "missing, install it using the project's declared package manager, then retry. Prefer "
+    "the project's virtual environment; only when no venv exists may Python use `python -m "
+    "pip install --break-system-packages`. Do not claim validation from a command you only "
+    "described."
+)
+
+
+def _validation_dependency_hint(command: str, error: str = "") -> str:
+    """Give the model a safe, project-appropriate install recovery path."""
+    missing = any(marker in (error or "").lower() for marker in (
+        "command not found", "no module named", "cannot find module", "not recognized",
+        "no such file or directory",
+    ))
+    if not missing:
+        return ""
+    if command.startswith("npm "):
+        return "The Node dependency tree appears missing; run `npm ci` when package-lock.json exists, otherwise `npm install`, then retry."
+    if command.startswith(("pytest", "ruff", "python ")):
+        return "The Python validator appears missing; prefer `.venv/bin/python -m pip install -e '.[dev]'` when the project declares dev extras, otherwise install the named validator with `python -m pip install --break-system-packages`."
+    if command.startswith("composer") or command.startswith("find .") and "php -l" in command:
+        return "The PHP dependencies or runtime appear missing; run `composer install` for project dependencies and report an unavailable system PHP runtime instead of using an unsafe workaround."
+    if command.startswith(("go ", "cargo ", "dotnet ", "mvn", "./mvnw", "gradle", "./gradlew", "cmake", "make")):
+        return "The project toolchain appears missing; install it through the project's documented toolchain or package manager, then retry the validation command."
+    return "Install the missing project validator through the project's declared package manager, then retry."
+
 RESUME_EXECUTION_INSTRUCTION = (
     "You are resuming an unfinished engineering task from durable state. The user's "
     "continuation directive is authoritative: do not declare that there is no clear next "
@@ -184,10 +310,38 @@ def _requests_no_confirmation(text: str) -> bool:
 # window, not meant to match a real tokenizer exactly.
 _CHARS_PER_TOKEN_ESTIMATE = 4
 MAX_TOKENS_PER_REQUEST = 4096
+
+# FIX: _stream_one_completion's chunk loop had no bound on the gap between
+# two consecutive stream chunks -- a provider connection that stalls
+# mid-response (server hangs without closing, a proxy silently drops the
+# connection state, a network blip that never sends RST/FIN) left the
+# await parked in a genuine epoll wait on a real socket forever, with
+# nothing to ever raise past it: no CPU spin, no child process, no timer,
+# just an event loop correctly waiting for data that will never arrive.
+# Live-reported: total input freeze during the "respond" phase requiring
+# the terminal to be closed, no way to Ctrl+C past it (same mechanism
+# runner.py's STREAM_IDLE_TIMEOUT_SECONDS already fixed once for the
+# Remote-mode runner -- "500+ minutes in one report" -- that fix never
+# carried over to this, the local/standalone runner). Same env var name
+# so one setting covers both modes. This bounds the GAP between chunks,
+# not the total response time, so a long but actively-streaming answer
+# is never cut off.
+try:
+    STREAM_IDLE_TIMEOUT_SECONDS = max(
+        10.0, float(os.getenv("TAMFIS_CODE_STREAM_IDLE_TIMEOUT", "90"))
+    )
+except (TypeError, ValueError):
+    STREAM_IDLE_TIMEOUT_SECONDS = 90.0
 # Leave headroom below the provider's stated context_window: it's a
 # conservative estimate already (see providers.py), and this estimate's own
 # char/token ratio is approximate too.
-_CONTEXT_SAFETY_MARGIN = 0.9
+# The estimator is intentionally provider-independent (four characters per
+# token), while code, JSON, paths, and tool schemas tokenize more densely than
+# ordinary prose.  0.90 let a displayed "~97k" context still overflow a
+# nominal 128k endpoint in real turns.  Keep a larger reserve so compaction
+# leaves room for provider-side tokenization variance and the next response,
+# allowing the same task to continue instead of being cut off at the request.
+_CONTEXT_SAFETY_MARGIN = 0.75
 
 
 # Workspace scoping keeps broad requests such as "audit the full stack" from
@@ -215,7 +369,10 @@ _SCOPE_PATH_TOOLS = {
     "list_directory",
     "search_code",
     "get_git_info",
+    "create_artifact",
+    "inspect_artifact",
 }
+_EXTERNAL_SCOPE_PATHS_KEY = "_tamfis_external_scope_paths"
 
 
 def _is_project_root(path: Path) -> bool:
@@ -607,14 +764,25 @@ def _apply_mcp_task_scope(
     }
 
 
-def _scope_instruction(workspace_root: str, scope_roots: list[Path]) -> str:
+def _scope_instruction(workspace_root: str, scope_roots: list[Path], *, scratch_root: Optional[Path] = None) -> str:
     roots = "\n".join(f"- {path}" for path in scope_roots)
+    scratch_paragraph = (
+        f"\n\nSCRATCH SPACE: {scratch_root} is always available for throwaway work that "
+        "does not belong in the project itself -- downloading something to inspect, "
+        "extracting an archive to look through it, writing and running a one-off script "
+        "to test an idea, a temp file for a multi-step shell pipeline. It is not a "
+        "project root: do not treat files there as part of the task's deliverable, "
+        "report on them, or expect them to persist beyond this session."
+        if scratch_root else ""
+    )
     return (
         "WORKSPACE SCOPE (authoritative for this turn):\n"
         f"Workspace root: {Path(workspace_root).resolve()}\n"
         f"Target project roots:\n{roots}\n"
-        "Operate only inside these target roots unless the user explicitly names "
-        "another path. Do not recursively search the workspace parent. For a "
+        "Operate inside these target roots by default. If the task genuinely requires "
+        "another path, call the appropriate tool with that explicit path; the runtime "
+        "will request elevated approval instead of rejecting it as out of scope. Do not "
+        "recursively search the workspace parent unless that broader access is necessary. For a "
         "multi-project stack, inspect each listed root separately and use focused "
         "queries, bounded result counts, and project markers before reading files. "
         "Do not run repository-wide find/grep/rg from the parent directory. "
@@ -622,6 +790,7 @@ def _scope_instruction(workspace_root: str, scope_roots: list[Path]) -> str:
         "Do not mention, inspect or propose files from excluded or unselected sibling "
         "directories. If a planned path falls outside the target roots, discard and "
         "regenerate that plan step before displaying it."
+        f"{scratch_paragraph}"
     )
 
 
@@ -644,6 +813,18 @@ def _is_within(path: Path, root: Path) -> bool:
         return True
     except ValueError:
         return False
+
+
+def _mark_external_scope(scoped: dict[str, Any], paths: list[Path]) -> None:
+    """Record a boundary crossing for the approval gate and dispatcher.
+
+    The marker is internal: it is removed before invoking the actual tool.
+    Keeping it in the normalized arguments until then makes even read-only
+    file tools classify as dangerous and therefore require explicit consent.
+    """
+    unique = list(dict.fromkeys(str(path) for path in paths))
+    if unique:
+        scoped[_EXTERNAL_SCOPE_PATHS_KEY] = unique
 
 
 def _scope_tool_arguments(
@@ -693,15 +874,42 @@ def _scope_tool_arguments(
             ])
         failed = [label for label, allowed in checks if not allowed]
         if failed:
-            return scoped, (
-                f"{', '.join(failed)} is outside the resolved task scope. Allowed roots: "
-                + ", ".join(str(root) for root in scope_roots)
-            )
+            external_paths: list[Path] = []
+            for key in ("path", "destination", "source_dir", "output_path"):
+                candidate = _resolve_argument_path(scoped.get(key), workspace_root)
+                if candidate is not None and not any(_is_within(candidate, root) for root in scope_roots):
+                    external_paths.append(candidate)
+            _mark_external_scope(scoped, external_paths)
         return scoped, None
 
     if tool_name == "execute_command":
         cwd = _resolve_argument_path(scoped.get("cwd"), workspace_root) or workspace
         command = str(scoped.get("command") or "").strip()
+        external_paths: list[Path] = []
+
+        # Heredoc bodies are source text, not command operands. Inspecting the
+        # entire body with shlex makes literals such as `/` or URL fragments
+        # look like filesystem paths and can incorrectly resolve a target to
+        # the filesystem root. Keep the heredoc header and any suffix command
+        # for scope validation, while excluding the body itself.
+        heredoc_header = re.search(
+            r"<<-?\s*(?P<quote>['\"]?)(?P<delimiter>[A-Za-z_][A-Za-z0-9_-]*)"
+            r"\1[^\n]*(?:\n|$)",
+            command,
+        )
+        if heredoc_header:
+            delimiter = heredoc_header.group("delimiter")
+            terminator = re.search(
+                rf"(?m)^[ \t]*{re.escape(delimiter)}[ \t]*(?:\r?\n|$)",
+                command[heredoc_header.end():],
+            )
+            if terminator:
+                body_end = heredoc_header.end() + terminator.end()
+                command_for_scope_validation = command[:heredoc_header.end()] + command[body_end:]
+            else:
+                command_for_scope_validation = command[:heredoc_header.end()]
+        else:
+            command_for_scope_validation = command
 
         # Models commonly emit:
         #
@@ -734,15 +942,10 @@ def _scope_tool_arguments(
 
             cd_target = _resolve_argument_path(parsed_target[0], str(cwd))
 
-            if cd_target is None or not any(
-                _is_within(cd_target, root)
-                for root in scope_roots
-            ):
-                return scoped, (
-                    f"Command cd target is outside the resolved task scope: "
-                    f"{cd_target or parsed_target[0]}. Allowed roots: "
-                    + ", ".join(str(root) for root in scope_roots)
-                )
+            if cd_target is None:
+                return scoped, "Invalid leading cd target in command."
+            if not any(_is_within(cd_target, root) for root in scope_roots):
+                external_paths.append(cd_target)
 
             cwd = cd_target
             command = leading_cd.group("remainder").strip()
@@ -754,7 +957,7 @@ def _scope_tool_arguments(
         )
 
         try:
-            command_tokens = shlex.split(command)
+            command_tokens = shlex.split(command_for_scope_validation)
         except ValueError:
             command_tokens = []
 
@@ -762,7 +965,13 @@ def _scope_tool_arguments(
         operand_roots: set[Path] = set()
 
         for token in command_tokens[1:]:
-            candidate_text = token.split("=", 1)[-1] if "=" in token else token
+            # Shell environment assignments are not command path operands.
+            # Treating `SMTP_PASSWORD=...` as a path caused the checker to
+            # report misleading errors such as `/SMTP_PASSWORD=` and made
+            # reasoning models retry the same invalid call repeatedly.
+            if re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", token):
+                continue
+            candidate_text = token
 
             if (
                 not candidate_text.startswith("/")
@@ -814,32 +1023,22 @@ def _scope_tool_arguments(
                 scoped["cwd"] = str(target_root)
                 cwd = target_root
             else:
-                return scoped, (
-                    "Broad parent-directory scan blocked. Run the command "
-                    "separately in one of these project roots: "
-                    + ", ".join(str(root) for root in scope_roots)
-                )
+                external_paths.append(cwd)
 
         if not any(_is_within(cwd, root) for root in scope_roots):
-            return scoped, (
-                f"Command cwd is outside the resolved task scope: {cwd}. "
-                "Allowed roots: "
-                + ", ".join(str(root) for root in scope_roots)
-            )
+            external_paths.append(cwd)
 
         for candidate in absolute_operands:
-            if not any(
-                _is_within(candidate, root)
-                for root in scope_roots
-            ):
-                return scoped, (
-                    f"Command path is outside the resolved task scope: "
-                    f"{candidate}. Allowed roots: "
-                    + ", ".join(str(root) for root in scope_roots)
-                )
+            if not any(_is_within(candidate, root) for root in scope_roots):
+                external_paths.append(candidate)
 
         scoped["cwd"] = str(cwd)
         scoped["command"] = command
+        if external_paths:
+            _mark_external_scope(scoped, external_paths)
+            # Commands crossing scope run outside the workspace sandbox only
+            # after the dangerous-risk approval gate accepts the request.
+            scoped["sandbox_permissions"] = "require_escalated"
         return scoped, None
 
     if path_key is None:
@@ -872,16 +1071,14 @@ def _scope_tool_arguments(
         if len(scope_roots) == 1:
             scoped[path_key] = str(scope_roots[0])
             return scoped, None
-        return scoped, (
-            "Parent-directory operation blocked for this multi-project stack. Use one "
-            "target root at a time: " + ", ".join(str(root) for root in scope_roots)
-        )
+        scoped[path_key] = str(requested)
+        _mark_external_scope(scoped, [requested])
+        return scoped, None
 
     if not any(_is_within(requested, root) for root in scope_roots):
-        return scoped, (
-            f"Path is outside the resolved task scope: {requested}. Allowed roots: "
-            + ", ".join(str(root) for root in scope_roots)
-        )
+        scoped[path_key] = str(requested)
+        _mark_external_scope(scoped, [requested])
+        return scoped, None
 
     scoped[path_key] = str(requested)
     return scoped, None
@@ -896,6 +1093,56 @@ EMPTY_CONTINUATION_INSTRUCTION = (
     "If the task is complete, provide a concrete evidence-backed final answer. "
     "Do not return an empty response."
 )
+
+
+def _empty_continuation_messages(
+    messages: list[dict[str, Any]], attempt: int,
+) -> list[dict[str, Any]]:
+    """Build a fresh, provider-visible continuation request.
+
+    Appending a late ``system`` message after a tool result is legal in some
+    OpenAI-compatible APIs but is ignored or handled inconsistently by
+    others. More importantly, retrying that identical transcript can produce
+    the same cached/deterministic empty completion forever. A user-role nudge
+    is universally visible and the attempt marker makes every bounded retry
+    a genuinely new request.
+    """
+    retry_detail = (
+        ""
+        if attempt <= 1
+        else (
+            f" Continuation recovery attempt {attempt}: the previous recovery "
+            "also returned no assistant text or tool call, so choose a concrete "
+            "next action now."
+        )
+    )
+    return [
+        *messages,
+        {
+            "role": "user",
+            "content": EMPTY_CONTINUATION_INSTRUCTION + retry_detail,
+        },
+    ]
+
+
+def _same_provider_recovery_models(config: Any, current_model: str) -> list[str]:
+    """Return safe alternate models without leaving the selected provider."""
+    candidates = [
+        str(getattr(config, "default_model", "") or ""),
+        *[str(item or "") for item in (getattr(config, "models", None) or [])],
+    ]
+    extra_usage_enabled = os.environ.get(
+        "TAMFIS_CODE_OLLAMA_EXTRA_USAGE", "false"
+    ).strip().lower() in {"1", "true", "yes", "on"}
+    result: list[str] = []
+    for candidate in candidates:
+        if not candidate or candidate == current_model or candidate in result:
+            continue
+        if candidate == "kimi-k3:cloud" and not extra_usage_enabled:
+            continue
+        result.append(candidate)
+    return result
+
 
 # A long, reasoning-heavy final answer (e.g. a full-stack audit report) can
 # hit MAX_TOKENS_PER_REQUEST mid-sentence -- confirmed live: a nemotron
@@ -1050,6 +1297,17 @@ async def _stream_completion_with_reconnect(
     prefix and are kept internal until a clean response arrives.  Only the
     novel suffix is then rendered and checkpointed.  This makes provider or
     service restarts look like one continuous answer to the user.
+
+    A transient drop is retried silently (the live status spinner keeps
+    ticking throughout, driven by its own timer independent of this
+    function) -- it is not announced with a "Stream interrupted;
+    reconnecting" line on every attempt. That line used to print on EVERY
+    retry regardless of outcome, which worked against the whole point of
+    this function: reconnecting is supposed to make a dropped connection
+    invisible, and announcing the plumbing on each attempt (repeatedly, on
+    a long turn with a flaky route) made a working continuation look like a
+    recurring failure instead. Visible only under TAMFIS_CODE_DEBUG, where
+    seeing every retry attempt is exactly the point.
     """
     durable_partial = initial_partial
     last_error: Optional[Exception] = None
@@ -1104,16 +1362,17 @@ async def _stream_completion_with_reconnect(
                 raise _InterruptedCompletion(exc, durable_partial) from exc
 
             delay = STREAM_RECONNECT_BACKOFF_SECONDS[attempt]
-            renderer.handle_event({
-                "event_type": "diagnostics",
-                "payload": {
-                    "content": (
-                        f"Stream from {provider.value} was interrupted; keeping this task alive "
-                        f"and reconnecting in {int(delay)}s "
-                        f"({attempt + 1}/{len(STREAM_RECONNECT_BACKOFF_SECONDS)})."
-                    )
-                },
-            })
+            if getattr(renderer, "debug", False):
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Stream from {provider.value} was interrupted; keeping this task alive "
+                            f"and reconnecting in {int(delay)}s "
+                            f"({attempt + 1}/{len(STREAM_RECONNECT_BACKOFF_SECONDS)})."
+                        )
+                    },
+                })
             await asyncio.sleep(delay)
 
     # The loop always returns or raises; this protects type-checkers and any
@@ -1138,8 +1397,37 @@ def _novel_continuation(existing: str, continuation: str, *, overlap_window: int
     return continuation
 
 
+# Anchored at the start (not a free-text search) so an unrelated new
+# request that merely mentions one of these words mid-sentence ("the build
+# should continue to support Python 3.9") never falsely triggers a resume.
+# The filler group absorbs common lead-ins ("yes", "ok", "please", "can/
+# could/would you", "let's") before the actual resume verb/phrase so those
+# don't have to be repeated in every alternative below; a message that
+# consumes filler but then isn't followed by a real resume verb still
+# correctly fails to match (e.g. "please check the auth file").
+#
+# Before this, only five exact lead words (yes-prefixed proceed/continue/
+# resume/carry on/go ahead) were recognised -- "please continue", "keep
+# going", "try again", "retry", "go on", and "let's continue" all missed,
+# silently falling through to the ordinary (non-checkpoint) turn path and
+# losing the interrupted turn's in-flight tool state -- see
+# _run_local_agent_turn_impl's resume handling and _close_interrupted_
+# tool_calls, which only run when this matches.
+_RESUME_FILLER_RE = (
+    r"(?:(?:yes|yeah|yep|yup|sure|ok|okay|alright)[,.\s]+)?"
+    r"(?:let'?s\s+|please\s+|can\s+you\s+|could\s+you\s+|would\s+you\s+)?"
+)
 _RESUME_REQUEST_RE = re.compile(
-    r"^(?:yes[,. ]+)?(?:proceed|continue|resume|carry\s+on|go\s+ahead)\b",
+    r"^" + _RESUME_FILLER_RE + r"(?:"
+    r"proceed|resume|"
+    r"continue(?:\s+(?:on|with|from)\b)?|"
+    r"carry\s+on|"
+    r"keep\s+(?:going|on|working)|"
+    r"go\s+(?:ahead|on)|"
+    r"pick\s+up(?:\s+where\s+(?:you|it)\s+left\s+off)?|"
+    r"try\s+again|retry|"
+    r"don'?t\s+stop"
+    r")\b",
     re.IGNORECASE,
 )
 
@@ -1170,6 +1458,101 @@ def _auto_provider_fallback_enabled(manager: Any) -> bool:
 def _paid_provider_fallback_enabled(manager: Any) -> bool:
     method = getattr(manager, "paid_fallback_enabled", None)
     return bool(method()) if callable(method) else True
+
+
+PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS = 30
+
+
+async def _ask_provider_fallback_approval(
+    console: Console,
+    *,
+    failed_provider: ProviderType,
+    interactive: bool,
+    choices: list[tuple[ProviderType, str]] = (),
+) -> str:
+    """Ask before leaving an explicitly configured premium primary route.
+
+    A provider outage is recoverable, so an unanswered interactive prompt
+    authorises the safe continuation after the bounded 30-second window. An
+    explicit negative answer still preserves the failure for the user to
+    inspect or resume later.
+    """
+    from .public_identity import public_model_name
+
+    choice_text = ""
+    if choices:
+        choice_text = "\nAvailable TamfisGPT models:\n" + "\n".join(
+            f"  {index}. {public_model_name(model)}"
+            for index, (_provider, model) in enumerate(choices, start=1)
+        ) + "\n"
+    prompt = (
+        "The selected TamfisGPT model is temporarily unavailable. Switch "
+        "to the best available TamfisGPT model? "
+        "[Y/n] or enter a model number "
+        f"(auto-switching in {PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS} seconds): "
+    )
+    if choice_text:
+        console.print(choice_text, end="")
+    console.print(
+        "[yellow]The selected TamfisGPT model is unavailable for this turn.[/yellow] "
+        f"Model fallback requires approval; no response after {PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS} seconds will continue automatically."
+    )
+    if not interactive:
+        return "timeout"
+    # Use prompt_toolkit's async input path. A background ``console.input``
+    # thread competes with the REPL's terminal application and can leave the
+    # live renderer apparently frozen after the provider failure.
+    from prompt_toolkit import PromptSession
+    from prompt_toolkit.formatted_text import HTML
+
+    session = PromptSession()
+    try:
+        answer = await asyncio.wait_for(
+            session.prompt_async(HTML(prompt)),
+            timeout=PROVIDER_FALLBACK_APPROVAL_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        console.print("[dim]No response after 30 seconds; selecting the best available TamfisGPT model.[/dim]")
+        return "timeout"
+    except (EOFError, KeyboardInterrupt):
+        return "deny"
+    normalized = answer.strip().lower()
+    return "deny" if normalized in {"n", "no"} else normalized or "approve"
+
+
+def _requested_fallback_choice(
+    answer: str,
+    choices: list[tuple[ProviderType, str]],
+) -> tuple[ProviderType, str] | None:
+    if answer in {"approve", "timeout", "", "y", "yes"}:
+        return choices[0] if choices else None
+    if answer.isdigit() and 1 <= int(answer) <= len(choices):
+        return choices[int(answer) - 1]
+    requested_provider, separator, requested_model = answer.partition("/")
+    for provider, model in choices:
+        if provider.value == requested_provider or (
+            separator and provider.value == requested_provider and model == requested_model
+        ):
+            return provider, requested_model if separator else model
+    return None
+
+
+def _fallback_candidates_for_turn(
+    manager: Any,
+    current: ProviderType,
+    task_profile: Any,
+    *,
+    allow_premium_primary: bool = False,
+) -> list[ProviderType]:
+    method = getattr(manager, "fallback_candidates", None)
+    if not callable(method):
+        return []
+    try:
+        return list(method(current, task_profile, allow_premium_primary=allow_premium_primary))
+    except TypeError:
+        # Compatibility with lightweight provider doubles used by older
+        # integrations and tests.
+        return list(method(current, task_profile))
 
 
 def _is_resume_request(text: str) -> bool:
@@ -1654,6 +2037,12 @@ def _semantic_tool_failure(tool_name: str, arguments: dict[str, Any], result: di
     if isinstance(inner, str):
         stripped = inner.strip()
         lowered = stripped.lower()
+        # Built-in MCP mutation tools return human-readable status strings
+        # prefixed with glyphs (for example "❌ Error: old_string not
+        # found"). Strip presentation glyphs before classifying semantics;
+        # transport success only means the Python handler returned, not that
+        # the requested edit happened.
+        semantic_text = re.sub(r"^[^\w]+", "", lowered)
         failure_prefixes = (
             "error:",
             "file not found:",
@@ -1662,7 +2051,7 @@ def _semantic_tool_failure(tool_name: str, arguments: dict[str, Any], result: di
             "fatal:",
             "failed:",
         )
-        if lowered.startswith(failure_prefixes):
+        if semantic_text.startswith(failure_prefixes):
             return stripped
 
     if tool_name == "read_file":
@@ -1714,6 +2103,34 @@ def _normalise_tool_result(
     return normalised
 
 
+def _is_old_string_not_found(tool_name: str, result: dict[str, Any]) -> bool:
+    """Identify the edit failure that requires a fresh source read."""
+    if tool_name != "edit_file" or result.get("success") is not False:
+        return False
+    error = str(result.get("error") or result.get("message") or "").lower()
+    return "old_string not found" in error
+
+
+def _update_unresolved_edit_paths(
+    unresolved: set[str], *, path: str, workspace_root: str, failed: bool,
+) -> str:
+    """Track stale-edit recovery by canonical path.
+
+    A later successful write/edit to the same file resolves the earlier
+    old_string mismatch. Keeping the original failure forever makes the
+    finalizer falsely fail turns that recovered correctly.
+    """
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = Path(workspace_root) / candidate
+    key = str(candidate.resolve())
+    if failed:
+        unresolved.add(key)
+    else:
+        unresolved.discard(key)
+    return key
+
+
 _AUDIT_PLAN_PATH_RE = re.compile(r"(?<![\w])/(?:[^\s,;()\[\]{}<>]+)")
 
 
@@ -1753,6 +2170,9 @@ async def _recover_audit_plan_file(
     scope_roots: list[Path],
     objective: str,
     round_number: int,
+    configured_hooks: list[Any],
+    session_id: int,
+    workspace_root: str,
 ) -> bool:
     """Execute one concrete pending audit read after a malformed completion."""
     path = _next_audit_plan_file(plan, scope_roots)
@@ -1772,6 +2192,21 @@ async def _recover_audit_plan_file(
             "function": {"name": "read_file", "arguments": json.dumps(arguments)},
         }],
     })
+    # This is a runtime-synthesized tool call (the model itself never
+    # requested it), executed directly against mcp_server rather than
+    # through the round loop's generic dispatch branch below -- which means
+    # it would otherwise never reach PreToolUse at all. Run it explicitly so
+    # a configured hook still observes/can block this read the same as any
+    # model-requested one; read_file is non-mutating today, but the bypass
+    # was in the dispatch shape, not in what this particular tool happens to do.
+    blocked = await _run_pre_tool_use_hooks(
+        configured_hooks, tool_name="read_file", arguments=arguments,
+        session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+    )
+    if blocked is not None:
+        working_messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(blocked)})
+        renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "read_file", "result": blocked}})
+        return True
     envelope = ToolEnvelope(
         tool_call_id=call_id,
         tool_name="read_file",
@@ -1851,12 +2286,11 @@ async def _recover_empty_continuation(
     task_profile: Any,
 ) -> tuple[str, list[_StreamedToolCall], ProviderType, Any, Any, str]:
     """Recover an empty post-tool continuation without abandoning the task."""
-    retry_messages = list(messages) + [
-        {"role": "system", "content": EMPTY_CONTINUATION_INSTRUCTION}
-    ]
+    retry_messages = _empty_continuation_messages(messages, 1)
     last_error: Optional[Exception] = None
 
     for attempt in range(1, MAX_EMPTY_CONTINUATION_RETRIES + 1):
+        retry_messages = _empty_continuation_messages(messages, attempt)
         renderer.handle_event({
             "event_type": "diagnostics",
             "payload": {
@@ -1892,6 +2326,46 @@ async def _recover_empty_continuation(
         except Exception as exc:  # provider-specific failures are handled below
             last_error = exc
             break
+
+    # A user who explicitly selected ollama_cloud selected the provider, not
+    # a promise that one particular model may terminate the entire task. Try
+    # a bounded alternate model on the same endpoint before considering any
+    # cross-provider fallback. This also covers AUTO when its primary model
+    # alone has a broken post-tool continuation.
+    for recovery_model in _same_provider_recovery_models(config, model):
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {
+                "content": (
+                    f"{resolved_provider.value} / {model} produced no continuation; "
+                    f"retrying on the same provider with {recovery_model}."
+                )
+            },
+        })
+        try:
+            alternate_messages = _empty_continuation_messages(
+                messages, MAX_EMPTY_CONTINUATION_RETRIES + 1,
+            )
+            content, calls, _finish_reason = await _stream_one_completion(
+                client,
+                model=recovery_model,
+                messages=alternate_messages,
+                tools=tools,
+                renderer=renderer,
+            )
+            if not content.strip() and not calls:
+                continue
+            return (
+                content,
+                calls,
+                resolved_provider,
+                config,
+                client,
+                recovery_model,
+            )
+        except Exception as exc:
+            last_error = exc
+            continue
 
     if requested_provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
         failed_provider = resolved_provider
@@ -2268,6 +2742,39 @@ def _looks_like_service_restart(command: str) -> bool:
     return bool(_SERVICE_RESTART_RE.search(command or ""))
 
 
+_PORT_CONFLICT_RE = re.compile(r"\bEADDRINUSE\b|address already in use", re.IGNORECASE)
+_FORCED_LISTENER_RECLAMATION_RE = re.compile(
+    r"(?:^|[;&|]\s*)(?:sudo\s+)?(?:kill(?:all)?|pkill)\b"
+    r"|\bfuser\b[^\n;&|]*(?:\s-k\b|--kill\b)"
+    r"|\bxargs\b[^\n;&|]*\bkill(?:all)?\b"
+    r"|\bsystemctl\s+(?:stop|restart)\b"
+    r"|\bservice\s+\S+\s+(?:stop|restart)\b",
+    re.IGNORECASE,
+)
+_EXPLICIT_SERVICE_DISRUPTION_RE = re.compile(
+    r"\b(?:stop|restart|replace|terminate|kill|shut\s*down)\b[^.!?\n]{0,100}"
+    r"\b(?:app|application|server|service|process|daemon|listener)\b"
+    r"|\b(?:app|application|server|service|process|daemon|listener)\b[^.!?\n]{0,100}"
+    r"\b(?:stop|restart|replace|terminate|kill|shut\s*down)\b",
+    re.IGNORECASE,
+)
+
+
+def _has_port_conflict(result: dict[str, Any]) -> bool:
+    """Recognise Node and generic socket bind conflicts in any tool envelope."""
+    return bool(_PORT_CONFLICT_RE.search(json.dumps(result, default=str)))
+
+
+def _looks_like_forced_listener_reclamation(command: str) -> bool:
+    """True for commands that can disrupt the process owning a listener."""
+    return bool(_FORCED_LISTENER_RECLAMATION_RE.search(command or ""))
+
+
+def _user_authorized_service_disruption(text: str) -> bool:
+    """Require an explicit user request before reclaiming an occupied port."""
+    return bool(_EXPLICIT_SERVICE_DISRUPTION_RE.search(text or ""))
+
+
 def _preview_diff_for_tool_call(mcp_server: MCPServer, tool_name: str, arguments: dict[str, Any]) -> Optional[str]:
     """Best-effort unified-diff preview for write_file/edit_file, computed
     WITHOUT writing anything -- read-only preview of exactly what
@@ -2338,9 +2845,32 @@ _FAKE_TOOL_CALL_JSON_RE = re.compile(
     r'search_code|execute_command|get_git_info|browser|web_search)"'
 )
 
+# Confirmed live, a third shape: instead of a paren-call or a JSON object, a
+# weak model can narrate a CLI-flag-style pseudo-invocation --
+# `execute_command --command="..."` -- with no opening paren and no JSON,
+# so neither pattern above matches. Also seen: a `<tool_call>` block that
+# the streaming text-tool parser (_parse_text_tool_block) rejected because
+# it used a raw JSON body instead of `<parameter=...>` tags -- the rejected
+# block's XML-ish markup (`<function=`, `<parameter`, `</tool_call>`) is
+# preserved verbatim as trailing assistant text by _TextToolStreamFilter.
+# finish() and never gets any other guard's attention.
+_FAKE_TOOL_CALL_FLAG_RE = re.compile(
+    r"\b(?:read_file|write_file|edit_file|extract_archive|repackage_archive|list_directory|"
+    r"search_code|execute_command|get_git_info|browser|web_search)\s+--[A-Za-z_][\w-]*\s*="
+)
+_FAKE_TOOL_CALL_XML_RE = re.compile(
+    r"</tool_call\s*>|<tool_call[\s>]|<function(?:\s*=|\s+name\s*=)|<parameter(?:\s*=|\s+name\s*=)",
+    re.IGNORECASE,
+)
+
 
 def _looks_like_fake_tool_call(text: str) -> bool:
-    return bool(_FAKE_TOOL_CALL_RE.search(text) or _FAKE_TOOL_CALL_JSON_RE.search(text))
+    return bool(
+        _FAKE_TOOL_CALL_RE.search(text)
+        or _FAKE_TOOL_CALL_JSON_RE.search(text)
+        or _FAKE_TOOL_CALL_FLAG_RE.search(text)
+        or _FAKE_TOOL_CALL_XML_RE.search(text)
+    )
 
 
 _NARRATED_TOOL_INTENT_RE = re.compile(
@@ -2693,7 +3223,17 @@ async def _stream_one_completion(
     stream_iterator = stream.__aiter__()
     while True:
         try:
-            chunk = await stream_iterator.__anext__()
+            # FIX: bounds the gap between two consecutive chunks, not the
+            # total response time -- see STREAM_IDLE_TIMEOUT_SECONDS above
+            # for the full incident this responds to. asyncio.TimeoutError
+            # is a plain Exception subclass (aliased to the builtin
+            # TimeoutError since Python 3.11), so it falls straight into
+            # the existing `except Exception` below and gets the same
+            # stream-error/reconnect-or-fail treatment as any other
+            # mid-stream provider failure -- no separate handling needed.
+            chunk = await asyncio.wait_for(
+                stream_iterator.__anext__(), timeout=STREAM_IDLE_TIMEOUT_SECONDS,
+            )
         except StopAsyncIteration:
             break
         except Exception as exc:
@@ -2813,6 +3353,29 @@ RETRIEVE_EVIDENCE_TOOL_SCHEMA: dict[str, Any] = {
                 "evidence_id": {"type": "string", "description": "The evidence_id to retrieve"},
             },
             "required": ["evidence_id"],
+        },
+    },
+}
+
+
+READ_BACKGROUND_JOB_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "read_background_job",
+        "description": (
+            "Check on a command that was moved to the background (the user pressed "
+            "Ctrl+B while it was running -- an execute_command result with "
+            "backgrounded=true and a job_id means this happened). Returns status="
+            "'running' with elapsed time if it's still going, or status='finished'/"
+            "'failed' with its exit code and captured stdout/stderr once it's done. "
+            "Safe to call more than once to poll the same job_id."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "The job_id from the backgrounded execute_command result"},
+            },
+            "required": ["job_id"],
         },
     },
 }
@@ -3405,6 +3968,49 @@ def _perform_context_rollover(
     return [leading_system, scope_message, continuation, latest_user]
 
 
+async def _run_pre_tool_use_hooks(
+    configured_hooks: list[Any],
+    *,
+    tool_name: str,
+    arguments: dict[str, Any],
+    session_id: int,
+    workspace_root: str,
+    renderer: StreamRenderer,
+) -> Optional[dict[str, Any]]:
+    """Run configured pre_tool_use hooks for one call and, if a hook blocks
+    it, return the tool-result payload the caller should hand back instead
+    of executing anything. Returns None when the call is allowed to proceed.
+
+    Extracted so every tool dispatch path -- not just the generic
+    filesystem/shell branch further down this loop -- actually goes through
+    PreToolUse. retrieve_evidence/read_background_job/delegate_parallel_tasks
+    are dispatched from early `continue` branches ahead of the generic
+    branch's own inline hook call (they skip its approval gate on purpose,
+    since none of them are a filesystem/shell command an approval policy
+    was ever meant to gate) -- but a hook with an empty matcher, or one
+    written specifically to observe/gate delegate_parallel_tasks (the actual
+    background/parallel-subagent dispatch point), must still see the event.
+    Before this, those three tool names were invisible to every configured
+    hook regardless of matcher -- a hook that assumed PreToolUse fires for
+    "every tool call" (the documented contract) silently never ran for them.
+    """
+    if not configured_hooks:
+        return None
+    pre_hook_results = await run_tool_hooks(
+        configured_hooks, "pre_tool_use", tool_name=tool_name, tool_input=arguments,
+        session_id=session_id, workspace_root=workspace_root,
+    )
+    for hook_result in pre_hook_results:
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
+        })
+    blocking = next((r for r in pre_hook_results if r.blocked), None)
+    if blocking is None:
+        return None
+    return {"error": f"Blocked by hook: {blocking.message}", "success": False}
+
+
 async def _run_local_agent_turn_impl(
     manager: ProviderManager,
     provider: ProviderType,
@@ -3496,17 +4102,35 @@ async def _run_local_agent_turn_impl(
     # while get_client()/chat.completions.create() is resolving or waiting.
     renderer.handle_event({"event_type": "task_started", "payload": {"mode": "local"}})
     renderer.handle_event({"event_type": "context_loading", "payload": {"workspace_root": workspace_root}})
+    workspace_access_ok, workspace_access_error = await ensure_workspace_access(
+        workspace_root, read_only=read_only,
+    )
+    if not workspace_access_ok:
+        # Resolve host access before involving a model. This prevents a real
+        # boundary error from becoming a speculative sudo/chown/copy loop.
+        renderer.handle_event({
+            "event_type": "ai_task_failed",
+            "payload": {"error": workspace_access_error},
+        })
+        return TaskOutcome(status="failed", error=workspace_access_error)
 
     # One id for every mutation this turn makes, so a multi-file edit can
     # later be reverted together (safety.revert_transaction) instead of
     # one mutation_id at a time with no way to discover which ids
     # belonged to the same turn.
+    effective_config = cli_config or Config()
     mcp_server = MCPServer(
         workspace_root=workspace_root, session_id=session_id,
         console=console, renderer=renderer, interactive=interactive,
         transaction_id=f"turn_{uuid.uuid4().hex[:12]}",
         attachment_paths=list(attachment_paths),
         allowed_workspace_roots=list(prior_state.allowed_workspaces or [workspace_root]),
+        sandbox_policy=SandboxPolicy(
+            mode=effective_config.sandbox_mode,
+            network_access=effective_config.sandbox_network_access,
+            writable_roots=tuple(effective_config.sandbox_writable_roots),
+            fail_if_unavailable=effective_config.sandbox_fail_if_unavailable,
+        ),
     )
     # Read fresh once per turn (not cached across turns/process lifetime) so
     # editing hooks.toml takes effect on the next turn without a restart.
@@ -3536,10 +4160,11 @@ async def _run_local_agent_turn_impl(
             if recovered_objective else incoming_objective
         )
     )
-    _turn_budget_config = cli_config or Config()
+    _turn_budget_config = effective_config
     orchestrator = AgentOrchestrator(
         session_id=session_id, workspace_root=workspace_root, emit=renderer.handle_event,
         budgets=RuntimeBudgets(
+            max_tool_calls=_turn_budget_config.max_tool_calls,
             max_runtime_seconds=int(_turn_budget_config.turn_runtime_seconds),
             max_runtime_extensions=_turn_budget_config.max_runtime_extensions,
             max_repair_extensions=_turn_budget_config.max_repair_extensions,
@@ -3551,25 +4176,57 @@ async def _run_local_agent_turn_impl(
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
     )
-    # retrieve_evidence is always safe (a local, read-only lookup by id) and
-    # only useful once a rollover has actually happened; offering it
-    # whenever any other tool is offered costs one small schema entry and
-    # means the model never has to be told about it mid-turn.
     if tools:
-        tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA]
+        plugin_tool_names = [
+            str(tool.get("name")) for plugin in mcp_server.plugins for tool in plugin.tools
+            if tool.get("name") in mcp_server.tools
+        ]
+        tools.extend(mcp_server.tool_schemas_openai(names=plugin_tool_names))
+        tools.extend(await mcp_server.external_tool_schemas_openai())
+    # retrieve_evidence and read_background_job are both always safe (local,
+    # read-only lookups by id) and only useful once a rollover/backgrounded
+    # command has actually happened; offering them whenever any other tool
+    # is offered costs one small schema entry each and means the model
+    # never has to be told about them mid-turn.
+    if tools:
+        tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA, READ_BACKGROUND_JOB_TOOL_SCHEMA]
         if allow_swarm_tool and not read_only and cli_config is not None and cli_config.enable_subagent_delegation:
             tools = [*tools, SWARM_TOOL_SCHEMA]
 
     working_messages = list(orchestration.context.messages if orchestration.context else messages)
     # Resolve workspace authority before planning or repository inspection.
-    # Product names and sibling directory names never expand scope. External
-    # roots require both an explicit absolute path in the objective and a
-    # durable session grant.
+    # An absolute path in the current user objective is direct authorization:
+    # persist its existing project/directory root so interactive turns can
+    # continue without asking the user to run a second CLI command. Product
+    # names and sibling-directory inference still never expand scope.
+    durable_roots, added_roots = auto_grant_explicit_targets(
+        launch_root=workspace_root,
+        objective=objective,
+        allowed_roots=prior_state.allowed_workspaces or [workspace_root],
+    )
+    if added_roots:
+        local_state.save_session_state(
+            session_id,
+            allowed_workspaces=[str(path) for path in durable_roots],
+        )
+        renderer.handle_event({
+            "event_type": "workspace_expanded",
+            "payload": {"roots": [str(path) for path in added_roots]},
+        })
     try:
         workspace_resolution = resolve_workspace_targets(
             launch_root=workspace_root,
             objective=objective,
-            allowed_roots=prior_state.allowed_workspaces or [workspace_root],
+            # /tmp (not just the narrower per-session scratch_root(), which
+            # is only a recommended subpath within it) must be allowed here
+            # too, not just later in _apply_mcp_task_scope -- an objective
+            # that names /tmp itself, or any path under it, explicitly
+            # (e.g. "write a script to /tmp and run it") is resolved
+            # against THIS grant before scope_roots exists, and
+            # WorkspaceGrant.contains() only allows a candidate that is the
+            # granted root or a descendant of it -- granting just the
+            # deeper session subdirectory would still reject "/tmp" itself.
+            allowed_roots=[*durable_roots, tempfile.gettempdir()],
         )
     except WorkspaceAuthorityError as exc:
         message = str(exc)
@@ -3588,11 +4245,25 @@ async def _run_local_agent_turn_impl(
         )
         return TaskOutcome(status="failed", error=message)
     scope_roots = list(workspace_resolution.roots)
-    _apply_mcp_task_scope(mcp_server, scope_roots)
+    turn_scratch_root = scratch_root(session_id)
     scope_message = {
         "role": "system",
-        "content": _scope_instruction(workspace_root, scope_roots),
+        "content": _scope_instruction(workspace_root, scope_roots, scratch_root=turn_scratch_root),
     }
+    # Always granted, unlike every other path outside the launch workspace
+    # (which needs an explicit objective-named path plus a durable session
+    # grant -- see resolve_workspace_targets) -- scratch space to actually
+    # run/write throwaway code in is infrastructure, not a workspace
+    # target, the same way Claude Code's own scratchpad is always available
+    # without being "granted" per task. Both /tmp itself (matching the
+    # objective-level grant above -- see its comment on why the bare
+    # directory, not just the deeper session subpath, must be listed) and
+    # the session-scoped subdirectory are appended only AFTER building the
+    # prompt's "Target project roots" list, so they're enforced (mcp_server
+    # tools, execute_command cwd, etc.) without being displayed as if they
+    # were project roots themselves.
+    scope_roots.extend([Path(tempfile.gettempdir()), turn_scratch_root])
+    _apply_mcp_task_scope(mcp_server, scope_roots)
     # Put the scope rule immediately after the leading system instruction so
     # it survives later compaction and remains authoritative in every round.
     insert_at = 1 if working_messages and working_messages[0].get("role") == "system" else 0
@@ -3626,10 +4297,10 @@ async def _run_local_agent_turn_impl(
         nonlocal last_checkpoint_at
         checkpoint_partial_parts.append(delta)
         now = time.monotonic()
-        # Four atomic snapshots per second is effectively realtime for a
-        # terminal stream without fsyncing once per token (which can be
-        # hundreds of writes per second on fast local models).
-        if now - last_checkpoint_at >= 0.25:
+        # One atomic snapshot per second is close enough to realtime for
+        # recovery while keeping fsync work out of the hot token path. A
+        # completed provider chunk and every tool boundary are flushed below.
+        if now - last_checkpoint_at >= 1.0:
             _persist_turn_checkpoint(partial_assistant="".join(checkpoint_partial_parts))
             last_checkpoint_at = now
 
@@ -3650,6 +4321,33 @@ async def _run_local_agent_turn_impl(
             "event_type": "diagnostics",
             "payload": {"content": "User authorised automatic approval for ordinary permitted operations in this turn."},
         })
+
+    def _effective_approval_policy() -> str:
+        """The policy actually enforced for the NEXT approval decision.
+
+        `turn_approval_policy` above is a one-time snapshot -- either the
+        turn's starting policy or the objective-text auto-escalation just
+        above. Before this, every approval decision for the rest of the
+        turn kept using that frozen snapshot even after the user changed
+        mode mid-task (shift-tab / live_input.py's live listener, or the
+        `/mode` command reaching this same running turn) -- the toolbar and
+        the "auto mode on"/"plan mode on" banner updated immediately
+        (cli_config.approval_policy IS mutated live), but the actual
+        approval gate below silently kept enforcing whatever policy was
+        active when the turn started until the NEXT turn. A user watching a
+        long-running task, switching to manual mid-task expecting the very
+        next risky call to prompt them, would instead have it silently
+        auto-approved -- the opposite of what the switch was for.
+
+        Live-config takes priority the moment it actually differs from the
+        turn's starting value (the user made a deliberate change since this
+        turn began); otherwise this still returns the auto-escalated value
+        so the objective-text heuristic above isn't clobbered by a
+        `cli_config` that simply hasn't moved.
+        """
+        if cli_config is not None and cli_config.approval_policy != approval_policy:
+            return cli_config.approval_policy
+        return turn_approval_policy
     renderer.handle_event({
         "event_type": "context_reused" if orchestration.context and orchestration.context.reused else "context_rescanned",
         "payload": {"workspace_root": workspace_root},
@@ -3675,32 +4373,78 @@ async def _run_local_agent_turn_impl(
     # an execution endpoint, not a routing-decision one.
     renderer.handle_event({"event_type": "routing_started", "payload": {"requested_provider": provider.value, "task_type": task_profile.task_type.value}})
     if provider == ProviderType.AUTO and hasattr(manager, "resolve_route"):
-        resolved_provider, config = manager.resolve_route(provider, task_profile, quality_mode="quality")
+        try:
+            resolved_provider, config = manager.resolve_route(provider, task_profile, quality_mode="quality")
+        except ValueError:
+            # Keep the premium-primary route visible so the normal provider
+            # fallback approval can handle an unavailable Ollama daemon.
+            if (
+                getattr(manager, "ollama_cloud_is_premium_primary", lambda: False)()
+            ):
+                resolved_provider = ProviderType.OLLAMA_CLOUD
+                config = manager.PROVIDERS[resolved_provider]
+            else:
+                raise
     else:
         resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
         config = manager.PROVIDERS.get(resolved_provider)
     client = manager.get_client(resolved_provider)
-    if provider == ProviderType.AUTO and not _paid_provider_fallback_enabled(manager):
-        renderer.handle_event({
-            "event_type": "diagnostics",
-            "payload": {
-                "content": (
-                    f"Automatic routing selected {resolved_provider.value}; "
-                    "safe/free fallback only is enabled. Paid routes require an explicit --provider."
-                ),
-            },
-        })
+    # Automatic route policy is an internal deployment concern.  Do not emit
+    # backend names, billing topology, or provider-selection instructions to
+    # the user; the model_selected event exposes only the TamfisGPT alias.
     if not client or config is None:
-        error = f"Provider {resolved_provider.value} is not available (no client / no valid credentials)."
-        orchestrator.fail(error)
-        renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
-        return TaskOutcome(status="failed", error=error)
+        if (
+            provider == ProviderType.AUTO
+            and resolved_provider == ProviderType.OLLAMA_CLOUD
+            and getattr(manager, "ollama_cloud_is_premium_primary", lambda: False)()
+        ):
+            candidates = _fallback_candidates_for_turn(
+                manager,
+                resolved_provider,
+                task_profile,
+                allow_premium_primary=True,
+            )
+            choices = [
+                (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                for candidate in candidates
+                if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
+            ]
+            decision = await _ask_provider_fallback_approval(
+                console,
+                failed_provider=resolved_provider,
+                interactive=interactive,
+                choices=choices,
+            )
+            if decision != "deny":
+                selected = _requested_fallback_choice(decision, choices)
+                for candidate, selected_model in ([selected] if selected else choices):
+                    candidate_client = manager.get_client(candidate)
+                    candidate_config = manager.PROVIDERS.get(candidate)
+                    if candidate_client is not None and candidate_config is not None:
+                        resolved_provider, client, config = candidate, candidate_client, candidate_config
+                        if selected_model:
+                            # Preserve an in-flight premium model choice for
+                            # the first fallback attempt.
+                            model = selected_model
+                        break
+        if not client or config is None:
+            error = f"Provider {resolved_provider.value} is not available (no client / no valid credentials)."
+            orchestrator.fail(error)
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+            return TaskOutcome(status="failed", error=error)
     selected_default_model = (
         _select_fallback_model(manager, config, task_profile)
         if provider == ProviderType.AUTO and not _paid_provider_fallback_enabled(manager)
         else _select_model(manager, config, task_profile)
     )
-    resolved_model = model or selected_default_model
+    from .public_identity import resolve_public_model_alias
+
+    resolved_model = resolve_public_model_alias(
+        model,
+        models=getattr(config, "models", ()),
+        default_model=selected_default_model,
+        free_model=getattr(config, "free_model", None),
+    ) or selected_default_model
     configured_models = set(getattr(config, "models", None) or [])
     if (resumed_from_checkpoint or resumed_from_legacy) and model and configured_models and model not in configured_models:
         renderer.handle_event({
@@ -3735,20 +4479,44 @@ async def _run_local_agent_turn_impl(
             "event_type": "diagnostics",
             "payload": {"content": "Repository reconnaissance completed before plan generation."},
         })
+        # On a resumed turn ("continue"), ground the very first plan in real
+        # prior progress instead of proposing one from a blank slate. Without
+        # this, every resume re-planned as if nothing had happened yet --
+        # durable per-session progress (inspected/modified files, completed
+        # tool outcomes -- see _summarise_progress_for_rollover) already
+        # survives the interruption, but nothing carried it into the
+        # reasoning-plan prompt, so a resumed task could re-propose steps
+        # already done. Reuses the exact "REVISION: ... do not repeat
+        # completed work" grounding build_reasoning_plan_prompt already
+        # applies for a genuine mid-turn revision -- the same instruction is
+        # equally correct here: this is not the first attempt at the
+        # objective, only the first attempt in this process.
+        resumed_evidence_summary = (
+            _summarise_progress_for_rollover(session_id)
+            if (resumed_from_checkpoint or resumed_from_legacy) else None
+        )
+        repository_context = local_state.get_session_state(session_id).repository_context or {}
+        grounded_fallback = create_plan(
+            objective, task_profile,
+            reconnaissance_summary=planning_reconnaissance,
+            workspace_summary=repository_context,
+        )
         reasoning_plan = await _attempt_reasoning_plan(
             client, model=resolved_model, objective=objective, task_profile=task_profile,
             session_id=session_id, renderer=renderer,
             reconnaissance_summary=planning_reconnaissance,
+            evidence_summary=resumed_evidence_summary,
             reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
             scope_roots=scope_roots,
         )
-        if reasoning_plan is not None and orchestrator.run is not None:
-            orchestrator.replace_plan(reasoning_plan)
-            orchestrator.run.reasoning_plan = True
+        selected_plan = reasoning_plan or grounded_fallback
+        if selected_plan is not None and orchestrator.run is not None:
+            orchestrator.replace_plan(selected_plan)
+            orchestrator.run.reasoning_plan = reasoning_plan is not None
             plan_message = {
                 "role": "system",
                 "content": _plan_message_content(
-                    reasoning_plan,
+                    selected_plan,
                     heading=(
                         "TASK PLAN (grounded in the actual objective and real workspace facts -- "
                         "supersedes any generic plan mentioned above):"
@@ -3758,7 +4526,7 @@ async def _run_local_agent_turn_impl(
             working_messages.insert(working_messages.index(scope_message) + 1, plan_message)
             renderer.handle_event({
                 "event_type": "plan_created",
-                "payload": _plan_created_payload(reasoning_plan, title="Plan"),
+                "payload": _plan_created_payload(selected_plan, title="Plan"),
             })
 
     previous_tool_calls_signature: Optional[tuple[tuple[str, str], ...]] = None
@@ -3766,6 +4534,7 @@ async def _run_local_agent_turn_impl(
     recent_tool_signatures: list[tuple[tuple[str, str], ...]] = []
     any_mutation = False
     rollover_count = 0
+    compaction_count = 0
     replanned_after_evidence = False
     loop_nudge_count = 0
     narrated_retries: dict[ProviderType, int] = {}
@@ -3774,9 +4543,43 @@ async def _run_local_agent_turn_impl(
     capitulation_failed_providers: set[ProviderType] = set()
     fabricated_result_retries: dict[ProviderType, int] = {}
     fabricated_result_failed_providers: set[ProviderType] = set()
+    fake_tool_call_retries: dict[ProviderType, int] = {}
+    fake_tool_call_failed_providers: set[ProviderType] = set()
+    consecutive_scope_errors = 0
+    # Distinct from consecutive_identical_rounds/_is_cycling above: those
+    # catch the model retrying the SAME (or a short repeating cycle of)
+    # call(s). This catches the opposite shape of stall -- a *different*
+    # command/edit attempted each round, none of which land, e.g. three
+    # different "fix attempts" that each error out differently. Neither
+    # existing guard fires there since the calls are never identical or
+    # cycling; only this counts every round where every tool call this
+    # round failed and none succeeded. Nudged once per turn (like the
+    # narrated/capitulation/fabricated-result corrections above), not
+    # repeated -- this is a course-correction, not a running scold.
+    consecutive_failed_rounds = 0
+    failure_diagnosis_nudged = False
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
+    validation_commands = [] if read_only else detect_validation_commands(Path(workspace_root))
+    validation_confirmed: set[str] = set()
+    validation_retries: dict[str, int] = {}
+    validation_errors: dict[str, str] = {}
+    unresolved_edit_paths: set[str] = set()
+    # FIX: when a project has no detectable test/lint/build fingerprint,
+    # validation_commands is empty, so next_validation below is always None
+    # and the verify-before-finish nudge never engages -- a DEBUG/EDIT task
+    # could mutate files and finish with zero execute_command calls at all,
+    # the exact "claims fixed without ever checking" gap this guards
+    # against everywhere else. Tracks whether ANY execute_command has
+    # succeeded since the last mutation, mirroring validation_confirmed's
+    # clear-on-mutation semantics, as a generic fallback requirement.
+    any_execute_command_since_mutation = False
+    generic_verify_retries = 0
+    # A bind conflict must change the validation strategy, not become a
+    # kill/start loop. Keep this turn-local evidence so a later destructive
+    # command can be refused even when its PID/arguments differ each round.
+    port_conflict_seen = False
 
     async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
         """Turn accumulated completion output into the turn's final
@@ -3874,7 +4677,15 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
-        elif not read_only and not any_mutation and _looks_like_change_request(_latest_user_text(messages)):
+        elif (
+            not read_only
+            and not any_mutation
+            and _looks_like_change_request(_latest_user_text(messages))
+            and not verified_no_change_completion(
+                tool_records=[item.to_dict() for item in (orchestrator.run.tool_records if orchestrator.run else [])],
+                final_text=content,
+            )
+        ):
             caveat = (
                 "\n\n⚠ No files were changed during this task, despite the request "
                 "asking for a fix/change. The response above may describe an edit "
@@ -3883,6 +4694,15 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
+        if unresolved_edit_paths:
+            message = (
+                "Edit failed: the requested old_string was not found after a fresh read of "
+                + ", ".join(sorted(unresolved_edit_paths))
+                + ". The task is not complete; use the refreshed file contents before editing again."
+            )
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
+            return TaskOutcome(status="failed", error=message, summary=content)
         validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
         if validation.severity == "error":
             message = "Validation failed: " + "; ".join(validation.unresolved)
@@ -3901,6 +4721,49 @@ async def _run_local_agent_turn_impl(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
         )
         return TaskOutcome(status="completed", summary=content)
+
+    def _synthesize_stuck_recovery_summary(messages: list[dict]) -> str:
+        """Last resort when the model won't produce any text even with
+        tools disabled: rebuild a plain-text summary directly from the
+        tool calls/results already recorded on `working_messages` this
+        turn, so real work the model actually did (e.g. four completed
+        database cleanups) isn't thrown away just because the model
+        itself never narrated it. Returns "" if nothing usable was found."""
+        call_info: dict[str, tuple[str, Any]] = {}
+        lines: list[str] = []
+        for msg in messages:
+            if msg.get("role") == "assistant" and msg.get("tool_calls"):
+                for call in msg["tool_calls"]:
+                    fn = call.get("function") or {}
+                    call_info[call.get("id")] = (fn.get("name") or "tool", fn.get("arguments"))
+            elif msg.get("role") == "tool":
+                name, arguments = call_info.get(msg.get("tool_call_id"), ("tool", None))
+                try:
+                    result = json.loads(msg.get("content") or "{}")
+                except (TypeError, ValueError):
+                    result = {}
+                if not isinstance(result, dict):
+                    continue
+                if str(result.get("error", "")).startswith("Refused: this round was detected as stuck"):
+                    continue
+                success = result.get("success")
+                label = "done" if success else ("failed" if success is False else "ran")
+                detail = result.get("error") or result.get("message") or result.get("result")
+                arg_hint = ""
+                if isinstance(arguments, str):
+                    arg_hint = arguments[:120]
+                elif arguments is not None:
+                    arg_hint = json.dumps(arguments, default=str)[:120]
+                line = f"- {name}({arg_hint}) -> {label}"
+                if detail:
+                    line += f": {str(detail)[:200]}"
+                lines.append(line)
+        if not lines:
+            return ""
+        return (
+            "⚠ The model could not produce a text summary even with tools disabled, so this is "
+            "reconstructed directly from the actions it actually took this turn:\n\n" + "\n".join(lines)
+        )
 
     async def _handle_stuck_loop(
         stuck_reason: str, tool_calls: list["_StreamedToolCall"],
@@ -3995,6 +4858,16 @@ async def _run_local_agent_turn_impl(
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
             return TaskOutcome(status="failed", error=message)
         if not recovery_content.strip():
+            fallback_summary = _synthesize_stuck_recovery_summary(working_messages)
+            if fallback_summary:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": "Tools-disabled recovery answer was empty too -- reconstructing a "
+                                   "summary from actions actually taken this turn instead of failing."
+                    },
+                })
+                return await _finalize_completed_answer(fallback_summary, None)
             message = (f"Detected {stuck_reason}, and the tools-disabled recovery answer was empty too. ""Try narrowing the objective to a specific repository, component, file, or concern.")
             orchestrator.fail(message)
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
@@ -4015,7 +4888,33 @@ async def _run_local_agent_turn_impl(
                 vision_message_index = _idx
                 break
 
-    for _round in range(max_rounds):
+    _round = -1
+    _round_extensions_used = 0
+    _round_window_size = max_rounds
+    while True:
+        _round += 1
+        if _round >= max_rounds:
+            if _round_extensions_used >= MAX_AGENT_ROUND_EXTENSIONS:
+                break
+            _round_extensions_used += 1
+            max_rounds += _round_window_size
+            orchestrator.mark_repair(
+                f"Extending the tool-call round budget (extension {_round_extensions_used}/"
+                f"{MAX_AGENT_ROUND_EXTENSIONS}) -- {_round} rounds of real tool work with no "
+                "stall detected, task is larger than one round window rather than stuck"
+            )
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"Round budget reached after {_round} rounds of real, varied tool work "
+                        f"(no stall detected) -- granting {_round_window_size} more rounds "
+                        f"(extension {_round_extensions_used}/{MAX_AGENT_ROUND_EXTENSIONS}) instead "
+                        "of ending the task."
+                    ),
+                },
+            })
+            _persist_turn_checkpoint()
         # User-requested: reach a standalone task that's already running from
         # a SECOND terminal (`tamfis-code queue "..."` against the same
         # session) -- a single terminal can't do this mid-turn since the
@@ -4047,19 +4946,43 @@ async def _run_local_agent_turn_impl(
         local_state.save_session_state(session_id, estimated_context_tokens=input_tokens)
         if input_tokens > token_budget:
             before_compaction = input_tokens
-            compacted = _trim_tool_outputs(working_messages, token_budget)
+            # Compact well below the hard budget rather than right up to its
+            # edge -- confirmed live: trimming to exactly `token_budget`
+            # meant the very next tool result (a directory listing, a file
+            # read) pushed input_tokens back over the line immediately,
+            # triggering another compaction pass next round. On a long
+            # exploration turn this thrashed every single round, repeatedly
+            # discarding just-read tool output (the model then re-read the
+            # same paths, having lost the earlier detail) and spamming a
+            # "Context compacted" diagnostic on nearly every tool call.
+            # Trimming to 85% of budget instead gives several rounds of
+            # headroom before compaction has to run again.
+            compacted = _trim_tool_outputs(working_messages, int(token_budget * 0.85))
             input_tokens = _estimate_tokens(working_messages)
             if compacted:
-                renderer.handle_event({
-                    "event_type": "diagnostics",
-                    "payload": {
-                        "content": (
-                            f"Context compacted from ~{before_compaction} to "
-                            f"~{input_tokens} estimated tokens for "
-                            f"{resolved_provider.value}'s context window."
-                        )
-                    },
-                })
+                compaction_count += 1
+                # Throttle the diagnostic itself the same way: full detail
+                # for the first couple of occurrences, then a quieter
+                # one-liner so a long turn doesn't scroll the transcript
+                # full of near-identical "Context compacted" lines.
+                if compaction_count <= 2:
+                    content = (
+                        f"Context compacted from ~{before_compaction} to "
+                        f"~{input_tokens} estimated tokens for "
+                        f"{resolved_provider.value}'s context window."
+                    )
+                elif compaction_count % 5 == 0:
+                    content = (
+                        f"Context compacted again (~{input_tokens} estimated tokens) -- "
+                        f"{compaction_count} compactions so far this turn."
+                    )
+                else:
+                    content = None
+                if content is not None:
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": content},
+                    })
         if input_tokens > token_budget:
             # Compaction alone was not enough. Before ever failing the turn,
             # try (a) an internal context rollover -- persist the full
@@ -4164,6 +5087,13 @@ async def _run_local_agent_turn_impl(
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
                 progress_callback=_remember_stream_delta,
             )
+            # Do not wait for the next tool round/final answer: if the process
+            # is interrupted immediately after a provider stream completes,
+            # its latest assistant text is already durable.
+            _persist_turn_checkpoint(
+                partial_assistant=content,
+                status="running",
+            )
         except Exception as exc:
             # Automatic routing must treat provider/account failures as route
             # failures, not task failures. In particular, OpenRouter HTTP 402
@@ -4174,23 +5104,107 @@ async def _run_local_agent_turn_impl(
                 exc.partial if isinstance(exc, _InterruptedCompletion)
                 else "".join(checkpoint_partial_parts)
             )
+            # BUG FIX: `failed_provider` was previously first referenced below
+            # (in the premium-Ollama-fallback-approval check) before ever
+            # being assigned in this except block. The only earlier
+            # assignment in this function is inside the narrated-content
+            # repair retry (~line 4098), a separate and not-always-reached
+            # code path -- so the very first streaming call of a task failing
+            # (the most common failure shape: Ollama daemon down, a network
+            # blip, any retryable provider error on round 1) raised
+            # UnboundLocalError here instead of falling back gracefully. No
+            # existing test exercises this integration path (they cover
+            # providers.py's routing logic in isolation, not this function),
+            # which is how it went uncaught.
+            failed_provider = resolved_provider
+            # Infra/account failures (rate limits, quota exhaustion, 5xx,
+            # connection errors) must trigger cross-provider fallback even
+            # when the user (or session default) explicitly pinned a
+            # non-AUTO provider -- an explicit pin is a quality/preference
+            # choice, not consent to a hard failure the moment that
+            # provider's account hits a cap. Unlike the AUTO-only
+            # quality-based fallbacks elsewhere in this loop (degenerate
+            # output, fake tool calls, etc. -- those genuinely second-guess
+            # an explicit choice and stay AUTO-gated), this is the exact
+            # path that previously surfaced "Provider streaming failed on
+            # <provider> ... type `continue` to resume" for a plain HTTP 429
+            # on an explicitly-selected provider with configured fallback
+            # routes (Ollama Cloud / NVIDIA NIM / HF / OpenRouter) sitting
+            # unused. `_auto_provider_fallback_enabled` remains the master
+            # kill switch (TAMFIS_CODE_DISABLE_PROVIDER_FALLBACK).
             can_fallback = (
-                provider == ProviderType.AUTO
-                and _auto_provider_fallback_enabled(manager)
+                _auto_provider_fallback_enabled(manager)
                 and hasattr(manager, "is_retryable_provider_error")
                 and manager.is_retryable_provider_error(root_exc)
                 and hasattr(manager, "fallback_candidates")
             )
+            allow_premium_primary = False
+            # Same class of bug: only assigned inside the branch below, but
+            # read unconditionally further down (`candidate ==
+            # premium_choices[0][0] and premium_choices` -- indexed BEFORE
+            # the truthiness check even runs, so an empty/undefined list
+            # would raise UnboundLocalError or IndexError, not just skip the
+            # branch).
+            premium_choices: list[tuple[ProviderType, str]] = []
+            if (
+                can_fallback
+                and failed_provider == ProviderType.OLLAMA_CLOUD
+                and getattr(manager, "ollama_cloud_is_premium_primary", lambda: False)()
+            ):
+                premium_candidates = _fallback_candidates_for_turn(
+                    manager,
+                    failed_provider,
+                    task_profile,
+                    allow_premium_primary=True,
+                )
+                premium_choices = [
+                    (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                    for candidate in premium_candidates
+                    if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
+                ]
+                decision = await _ask_provider_fallback_approval(
+                    console,
+                    failed_provider=failed_provider,
+                    interactive=interactive,
+                    choices=premium_choices,
+                )
+                selected_choice = _requested_fallback_choice(decision, premium_choices)
+                allow_premium_primary = decision != "deny"
+                if selected_choice:
+                    # Put the requested route first; the normal loop still
+                    # tries other dynamically available routes if it fails.
+                    chosen_provider, chosen_model = selected_choice
+                    premium_candidates = [
+                        chosen_provider,
+                        *[candidate for candidate in premium_candidates if candidate != chosen_provider],
+                    ]
+                    premium_choices = [(chosen_provider, chosen_model), *[
+                        choice for choice in premium_choices if choice[0] != chosen_provider
+                    ]]
+                else:
+                    can_fallback = False
             fallback_succeeded = False
             last_error: Exception = root_exc
             failed_provider = resolved_provider
             if can_fallback:
-                for candidate in manager.fallback_candidates(failed_provider, task_profile):
+                candidates = _fallback_candidates_for_turn(
+                    manager,
+                    failed_provider,
+                    task_profile,
+                    allow_premium_primary=allow_premium_primary,
+                )
+                for candidate in candidates:
                     candidate_client = manager.get_client(candidate)
                     candidate_config = manager.PROVIDERS.get(candidate)
                     if candidate_client is None or candidate_config is None:
                         continue
-                    candidate_model = _select_fallback_model(manager, candidate_config, task_profile)
+                    candidate_model = _select_model(manager, candidate_config, task_profile)
+                    if (
+                        failed_provider == ProviderType.OLLAMA_CLOUD
+                        and premium_choices
+                        and candidate == premium_choices[0][0]
+                    ):
+                        candidate_model = premium_choices[0][1]
                     status = manager.provider_error_status(last_error) if hasattr(manager, "provider_error_status") else None
                     reason = f"HTTP {status}" if status is not None else str(last_error)
                     # A real repair attempt, tracked at the point it's actually
@@ -4236,6 +5250,10 @@ async def _run_local_agent_turn_impl(
                             progress_callback=_remember_stream_delta,
                             initial_partial=interrupted_partial,
                         )
+                        _persist_turn_checkpoint(
+                            partial_assistant=content,
+                            status="running",
+                        )
                     except Exception as candidate_exc:
                         last_error = (
                             candidate_exc.cause
@@ -4256,7 +5274,7 @@ async def _run_local_agent_turn_impl(
                         provider=resolved_provider.value,
                         model=resolved_model,
                         reason="automatic provider fallback",
-                        fallback_chain=["nvidia", "hf", "openrouter"],
+                        fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
                     )
                     fallback_succeeded = True
                     break
@@ -4311,6 +5329,9 @@ async def _run_local_agent_turn_impl(
                     scope_roots=scope_roots,
                     objective=objective,
                     round_number=_round,
+                    configured_hooks=configured_hooks,
+                    session_id=session_id,
+                    workspace_root=workspace_root,
                 )
             ):
                 audit_recovery_reads += 1
@@ -4475,6 +5496,9 @@ async def _run_local_agent_turn_impl(
                     scope_roots=scope_roots,
                     objective=objective,
                     round_number=_round,
+                    configured_hooks=configured_hooks,
+                    session_id=session_id,
+                    workspace_root=workspace_root,
                 )
             ):
                 audit_recovery_reads += 1
@@ -4549,6 +5573,76 @@ async def _run_local_agent_turn_impl(
                     "The available model repeatedly described repository actions without issuing a registered "
                     "tool call. The exact turn was checkpointed; type `continue` after enabling another "
                     "tool-capable provider, or select one explicitly."
+                )
+                _persist_turn_checkpoint(status="interrupted", last_error=error)
+                orchestrator.fail(error)
+                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+                return TaskOutcome(status="failed", error=error)
+
+            if tools and _looks_like_fake_tool_call(content):
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({"role": "system", "content": FAKE_TOOL_CALL_CORRECTION})
+                attempts = fake_tool_call_retries.get(resolved_provider, 0)
+                if attempts < MAX_FAKE_TOOL_CALL_RETRIES_PER_PROVIDER:
+                    fake_tool_call_retries[resolved_provider] = attempts + 1
+                    orchestrator.mark_repair(
+                        f"Converting a text-written fake tool call into a real tool call on {resolved_provider.value}"
+                    )
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {
+                            "content": (
+                                "The model wrote out a tool call as text/markup instead of issuing a real "
+                                "one; requesting the registered tool call now."
+                            )
+                        },
+                    })
+                    _persist_turn_checkpoint()
+                    continue
+
+                fake_tool_call_failed_providers.add(resolved_provider)
+                switched = False
+                if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
+                    for candidate in manager.fallback_candidates(resolved_provider, task_profile):
+                        if candidate in fake_tool_call_failed_providers:
+                            continue
+                        candidate_client = manager.get_client(candidate)
+                        candidate_config = manager.PROVIDERS.get(candidate)
+                        if candidate_client is None or candidate_config is None:
+                            continue
+                        old_provider = resolved_provider
+                        resolved_provider = candidate
+                        config = candidate_config
+                        client = candidate_client
+                        resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
+                        orchestrator.mark_repair(
+                            f"Falling back from {old_provider.value}: model repeatedly wrote fake tool calls as text"
+                        )
+                        orchestrator.record_route(
+                            provider=resolved_provider.value,
+                            model=resolved_model,
+                            reason="automatic fallback after unexecuted text-written tool call",
+                            fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    f"{old_provider.value} repeatedly wrote tool calls as text without executing "
+                                    f"them; falling back to {resolved_provider.value} / {resolved_model}."
+                                )
+                            },
+                        })
+                        switched = True
+                        break
+                if switched:
+                    _persist_turn_checkpoint()
+                    continue
+
+                error = (
+                    "The available model repeatedly wrote out tool calls as text/markup instead of issuing "
+                    "registered tool calls. The exact turn was checkpointed; type `continue` after enabling "
+                    "another tool-capable provider, or select one explicitly."
                 )
                 _persist_turn_checkpoint(status="interrupted", last_error=error)
                 orchestrator.fail(error)
@@ -4740,6 +5834,96 @@ async def _run_local_agent_turn_impl(
                 _persist_turn_checkpoint()
                 continue
 
+            if (
+                tools and any_mutation and not validation_commands
+                and not any_execute_command_since_mutation
+                and getattr(task_profile.task_type, "value", "") in {"debug", "edit"}
+            ):
+                if generic_verify_retries >= MAX_VERIFY_COMMAND_RETRIES:
+                    message = (
+                        "Validation incomplete: files were changed but no execute_command call "
+                        "ever verified the fix, and no project test/lint/build command could be "
+                        "detected to require automatically."
+                    )
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    _persist_turn_checkpoint(status="failed", last_error=message)
+                    return TaskOutcome(status="failed", error=message)
+                generic_verify_retries += 1
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({
+                    "role": "system",
+                    "content": (
+                        "You changed files in this project, but never ran any command via "
+                        "execute_command to verify the fix -- this project has no detectable "
+                        "test/lint/build command, so you must verify by re-running the original "
+                        "failing command/reproduction steps from the request (or the most direct "
+                        "equivalent, e.g. re-invoking the affected script/function) via "
+                        "execute_command, and confirm the real output shows it's fixed, before "
+                        "finishing. Do not claim the fix works from reading the code alone."
+                    ),
+                })
+                orchestrator.mark_repair(
+                    f"Requiring a real execute_command verification before completion "
+                    f"(attempt {generic_verify_retries}/{MAX_VERIFY_COMMAND_RETRIES})"
+                )
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "Files changed but no execute_command has verified the fix, and no "
+                            "project validation command was detected; requesting a real "
+                            "verification run before finishing."
+                        )
+                    },
+                })
+                _persist_turn_checkpoint()
+                continue
+
+            next_validation = next(
+                (item for item in validation_commands if item[1] not in validation_confirmed),
+                None,
+            )
+            if tools and any_mutation and next_validation is not None:
+                validation_label, validation_command = next_validation
+                retries = validation_retries.get(validation_command, 0)
+                if retries >= MAX_VERIFY_COMMAND_RETRIES:
+                    message = (
+                        f"Validation incomplete: `{validation_command}` did not produce a "
+                        "confirmed successful result after the allowed attempts."
+                    )
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    _persist_turn_checkpoint(status="failed", last_error=message)
+                    return TaskOutcome(status="failed", error=message)
+                validation_retries[validation_command] = retries + 1
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({
+                    "role": "system",
+                    "content": (
+                        VERIFY_COMMAND_CORRECTION.format(command=validation_command)
+                        + "\n\n"
+                        + _validation_dependency_hint(
+                            validation_command, validation_errors.get(validation_command, "")
+                        )
+                    ),
+                })
+                orchestrator.mark_repair(
+                    f"Requiring a real `{validation_command}` run before completion "
+                    f"(attempt {validation_retries[validation_command]}/{MAX_VERIFY_COMMAND_RETRIES})"
+                )
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Files changed but `{validation_command}` hasn't been confirmed clean since; "
+                            f"requesting validation ({validation_label}) before finishing."
+                        )
+                    },
+                })
+                _persist_turn_checkpoint()
+                continue
+
             return await _finalize_completed_answer(content, finish_reason)
 
         signature = _tool_calls_signature(tool_calls)
@@ -4820,7 +6004,7 @@ async def _run_local_agent_turn_impl(
             and _turn_batch.highest_risk not in session_approved_risks
         ):
             combined_text = describe_batch(_turn_batch)
-            suspend_live_if_active(renderer)
+            await suspend_live_async_if_active(renderer)
             orchestrator.waiting_for_approval(f"Approve {len(_risky_batch_actions)} actions")
             renderer.handle_event({
                 "event_type": "approval_required",
@@ -4833,7 +6017,7 @@ async def _run_local_agent_turn_impl(
             })
             try:
                 _batch_decision = await resolve_approval_decision_async(
-                    console, combined_text, _turn_batch.highest_risk, turn_approval_policy, interactive,
+                    console, combined_text, _turn_batch.highest_risk, _effective_approval_policy(), interactive,
                     display_preview=False, config=cli_config,
                 )
             finally:
@@ -4883,8 +6067,19 @@ async def _run_local_agent_turn_impl(
             if tc.name == "retrieve_evidence":
                 # A pure local lookup by id -- read-only, no workspace scope
                 # or approval gate applies (it isn't a filesystem/shell tool
-                # at all), so it's dispatched before either.
+                # at all), so it's dispatched before either. Still runs
+                # through PreToolUse (see _run_pre_tool_use_hooks) -- a
+                # configured hook must see every tool call, not just the
+                # ones that also need approval/scope enforcement.
                 renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+                blocked = await _run_pre_tool_use_hooks(
+                    configured_hooks, tool_name=tc.name, arguments=arguments,
+                    session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+                )
+                if blocked is not None:
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(blocked)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": blocked}})
+                    continue
                 segment = evidence_store.load_segment(session_id, str(arguments.get("evidence_id") or ""))
                 if segment is None:
                     result: dict[str, Any] = {
@@ -4909,14 +6104,48 @@ async def _run_local_agent_turn_impl(
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": _tool_output_for_render(result)}})
                 continue
 
+            if tc.name == "read_background_job":
+                # Same shape as retrieve_evidence above: a pure local lookup
+                # by id, not a filesystem/shell tool -- no workspace scope or
+                # approval gate applies. Still runs through PreToolUse.
+                from .mcp import read_background_job_status
+
+                renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+                blocked = await _run_pre_tool_use_hooks(
+                    configured_hooks, tool_name=tc.name, arguments=arguments,
+                    session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+                )
+                if blocked is not None:
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(blocked)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": blocked}})
+                    continue
+                result = read_background_job_status(str(arguments.get("job_id") or ""))
+                working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result, default=str)})
+                renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                continue
+
             if tc.name == "delegate_parallel_tasks":
-                # Not a filesystem/shell tool either -- no workspace scope
-                # or per-call approval gate applies to the call itself
+                # Not a filesystem/shell tool either -- no per-call workspace
+                # scope or approval gate applies to the call itself
                 # (mutation_policy_allows_swarm is the gate here, checked
                 # once up front by run_swarm rather than per file/command).
+                # It IS the actual background/parallel-subagent dispatch
+                # point, though, so PreToolUse still runs for it -- a hook
+                # meant to observe or block subagent fan-out must see this
+                # call; every mutating tool call each spawned sub-task makes
+                # is separately hooked inside its own turn (load_hooks runs
+                # again per sub-task turn), this is only the dispatch itself.
                 from .swarm import run_swarm
 
                 renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
+                blocked = await _run_pre_tool_use_hooks(
+                    configured_hooks, tool_name=tc.name, arguments=arguments,
+                    session_id=session_id, workspace_root=workspace_root, renderer=renderer,
+                )
+                if blocked is not None:
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(blocked)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": blocked}})
+                    continue
                 sub_tasks, sub_agent_types = _parse_swarm_tasks(arguments.get("tasks") or [])
                 mutate = bool(arguments.get("mutate", False))
                 if len(sub_tasks) < 2:
@@ -4927,7 +6156,7 @@ async def _run_local_agent_turn_impl(
                         swarm_results = await run_swarm(
                             sub_tasks, manager=manager, provider=provider, model=model, console=console,
                             workspace_root=workspace_root, session_id=session_id,
-                            approval_policy=turn_approval_policy, mutate=mutate,
+                            approval_policy=_effective_approval_policy(), mutate=mutate,
                             agent_types=sub_agent_types if any(sub_agent_types) else None,
                         )
                         result = {"success": True, "result": swarm_results}
@@ -4948,6 +6177,7 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
             if scope_error:
+                consecutive_scope_errors += 1
                 result = {
                     "error": scope_error,
                     "success": False,
@@ -4958,6 +6188,42 @@ async def _run_local_agent_turn_impl(
                     "tool_call_id": tc.call_id,
                     "content": json.dumps(result),
                 })
+                renderer.handle_event({
+                    "event_type": "tool_output",
+                    "payload": {"tool": tc.name, "result": result},
+                })
+                if consecutive_scope_errors >= 3:
+                    message = (
+                        "Stopped after three invalid commands were rejected by the workspace scope guard. "
+                        "The task is not complete; use a command rooted under the allowed project directory."
+                    )
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    return TaskOutcome(status="failed", error=message)
+                continue
+
+            consecutive_scope_errors = 0
+
+            if (
+                port_conflict_seen
+                and tc.name == "execute_command"
+                and _looks_like_forced_listener_reclamation(str(arguments.get("command") or ""))
+                and not _user_authorized_service_disruption(_latest_user_text(messages))
+            ):
+                result = {
+                    "success": False,
+                    "runtime_blocked": True,
+                    "error": (
+                        "Refused blind listener reclamation after EADDRINUSE. The user did not "
+                        "ask to stop or restart the existing service. Identify the listener and "
+                        "check its health; if it is the expected healthy service, leave it running."
+                    ),
+                }
+                working_messages.append({
+                    "role": "tool", "tool_call_id": tc.call_id,
+                    "content": json.dumps(result),
+                })
+                working_messages.append({"role": "system", "content": PORT_CONFLICT_CORRECTION})
                 renderer.handle_event({
                     "event_type": "tool_output",
                     "payload": {"tool": tc.name, "result": result},
@@ -4995,9 +6261,15 @@ async def _run_local_agent_turn_impl(
                 # approval panel (not just before the prompt) so nothing can
                 # race the card's visibility, then restore it once a
                 # decision is made.
-                suspend_live_if_active(renderer)
+                await suspend_live_async_if_active(renderer)
                 orchestrator.waiting_for_approval(f"Approve {tc.name}")
                 reason = "The agent requested this command."
+                external_scope_paths = list(arguments.get(_EXTERNAL_SCOPE_PATHS_KEY) or [])
+                if external_scope_paths:
+                    reason = (
+                        "The agent needs access outside the resolved workspace scope: "
+                        + ", ".join(str(path) for path in external_scope_paths)
+                    )
                 if (
                     tc.name == "execute_command" and not any_mutation
                     and _looks_like_service_restart(str(arguments.get("command") or ""))
@@ -5012,9 +6284,15 @@ async def _run_local_agent_turn_impl(
                 # from a password the model just read out of wp-config.php)
                 # must still reach the actual tool call below -- only the
                 # human-facing/logged rendering gets the redacted copy.
-                display_arguments = arguments
+                display_arguments = {
+                    key: value for key, value in arguments.items()
+                    if key != _EXTERNAL_SCOPE_PATHS_KEY
+                }
                 if isinstance(arguments.get("command"), str):
-                    display_arguments = {**arguments, "command": redact_secrets(arguments["command"])}
+                    display_arguments = {
+                        **display_arguments,
+                        "command": redact_secrets(arguments["command"]),
+                    }
                 diff_preview = _preview_diff_for_tool_call(mcp_server, tc.name, arguments)
                 if diff_preview is not None:
                     # The diff panel (below) already shows the real change;
@@ -5038,7 +6316,7 @@ async def _run_local_agent_turn_impl(
                 # (matches runner.py's remote-path fix for the same trap).
                 try:
                     decision = await resolve_approval_decision_async(
-                        console, display_command, risk, turn_approval_policy, interactive,
+                        console, display_command, risk, _effective_approval_policy(), interactive,
                         display_preview=False, config=cli_config,
                     )
                 finally:
@@ -5050,6 +6328,15 @@ async def _run_local_agent_turn_impl(
                     working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
                     renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                     continue
+
+            # Approval has completed (or policy already allowed this risk).
+            # Grant only the requested path's nearest useful root for this
+            # turn, then remove the internal marker before tool dispatch.
+            external_scope_paths = list(arguments.pop(_EXTERNAL_SCOPE_PATHS_KEY, []) or [])
+            for raw_path in external_scope_paths:
+                candidate = Path(str(raw_path)).expanduser().resolve()
+                grant_root = candidate if candidate.is_dir() else candidate.parent
+                mcp_server.allowed_workspace_roots.add(grant_root)
 
             if configured_hooks:
                 pre_hook_results = await run_tool_hooks(
@@ -5073,7 +6360,16 @@ async def _run_local_agent_turn_impl(
                 purpose=f"Execute {tc.name} for: {objective[:160]}", risk=risk,
                 requires_approval=risk != "read_only", cwd=str(arguments.get("cwd") or workspace_root),
             )
-            result = await mcp_server.call_tool(tc.name, arguments)
+            tool_extra_kwargs: Optional[dict[str, Any]] = None
+            if tc.name == "execute_command":
+                # Cleared right before each command starts, not just once
+                # per turn -- a Ctrl+B press that arrived after the PREVIOUS
+                # command already finished (or during model "thinking" time
+                # between rounds) must not immediately background the next,
+                # unrelated command the moment it starts.
+                renderer.background_requested.clear()
+                tool_extra_kwargs = {"background_signal": renderer.background_requested}
+            result = await mcp_server.call_tool(tc.name, arguments, extra_kwargs=tool_extra_kwargs)
             result = _normalise_tool_result(tc.name, arguments, result, workspace_root)
             envelope.finish(result=result, success=bool(result.get("success")))
             observation = orchestrator.record_tool(envelope)
@@ -5095,6 +6391,70 @@ async def _run_local_agent_turn_impl(
                 "tool_call_id": tc.call_id,
                 "content": json.dumps(result, default=str),
             })
+            if tc.name == "execute_command" and _has_port_conflict(result):
+                port_conflict_seen = True
+                working_messages.append({"role": "system", "content": PORT_CONFLICT_CORRECTION})
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "Port conflict detected -- preserving the existing listener and "
+                            "requesting ownership plus health checks instead of another start/kill cycle."
+                        ),
+                    },
+                })
+            if (
+                result.get("success") is False
+                and "permission denied" in json.dumps(result, default=str).lower()
+            ):
+                # Keep a single EACCES from turning into a long
+                # sudo/password/chown/copy-the-repository monologue.
+                working_messages.append({
+                    "role": "system",
+                    "content": PERMISSION_BOUNDARY_CORRECTION,
+                })
+            if _is_old_string_not_found(tc.name, result):
+                refresh_path = str(arguments.get("path") or "")
+                if refresh_path:
+                    refresh_path = _update_unresolved_edit_paths(
+                        unresolved_edit_paths,
+                        path=refresh_path,
+                        workspace_root=workspace_root,
+                        failed=True,
+                    )
+                    refresh_call_id = f"fresh_read_{_round}_{len(working_messages)}"
+                    renderer.handle_event({"event_type": "tool_call_requested", "payload": {
+                        "name": "read_file", "arguments": {"path": refresh_path},
+                    }})
+                    fresh_read = await mcp_server.call_tool("read_file", {"path": refresh_path})
+                    fresh_read = _normalise_tool_result(
+                        "read_file", {"path": refresh_path}, fresh_read, workspace_root,
+                    )
+                    working_messages.append({
+                        "role": "assistant", "tool_calls": [{
+                            "id": refresh_call_id, "type": "function",
+                            "function": {"name": "read_file", "arguments": json.dumps({"path": refresh_path})},
+                        }],
+                    })
+                    working_messages.append({
+                        "role": "tool", "tool_call_id": refresh_call_id,
+                        "content": json.dumps(fresh_read, default=str),
+                    })
+                    working_messages.append({
+                        "role": "system",
+                        "content": (
+                            f"Fresh read_file completed for {refresh_path!r} after edit_file failed. "
+                            "Do not retry the same old_string/edit arguments; use the refreshed content "
+                            "or report Edit failed."
+                        ),
+                    })
+                    renderer.handle_event({"event_type": "tool_output", "payload": {
+                        "tool": "read_file", "result": _tool_output_for_render(fresh_read),
+                    }})
+            # A batch may contain several tools. Flush after each completed
+            # result so a kill/network loss between tools cannot make resume
+            # treat an already-applied mutation as still in flight.
+            _persist_turn_checkpoint()
 
             if configured_hooks:
                 post_hook_results = await run_tool_hooks(
@@ -5111,8 +6471,20 @@ async def _run_local_agent_turn_impl(
                         "content": f"Hook feedback after {tc.name}: {hook_result.message}",
                     })
 
-            if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive"} and result.get("success"):
+            if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"} and result.get("success"):
                 any_mutation = True
+                if tc.name in {"write_file", "edit_file"} and arguments.get("path"):
+                    _update_unresolved_edit_paths(
+                        unresolved_edit_paths,
+                        path=str(arguments["path"]),
+                        workspace_root=workspace_root,
+                        failed=False,
+                    )
+                # A further edit after a clean verify run invalidates that
+                # result -- require re-verifying against the latest code,
+                # not whatever was true before this change.
+                validation_confirmed.clear()
+                any_execute_command_since_mutation = False
                 state = local_state.get_session_state(session_id)
                 if state.modified_files:
                     mutation = state.modified_files[-1]
@@ -5121,11 +6493,74 @@ async def _run_local_agent_turn_impl(
                         "lines_removed": mutation["lines_removed"], "mutation_id": mutation["mutation_id"],
                     }})
 
+            if tc.name == "execute_command" and result.get("success"):
+                any_execute_command_since_mutation = True
+                executed_command = str(arguments.get("command") or "")
+                for _, validation_command in validation_commands:
+                    if validation_command in executed_command:
+                        validation_confirmed.add(validation_command)
+            elif tc.name == "execute_command":
+                executed_command = str(arguments.get("command") or "")
+                for _, validation_command in validation_commands:
+                    if validation_command in executed_command:
+                        validation_errors[validation_command] = str(
+                            result.get("error") or result.get("result") or result.get("message") or "validation failed"
+                        )
+
         # The assistant tool-call message and every matching tool result are
         # now protocol-complete.  Save immediately before any optional
         # replanning/provider request so a kill here never repeats a tool
         # that already ran (especially a file mutation or command).
         _persist_turn_checkpoint()
+
+        # Failure-streak stall guard (see consecutive_failed_rounds above).
+        # Matches this round's tool results by tool_call_id rather than by
+        # position/count -- every branch above appends its own "role":
+        # "tool" message independently, so an id match is the only way to
+        # gather them that doesn't depend on every branch appending exactly
+        # once (most do, but this must not silently miscount if one ever
+        # doesn't).
+        _round_call_ids = {tc.call_id for tc in tool_calls}
+        _round_outcomes = []
+        for _msg in reversed(working_messages):
+            if _msg.get("role") != "tool":
+                continue
+            if _msg.get("tool_call_id") not in _round_call_ids:
+                if len(_round_outcomes) >= len(_round_call_ids):
+                    break
+                continue
+            try:
+                _round_outcomes.append(json.loads(_msg.get("content") or "{}").get("success"))
+            except (json.JSONDecodeError, AttributeError):
+                _round_outcomes.append(None)
+            if len(_round_outcomes) >= len(_round_call_ids):
+                break
+        if _round_outcomes and all(outcome is False for outcome in _round_outcomes):
+            consecutive_failed_rounds += 1
+        else:
+            consecutive_failed_rounds = 0
+        if (
+            consecutive_failed_rounds >= CONSECUTIVE_FAILED_ROUNDS_BEFORE_DIAGNOSIS_NUDGE
+            and not failure_diagnosis_nudged
+        ):
+            failure_diagnosis_nudged = True
+            working_messages.append({
+                "role": "system",
+                "content": FAILURE_DIAGNOSIS_CORRECTION.format(count=consecutive_failed_rounds),
+            })
+            orchestrator.mark_repair(
+                f"{consecutive_failed_rounds} different tool-call attempts in a row all failed -- "
+                "asking the model to diagnose root cause from the actual error evidence before trying again"
+            )
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"{consecutive_failed_rounds} varied attempts in a row have all failed -- "
+                        "requesting root-cause diagnosis from the actual error output before the next attempt."
+                    ),
+                },
+            })
 
         # Adaptive replanning: the plan above (whether reasoning-based or
         # the deterministic template) was necessarily made before any tool
@@ -5164,7 +6599,15 @@ async def _run_local_agent_turn_impl(
                     "payload": _plan_created_payload(revised_plan, title="Plan (revised)"),
                 })
 
-    message = f"(Stopped after {max_rounds} tool-call rounds without a final answer -- this usually means the task needs to be narrowed.)"
+    extension_note = (
+        f" (including {_round_extensions_used} round-budget extension"
+        f"{'s' if _round_extensions_used != 1 else ''} already granted)"
+        if _round_extensions_used else ""
+    )
+    message = (
+        f"(Stopped after {max_rounds} tool-call rounds{extension_note} without a final answer -- "
+        "this usually means the task needs to be narrowed.)"
+    )
     _persist_turn_checkpoint(status="interrupted", last_error=message)
     orchestrator.fail(message)
     renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})

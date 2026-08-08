@@ -8,8 +8,38 @@ from tamfis_code import state as state_module
 from tamfis_code.workspace import (
     _indexable_files, _project_metadata, blocking_dirty_files, build_system_prompt, classify_root,
     context_from_session, discover_local_repository, find_resumable_session,
-    resolve_local_workspace, resolve_workspace,
+    recent_local_sessions_for_workspace, resolve_local_workspace, resolve_workspace, scratch_root,
 )
+
+
+class ScratchRootTests(unittest.TestCase):
+    def test_creates_a_session_scoped_directory_under_the_os_temp_dir(self):
+        import tempfile as tempfile_module
+
+        root = scratch_root(90123)
+        try:
+            self.assertTrue(root.is_dir())
+            self.assertTrue(str(root).startswith(str(Path(tempfile_module.gettempdir()).resolve())))
+            self.assertIn("90123", root.parts)
+        finally:
+            root.rmdir()
+
+    def test_different_sessions_get_different_directories(self):
+        first = scratch_root(1)
+        second = scratch_root(2)
+        try:
+            self.assertNotEqual(first, second)
+        finally:
+            first.rmdir()
+            second.rmdir()
+
+    def test_is_idempotent_across_calls(self):
+        root = scratch_root(90124)
+        try:
+            self.assertEqual(scratch_root(90124), root)
+            self.assertTrue(root.is_dir())
+        finally:
+            root.rmdir()
 
 
 class WordpressProjectMetadataTests(unittest.TestCase):
@@ -293,6 +323,160 @@ class ResolveLocalWorkspaceTests(unittest.TestCase):
             ctx = resolve_local_workspace(cwd=Path(proj), discover=False)
         self.assertEqual(ctx.session_id, 6)
 
+    def test_does_not_reuse_a_session_actively_running_right_now(self):
+        # A second terminal opened in the same directory while the first is
+        # mid-task must not land in the same state.json row -- that used to
+        # make both processes clobber each other's current_phase/
+        # running_action/active_task (cross-talk between unrelated terminals).
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id, execution_status="running",
+            )
+            second = resolve_local_workspace(cwd=Path(proj), discover=False)
+        self.assertNotEqual(first.session_id, second.session_id)
+
+    def test_reuses_a_running_session_once_its_updated_at_goes_stale(self):
+        # A crashed/killed process can leave execution_status stuck at
+        # "running" forever -- that must not permanently block reuse, or
+        # every future launch in the same directory loses conversation
+        # history/turn_checkpoint continuity (the "resume after crash" flow).
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id, execution_status="running",
+            )
+            # put_session_state always stamps updated_at with "now" on write,
+            # so backdating it to simulate a crashed process (no further
+            # writes since) has to bypass that and edit the raw record
+            # directly, the way a real stale entry would look on disk.
+            stale = datetime.now(timezone.utc) - timedelta(hours=1)
+            data = state_module._load_raw()
+            data[str(first.session_id)]["updated_at"] = stale.isoformat()
+            state_module._save_raw(data)
+            second = resolve_local_workspace(cwd=Path(proj), discover=False)
+        self.assertEqual(first.session_id, second.session_id)
+
+    def test_idle_session_is_still_reused(self):
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id, execution_status="idle",
+            )
+            second = resolve_local_workspace(cwd=Path(proj), discover=False)
+        self.assertEqual(first.session_id, second.session_id)
+
+    def test_explicit_session_id_is_pinned_and_bookkept(self):
+        # The startup picker (cli.py's _offer_recent_session_picker) already
+        # decided which row to land in -- resolve_local_workspace must not
+        # run its own match/reuse logic in that case, just apply the same
+        # workspace bookkeeping/discovery to the chosen id.
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(41, workspace_root="/some/unrelated/root")
+            ctx = resolve_local_workspace(
+                cwd=Path(proj), discover=False, session_id=41,
+            )
+        self.assertEqual(ctx.session_id, 41)
+        self.assertEqual(
+            state_module.get_session_state(41).workspace_root,
+            str(Path(proj).resolve()),
+        )
+
+
+class RecentLocalSessionsForWorkspaceTests(unittest.TestCase):
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        self.tmp.cleanup()
+
+    def test_empty_when_no_session_has_touched_this_root(self):
+        with tempfile.TemporaryDirectory() as proj:
+            self.assertEqual(recent_local_sessions_for_workspace(Path(proj)), [])
+
+    def test_excludes_swarm_children_and_other_roots(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(1, workspace_root=root)
+            state_module.save_session_state(2, workspace_root="/somewhere/else")
+            state_module.save_session_state(3, workspace_root=root, is_swarm_child=True)
+
+            infos = recent_local_sessions_for_workspace(Path(proj))
+
+        self.assertEqual([info.session_id for info in infos], [1])
+
+    def test_orders_most_recently_updated_first_and_respects_limit(self):
+        import time
+
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            for sid in (1, 2, 3, 4):
+                state_module.save_session_state(sid, workspace_root=root)
+                time.sleep(0.01)  # updated_at has second-level+ resolution gaps to sort by
+
+            infos = recent_local_sessions_for_workspace(Path(proj), limit=2)
+
+        self.assertEqual([info.session_id for info in infos], [4, 3])
+
+    def test_status_distinguishes_running_interrupted_and_idle(self):
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(1, workspace_root=root, execution_status="running")
+            state_module.save_session_state(2, workspace_root=root, execution_status="running")
+            stale = datetime.now(timezone.utc) - timedelta(hours=1)
+            data = state_module._load_raw()
+            data["2"]["updated_at"] = stale.isoformat()
+            state_module._save_raw(data)
+            state_module.save_session_state(3, workspace_root=root, execution_status="idle")
+
+            infos = {
+                info.session_id: info.status
+                for info in recent_local_sessions_for_workspace(Path(proj), limit=3)
+            }
+
+        self.assertEqual(infos[1], "running")
+        self.assertEqual(infos[2], "interrupted")
+        self.assertEqual(infos[3], "idle")
+
+    def test_description_prefers_active_task_objective(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(
+                1, workspace_root=root,
+                active_task={"objective": "Refactor the auth middleware"},
+                conversation_summary="stale summary that should be skipped",
+            )
+            infos = recent_local_sessions_for_workspace(Path(proj))
+        self.assertEqual(infos[0].description, "Refactor the auth middleware")
+
+    def test_description_falls_back_to_last_user_turn(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(
+                1, workspace_root=root,
+                conversation_history=[
+                    {"role": "user", "content": "Fix the flaky test"},
+                    {"role": "assistant", "content": "Done"},
+                ],
+            )
+            infos = recent_local_sessions_for_workspace(Path(proj))
+        self.assertEqual(infos[0].description, "Fix the flaky test")
+
+    def test_description_defaults_when_nothing_recorded(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            infos = recent_local_sessions_for_workspace(Path(proj))
+        self.assertEqual(infos[0].description, "no recent activity")
+
 
 class ResolveSwarmSubtaskWorkspaceTests(unittest.TestCase):
     """Unlike resolve_local_workspace, this must NEVER reuse an existing
@@ -415,8 +599,46 @@ class BuildSystemPromptTests(_StatePatchMixin, unittest.TestCase):
             root = Path(tmp)
             (root / "AGENTS.md").write_text("x" * 50_000)
             prompt = build_system_prompt(1, root)
-        self.assertLess(len(prompt), 20_000)
+        self.assertLess(len(prompt), 40_000)
         self.assertIn("(truncated)", prompt)
+
+    def test_instruction_chain_uses_root_to_cwd_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            child = root / "services" / "payments"
+            child.mkdir(parents=True)
+            (root / "AGENTS.md").write_text("ROOT-RULE")
+            (root / "services" / "CLAUDE.md").write_text("SERVICE-RULE")
+            (child / "TAMFIS.md").write_text("PAYMENTS-RULE")
+            with patch("tamfis_code.workspace._git") as git:
+                git.side_effect = lambda _cwd, *args: str(root) if args == ("rev-parse", "--show-toplevel") else ""
+                prompt = build_system_prompt(1, child)
+        self.assertLess(prompt.index("ROOT-RULE"), prompt.index("SERVICE-RULE"))
+        self.assertLess(prompt.index("SERVICE-RULE"), prompt.index("PAYMENTS-RULE"))
+
+    def test_agents_override_replaces_agents_in_same_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_text("BASE-AGENT-RULE")
+            (root / "AGENTS.override.md").write_text("OVERRIDE-AGENT-RULE")
+            prompt = build_system_prompt(1, root)
+        self.assertIn("OVERRIDE-AGENT-RULE", prompt)
+        self.assertNotIn("BASE-AGENT-RULE", prompt)
+
+    def test_unrelated_nested_instructions_are_not_loaded(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            active = root / "active"
+            sibling = root / "unrelated"
+            active.mkdir()
+            sibling.mkdir()
+            (root / "AGENTS.md").write_text("ROOT-RULE")
+            (sibling / "AGENTS.md").write_text("UNRELATED-RULE")
+            with patch("tamfis_code.workspace._git") as git:
+                git.side_effect = lambda _cwd, *args: str(root) if args == ("rev-parse", "--show-toplevel") else ""
+                prompt = build_system_prompt(1, active)
+        self.assertIn("ROOT-RULE", prompt)
+        self.assertNotIn("UNRELATED-RULE", prompt)
 
     def test_dirty_repo_is_flagged(self):
         with patch("tamfis_code.workspace._git") as git:

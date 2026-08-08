@@ -98,8 +98,28 @@ class AgentOrchestrator:
         """
         assert self.run is not None
         if not self.run.runtime.record_plan_revision():
-            self.fail(self.run.runtime.snapshot.failure_reason)
-            return
+            # Same reasoning as mark_repair's extension below: a genuinely
+            # evolving task can legitimately need more than
+            # max_plan_revisions replans as it learns more about the real
+            # codebase. Grant a fresh window instead of ending the task on
+            # this accounting ceiling.
+            if self.run.runtime.extend_plan_revision_budget():
+                extensions = self.run.runtime.snapshot.plan_revision_extensions
+                limit = self.run.runtime.budgets.max_plan_revision_extensions
+                self.emit({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Plan revision budget reached -- granting another "
+                            f"{self.run.runtime.budgets.max_plan_revisions} revisions "
+                            f"(extension {extensions}/{limit}) instead of ending the task."
+                        ),
+                    },
+                })
+                self.run.runtime.record_plan_revision()
+            else:
+                self.fail(self.run.runtime.snapshot.failure_reason)
+                return
         saved = local_state.save_plan(
             self.session_id, objective=self.run.objective,
             content="\n".join(f"{s.index}. {s.name}" for s in plan.steps),
@@ -172,6 +192,25 @@ class AgentOrchestrator:
                     "payload": {
                         "content": (
                             f"Turn budget reached -- starting turn {extensions + 1} "
+                            f"(extension {extensions}/{limit}) instead of ending the task."
+                        ),
+                    },
+                })
+                decision = self.run.runtime.guard_action(tool_name, arguments)
+        elif not decision.allowed and decision.tool_call_budget_exhausted:
+            # Same reasoning as the wall-clock extension above, for the raw
+            # tool-call count: a genuine stall is still caught independently
+            # by the repeated-action/empty-observation guards, so a large
+            # but genuinely productive audit shouldn't hard-fail here and
+            # force the user to go edit config.toml before it can finish.
+            if self.run.runtime.extend_tool_call_budget():
+                extensions = self.run.runtime.snapshot.tool_call_extensions
+                limit = self.run.runtime.budgets.max_tool_call_extensions
+                self.emit({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Tool-call budget reached -- granting more headroom "
                             f"(extension {extensions}/{limit}) instead of ending the task."
                         ),
                     },
@@ -269,6 +308,7 @@ class AgentOrchestrator:
             profile=self.run.profile,
             tool_records=[item.to_dict() for item in self.run.tool_records],
             any_mutation=any_mutation, final_text=final_text,
+            objective=self.run.objective, workspace_root=self.workspace_root,
         )
         if (
             self.run.reasoning_plan

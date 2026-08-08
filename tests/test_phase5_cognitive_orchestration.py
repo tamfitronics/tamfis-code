@@ -90,3 +90,36 @@ def test_unified_runtime_records_contract_and_review(tmp_path: Path, monkeypatch
     assert result.status == "completed"
     assert runtime.task_contract is not None
     assert runtime.last_review is not None and runtime.last_review.approved is True
+
+
+def test_unified_runtime_derives_legacy_runner_evidence_from_session_state(tmp_path: Path, monkeypatch):
+    import tamfis_code.state as state
+    original = state.CONFIG_DIR, state.STATE_PATH
+    state.CONFIG_DIR = tmp_path / ".config"
+    state.STATE_PATH = state.CONFIG_DIR / "state.json"
+    try:
+        runtime = UnifiedAgentRuntime()
+        request = ExecutionRequest(
+            mode=ExecutionMode.LOCAL_AGENT,
+            session_id=22,
+            objective="Fix the bug",
+            workspace_root=str(tmp_path),
+            interactive=False,
+            approval_policy="auto",
+        )
+
+        async def operation():
+            state.save_session_state(
+                22,
+                workspace_root=str(tmp_path),
+                modified_files=[{"mutation_id": "m1", "path": str(tmp_path / "app.py")}],
+                validation_results=[{"passed": True, "command": "pytest -q"}],
+            )
+            return Result(status="completed", summary="changed", changed_files=[], validations=[])
+
+        result = asyncio.run(runtime._run_exclusive(request, operation))
+        assert result.status == "completed"
+        assert result.changed_files == [str(tmp_path / "app.py")]
+        assert runtime.last_review is not None and runtime.last_review.approved is True
+    finally:
+        state.CONFIG_DIR, state.STATE_PATH = original

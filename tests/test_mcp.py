@@ -131,6 +131,84 @@ class TestMCPServer:
         assert test_file.read_text() == 'Test content'
 
     @pytest.mark.asyncio
+    async def test_write_file_accepts_file_path_alias(self):
+        test_file = Path(self.temp_dir) / "alias.txt"
+        result = await self.server.call_tool("write_file", {
+            "file_path": str(test_file),
+            "text": "alias content",
+        })
+        assert result["success"] is True
+        assert test_file.read_text() == "alias content"
+
+    @pytest.mark.asyncio
+    async def test_write_file_missing_path_returns_recoverable_validation_error(self):
+        result = await self.server.call_tool("write_file", {"content": "orphaned content"})
+        assert result["success"] is False
+        assert result["error"] == "write_file requires path; retry with the missing argument(s)"
+        assert "missing 1 required positional argument" not in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_write_file_preserves_existing_file_permissions(self):
+        # FIX: _atomic_write_text's os.replace() swaps inodes -- the
+        # replacement file previously inherited mkstemp's restrictive 0600
+        # mode instead of the original file's, silently tightening
+        # permissions on every edit. Confirmed live: user-reported files
+        # ending up 0600 after write_file/edit_file.
+        import stat
+        test_file = Path(self.temp_dir) / "perms.txt"
+        test_file.write_text("original")
+        os.chmod(test_file, 0o644)
+
+        result = await self.server.call_tool("write_file", {
+            "path": str(test_file), "content": "updated content",
+        })
+
+        assert result["success"] is True
+        assert test_file.read_text() == "updated content"
+        assert stat.S_IMODE(test_file.stat().st_mode) == 0o644
+
+    @pytest.mark.asyncio
+    async def test_edit_file_preserves_existing_file_permissions(self):
+        import stat
+        test_file = Path(self.temp_dir) / "edit_perms.txt"
+        test_file.write_text("hello world")
+        os.chmod(test_file, 0o640)
+
+        result = await self.server.call_tool("edit_file", {
+            "path": str(test_file), "old_string": "world", "new_string": "there",
+        })
+
+        assert result["success"] is True
+        assert test_file.read_text() == "hello there"
+        assert stat.S_IMODE(test_file.stat().st_mode) == 0o640
+
+    @pytest.mark.asyncio
+    async def test_write_file_new_file_gets_ordinary_default_permissions(self):
+        # A brand-new file has no prior metadata to preserve -- it must not
+        # end up unexpectedly restrictive (0600) either, since there is no
+        # "original" to fall back to; the process's normal umask-derived
+        # default applies, same as any other tool creating a new file.
+        import stat
+        test_file = Path(self.temp_dir) / "brand_new.txt"
+
+        result = await self.server.call_tool("write_file", {
+            "path": str(test_file), "content": "fresh content",
+        })
+
+        assert result["success"] is True
+        mode = stat.S_IMODE(test_file.stat().st_mode)
+        assert mode != 0o600, f"new file unexpectedly restrictive: {oct(mode)}"
+
+    @pytest.mark.asyncio
+    async def test_edit_file_missing_path_returns_recoverable_validation_error(self):
+        result = await self.server.call_tool("edit_file", {
+            "old_string": "before",
+            "new_string": "after",
+        })
+        assert result["success"] is False
+        assert result["error"] == "edit_file requires path; retry with the missing argument(s)"
+
+    @pytest.mark.asyncio
     async def test_list_directory(self):
         """Test listing a directory"""
         result = await self.server.call_tool('list_directory', {'path': self.temp_dir})
@@ -334,6 +412,19 @@ class TestMCPServerWorkspaceScoped:
         assert result['success'] is True  # call_tool succeeds; the handler reports failure in its message
         assert 'not found' in result['result']
         assert target.read_text() == "def foo():\n    return 1\n"  # unchanged
+
+    @pytest.mark.asyncio
+    async def test_edit_file_zero_matches_hints_whitespace_drift(self):
+        target = Path(self.temp_dir) / "edit.py"
+        with target.open("wb") as fh:
+            fh.write(b"def foo():\r\n    return 1   \r\n")
+        before = target.read_bytes()
+        result = await self.server.call_tool('edit_file', {
+            'path': str(target), 'old_string': 'def foo():\n    return 1\n', 'new_string': 'x',
+        })
+        assert 'not found' in result['result']
+        assert 'whitespace' in result['result'].lower()
+        assert target.read_bytes() == before  # unchanged
 
     @pytest.mark.asyncio
     async def test_edit_file_fails_on_multiple_matches(self):

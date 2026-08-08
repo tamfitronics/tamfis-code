@@ -159,15 +159,36 @@ class PlannerEvidence:
         )
 
     def path_is_authorised(self, candidate: Path) -> bool:
+        """Security boundary only: is `candidate` inside an authorised root.
+
+        Deliberately does NOT require the path to exist. Confirmed live: a
+        plan step naming the file a create/add/scaffold objective is about
+        to bring into existence (e.g. "Create utils.py with square()") was
+        silently dropped by validate_plan_step because reconnaissance is
+        read-only and runs before anything is created, so it can never see
+        a not-yet-created path -- for an objective made up entirely of such
+        steps, every step was rejected, `parse_reasoning_plan` returned
+        None, and the turn fell all the way back to the generic template
+        plan. Requiring existence conflated "may this turn touch this
+        location" with "does this already exist"; only the former is
+        actually a security boundary. This only governs whether a plan
+        *step description* survives -- it does not authorise any actual
+        file write, which still goes through the tool layer's own
+        workspace-root/sandbox/approval gates regardless of what the plan
+        said.
+        """
         resolved = _safe_resolve(candidate)
         if resolved is None:
             return False
-        if self.roots and not any(_is_within(resolved, root) for root in self.roots):
-            return False
+        if self.roots:
+            return any(_is_within(resolved, root) for root in self.roots)
+        # No configured roots at all is not the normal live path (scope_roots
+        # always includes at least the workspace root) but keep the original,
+        # stricter existence-only behaviour for that unconfigured case.
         return resolved.exists()
 
     def path_was_discovered(self, candidate: Path) -> bool:
-        """Return whether a path is both real and relevant to this stack.
+        """Return whether a path is both authorised and relevant to this stack.
 
         Authorised-root membership is only the security boundary. When
         reconnaissance supplied an architecture graph, ordinary source files
@@ -177,7 +198,10 @@ class PlannerEvidence:
 
         Repository roots and verified manifests remain valid structural
         anchors. When no graph evidence exists, retain backwards-compatible
-        existence validation rather than pretending a graph was discovered.
+        validation rather than pretending a graph was discovered -- an
+        authorised, not-yet-existing path is accepted here (see
+        path_is_authorised) precisely so a legitimate creation target is not
+        rejected merely for not existing yet at read-only reconnaissance time.
         """
         resolved = _safe_resolve(candidate)
         if resolved is None or not self.path_is_authorised(resolved):
@@ -187,10 +211,15 @@ class PlannerEvidence:
             return True
 
         if not self.connected_paths:
-            return (
-                resolved in self.existing_paths
-                or self.path_is_authorised(resolved)
-            )
+            # No architecture graph to check relevance against -- the guard
+            # above already confirmed `resolved` is inside an authorised
+            # root, which is all this backwards-compatible fallback ever
+            # required for something that already exists. A not-yet-existing
+            # path additionally needs a real parent directory (the root
+            # itself counts) so a wholly fabricated, multi-level-deep path
+            # still isn't accepted just for naming an authorised root as an
+            # ancestor.
+            return resolved.exists() or resolved.parent.exists()
 
         if resolved in self.connected_paths:
             return True
@@ -208,6 +237,22 @@ class PlannerEvidence:
             for connected in self.connected_paths
         ):
             return True
+
+        # A not-yet-existing path sitting next to (or inside a directory
+        # that is itself inside/below) evidence reconnaissance already
+        # confirmed relevant is grounded the same way an existing sibling
+        # file would be -- e.g. a new test file proposed alongside an
+        # existing, objective-matched test module. Only the create/add
+        # case needs this: an existing-but-unconnected file is correctly
+        # still rejected above, on the theory that a real path the agent
+        # can already read is not evidence it's relevant on its own.
+        if not resolved.exists():
+            parent = resolved.parent
+            if parent.exists() and any(
+                _is_within(connected, parent) or _is_within(parent, connected)
+                for connected in self.connected_paths
+            ):
+                return True
 
         return False
 
@@ -253,13 +298,20 @@ def create_plan(
         workspace_summary=workspace_summary or {},
     )
 
+    # Step text is deliberately terse -- Claude Code/Codex-style single-line
+    # action items, not full sentences. This is the deterministic plan shown
+    # to the user immediately (before any reasoning-plan revision), so its
+    # verbosity was the first, most visible instance of the "plans are too
+    # long per item" complaint. Every constraint that matters (which root,
+    # which manifest, which verified command) is still named explicitly;
+    # only the connective, explanatory prose around it is trimmed.
     steps: list[PlanStep] = []
     if evidence.roots:
         for root in evidence.roots[:4]:
             steps.append(
                 PlanStep(
                     len(steps) + 1,
-                    f"Inventory the verified project structure under {root} and identify the components relevant to the objective.",
+                    f"Inventory `{root}` for objective-relevant components.",
                     evidence=[f"path:{root}"],
                 )
             )
@@ -267,7 +319,7 @@ def create_plan(
         steps.append(
             PlanStep(
                 1,
-                "Review the deterministic workspace inventory and identify objective-relevant components without assuming a project type.",
+                "Review the workspace inventory for objective-relevant components.",
             )
         )
 
@@ -277,23 +329,30 @@ def create_plan(
         steps.append(
             PlanStep(
                 len(steps) + 1,
-                f"Read the discovered project metadata at {rendered} and derive only the scripts and dependencies it actually defines.",
+                f"Read project metadata: {rendered}.",
                 evidence=[f"path:{path}" for path in paths],
             )
         )
 
-    steps.append(
-        PlanStep(
+    if evidence.connected_paths:
+        paths = sorted(evidence.connected_paths, key=str)[:6]
+        rendered = ", ".join(str(path) for path in paths)
+        steps.append(PlanStep(
             len(steps) + 1,
-            "Trace the objective-relevant code paths found during reconnaissance and record concrete findings before proposing changes.",
-        )
-    )
+            f"Trace objective-relevant paths: {rendered}.",
+            evidence=[f"path:{path}" for path in paths],
+        ))
+    else:
+        steps.append(PlanStep(
+            len(steps) + 1,
+            f"Trace the code paths governing: {objective.strip()[:140]}.",
+        ))
 
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG, TaskType.MIXED}:
         steps.append(
             PlanStep(
                 len(steps) + 1,
-                "Apply the smallest evidence-backed changes while preserving unrelated behaviour and the authorised workspace boundary.",
+                "Apply the smallest evidence-backed change; preserve unrelated behaviour.",
             )
         )
 
@@ -303,7 +362,7 @@ def create_plan(
             steps.append(
                 PlanStep(
                     len(steps) + 1,
-                    f"Validate the result with the verified repository command `{command}` and investigate any observed failure.",
+                    f"Validate with `{command}`; investigate any failure.",
                     evidence=[f"command:{command}"],
                 )
             )
@@ -311,14 +370,14 @@ def create_plan(
             steps.append(
                 PlanStep(
                     len(steps) + 1,
-                    "Validate using only commands discovered from real repository metadata during execution; do not guess a test or build command.",
+                    "Validate using only commands discovered during execution.",
                 )
             )
 
     steps.append(
         PlanStep(
             len(steps) + 1,
-            "Report only findings, changes, validations, and remaining risks supported by recorded evidence.",
+            "Report evidence-backed findings, changes, validations, and risks.",
         )
     )
 
@@ -362,6 +421,10 @@ NON-NEGOTIABLE RULES
 6. Do not include provider selection, generic methodology, or vague steps such as
    'inspect the repository', 'look for bugs', 'ensure dependencies', or 'run
    tests'. Name the verified target and purpose.
+6a. Keep "action" a single short imperative line (roughly 12 words), the way a
+   terse engineering checklist reads -- not a full sentence explaining itself.
+   "purpose" is separate and is not shown next to the action, so do not repeat
+   it inside "action".
 7. When evidence is insufficient, plan a bounded read-only inventory of an
    authorised root or a verified path. Do not fill gaps with guesses.
 8. For multi-root work, keep each root explicit. Never collapse the common parent
@@ -687,6 +750,7 @@ def build_planner_evidence(
         if path.is_file() and path.name.lower() in _KNOWN_MANIFEST_NAMES:
             evidence.manifest_paths.add(path)
 
+    current_summary_root: Path | None = None
     for line in summary.splitlines():
         stripped = line.strip()
         lowered = stripped.lower()
@@ -695,8 +759,24 @@ def build_planner_evidence(
             value = stripped.split(":", 1)[1].strip()
             path = _safe_resolve(Path(value).expanduser())
             if path is not None and path.is_dir():
+                current_summary_root = path
                 evidence.roots.append(path)
                 evidence.existing_paths.add(path)
+
+        if lowered.startswith("manifests:"):
+            value = stripped.split(":", 1)[1].strip()
+            if value.lower() not in {"", "none", "none found", "unknown"}:
+                for raw_item in re.split(r"[,;]", value):
+                    candidate_text = raw_item.strip()
+                    if not candidate_text:
+                        continue
+                    candidate_path = Path(candidate_text).expanduser()
+                    if not candidate_path.is_absolute() and current_summary_root is not None:
+                        candidate_path = current_summary_root / candidate_path
+                    candidate = _safe_resolve(candidate_path)
+                    if candidate is not None and candidate.exists():
+                        evidence.manifest_paths.add(candidate)
+                        evidence.existing_paths.add(candidate)
 
         if lowered.startswith((
             "connected_path:",
@@ -723,7 +803,10 @@ def build_planner_evidence(
                 raw_item = raw_item.strip()
                 if not raw_item:
                     continue
-                candidate = _safe_resolve(Path(raw_item).expanduser())
+                candidate_path = Path(raw_item).expanduser()
+                if not candidate_path.is_absolute() and current_summary_root is not None:
+                    candidate_path = current_summary_root / candidate_path
+                candidate = _safe_resolve(candidate_path)
                 if candidate is not None and candidate.exists():
                     evidence.connected_paths.add(candidate)
                     evidence.existing_paths.add(candidate)
@@ -780,12 +863,17 @@ def _parse_step_candidate(
         or raw_step.get("step")
         or ""
     ).strip()
-    purpose = str(raw_step.get("purpose") or "").strip()
-    name = (
-        f"{action.rstrip('.')} — {purpose.rstrip('.')}."
-        if purpose and purpose.lower() not in action.lower()
-        else action
-    )
+    # Every plan step used to render as "<action> — <purpose>.", stitching
+    # the model's full "why this step is needed" sentence onto every single
+    # line. Claude Code/Codex plans read as short, scannable action items --
+    # this made ours consistently two to three times longer per step for no
+    # added information (the model already grounds *why* in the objective/
+    # evidence surfaced elsewhere; validate_plan_step below still requires
+    # `action` alone to be a real, evidence-backed, specific step). `purpose`
+    # is still accepted from the model (kept for schema stability/backwards
+    # compatibility with any caller reading raw JSON) but no longer widens
+    # the rendered name.
+    name = action
     targets = [
         str(item).strip()
         for item in _iter_values(raw_step.get("targets"))

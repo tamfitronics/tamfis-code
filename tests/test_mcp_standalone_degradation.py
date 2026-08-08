@@ -24,7 +24,7 @@ class StandaloneDegradationTests(unittest.IsolatedAsyncioTestCase):
         server = MCPServer()
         result = await server.call_tool("some_shared_tool", {})
         self.assertFalse(result["success"])
-        self.assertIn("unavailable outside a monorepo checkout", result["error"])
+        self.assertIn("External MCP tool unavailable", result["error"])
 
     @patch("tamfis_code.mcp._get_shared_mcp_bridge", return_value=None)
     async def test_list_tools_async_reports_unavailable_bridge_clearly(self, _mock_bridge):
@@ -32,14 +32,20 @@ class StandaloneDegradationTests(unittest.IsolatedAsyncioTestCase):
         tools = await server.list_tools_async()
         shared_entry = next(t for t in tools if t["name"] == "shared_mcp")
         self.assertFalse(shared_entry["available"])
-        self.assertIn("unavailable outside a monorepo checkout", shared_entry["description"])
+        self.assertIn("External MCP registry unavailable", shared_entry["description"])
 
     @patch("tamfis_code.mcp.get_browser_tool_class", return_value=None)
     async def test_browser_facade_reports_unavailable_class_clearly(self, _mock_cls):
         server = MCPServer()
         result = await server.call_tool("browser", {"url": "https://example.com", "action": "navigate"})
         self.assertFalse(result["success"])
-        self.assertIn("unavailable outside a monorepo checkout", result["error"])
+        self.assertIn("Portable browser support is unavailable", result["error"])
+
+    def test_portable_browser_is_owned_by_tamfis_code(self):
+        from tamfis_code.browser import PortableBrowserTool
+        from tamfis_code.mcp import get_browser_tool_class
+
+        self.assertIs(get_browser_tool_class(), PortableBrowserTool)
 
 
 if __name__ == "__main__":

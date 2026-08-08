@@ -102,36 +102,128 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             scope = _detect_workspace_scope(str(root), "look inside old_backups for the removed file")
             self.assertIn(backups.resolve(), scope)
 
-    def test_broad_parent_directory_search_command_is_blocked(self):
+    def test_broad_parent_directory_search_command_requires_escalation(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)
             backend = _make_project(root, "backend")
             frontend = _make_project(root, "frontend", marker="package.json")
             scope_roots = [backend.resolve(), frontend.resolve()]
 
-            _, error = _scope_tool_arguments(
+            scoped, error = _scope_tool_arguments(
                 "execute_command",
                 {"command": "grep -r TODO .", "cwd": str(root)},
                 workspace_root=str(root),
                 scope_roots=scope_roots,
             )
-            self.assertIsNotNone(error)
-            self.assertIn("Broad parent-directory scan blocked", error)
+            self.assertIsNone(error)
+            self.assertIn(str(root.resolve()), scoped["_tamfis_external_scope_paths"])
+            self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
 
-    def test_command_absolute_operand_outside_scope_is_blocked(self):
+    def test_command_absolute_operand_outside_scope_requires_escalation(self):
         with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as outside:
             root = Path(ws)
             project = _make_project(root, "backend")
 
-            _, error = _scope_tool_arguments(
+            scoped, error = _scope_tool_arguments(
                 "execute_command",
                 {"command": f"find {outside} -type f", "cwd": str(project)},
                 workspace_root=str(root),
                 scope_roots=[project.resolve()],
             )
 
-            self.assertIsNotNone(error)
-            self.assertIn("Command path is outside", error)
+            self.assertIsNone(error)
+            self.assertIn(str(Path(outside).resolve()), scoped["_tamfis_external_scope_paths"])
+            self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
+
+    def test_read_only_postgresql_config_inspection_is_allowed(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {
+                    "command": "cat /etc/postgresql/17/main/pg_hba.conf",
+                    "cwd": str(project),
+                },
+                workspace_root=str(root),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(project.resolve()))
+            self.assertIn(
+                "/etc/postgresql/17/main/pg_hba.conf",
+                scoped["_tamfis_external_scope_paths"],
+            )
+            self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
+
+    def test_read_only_postgresql_socket_inspection_is_allowed_after_symlink_resolution(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {
+                    "command": "ls -l /var/run/postgresql/.s.PGSQL.5432",
+                    "cwd": str(project),
+                },
+                workspace_root=str(root),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertIn(
+                str(Path("/var/run/postgresql/.s.PGSQL.5432").resolve()),
+                scoped["_tamfis_external_scope_paths"],
+            )
+
+    def test_any_external_path_uses_the_same_explicit_escalation_flow(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            for command in (
+                "rm /run/postgresql/.s.PGSQL.5432",
+                "cat /etc/shadow",
+                "cat /etc/postgresql/server.key",
+            ):
+                with self.subTest(command=command):
+                    scoped, error = _scope_tool_arguments(
+                        "execute_command",
+                        {"command": command, "cwd": str(project)},
+                        workspace_root=str(root),
+                        scope_roots=[project.resolve()],
+                    )
+                    self.assertIsNone(error)
+                    self.assertTrue(scoped["_tamfis_external_scope_paths"])
+                    self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
+
+    def test_direct_file_tool_outside_scope_requires_escalation(self):
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as outside:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            target = Path(outside) / "config.txt"
+            scoped, error = _scope_tool_arguments(
+                "read_file",
+                {"path": str(target)},
+                workspace_root=str(root),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertEqual(scoped["path"], str(target.resolve()))
+            self.assertEqual(scoped["_tamfis_external_scope_paths"], [str(target.resolve())])
+
+    def test_heredoc_source_is_not_parsed_as_command_paths(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "tamfisseo")
+            command = "cat > /tmp-placeholder/api.ts << 'EOF'\nimport { readFile } from 'node:fs/promises';\nconst route = '/';\nEOF"
+            command = command.replace("/tmp-placeholder", str(project))
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {"command": command, "cwd": str(root)},
+                workspace_root=str(root),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(project.resolve()))
 
     def test_do_not_touch_excludes_the_launch_directory_and_routes_to_siblings(self):
         """Confirmed live: launching tamfis-code from inside its own repo
@@ -180,21 +272,21 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
         )
         self.assertEqual(excluded, {"tamfis-code"})
 
-    def test_search_code_targeting_the_common_parent_is_rejected_for_a_stack(self):
+    def test_search_code_targeting_the_common_parent_requires_escalation_for_a_stack(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)
             backend = _make_project(root, "backend")
             frontend = _make_project(root, "frontend", marker="package.json")
             scope_roots = [backend.resolve(), frontend.resolve()]
 
-            _, error = _scope_tool_arguments(
+            scoped, error = _scope_tool_arguments(
                 "search_code",
                 {"query": "TODO", "path": str(root)},
                 workspace_root=str(root),
                 scope_roots=scope_roots,
             )
-            self.assertIsNotNone(error)
-            self.assertIn("Parent-directory operation blocked", error)
+            self.assertIsNone(error)
+            self.assertEqual(scoped["_tamfis_external_scope_paths"], [str(root.resolve())])
 
 
 if __name__ == "__main__":

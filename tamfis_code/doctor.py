@@ -20,8 +20,9 @@ from . import state as local_state
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .config import Config, load_credentials
 from .providers import get_provider_status
+from .public_identity import redact_routing_text
 from .workspace import resolve_local_workspace
-from .runtime.journal import JOURNAL_PATH, recent_failures
+from .runtime.journal import JOURNAL_PATH, read_recent_events, recent_failures
 
 
 @dataclass
@@ -128,17 +129,12 @@ def _diagnose_local_providers() -> list[CheckResult]:
     for name, info in status["config"].items():
         configured = bool(info.get("api_key_set")) or name == "tier_iv"
         any_configured = any_configured or configured
-        results.append(CheckResult(
-            f"Local provider: {name}",
-            "PASS" if configured else "WARNING",
-            info.get("key_preview") or ("not configured" if not configured else ""),
-        ))
     if any_configured:
-        results.append(CheckResult("Local automatic routing", "PASS", f"would select: {status['default']}"))
+        results.append(CheckResult("TamfisGPT model service", "PASS", "automatic model selection is ready"))
     else:
         results.append(CheckResult(
-            "Local automatic routing", "FAIL",
-            "no provider configured -- set HF_TOKEN / NVIDIA_API_KEY / OPENROUTER_API_KEY",
+            "TamfisGPT model service", "FAIL",
+            "not configured on this installation; contact the administrator",
         ))
     return results
 
@@ -208,6 +204,90 @@ def _diagnose_local_session(workspace_root: Path) -> list[CheckResult]:
     return results
 
 
+def _diagnose_self_health(workspace_root: Optional[Path] = None) -> list[CheckResult]:
+    """Deep self-health-check of the CLI's own subsystems -- the kind of
+    "is everything I rely on actually working" self-diagnosis Claude Code
+    and Codex run before/during a session, beyond mere provider
+    reachability. Checks the durable state file's writability, the runtime
+    execution journal, the evidence/context-rollover store, and the local
+    MCP tool registry, all from real on-disk artefacts rather than
+    assumptions.
+    """
+    from .config import CONFIG_DIR as _CONFIG_DIR
+    from .state import STATE_PATH as _STATE_PATH
+    from .runtime.journal import JOURNAL_PATH as _JOURNAL_PATH
+    from . import evidence as _evidence_store
+    from . import mcp as _mcp
+
+    results: list[CheckResult] = []
+
+    # 1. State file writability -- a read-only/ownership-mismatched state
+    #    dir silently makes the CLI amnesiac (state.py warns but continues).
+    try:
+        _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        if _STATE_PATH.exists():
+            _STATE_PATH.touch()  # raises if not writable
+        results.append(CheckResult("Session state writability", "PASS", str(_STATE_PATH)))
+    except OSError as exc:
+        results.append(CheckResult("Session state writability", "FAIL", f"{_STATE_PATH}: {exc}"))
+
+    # 2. Runtime execution journal -- recent failures are real evidence the
+    #    agent has been struggling, not just a percentage.
+    try:
+        if _JOURNAL_PATH.exists():
+            events = read_recent_events(100)
+            failures = [e for e in events if e.get("event") == "execution_finished" and e.get("status") in {"failed", "cancelled", "partial", "blocked"}]
+            if failures:
+                latest = failures[-1]
+                results.append(CheckResult(
+                    "Runtime execution journal", "WARNING",
+                    f"{len(failures)} recent failed/cancelled execution(s); latest {latest.get('mode', 'unknown')}: {latest.get('error') or latest.get('status') or 'unknown'}",
+                ))
+            else:
+                results.append(CheckResult("Runtime execution journal", "PASS", f"{len(events)} event(s) recorded, no recent failures"))
+        else:
+            results.append(CheckResult("Runtime execution journal", "WARNING", "no executions recorded yet -- run a task first"))
+    except OSError as exc:
+        results.append(CheckResult("Runtime execution journal", "FAIL", str(exc)))
+
+    # 3. Evidence/context-rollover store -- internal context rollovers
+    #    persist full tool output here. If the store directory isn't
+    #    writable, rollovers silently lose recoverable evidence.
+    try:
+        evidence_dir = _evidence_store.EVIDENCE_DIR
+        evidence_dir.mkdir(parents=True, exist_ok=True)
+        segment_count = len(list(evidence_dir.glob("*.json")))
+        results.append(CheckResult(
+            "Context-rollover evidence store", "PASS",
+            f"{segment_count} segment(s) at {evidence_dir}",
+        ))
+    except OSError as exc:
+        results.append(CheckResult("Context-rollover evidence store", "FAIL", str(exc)))
+    except Exception as exc:
+        results.append(CheckResult("Context-rollover evidence store", "WARNING", f"could not inspect: {exc}"))
+
+    # 4. Local MCP tool registry -- the real tool set every turn dispatches
+    #    through. A missing/broken tool here means the agent silently can't
+    #    perform a class of action.
+    try:
+        server = _mcp.MCPServer(workspace_root=str(workspace_root or Path.cwd()), session_id=0)
+        tool_names = sorted(server.tools.keys()) if hasattr(server, "tools") else []
+        core = {"read_file", "write_file", "edit_file", "execute_command", "search_code", "list_directory"}
+        present = core & set(tool_names)
+        missing = core - set(tool_names)
+        if not missing:
+            results.append(CheckResult("Local tool registry", "PASS", f"{len(tool_names)} tools registered; core set present"))
+        else:
+            results.append(CheckResult(
+                "Local tool registry", "FAIL",
+                f"missing core tool(s): {', '.join(sorted(missing))}",
+            ))
+    except Exception as exc:
+        results.append(CheckResult("Local tool registry", "FAIL", f"could not initialize MCPServer: {exc}"))
+
+    return results
+
+
 async def run_doctor(
     config: Config,
     console: Console,
@@ -237,6 +317,13 @@ async def run_doctor(
     results.extend(_diagnose_local_providers())
     if workspace_root is not None:
         results.extend(_diagnose_local_session(workspace_root))
+        # Deep self-health-check of the CLI's own subsystems (state
+        # writability, runtime journal, evidence store, tool registry) --
+        # the Claude Code/Codex-parity "is everything I rely on actually
+        # working" layer, beyond provider reachability. Runs in both
+        # standalone and --remote modes since these are local-on-disk
+        # artefacts either way.
+        results.extend(_diagnose_self_health(workspace_root))
 
     client = RemoteAPIClient(config, creds)
     try:
@@ -278,7 +365,7 @@ async def run_doctor(
         # actually proves the whole chain, which `doctor` deliberately does
         # not do (it would create session/task rows as a side effect of a
         # health check).
-        results.append(CheckResult("Tier IV (agent runtime)", "WARNING", "not directly probed -- verified indirectly via a real `tamfis-code ask`"))
+        results.append(CheckResult("TamfisGPT agent runtime", "WARNING", "verified when a real `tamfis-code ask` is run"))
 
         if session_id is not None:
             results.extend(await _diagnose_session(client, session_id, workspace_root))
@@ -288,6 +375,9 @@ async def run_doctor(
 
     for result in results:
         style = _STATUS_STYLE[result.status]
-        console.print(f"[{style}]{result.status:8}[/{style}] {result.name}  [dim]{result.detail}[/dim]")
+        console.print(
+            f"[{style}]{result.status:8}[/{style}] {result.name}  "
+            f"[dim]{redact_routing_text(result.detail)}[/dim]"
+        )
 
     return all(r.status != "FAIL" for r in results)

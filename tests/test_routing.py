@@ -90,6 +90,105 @@ def test_auto_prefers_nvidia_over_hf_for_audit():
     assert manager._select_best_provider(classify_task("audit the whole repository")) == ProviderType.NVIDIA
 
 
+def test_premium_ollama_is_authoritative_for_auto(monkeypatch):
+    monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+    resolved, _ = manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    assert resolved == ProviderType.OLLAMA_CLOUD
+
+
+def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", raising=False)
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_CODING_MODEL", raising=False)
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD)
+
+    for prompt in ("hello", "fix the API", "audit the entire repository"):
+        profile = classify_task(prompt)
+        assert manager.select_model(
+            manager.PROVIDERS[ProviderType.OLLAMA_CLOUD], profile
+        ) == "kimi-k2.7-code:cloud"
+
+
+def test_premium_ollama_remains_enabled_without_auto_primary(monkeypatch):
+    # Subscription entitlement must remain enabled without forcing AUTO to
+    # Ollama Cloud. Historically one flag controlled both concerns and
+    # disabling forced-primary also downgraded the included-plan model from
+    # kimi-k2.7-code:cloud to the much weaker gemma4:cloud any time Ollama
+    # Cloud was used (automatic fallback after NIM, or explicit
+    # --provider ollama_cloud). kimi-k2.7-code:cloud is not an extra-usage
+    # cost (unlike kimi-k3:cloud, still gated below), so there is no reason
+    # to withhold it just because AUTO isn't forced onto Ollama Cloud.
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "false")
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", raising=False)
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_CODING_MODEL", raising=False)
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD)
+
+    for prompt in ("hello", "fix the API", "audit the entire repository"):
+        profile = classify_task(prompt)
+        assert manager.select_model(
+            manager.PROVIDERS[ProviderType.OLLAMA_CLOUD], profile
+        ) == "kimi-k2.7-code:cloud"
+
+    # But AUTO still must not force Ollama Cloud as primary with the flag
+    # off -- when NVIDIA is also available, NIM (priority 0) wins, not
+    # Ollama Cloud (priority 3), confirming the AUTO-forcing behavior this
+    # dedicated AUTO-primary flag stays off.
+    manager_with_nim = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+    resolved, _ = manager_with_nim.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    assert resolved == ProviderType.NVIDIA
+
+
+def test_ollama_exposes_glm_52_as_a_priority():
+    config = ProviderManager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
+    assert "glm-5.2:cloud" in config.models
+    assert config.models.index("glm-5.2:cloud") == (
+        config.models.index("kimi-k2.7-code:cloud") + 1
+    )
+
+
+def test_ollama_exposes_deepseek_v4_flash_0731():
+    config = ProviderManager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
+    assert "deepseek-v4-flash:0731-cloud" in config.models
+
+
+def test_ollama_extra_usage_requires_operator_opt_in_and_heavy_task(monkeypatch):
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_EXTRA_USAGE", "true")
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_HEAVY_MODEL", raising=False)
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD)
+    config = manager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
+
+    assert manager.select_model(config, classify_task("hello")) == "kimi-k2.7-code:cloud"
+    assert manager.select_model(
+        config, classify_task("audit the entire repository")
+    ) == "kimi-k3:cloud"
+
+
+def test_premium_ollama_does_not_fallback_to_nvidia(monkeypatch):
+    monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+    assert manager.fallback_candidates(ProviderType.OLLAMA_CLOUD) == []
+
+
+def test_unavailable_premium_ollama_fails_explicitly_in_auto(monkeypatch):
+    monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
+    manager = _manager_with(ProviderType.NVIDIA)
+    try:
+        manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    except ValueError as exc:
+        assert "Ollama Cloud is enabled as the AUTO primary route" in str(exc)
+    else:
+        raise AssertionError("AUTO silently selected a non-Ollama provider")
+
+
 def test_auto_prefers_openrouter_for_edit_when_nvidia_unavailable():
     manager = _manager_with(ProviderType.OPENROUTER, ProviderType.HF)
     assert manager._select_best_provider(classify_task("fix and refactor the code")) == ProviderType.HF
@@ -107,11 +206,16 @@ def test_openrouter_default_is_not_openai_family():
 
 def test_nvidia_default_model_is_tool_capable_and_not_unentitled_kimi():
     # The plain Llama route is fluent but has been observed fabricating local
-    # tool results. Use the verified NVIDIA reasoning/tool route instead;
+    # tool results. Use a verified NVIDIA nemotron tool-calling route instead;
     # never use the account-unentitled Kimi route as the default.
+    # 2026-07-26: re-prioritized off nemotron-3-nano-omni-30b-a3b-reasoning
+    # after it was caught live wrapping a fake tool call in CLI-flag/XML-ish
+    # text (see runner_local.py's fake-tool-call detection fix) -- a failure
+    # mode a single simple tool-calling smoke test doesn't surface, since
+    # that model also returns clean real tool_calls on simple prompts.
     default_model = ProviderManager.PROVIDERS[ProviderType.NVIDIA].default_model
     assert default_model != "moonshotai/kimi-k2.6"
-    assert default_model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    assert default_model == "nvidia/nemotron-3-ultra-550b-a55b"
 
 
 def test_kimi_k2_6_is_still_selectable_on_openrouter_and_hf():
@@ -148,11 +252,32 @@ def test_hf_prefers_official_qwen36_coding_route_and_keeps_deepseek_fallbacks():
     assert config.context_window >= 262144
 
 
-def test_nvidia_exposes_deepseek_v4_routes_without_replacing_verified_default():
+def test_nvidia_exposes_deepseek_v4_pro_without_replacing_verified_default():
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
-    assert config.default_model == "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning"
+    assert config.default_model == "nvidia/nemotron-3-ultra-550b-a55b"
     assert "deepseek-ai/deepseek-v4-pro" in config.models
-    assert "deepseek-ai/deepseek-v4-flash" in config.models
+    # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached NVIDIA NIM
+    # end-of-life 2026-08-07 (HTTP 410 confirmed live in tamgpt6's intent
+    # classifier) -- must not silently reappear as a selectable NIM route.
+    assert "deepseek-ai/deepseek-v4-flash" not in config.models
+
+
+def test_nvidia_exposes_newly_added_coding_and_tool_calling_models():
+    # 2026-07-26: added per a live NVIDIA NIM catalog re-check for models
+    # described as strong at coding/tool-calling. All were live-verified
+    # against this account (real chat-completions calls with tools
+    # attached, real tool_calls returned) before being added here.
+    config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
+    assert "nvidia/nemotron-3-ultra-550b-a55b" in config.models
+    assert "nvidia/nemotron-3-super-120b-a12b" in config.models
+    assert "nvidia/nemotron-3-nano-30b-a3b" in config.models
+    assert "nvidia/llama-3.3-nemotron-super-49b-v1.5" in config.models
+    assert "nvidia/llama-3.3-nemotron-super-49b-v1" in config.models
+    assert "minimaxai/minimax-m3" in config.models
+    # The nano-omni-reasoning route stays selectable (not removed), just no
+    # longer the default -- see test_nvidia_default_model_is_tool_capable_
+    # and_not_unentitled_kimi.
+    assert "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" in config.models
 
 
 def test_remote_fallback_candidates_stay_in_policy_order():
@@ -235,21 +360,26 @@ def test_standalone_provider_manager_excludes_tier_iv_from_routing_order():
     # everything, including automatic fallback candidates) and moved TAMFIS
     # to the back of PRIORITY_ORDER -- it no longer appears in NVIDIA's
     # automatic fallback chain unless a free/paid-fallback route applies.
+    # xAI Grok was added, then demoted to priority=6 / last in PRIORITY_ORDER
+    # (2026-08-06: real billed xAI spend within the first week of enabling
+    # it), so it now appears last in NVIDIA's automatic fallback chain
+    # instead of straight after Ollama Cloud.
     assert manager.fallback_chain_names(ProviderType.NVIDIA) == [
             ProviderType.OLLAMA_CLOUD.value,
             ProviderType.HF.value,
             ProviderType.OPENROUTER.value,
+            ProviderType.GROK.value,
     ]
 
 
 def test_remote_provider_manager_may_include_tier_iv():
     manager = ProviderManager.__new__(ProviderManager)
     manager.runtime_mode = "remote"
-    # Ollama Cloud priority routing ranks OLLAMA_CLOUD (priority=0) ahead of
+    # NIM priority routing (2026-08-08) ranks NVIDIA (priority=0) ahead of
     # TIER_IV (priority=5) in PRIORITY_ORDER even in remote mode -- remote
     # mode's only remaining distinction from standalone is that it does not
     # exclude TIER_IV from the order entirely.
-    assert manager.routing_order[0] == ProviderType.OLLAMA_CLOUD
+    assert manager.routing_order[0] == ProviderType.NVIDIA
     assert ProviderType.TIER_IV in manager.routing_order
 
 

@@ -133,8 +133,7 @@ class DiagnoseLocalProvidersTests(unittest.TestCase):
         with patch("tamfis_code.doctor.get_provider_status", return_value=self._status(configured=True)):
             results = _diagnose_local_providers()
         by_name = {r.name: r for r in results}
-        self.assertEqual(by_name["Local provider: nvidia"].status, "PASS")
-        self.assertEqual(by_name["Local automatic routing"].status, "PASS")
+        self.assertEqual(by_name["TamfisGPT model service"].status, "PASS")
 
     def test_no_provider_configured_fails_routing(self):
         # A truly unusable environment: no API keys set for any provider,
@@ -142,7 +141,7 @@ class DiagnoseLocalProvidersTests(unittest.TestCase):
         with patch("tamfis_code.doctor.get_provider_status", return_value=self._status(configured=False)):
             results = _diagnose_local_providers()
         by_name = {r.name: r for r in results}
-        self.assertEqual(by_name["Local automatic routing"].status, "FAIL")
+        self.assertEqual(by_name["TamfisGPT model service"].status, "FAIL")
 
 
 class DiagnoseLocalSessionTests(unittest.TestCase):

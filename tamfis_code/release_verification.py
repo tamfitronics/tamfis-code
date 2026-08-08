@@ -15,8 +15,12 @@ from pathlib import Path
 from typing import Iterable
 
 AUTHORITATIVE_PROVIDER_ORDER = (
-    "ollama_cloud",
+    # NVIDIA NIM first (2026-08-08): Ollama Cloud's weekly usage limit is a
+    # real multi-day-reset HTTP 429, not transient. Keep this in sync with
+    # providers.py's ProviderManager.PRIORITY_ORDER, which is the tuple this
+    # release gate actually inspects in the built source.
     "nvidia",
+    "ollama_cloud",
     "hf",
     "openrouter",
 )
@@ -187,12 +191,16 @@ def run_release_verification(root: Path, artifacts: Iterable[Path] = ()) -> Veri
     priority_block = priority_match.group(1) if priority_match else ""
     positions = [priority_block.find(f"ProviderType.{name.upper()}") for name in AUTHORITATIVE_PROVIDER_ORDER]
     provider_ok = all(position >= 0 for position in positions) and positions == sorted(positions)
-    provider_detail = " > ".join(AUTHORITATIVE_PROVIDER_ORDER)
-    report.add("Authoritative provider order", provider_ok, provider_detail, "routing")
+    report.add("Private model-route order", provider_ok, "internal route policy is valid", "routing")
 
     render_text = _read(root / "tamfis_code" / "render.py")
-    banner = "ollama_cloud, nvidia, hf, openrouter, in authoritative priority order"
-    report.add("Provider banner", banner in render_text, banner, "routing")
+    branded = "Model:[/dim] {route_label}"
+    report.add(
+        "Public model banner",
+        branded in render_text and "public_route_name(route)" in render_text,
+        "TamfisGPT model aliases only",
+        "routing",
+    )
 
     runner_text = _read(root / "tamfis_code" / "runner_local.py")
     compaction_markers = (

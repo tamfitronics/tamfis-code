@@ -21,6 +21,7 @@ from tamfis_code.safety import (
 class ClassifyCommandRiskTests(unittest.TestCase):
     def test_allowlisted_inspection_command_is_read_only(self):
         self.assertEqual(classify_command_risk("ls -la"), RISK_READ_ONLY)
+        self.assertEqual(classify_command_risk("cat /etc/postgresql/17/main/pg_hba.conf"), RISK_READ_ONLY)
 
     def test_inspection_program_write_or_exec_flags_are_not_read_only(self):
         for command in (
@@ -99,6 +100,17 @@ class RedactSecretsTests(unittest.TestCase):
         self.assertNotIn("token123", redacted)
         self.assertIn("github.com/org/repo.git", redacted)
 
+    def test_inline_program_object_password_is_masked(self):
+        command = 'node -e "const pool = new pg.Pool({ user: \'app\', password: \'live-db-password-example\', host: \'/var/run/postgresql\' });"'
+        redacted = redact_secrets(command)
+        self.assertNotIn("live-db-password-example", redacted)
+        self.assertIn("password: '***'", redacted)
+        self.assertIn("/var/run/postgresql", redacted)
+
+    def test_json_and_unquoted_secret_assignments_are_masked(self):
+        self.assertNotIn("hunter2", redact_secrets("node -e '{\"password\": \"hunter2\"}'"))
+        self.assertNotIn("abc123", redact_secrets("PASSWORD=abc123 psql app"))
+
     def test_long_dashed_flags_are_not_mistaken_for_dash_p(self):
         """The bare `-p` password pattern must not fire inside `--password`
         itself (which contains the literal substring "-p") or unrelated
@@ -132,6 +144,17 @@ class ClassifyPathRiskTests(unittest.TestCase):
 
 
 class ClassifyToolCallRiskTests(unittest.TestCase):
+    def test_external_scope_marker_requires_dangerous_approval_even_for_read(self):
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                classify_tool_call_risk(
+                    "read_file",
+                    {"path": "/etc/hosts", "_tamfis_external_scope_paths": ["/etc/hosts"]},
+                    workspace_root=root,
+                ),
+                RISK_DANGEROUS,
+            )
+
     def test_read_only_tools_are_always_read_only(self):
         with tempfile.TemporaryDirectory() as root:
             for name in ("read_file", "list_directory", "search_code", "get_git_info", "ask_user_question"):

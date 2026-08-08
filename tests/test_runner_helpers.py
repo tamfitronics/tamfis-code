@@ -37,19 +37,27 @@ class NormalizeProviderTests(unittest.TestCase):
         self.assertEqual(normalize_provider("hf"), "huggingface")
         self.assertEqual(normalize_provider("nvidia"), "nvidia_nim")
         self.assertEqual(normalize_provider("or"), "openrouter")
+        self.assertEqual(normalize_provider("ollama"), "ollama_cloud")
 
     def test_canonical_names_pass_through_unchanged(self):
-        for name in ("huggingface", "openrouter", "nvidia_nim", "gemini", "apiframe", "auto"):
+        for name in ("huggingface", "openrouter", "ollama_cloud", "nvidia_nim", "gemini", "apiframe", "auto"):
             self.assertEqual(normalize_provider(name), name)
 
     def test_unsupported_provider_raises_value_error(self):
         with self.assertRaises(ValueError):
             normalize_provider("not-a-real-provider")
 
+    def test_decommissioned_ollama_gpu_is_rejected(self):
+        # ollama_gpu (self-hosted rented GPU box) was decommissioned and its
+        # instance destroyed 2026-08-06 -- must be rejected like any other
+        # unsupported provider, not silently accepted.
+        with self.assertRaises(ValueError):
+            normalize_provider("ollama_gpu")
+
 
 class ProviderNameMapTests(unittest.TestCase):
     def test_every_allowed_alias_target_has_a_display_name(self):
-        for canonical in ("huggingface", "openrouter", "nvidia_nim", "gemini", "apiframe", "auto"):
+        for canonical in ("huggingface", "openrouter", "ollama_cloud", "nvidia_nim", "gemini", "apiframe", "auto"):
             self.assertIn(canonical, PROVIDER_NAME_MAP)
 
 

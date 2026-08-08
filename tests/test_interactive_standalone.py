@@ -11,7 +11,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from rich.console import Console
 
@@ -19,7 +19,16 @@ from prompt_toolkit.document import Document
 
 from tamfis_code import state as state_module
 from tamfis_code.config import Config
-from tamfis_code.interactive import PASTE_COLLAPSE_LINE_THRESHOLD, SLASH_COMMANDS, _SlashCommandCompleter, paste_placeholder
+from tamfis_code.interactive import (
+    PASTE_COLLAPSE_CHAR_THRESHOLD,
+    PASTE_COLLAPSE_LINE_THRESHOLD,
+    SLASH_COMMANDS,
+    _NextMessageAutoSuggest,
+    _SlashCommandCompleter,
+    _seed_next_message_suggestion,
+    next_message_suggestion,
+    paste_placeholder,
+)
 from tamfis_code.runner import TaskOutcome
 from tamfis_code.workspace import WorkspaceContext
 
@@ -58,6 +67,12 @@ class PastePlaceholderTests(unittest.TestCase):
     def test_single_line_paste_with_no_trailing_newline_is_not_collapsed(self):
         self.assertIsNone(paste_placeholder("just one long line, no newline at all", 1))
 
+    def test_large_single_line_paste_collapses_at_character_threshold(self):
+        text = "x" * PASTE_COLLAPSE_CHAR_THRESHOLD
+        placeholder, normalized = paste_placeholder(text, 1)
+        self.assertEqual(placeholder, f"[Pasted text #1 +{PASTE_COLLAPSE_CHAR_THRESHOLD} chars]")
+        self.assertEqual(normalized, text)
+
     def test_empty_paste_returns_none(self):
         self.assertIsNone(paste_placeholder("", 1))
 
@@ -91,6 +106,43 @@ class SlashCommandCompleterTests(unittest.TestCase):
     def test_bare_slash_offers_every_command(self):
         results = self._complete("/")
         self.assertEqual(set(results), {name for name, _ in SLASH_COMMANDS})
+
+
+class NextMessageSuggestionTests(unittest.TestCase):
+    def test_explicit_next_step_becomes_the_tab_suggestion(self):
+        answer = "Done.\n\nNext step: Run the integration tests"
+        self.assertEqual(
+            next_message_suggestion(answer),
+            "Run the integration tests",
+        )
+
+    def test_answer_without_explicit_next_step_gets_safe_fallback(self):
+        self.assertEqual(
+            next_message_suggestion("The issue is fixed."),
+            "Continue with the next recommended step",
+        )
+
+    def test_ghost_suggestion_only_appears_for_empty_composer(self):
+        suggest = _NextMessageAutoSuggest(lambda: "Next step: Verify production")
+        empty = suggest.get_suggestion(None, Document(""))
+        typed = suggest.get_suggestion(None, Document("already typing"))
+
+        self.assertEqual(empty.text, "Verify production")
+        self.assertIsNone(typed)
+
+    def test_new_empty_prompt_is_seeded_before_user_types(self):
+        session = MagicMock()
+        session.default_buffer = MagicMock()
+
+        _seed_next_message_suggestion(
+            session,
+            "Next step: Run the integration tests",
+        )
+
+        self.assertEqual(
+            session.default_buffer.suggestion.text,
+            "Run the integration tests",
+        )
 
 
 class SlashCommandCompleterCustomCommandsTests(unittest.TestCase):
@@ -173,6 +225,31 @@ def run_interactive_import(**kwargs):
 
 
 class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
+    def test_message_prompt_does_not_duplicate_mode_before_input(self):
+        from tamfis_code.interactive import message_prompt
+
+        rendered = "".join(
+            text for _style, text in message_prompt().__pt_formatted_text__()
+        )
+        self.assertEqual(rendered, "message› ")
+        self.assertNotIn("manual", rendered)
+
+    def test_interactive_prompt_uses_a_real_composer_frame(self):
+        with patch("tamfis_code.interactive.Console", return_value=Console(file=io.StringIO())), \
+                patch("tamfis_code.interactive.PromptSession") as session_cls, \
+                patch("tamfis_code.interactive.print_banner"):
+            session_cls.return_value.prompt_async = AsyncMock(side_effect=[EOFError()])
+            asyncio.run(run_interactive_import(
+                client=None,
+                config=Config(),
+                workspace=WorkspaceContext(session_id=99, workspace_root="/tmp/fake-workspace"),
+            ))
+
+        self.assertTrue(session_cls.call_args.kwargs["show_frame"])
+        self.assertTrue(
+            session_cls.return_value.prompt_async.await_args.kwargs["show_frame"]
+        )
+
     def test_status_shows_standalone_not_server_id(self):
         output = _run(["/status", EOFError()])
         self.assertIn("standalone, local session", output)
@@ -445,8 +522,8 @@ class StandalonePtyAndDoctorTests(_StatePatchMixin, unittest.TestCase):
 
     def test_doctor_shows_provider_status_table(self):
         output = _run(["/doctor", EOFError()])
-        self.assertIn("PROVIDER", output)
-        self.assertIn("CONFIGURED", output)
+        self.assertIn("TamfisGPT model service", output)
+        self.assertNotIn("nvidia", output.lower())
 
 
 class StandaloneAiDispatchTests(_StatePatchMixin, unittest.TestCase):

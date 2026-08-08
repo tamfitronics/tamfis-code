@@ -67,6 +67,7 @@ class LoadConfigTests(unittest.TestCase):
         config_module.USER_CONFIG_PATH = tmp_path / "config.toml"
         self._env_token = os.environ.pop("TAMFIS_CODE_TOKEN", None)
         self._env_api_base = os.environ.pop("TAMFIS_CODE_API_BASE", None)
+        self._env_max_tool_calls = os.environ.pop("TAMFIS_CODE_MAX_TOOL_CALLS", None)
 
     def tearDown(self):
         config_module.CONFIG_DIR = self._originals["CONFIG_DIR"]
@@ -77,11 +78,33 @@ class LoadConfigTests(unittest.TestCase):
             os.environ["TAMFIS_CODE_TOKEN"] = self._env_token
         if self._env_api_base is not None:
             os.environ["TAMFIS_CODE_API_BASE"] = self._env_api_base
+        if self._env_max_tool_calls is not None:
+            os.environ["TAMFIS_CODE_MAX_TOOL_CALLS"] = self._env_max_tool_calls
 
     def test_default_api_base_when_no_config_present(self):
         cfg = config_module.load_config()
         self.assertEqual(cfg.api_base, config_module.DEFAULT_API_BASE)
         self.assertEqual(cfg.sources["api_base"], "default")
+        self.assertEqual(cfg.max_tool_calls, 120)
+
+    def test_tool_budget_can_be_set_in_config_file(self):
+        config_module.USER_CONFIG_PATH.write_text("max_tool_calls = 240\n")
+        cfg = config_module.load_config()
+        self.assertEqual(cfg.max_tool_calls, 240)
+        self.assertEqual(cfg.sources["max_tool_calls"], "user config")
+
+    def test_tool_budget_environment_override_wins(self):
+        config_module.USER_CONFIG_PATH.write_text("max_tool_calls = 160\n")
+        os.environ["TAMFIS_CODE_MAX_TOOL_CALLS"] = "300"
+        try:
+            cfg = config_module.load_config()
+        finally:
+            del os.environ["TAMFIS_CODE_MAX_TOOL_CALLS"]
+        self.assertEqual(cfg.max_tool_calls, 300)
+        self.assertEqual(
+            cfg.sources["max_tool_calls"],
+            "env TAMFIS_CODE_MAX_TOOL_CALLS",
+        )
 
     def test_user_config_overrides_default(self):
         config_module.USER_CONFIG_PATH.write_text('api_base = "http://user.invalid"\n')
@@ -223,6 +246,26 @@ class DurableSessionStateTests(unittest.TestCase):
         self.assertIsNone(loaded.running_action)
         self.assertEqual(loaded.completed_actions[-1]["id"], action.id)
         self.assertEqual(loaded.context_checkpoints[-1]["reason"], "validation_complete")
+
+    def test_live_checkpoint_is_bounded_and_cancellation_is_durable(self):
+        state_module.save_turn_checkpoint(
+            12,
+            objective="recover this turn",
+            mode="execute",
+            messages=[
+                {"role": "user", "content": "x" * 200_000},
+                {"role": "assistant", "content": "partial answer"},
+            ],
+        )
+        state_module.mark_turn_checkpoint_interrupted(
+            12, error="Execution cancelled by user.",
+        )
+        loaded = state_module.get_session_state(12)
+        self.assertEqual(loaded.turn_checkpoint["status"], "interrupted")
+        self.assertEqual(loaded.turn_checkpoint["last_error"], "Execution cancelled by user.")
+        self.assertLess(len(state_module.STATE_PATH.read_text()), 220_000)
+        memory = Path(state_module.CONFIG_DIR) / ".memory" / "session-12.json"
+        self.assertTrue(memory.is_file())
 
     def test_persisted_queue_and_actions_redact_likely_secrets(self):
         state_module.enqueue_instruction(10, "retry with access_token=super-secret-token")

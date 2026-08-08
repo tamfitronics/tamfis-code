@@ -13,12 +13,18 @@ import traceback
 from dataclasses import dataclass, field
 from typing import Any, Optional, AsyncGenerator
 
+import httpx
 from rich.console import Console
 from rich.panel import Panel
 
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .config import Config, mode_label_for_policy, next_mode_in_cycle
-from .render import StreamRenderer, resume_live_if_active, suspend_live_if_active
+from .render import (
+    BRANDED_PROVIDER_LABEL,
+    StreamRenderer,
+    resume_live_if_active,
+    suspend_live_async_if_active,
+)
 from . import state as local_state
 from .providers import ProviderManager, ProviderType
 
@@ -33,15 +39,38 @@ try:
 except (TypeError, ValueError):
     MAX_TASK_STREAM_RECONNECTS = 12
 
+# How long a reattached event stream may sit completely silent before it's
+# treated as dead rather than merely slow. Confirmed live: a task reattached
+# via cli.py's startup `_resume_interrupted_task_if_any` (or the explicit
+# `attach` command) that had gone stale server-side -- no more events ever
+# coming -- left the CLI parked in select() indefinitely (500+ minutes in
+# one report), with Ctrl+C unable to reach the blocked read because the
+# interrupt watcher only gets scheduled between received events. This does
+# NOT bound a normal live turn's total runtime, only the gap between two
+# consecutive events/keepalives.
+try:
+    STREAM_IDLE_TIMEOUT_SECONDS = max(
+        10.0, float(os.getenv("TAMFIS_CODE_STREAM_IDLE_TIMEOUT", "90"))
+    )
+except (TypeError, ValueError):
+    STREAM_IDLE_TIMEOUT_SECONDS = 90.0
+
 # Allowed providers - expanded from just hf/openrouter
-ALLOWED_PROVIDERS = ["hf", "huggingface", "or", "openrouter", "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None]
-PROVIDER_ALIASES = {"hf": "huggingface", "nvidia": "nvidia_nim", "or": "openrouter"}
+ALLOWED_PROVIDERS = [
+    "hf", "huggingface", "or", "openrouter", "ollama", "ollama_cloud",
+    "nvidia", "nvidia_nim", "gemini", "apiframe", "auto", None,
+]
+PROVIDER_ALIASES = {
+    "hf": "huggingface", "nvidia": "nvidia_nim", "or": "openrouter",
+    "ollama": "ollama_cloud",
+}
 
 # Provider name mapping
 PROVIDER_NAME_MAP = {
     "hf": "Hugging Face",
     "huggingface": "Hugging Face",
     "openrouter": "OpenRouter",
+    "ollama_cloud": "Ollama Cloud",
     "nvidia": "NVIDIA NIM",
     "nvidia_nim": "NVIDIA NIM",
     "gemini": "Google Gemini",
@@ -63,6 +92,11 @@ class TaskOutcome:
     error: Optional[str] = None
     plan_id: Optional[str] = None
     plan_items: list[dict[str, Any]] = field(default_factory=list)
+    # Shared runtime evidence.  Local and remote stream adapters historically
+    # returned only status/summary, which made the unified reviewer believe a
+    # successful mutation had no changed files or validation evidence.
+    changed_files: list[str] = field(default_factory=list)
+    validations: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _decision_for_policy(policy: str, risk: str, interactive: bool) -> Optional[str]:
@@ -375,8 +409,10 @@ async def _run_ai_task_and_stream_impl(
     # replaced with auto or a different provider.
     provider = normalize_provider(provider)
 
-    provider_name = PROVIDER_NAME_MAP.get(provider or "auto", provider or "auto")
-    console.print(f"[dim]Using provider: {provider_name}[/dim]")
+    # PROVIDER_NAME_MAP still resolves the real backend name for internal/
+    # diagnostic use (see `tamfis-code providers`); the raw backend a Remote
+    # task actually lands on is never shown here -- TamfisGPT is the brand.
+    console.print(f"[dim]Using provider: {BRANDED_PROVIDER_LABEL}[/dim]")
 
     # Preserve auto selection for Tier IV. The CLI must not silently pin
     # automatic requests to a specific provider; the orchestration layer
@@ -406,6 +442,7 @@ async def _run_ai_task_and_stream_impl(
             client, renderer, console, session_id=session_id, task_id=task_id,
             approval_policy=approval_policy, interactive=interactive,
             from_event_id=stream_cursor, config=config,
+            requested_mutation=mode in {"coding", "agent", "edit", "debug"},
         )
     except BaseException:
         local_state.finish_action(session_id, action.id, status="failed", summary="stream failed")
@@ -453,6 +490,7 @@ async def retry_task_and_stream(
         session_id=session_id, task_id=new_task_id,
         approval_policy=approval_policy, interactive=interactive,
         from_event_id=stream_cursor, config=config,
+        requested_mutation=mode in {"coding", "agent", "edit", "debug"},
     )
     await _print_command_budget_if_notable(client, console, new_task_id)
     return outcome
@@ -470,11 +508,14 @@ async def attach_and_stream(
     config: Optional[Config] = None,
 ) -> TaskOutcome:
     from_event_id = local_state.get_session_state(session_id).last_event_id
+    active_mode = str(local_state.get_session_state(session_id).active_task.get("mode", "")) if local_state.get_session_state(session_id).active_task else ""
     return await _stream_task(
         client, renderer, console,
         session_id=session_id, task_id=task_id,
         approval_policy=approval_policy, interactive=interactive,
         from_event_id=from_event_id, on_interrupt="detach", config=config,
+        requested_mutation=active_mode in {"coding", "agent", "edit", "debug"},
+        idle_timeout=STREAM_IDLE_TIMEOUT_SECONDS,
     )
 
 
@@ -490,11 +531,25 @@ async def _stream_task(
     from_event_id: int = 0,
     on_interrupt: str = "cancel",
     reconnect_attempt: int = 0,
+    requested_mutation: bool = False,
     config: Optional[Config] = None,
+    idle_timeout: Optional[float] = None,
 ) -> TaskOutcome:
     outcome: Optional[TaskOutcome] = None
     last_assistant_content: Optional[str] = None
     last_plan_items: list[dict[str, Any]] = []
+    # A "coding" mode task that answers a question, reports status, or
+    # decides nothing needs to change this turn is a legitimate outcome, not
+    # a failure -- the no-mutation check below must only fire once the model
+    # actually reached for a tool capable of changing something. Read-only
+    # tools (read_file/glob_files/grep_files) never set this.
+    _MUTATING_TOOL_NAMES = {"write_file", "edit_file", "remote_exec"}
+    mutation_attempted = False
+    initial_mutation_ids = {
+        str(item.get("mutation_id"))
+        for item in local_state.get_session_state(session_id).modified_files
+        if item.get("mutation_id")
+    }
     prompted_command_ids: set[int] = set()
     interrupted, uninstall_sigint = _install_sigint_watcher()
     queued_interrupt: Optional[dict[str, Any]] = None
@@ -514,8 +569,28 @@ async def _stream_task(
             await asyncio.sleep(0.25)
 
     async def consume() -> None:
-        nonlocal outcome, last_assistant_content, last_plan_items, task_id
-        async for event in client.stream_session(session_id, from_event_id):
+        nonlocal outcome, last_assistant_content, last_plan_items, task_id, mutation_attempted
+        # Iterate the stream manually (rather than `async for`) so a
+        # silent-too-long read raises httpx.TimeoutException *into this
+        # loop* instead of propagating out uncaught -- a task reattached
+        # from a previous session that had gone stale server-side (no more
+        # events ever coming) otherwise left the CLI parked here forever,
+        # with Ctrl+C unable to reach the blocked read since the interrupt
+        # watcher only gets scheduled between received events.
+        stream_iter = client.stream_session(
+            session_id, from_event_id, idle_timeout=idle_timeout,
+        ).__aiter__()
+        while True:
+            try:
+                event = await stream_iter.__anext__()
+            except StopAsyncIteration:
+                return
+            except httpx.TimeoutException:
+                console.print(
+                    "[dim]· No update from the server in a while; checking task status...[/dim]"
+                )
+                return
+
             sequence = event.get("stream_sequence")
             if sequence is not None:
                 local_state.save_session_state(session_id, last_event_id=int(sequence))
@@ -553,6 +628,11 @@ async def _stream_task(
             }
             if event_type in phase_by_event:
                 local_state.save_session_state(session_id, current_phase=phase_by_event[event_type])
+
+            if event_type == "tool_call_requested":
+                tool_name = str(payload.get("name") or payload.get("tool") or "")
+                if tool_name in _MUTATING_TOOL_NAMES:
+                    mutation_attempted = True
 
             if event_type == "plan_created":
                 items = payload.get("items") if isinstance(payload.get("items"), list) else []
@@ -641,7 +721,7 @@ async def _stream_task(
                 # a pty capture of the equivalent local-loop path).
                 if is_new_prompt:
                     prompted_command_ids.add(command_id)
-                    suspend_live_if_active(renderer)
+                    await suspend_live_async_if_active(renderer)
                 renderer.handle_event(event)
                 if is_new_prompt:
                     try:
@@ -665,6 +745,26 @@ async def _stream_task(
                 renderer.handle_event(event)
 
             if event_type == "ai_task_completed":
+                state = local_state.get_session_state(session_id)
+                new_mutations = {
+                    str(item.get("mutation_id"))
+                    for item in state.modified_files
+                    if item.get("mutation_id")
+                } - initial_mutation_ids
+                validation = payload.get("validation") if isinstance(payload.get("validation"), dict) else {}
+                if validation.get("passed") is False:
+                    message = "TamfisGPT reported completion, but its validation did not pass."
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    outcome = TaskOutcome(status="failed", error=message, summary=last_assistant_content or "")
+                    return
+                if requested_mutation and mutation_attempted and not new_mutations:
+                    message = (
+                        "TamfisGPT reported completion, but no file mutation was recorded for this coding task. "
+                        "The task is not considered complete."
+                    )
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    outcome = TaskOutcome(status="failed", error=message, summary=last_assistant_content or "")
+                    return
                 outcome = TaskOutcome(status="completed", summary=last_assistant_content or "", plan_items=last_plan_items)
                 if last_assistant_content:
                     local_state.save_session_state(
@@ -722,6 +822,7 @@ async def _stream_task(
                     approval_policy=approval_policy, interactive=interactive,
                     from_event_id=cursor, on_interrupt=on_interrupt,
                     reconnect_attempt=reconnect_attempt + 1, config=config,
+                    requested_mutation=requested_mutation, idle_timeout=idle_timeout,
                 )
             outcome = TaskOutcome(status="detached", summary=task_id)
         else:

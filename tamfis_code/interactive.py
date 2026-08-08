@@ -7,20 +7,26 @@ management.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
+from prompt_toolkit.document import Document
 from prompt_toolkit.formatted_text import HTML
-from prompt_toolkit.history import FileHistory
+from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
 from rich.console import Console
+from rich.markup import escape
 from rich.markdown import Markdown
+from rich.panel import Panel
 from rich.table import Table
 
+from . import __version__
 from . import state as local_state
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .clipboard import copy_to_clipboard
@@ -42,7 +48,12 @@ from .custom_commands import (
     load_custom_commands,
 )
 from .doctor import run_doctor
-from .live_input import LiveInputListener, idle_bottom_toolbar
+from .live_input import (
+    LiveInputListener,
+    composer_style,
+    force_bottom_toolbar_visible,
+    idle_bottom_toolbar,
+)
 from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
 from .runner import (
     TaskOutcome,
@@ -67,6 +78,10 @@ from .workspace import (
 # paste of a few lines stays visible and directly editable, matching how
 # those tools only collapse genuinely large pastes.
 PASTE_COLLAPSE_LINE_THRESHOLD = 3
+# A single-line paste can still be a large log, JSON blob, or source file.
+# Collapse it at the same practical size users expect from the terminal UI;
+# line count alone incorrectly left 896-character pastes fully visible.
+PASTE_COLLAPSE_CHAR_THRESHOLD = 896
 
 async def _run_cancellable_local_turn(
     *,
@@ -92,22 +107,72 @@ async def _run_cancellable_local_turn(
     live_input.start()
 
     try:
-        return await agent_task
+        outcome = await agent_task
+        live_input.set_outcome_status(outcome.status)
+        return outcome
     except asyncio.CancelledError:
         classification = live_input.interrupt_classification or "cancel"
 
         if classification == "exit":
-            return TaskOutcome(
+            outcome = TaskOutcome(
                 status="exited",
                 error="Exit requested by user",
             )
+            live_input.set_outcome_status(outcome.status)
+            return outcome
 
-        return TaskOutcome(
+        outcome = TaskOutcome(
             status="cancelled",
             error="Task cancelled by user.",
         )
+        live_input.set_outcome_status(outcome.status)
+        return outcome
+    except BaseException:
+        live_input.set_outcome_status("failed")
+        raise
     finally:
-        await live_input.stop()
+        stop_result = live_input.stop()
+        if inspect.isawaitable(stop_result):
+            await stop_result
+
+
+async def _run_remote_turn_with_live_ui(
+    *,
+    session_id: int,
+    renderer: StreamRenderer,
+    config: Config,
+    turn_coro,
+) -> TaskOutcome:
+    """Give Remote Workspace turns the same live composer/footer as local turns.
+
+    Escape is intentionally delivered through LiveInputListener's durable
+    instruction queue. runner._stream_task already watches that queue and
+    cancels the real server task, so the UI never abandons a task that keeps
+    running invisibly in TamfisGPT.
+    """
+    live_input = LiveInputListener(
+        session_id=session_id,
+        renderer=renderer,
+        cli_config=config,
+    )
+    live_input.start()
+    try:
+        outcome = await turn_coro
+        live_input.set_outcome_status(outcome.status)
+        return outcome
+    except BaseException:
+        live_input.set_outcome_status("failed")
+        raise
+    finally:
+        stop_result = live_input.stop()
+        if inspect.isawaitable(stop_result):
+            await stop_result
+        # execute_remote (runtime/unified.py) now runs turns through the
+        # local engine instead of runner._stream_task, which used to close
+        # the renderer itself in its own finally block. Without this, the
+        # assistant box's bottom border never prints and box state leaks
+        # into the next turn.
+        renderer.finish()
 
 
 HELP_TEXT = """\
@@ -131,6 +196,9 @@ $ <command>            explicit shell command
 /queue               show queued instructions
 /queue <instruction> append a follow-up instruction
 /cwd                 show the current workspace root
+/cd <path>           change the working directory for this session (auto-approves the
+                      containing project root); every following turn's tools and
+                      repository context re-orient to it immediately
 /copy                copy the last assistant response to the clipboard (OSC 52 --
                       works over plain SSH, no X11/Wayland/xclip required)
 /doctor              run connectivity/auth checks
@@ -154,7 +222,10 @@ $ <command>            explicit shell command
                       nothing in this REPL ties a task's lifetime to this process; see
                       `tamfis-code attach <session_id>` in another terminal to reconnect)
 /clear               clear the screen
-/compact             save a durable checkpoint of the current task context
+/compact             compress the thread: fold older turns into the session summary and keep
+                      only the recent few turns in full, so a long REPL stays light in the
+                      terminal and the next turn's context (Claude Code/Codex-style compaction)
+/summary             show a structured recap of the conversation so far without compressing it
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
@@ -162,9 +233,9 @@ Shift+Tab            cycle mode without typing a command (shown in the prompt as
                      also works while a task is already running, not just at this prompt
 message>             while a task is running: type a message and press Enter
 /model               show the active model route
-/model list [route]  list coding models (route: hf or openrouter)
-/model auto          restore Hugging Face -> OpenRouter automatic routing
-/model <route> [id]  pin a provider, optionally with a catalog model id
+/model list          list TamfisGPT model aliases
+/model auto          restore TamfisGPT automatic model selection
+/model <alias>       select Auto, Fast, Code, Pro, or Vision
 /tools               show the tools exposed to tamfis-code tasks
 /pty start [command]  start a persistent background terminal (default: bash)
 /pty list             list this session's background terminals
@@ -191,6 +262,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/reports", "show the repository report index"),
     ("/queue", "show or append queued instructions"),
     ("/cwd", "show the current workspace root"),
+    ("/cd", "change the working directory for this session"),
     ("/copy", "copy the last assistant response to the clipboard"),
     ("/doctor", "run connectivity/auth checks"),
     ("/resume", "switch to another session"),
@@ -203,10 +275,12 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/revert", "restore a file to its content before a mutation"),
     ("/detach", "exit without cancelling anything server-side"),
     ("/clear", "clear the screen"),
-    ("/compact", "save a durable checkpoint of the current task context"),
+    ("/compact", "compress the thread (fold older turns into the summary, keep recent turns)"),
+    ("/summary", "show a structured recap of the conversation so far"),
     ("/permissions", "show approval policy and immutable server safeguards"),
     ("/mode", "show or switch the active approval mode"),
     ("/model", "show or switch the active model route"),
+    ("/update", "apply a newer installed version and restart into this session"),
     ("/tools", "show the tools exposed to tamfis-code tasks"),
     ("/commands", "list user-defined custom slash commands loaded from .md files"),
     ("/agent-types", "list declarative subagent types available to /delegate and /swarm"),
@@ -272,6 +346,85 @@ class Intent:
 MAX_STANDALONE_HISTORY_TURNS = 30
 
 
+def next_message_suggestion(answer: Optional[str]) -> Optional[str]:
+    """Derive a concise, editable next action from the last assistant turn."""
+    if not answer:
+        return None
+    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    for index, line in enumerate(lines):
+        match = re.match(
+            r"(?i)^(?:[-*]\s*)?(?:recommended\s+)?next\s+step(?:s)?\s*[:—-]\s*(.+)$",
+            line,
+        )
+        candidate = match.group(1).strip() if match else ""
+        if not candidate and re.match(
+            r"(?i)^#{0,4}\s*(?:recommended\s+)?next\s+step(?:s)?\s*:?\s*$",
+            line,
+        ):
+            for following in lines[index + 1:]:
+                candidate = re.sub(r"^[-*\d.)\s]+", "", following).strip()
+                if candidate:
+                    break
+        if candidate:
+            return candidate[:240]
+    return "Continue with the next recommended step"
+
+
+class _NextMessageAutoSuggest(AutoSuggest):
+    def __init__(self, get_answer: Callable[[], Optional[str]]) -> None:
+        self._get_answer = get_answer
+
+    def get_suggestion(self, buffer, document: Document) -> Optional[Suggestion]:
+        if document.text:
+            return None
+        value = next_message_suggestion(self._get_answer())
+        return Suggestion(value) if value else None
+
+
+def _seed_next_message_suggestion(
+    session: PromptSession,
+    answer: Optional[str],
+) -> None:
+    """Prime ghost text for an untouched, newly opened empty composer.
+
+    prompt-toolkit normally runs AutoSuggest only after the buffer changes.
+    A new post-response prompt starts empty and unchanged, so its first
+    suggestion otherwise remains invisible until the user types and erases a
+    character. Seeding Buffer.suggestion in pre_run makes the ghost visible
+    immediately.
+    """
+    value = next_message_suggestion(answer)
+    session.default_buffer.suggestion = Suggestion(value) if value else None
+
+
+def message_prompt() -> HTML:
+    """The uncluttered editable-line label used by the interactive REPL."""
+    return HTML("<b>message</b><ansicyan>›</ansicyan> ")
+
+
+def _prompt_history(history_path: Path, console: Console):
+    """Return durable prompt history when possible, otherwise stay usable.
+
+    ``FileHistory`` defers opening the file until the first submitted line.
+    In read-only containers, locked-down SSH homes, and some CI shells that
+    turns a normal Enter press into an unhandled prompt-toolkit exception.
+    Probe the path up front and fall back to process-local history; the REPL
+    should lose persistence, not the user's session.
+    """
+    try:
+        history_path.parent.mkdir(parents=True, exist_ok=True)
+        with history_path.open("ab"):
+            pass
+    except (OSError, PermissionError) as exc:
+        console.print(
+            "[dim]Prompt history is session-only ("
+            f"{escape(str(exc))}"
+            "); your REPL is still usable.[/dim]"
+        )
+        return InMemoryHistory()
+    return FileHistory(str(history_path))
+
+
 def _append_turn_to_history(
     history: list[dict[str, str]], *, objective: str, answer: Optional[str],
 ) -> None:
@@ -304,9 +457,15 @@ def paste_placeholder(data: str, count: int) -> Optional[tuple[str, str]]:
     if not normalized:
         return None
     line_count = normalized.count("\n") + (0 if normalized.endswith("\n") else 1)
-    if line_count <= PASTE_COLLAPSE_LINE_THRESHOLD:
+    if (
+        line_count <= PASTE_COLLAPSE_LINE_THRESHOLD
+        and len(normalized) < PASTE_COLLAPSE_CHAR_THRESHOLD
+    ):
         return None
-    placeholder = f"[Pasted text #{count} +{line_count} lines]"
+    if line_count > PASTE_COLLAPSE_LINE_THRESHOLD:
+        placeholder = f"[Pasted text #{count} +{line_count} lines]"
+    else:
+        placeholder = f"[Pasted text #{count} +{len(normalized)} chars]"
     return placeholder, normalized
 
 
@@ -425,6 +584,14 @@ async def run_interactive(
         "your text is queued without a special shortcut. Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
 
+    from .self_update import check_update_available
+    _available_update = check_update_available()
+    if _available_update:
+        console.print(
+            f"[yellow]◆ Update available: {__version__} -> {_available_update}.[/yellow] "
+            "[dim]Type /update to apply and restart into this same session.[/dim]\n"
+        )
+
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
     bindings = KeyBindings()
@@ -437,7 +604,22 @@ async def run_interactive(
 
     @bindings.add("enter")
     def _submit(event) -> None:
-        event.current_buffer.validate_and_handle()
+        # An empty Enter is a no-op: keep the same composer and footer on
+        # screen rather than submitting/redrawing a blank message.
+        if event.current_buffer.text.strip():
+            event.current_buffer.validate_and_handle()
+
+    # Some SSH/terminal clients report focus changes as CSI sequences
+    # (ESC [ I / ESC [ O). Consume them explicitly so the escape byte is
+    # not treated as a bare cancel and the trailing I/O characters are not
+    # inserted into the prompt when entering or leaving tamfis-code.
+    @bindings.add("escape", "[", "I")
+    def _ignore_focus_in(event) -> None:
+        return
+
+    @bindings.add("escape", "[", "O")
+    def _ignore_focus_out(event) -> None:
+        return
 
     @bindings.add("escape", "enter")
     def _newline(event) -> None:
@@ -452,6 +634,15 @@ async def run_interactive(
         # prompt_toolkit re-evaluates a callable `message=` on invalidate.
         config.approval_policy = next_mode_in_cycle(config.approval_policy)
         event.app.invalidate()
+
+    @bindings.add("tab")
+    def _accept_next_suggestion(event) -> None:
+        buffer = event.current_buffer
+        suggestion = next_message_suggestion(last_response_text)
+        if not buffer.text and suggestion:
+            buffer.insert_text(suggestion)
+            return
+        buffer.start_completion(select_first=False)
 
     # Reported live: pasting a long block (clipboard paste, terminal
     # bracketed-paste mode) inserted the entire raw text into the input
@@ -482,7 +673,10 @@ async def run_interactive(
         event.current_buffer.insert_text(placeholder)
 
     def _prompt_message() -> HTML:
-        return HTML(f"tamfis-code <ansicyan>[{mode_label_for_policy(config.approval_policy)}]</ansicyan>> ")
+        # Keep the editable line clean, like Codex/Claude Code: mode and
+        # status live in prompt-toolkit's persistent toolbar *below* the
+        # message box instead of consuming space before every message.
+        return message_prompt()
 
     # multiline=True is essential for bracketed terminal paste: embedded
     # newlines remain part of one objective instead of submitting the first
@@ -492,11 +686,33 @@ async def run_interactive(
     # completer -- constructed once, here -- always reflects the latest
     # command files without needing to be rebuilt.
     custom_commands: dict[str, CustomCommand] = load_custom_commands(workspace.workspace_root)
-    session: PromptSession = PromptSession(
-        history=FileHistory(str(history_path)), multiline=True, key_bindings=bindings,
-        completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
-        bottom_toolbar=lambda: idle_bottom_toolbar(config, workspace.session_id),
+    # Footer callbacks run on every keystroke. Resolve the delegated-agent
+    # count once before entering prompt-toolkit instead of reading the
+    # multi-megabyte session ledger from the rendering hot path.
+    idle_active_agents = local_state.active_swarm_child_count(
+        exclude_session_id=workspace.session_id,
     )
+    session: PromptSession = PromptSession(
+        history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
+        completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
+        bottom_toolbar=lambda: idle_bottom_toolbar(
+            config,
+            workspace.session_id,
+            provider=provider,
+            model=model,
+            has_suggestion=bool(next_message_suggestion(last_response_text)),
+            active_agents=idle_active_agents,
+        ),
+        auto_suggest=_NextMessageAutoSuggest(lambda: last_response_text),
+        style=composer_style(),
+        reserve_space_for_menu=0,
+        # prompt-toolkit supplies a real dynamic Frame around the entire
+        # multiline editor. This is the composer box the previous prompt-only
+        # change failed to provide; the status/mode toolbar remains directly
+        # below the frame, matching Codex/Claude Code's visual hierarchy.
+        show_frame=True,
+    )
+    force_bottom_toolbar_visible(session)
 
     async def _run_saved_plan(plan_id_arg: Optional[str]) -> bool:
         """Execute a saved plan by id (or the most recent if plan_id_arg is
@@ -538,13 +754,18 @@ async def run_interactive(
             )
             last_turn = (plan_objective, "execute")
         else:
-            outcome = await run_ai_task_and_stream(
-                client, renderer, console,
+            outcome = await _run_remote_turn_with_live_ui(
                 session_id=workspace.session_id,
-                objective=plan_objective, mode="execute",
-                approval_policy=config.approval_policy, interactive=True,
-                model=model_state.selected_model, provider=model_state.selected_provider,
+                renderer=renderer,
                 config=config,
+                turn_coro=run_ai_task_and_stream(
+                    client, renderer, console,
+                    session_id=workspace.session_id,
+                    objective=plan_objective, mode="execute",
+                    approval_policy=config.approval_policy, interactive=True,
+                    model=model_state.selected_model, provider=model_state.selected_provider,
+                    config=config,
+                ),
             )
         if standalone:
             renderer.finish()
@@ -577,7 +798,14 @@ async def run_interactive(
             pending_pastes.clear()
             paste_counter = 0
             try:
-                text = await session.prompt_async(_prompt_message)
+                text = await session.prompt_async(
+                    _prompt_message,
+                    show_frame=True,
+                    pre_run=lambda: _seed_next_message_suggestion(
+                        session,
+                        last_response_text,
+                    ),
+                )
             except KeyboardInterrupt:
             # NOTE: this used to just `continue`, silently redrawing the
             # prompt -- Ctrl+C appeared to do nothing at all, with no
@@ -606,7 +834,7 @@ async def run_interactive(
                 )
 
             unresolved_pastes = re.findall(
-                r"\[Pasted text #\d+ \+\d+ lines\]",
+                r"\[Pasted text #\d+ \+\d+ (?:lines|chars)\]",
                 text,
             )
             if unresolved_pastes:
@@ -659,6 +887,65 @@ async def run_interactive(
         if text == "/cwd":
             console.print(workspace.workspace_root)
             continue
+        if text == "/cd" or text.startswith("/cd "):
+            # Claude Code/Codex both let you just tell the agent to look
+            # somewhere else and it re-orients immediately -- this REPL had
+            # no equivalent at all: `tamfis-code cwd <path>` only existed as
+            # a *separate* CLI invocation (a new process, so it could never
+            # affect a session already running), and even then only updated
+            # a mostly-cosmetic `current_working_directory` field, not the
+            # `workspace_root` tools actually execute against. This updates
+            # `workspace.workspace_root` in place, which every subsequent
+            # turn's MCPServer/context discovery is built fresh from (see
+            # the `workspace_root=workspace.workspace_root` passed into each
+            # `_run_local_agent_turn_impl` call below), so the very next
+            # turn's file reads, edits, and repository context (branch,
+            # dirty files, project metadata) all reflect the new directory.
+            arg = text[len("/cd "):].strip() if text != "/cd" else ""
+            if not arg:
+                console.print(f"[dim]Current working directory: {workspace.workspace_root}[/dim]")
+                console.print("[dim]Usage: /cd <path>[/dim]")
+                continue
+            candidate = Path(arg).expanduser()
+            if not candidate.is_absolute():
+                candidate = Path(workspace.workspace_root) / candidate
+            try:
+                resolved = candidate.resolve(strict=True)
+            except OSError as exc:
+                console.print(f"[red]Can't change directory: {exc}[/red]")
+                continue
+            if not resolved.is_dir():
+                console.print(f"[red]Not a directory: {resolved}[/red]")
+                continue
+            target = str(resolved)
+            state = local_state.get_session_state(workspace.session_id)
+            approved = any(
+                target == allowed or target.startswith(allowed.rstrip("/") + "/")
+                for allowed in state.allowed_workspaces
+            )
+            if not approved:
+                # Same auto-grant shape as an explicit absolute path in an
+                # objective (cli.py's _project_root_for_target): approve the
+                # containing git project root, not just the literal
+                # directory, so a subsequent `/cd` into a sibling
+                # subdirectory of the same project doesn't need its own
+                # approval prompt.
+                start = resolved
+                expansion_root = resolved
+                for candidate_root in (start, *start.parents):
+                    if (candidate_root / ".git").exists():
+                        expansion_root = candidate_root
+                        break
+                allowed_list = list(dict.fromkeys([*state.allowed_workspaces, str(expansion_root)]))
+                local_state.save_session_state(workspace.session_id, allowed_workspaces=allowed_list)
+                console.print(f"[dim]Workspace added: {expansion_root}[/dim]")
+            workspace.workspace_root = target
+            local_state.save_session_state(
+                workspace.session_id, workspace_root=target, current_working_directory=target,
+            )
+            discover_local_repository(workspace.session_id, resolved, force=True)
+            console.print(f"[green]Working directory:[/green] {target}")
+            continue
         if text == "/copy":
             if not last_response_text:
                 console.print("[dim]Nothing to copy yet.[/dim]")
@@ -673,8 +960,10 @@ async def run_interactive(
                 f"session_id={workspace.session_id}  (standalone, local session)"
                 if standalone else f"session_id={workspace.session_id}  server_id={workspace.server_id}"
             )
+            from .public_identity import PUBLIC_PROVIDER_NAME, public_model_name
+
             backend_line = (
-                f"approval_policy={config.approval_policy}  provider={provider_type.value if provider_type else provider}"
+                f"approval_policy={config.approval_policy}  provider={PUBLIC_PROVIDER_NAME}"
                 if standalone else f"approval_policy={config.approval_policy}  api_base={config.api_base}"
             )
             console.print(
@@ -686,7 +975,7 @@ async def run_interactive(
                 f"validations={len(state.validation_results)}  issues={len(state.unresolved_issues)}\n"
                 f"saved_plans={len(state.saved_plans)}  active_plan={state.active_plan_id or '-'}\n"
                 f"{backend_line}\n"
-                f"model={state.selected_model}  route={state.selected_provider or 'auto'}"
+                f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
             )
             continue
         if text == "/context":
@@ -734,6 +1023,21 @@ async def run_interactive(
             )
             console.print(Markdown(str(plan.get("content") or "")))
             continue
+        if text == "/update":
+            from .self_update import apply_update, check_update_available, reexec
+
+            pending = check_update_available()
+            if not pending:
+                console.print("[dim]No newer version available.[/dim]")
+                continue
+            console.print(f"[dim]Updating {__version__} -> {pending}...[/dim]")
+            ok, message = apply_update()
+            if not ok:
+                print_error(console, message)
+                continue
+            console.print(f"[green]{message}[/green] [dim]Restarting into this session...[/dim]")
+            reexec()
+            continue
         if text == "/queue" or text.startswith("/queue "):
             arg = text[len("/queue"):].strip()
             if arg:
@@ -746,45 +1050,73 @@ async def run_interactive(
             arg = text[len("/model"):].strip()
             state = local_state.get_session_state(workspace.session_id)
             if not arg:
-                console.print(
-                    f"model={state.selected_model}  "
-                    f"provider={state.selected_provider or 'auto (hf -> openrouter)'}"
-                )
+                from .public_identity import public_model_name
+                console.print(f"model={public_model_name(state.selected_model)}")
                 continue
             parts = arg.split()
+
+            from .public_identity import (
+                PUBLIC_MODEL_ALIASES,
+                PUBLIC_MODEL_AUTO,
+                PUBLIC_MODEL_TIERS,
+                parse_public_model_alias,
+                public_model_name,
+            )
+            if parts[0].lower() == "list":
+                table = Table(show_header=True, header_style="bold")
+                table.add_column("TAMFISGPT MODEL")
+                table.add_column("USE")
+                table.add_column("STATUS")
+                uses = {
+                    PUBLIC_MODEL_AUTO: "Automatic selection",
+                    "TamfisGPT Smart": "Low-latency, low-cost tasks",
+                    "TamfisGPT Pro": "Everyday coding and agent tasks",
+                    "TamfisGPT Ultra": "Heavy multi-file / tool-heavy work",
+                    "TamfisGPT Ultima": "Frontier reasoning -- top subscription tier only",
+                }
+                if standalone:
+                    # No TamfisGPT subscription applies to a standalone (BYOK)
+                    # session -- list the tiers as reference labels only,
+                    # same as Claude Code/Codex listing their own model names.
+                    for alias in PUBLIC_MODEL_ALIASES:
+                        table.add_row(alias, uses[alias], "n/a (standalone)")
+                else:
+                    try:
+                        available = await client.list_models()
+                    except (AuthRequiredError, RemoteAPIError) as e:
+                        print_error(console, str(e))
+                        continue
+                    entitled_tiers = {
+                        public_model_name(item.get("id"))
+                        for item in (available.get("models") or [])
+                    }
+                    table.add_row(PUBLIC_MODEL_AUTO, uses[PUBLIC_MODEL_AUTO], "🟢 Available")
+                    for tier in PUBLIC_MODEL_TIERS:
+                        status = "🟢 Available" if tier in entitled_tiers else "🔒 Not on your plan"
+                        table.add_row(tier, uses[tier], status)
+                console.print(table)
+                continue
+            public_alias = parse_public_model_alias(parts[0])
+            if public_alias:
+                local_state.save_session_state(
+                    workspace.session_id, selected_model=public_alias, selected_provider=None,
+                )
+                console.print(f"[green]Model set to[/green] {public_alias}")
+                continue
 
             if standalone:
                 from .local_chat import resolve_provider_type as _resolve_provider_type
                 from .providers import ProviderManager as _ProviderManager, ProviderType
 
-                if parts[0].lower() == "list":
-                    route_arg = parts[1].lower() if len(parts) > 1 else None
-                    manager = _ProviderManager()
-                    routes = [route_arg] if route_arg else [p.value for p in manager.PROVIDERS]
-                    table = Table(show_header=True, header_style="bold")
-                    for column in ("PROVIDER", "MODELS"):
-                        table.add_column(column)
-                    shown = False
-                    for route_name in routes:
-                        try:
-                            route_type = _resolve_provider_type(route_name)
-                        except ValueError:
-                            continue
-                        pcfg = manager.PROVIDERS.get(route_type)
-                        if pcfg:
-                            table.add_row(pcfg.name, ", ".join(pcfg.models) or pcfg.default_model)
-                            shown = True
-                    console.print(table if shown else "[dim]Unknown provider. Use hf, nvidia, or openrouter.[/dim]")
-                    continue
                 if parts[0].lower() == "auto":
                     provider_type = ProviderType.AUTO
                     local_state.save_session_state(workspace.session_id, selected_model="auto", selected_provider=None)
-                    console.print("[green]Provider routing set to automatic.[/green]")
+                    console.print("[green]Model set to TamfisGPT Auto.[/green]")
                     continue
                 try:
                     provider_type = _resolve_provider_type(parts[0])
                 except ValueError as exc:
-                    print_error(console, f"{exc} Usage: /model auto | /model <tamfis|hf|nvidia|openrouter> [model-id]")
+                    print_error(console, "Unknown model. Use /model list to view TamfisGPT models.")
                     continue
                 model_id = parts[1] if len(parts) > 1 else "auto"
                 if len(parts) > 2:
@@ -794,40 +1126,19 @@ async def run_interactive(
                 local_state.save_session_state(
                     workspace.session_id, selected_model=model_id, selected_provider=parts[0].lower(),
                 )
-                console.print(f"[green]Pinned {parts[0].lower()} route[/green]  model={model_id}")
+                from .public_identity import public_model_name
+                console.print(f"[green]Model set to[/green] {public_model_name(model_id)}")
                 continue
 
-            if parts[0].lower() == "list":
-                route = parts[1].lower() if len(parts) > 1 else None
-                if route not in (None, "hf", "openrouter"):
-                    print_error(console, "Usage: /model list [hf|openrouter]")
-                    continue
-                api_provider = "huggingface" if route == "hf" else route
-                try:
-                    result = await client.list_models(api_provider)
-                except (AuthRequiredError, RemoteAPIError) as e:
-                    print_error(console, str(e))
-                    continue
-                rows = [m for m in (result.get("models") or []) if "coding" in [str(c).lower() for c in (m.get("categories") or [])]]
-                table = Table(show_header=True, header_style="bold")
-                for column in ("ID", "PROVIDER", "REASONING", "MAX TOKENS"):
-                    table.add_column(column)
-                for item in rows[:40]:
-                    table.add_row(
-                        str(item.get("id")), str(item.get("provider") or item.get("backend") or ""),
-                        str(item.get("reasoning") or "-"), str(item.get("maxTokens") or "-"),
-                    )
-                console.print(table if rows else "[dim]No coding models found for that route.[/dim]")
-                continue
             if parts[0].lower() == "auto":
                 local_state.save_session_state(
                     workspace.session_id, selected_model="auto", selected_provider=None,
                 )
-                console.print("[green]Model routing set to automatic: Hugging Face, then OpenRouter.[/green]")
+                console.print("[green]Model set to TamfisGPT Auto.[/green]")
                 continue
             route = parts[0].lower()
-            if route not in ("hf", "openrouter"):
-                print_error(console, "Usage: /model auto | /model <hf|openrouter> [catalog-model-id]")
+            if route not in ("hf", "openrouter", "ollama_cloud", "nvidia", "nvidia_nim", "gemini", "apiframe"):
+                print_error(console, "Unknown model. Use /model list to view TamfisGPT models.")
                 continue
             model_id = parts[1] if len(parts) > 1 else "auto"
             if len(parts) > 2:
@@ -842,50 +1153,44 @@ async def run_interactive(
                     continue
                 ids = {str(item.get("id")) for item in (available.get("models") or [])}
                 if model_id not in ids:
-                    print_error(console, f"Unknown {route} model '{model_id}'. Use /model list {route}.")
+                    print_error(console, "Unknown TamfisGPT model. Use /model list.")
                     continue
             local_state.save_session_state(
                 workspace.session_id, selected_model=model_id, selected_provider=route,
             )
-            console.print(f"[green]Pinned {route} route[/green]  model={model_id}")
+            from .public_identity import public_model_name
+            console.print(f"[green]Model set to[/green] {public_model_name(model_id)}")
             continue
         if text == "/tools":
+            # One real tool set regardless of standalone vs --remote: every
+            # task -- remote-mode ones included -- now executes through the
+            # local engine (mcp.py), never a server-side agent loop (see
+            # runtime/unified.py's execute_remote). This used to branch on
+            # `standalone` and show a second, Remote-only table (grep_files,
+            # remote_exec, codex_apps.*, ...) describing a tool catalog that
+            # no longer exists anywhere -- stale documentation for a
+            # retired execution path, not a real second tool set.
             table = Table(show_header=True, header_style="bold")
             table.add_column("Tool")
             table.add_column("Purpose")
             table.add_column("Safeguard")
-            if standalone:
-                table.add_row("read_file", "Read a file's contents", "Read-only")
-                table.add_row("list_directory", "List a directory's contents", "Read-only")
-                table.add_row("search_code", "ripgrep-backed content search", "Read-only")
-                table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
-                table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Local risk classifier + approval + mutation ledger")
-                table.add_row("write_file", "Create or fully replace a file", "Workspace-boundary check + approval + mutation ledger")
-                table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
-                table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
-                table.add_row("web_search", "Tavily (if TAVILY_API_KEY set) or DuckDuckGo fallback", "Read-only; self-contained, no monorepo required")
-                console.print(table)
-                console.print(
-                    "[dim]This is the real local tool set (mcp.py) the standalone agent loop uses -- "
-                    "see safety.py for how risk is classified and see /diffs for the mutation ledger.[/dim]"
-                )
-                continue
-            table.add_row("read_file", "Bounded, line-numbered file reads", "Read-only + CWD confinement")
-            table.add_row("glob_files", "Find files by filename glob, not full paths", "Read-only + CWD confinement")
-            table.add_row("grep_files", "Search repository contents", "Read-only + CWD confinement")
-            table.add_row("list_symbols", "List definitions in a source file", "Read-only + CWD confinement")
-            table.add_row("find_dependencies", "Inspect imports and require targets", "Read-only + CWD confinement")
-            table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Approval + mutation ledger")
-            table.add_row("write_file", "Create or fully replace a file", "Approval + mutation ledger")
-            table.add_row("extract/repackage_archive", "Inspect and rebuild repository archives", "CWD confinement + approval for writes")
-            table.add_row("remote_exec", "Tests, builds, Git and shell operations", "CWD confinement + risk approval")
-            table.add_row("browser", "Public Chromium navigation and screenshots", "Clean session + SSRF protection")
-            table.add_row("web_search", "Current external research when needed", "Read-only; provider/network policy")
-            table.add_row("codex_apps.*", "Optional organization-operated connector gateway", "Unavailable unless explicitly configured")
-            table.add_row("claude_apps.*", "Optional organization-operated connector gateway", "Unavailable unless explicitly configured")
+            table.add_row("read_file", "Read a file's contents", "Read-only")
+            table.add_row("list_directory", "List a directory's contents", "Read-only")
+            table.add_row("search_code", "ripgrep-backed content search", "Read-only")
+            table.add_row("find_references", "Find where a symbol is defined and referenced", "Read-only")
+            table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
+            table.add_row("read_background_job", "Check on a Ctrl+B-backgrounded command", "Read-only")
+            table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Local risk classifier + approval + mutation ledger")
+            table.add_row("write_file", "Create or fully replace a file", "Workspace-boundary check + approval + mutation ledger")
+            table.add_row("extract_archive / repackage_archive", "Inspect and rebuild archives", "Workspace-boundary check + approval for writes")
+            table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
+            table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
+            table.add_row("web_search", "Tavily (if TAVILY_API_KEY set) or DuckDuckGo fallback", "Read-only; self-contained, no monorepo required")
             console.print(table)
-            console.print("[dim]Use glob_files with patterns like '*.tsx' or 'src/**/*.tsx'. Do not paste a full filesystem path into pattern; use path for the search root instead.[/dim]")
-            console.print("[dim]Native coding tools above do not require Codex Apps, Claude Apps, or MCP. Optional connector tools appear only when a real gateway is enabled and successfully discovered.[/dim]")
+            console.print(
+                "[dim]This is the real local tool set (mcp.py) every turn uses -- see safety.py for how "
+                "risk is classified and see /diffs for the mutation ledger.[/dim]"
+            )
             continue
         if text == "/commands":
             if not custom_commands:
@@ -1089,29 +1394,38 @@ async def run_interactive(
             console.print(f"[green]Mode set to[/green] {arg} [dim]({resolved})[/dim]")
             continue
         if text == "/compact":
-            state = local_state.get_session_state(workspace.session_id)
-            summary = (state.active_task or {}).get("objective") or state.conversation_summary or "Session checkpoint"
+            # Real thread compression (Claude Code/Codex parity): fold older
+            # turns into conversation_summary and keep only the recent few
+            # turns in conversation_history, so a long REPL thread stops
+            # dominating the terminal and the next turn's context. The
+            # durable checkpoint is still saved too, so resume is unaffected.
+            recap = local_state.compact_session_thread(workspace.session_id)
+            # Read the freshly-compacted state directly rather than reusing a
+            # `state` local that is only assigned inside the /status and
+            # /context blocks (both of which `continue`). Before this fix,
+            # running /compact as the very first command in a fresh REPL
+            # raised UnboundLocalError on `state` here.
+            compact_state = local_state.get_session_state(workspace.session_id)
+            summary = (compact_state.active_task or {}).get("objective") or compact_state.conversation_summary or "Session checkpoint"
             local_state.checkpoint(workspace.session_id, reason="user_compact", summary=summary)
-            console.print("[green]Context checkpoint saved.[/green]")
+            console.print("[green]Thread compressed.[/green] Older turns were folded into the session summary; recent turns are retained in full.")
+            console.print(f"[dim]~{len(recap)} char recap saved. Next turn starts from the compressed context.[/dim]")
+            continue
+        if text == "/summary":
+            recap = local_state.summarize_thread(workspace.session_id)
+            console.print(Panel(recap, title="Thread summary", border_style="cyan", expand=False))
             continue
         if text == "/doctor":
-            if standalone:
-                from .providers import get_provider_status as _get_provider_status
-
-                status = _get_provider_status()
-                table = Table(show_header=True, header_style="bold")
-                for column in ("PROVIDER", "CONFIGURED", "KEY"):
-                    table.add_column(column)
-                for name, info in status["config"].items():
-                    configured = "[green]yes[/green]" if info["api_key_set"] or name == "tier_iv" else "[dim]no[/dim]"
-                    table.add_row(name, configured, info["key_preview"])
-                console.print(table)
-                console.print(
-                    f"[dim]Currently selected: {provider_type.value if provider_type else provider}  "
-                    f"· auto would pick: {status['default']}[/dim]"
-                )
-                continue
-            await run_doctor(config, console, Path(workspace.workspace_root), session_id=workspace.session_id)
+            # Full self-health-check in both modes (Claude Code/Codex parity):
+            # standalone mode used to only print a one-line provider status,
+            # never running the real session/workspace/context/recent-failure
+            # diagnostics _diagnose_local_session already provides. Run the
+            # actual doctor so a standalone user gets the same PASS/WARNING/
+            # FAIL self-diagnosis the --remote path always had.
+            await run_doctor(
+                config, console, Path(workspace.workspace_root),
+                session_id=workspace.session_id,
+            )
             continue
         if text == "/agents" or text == "/agents --all":
             show_all = text.endswith("--all")
@@ -1419,10 +1733,15 @@ async def run_interactive(
                         continue
                     task_id = failed["id"]
                 renderer = StreamRenderer(console)
-                outcome = await retry_task_and_stream(
-                    client, renderer, console,
-                    session_id=workspace.session_id, task_id=task_id, mode=None,
-                    approval_policy=config.approval_policy, interactive=True, config=config,
+                outcome = await _run_remote_turn_with_live_ui(
+                    session_id=workspace.session_id,
+                    renderer=renderer,
+                    config=config,
+                    turn_coro=retry_task_and_stream(
+                        client, renderer, console,
+                        session_id=workspace.session_id, task_id=task_id, mode=None,
+                        approval_policy=config.approval_policy, interactive=True, config=config,
+                    ),
                 )
                 if outcome.status == "completed" and outcome.summary:
                     last_response_text = outcome.summary
@@ -1536,13 +1855,18 @@ async def run_interactive(
                         else:
                             console.print(f"[dim]Run /execute-plan {saved.id} to execute.[/dim]")
                 else:
-                    outcome = await run_ai_task_and_stream(
-                        client, renderer, console,
-                        session_id=workspace.session_id, objective=intent.objective, mode=intent.mode,
-                        approval_policy=config.approval_policy, interactive=True,
-                        model=model_state.selected_model,
-                        provider=model_state.selected_provider,
+                    outcome = await _run_remote_turn_with_live_ui(
+                        session_id=workspace.session_id,
+                        renderer=renderer,
                         config=config,
+                        turn_coro=run_ai_task_and_stream(
+                            client, renderer, console,
+                            session_id=workspace.session_id, objective=intent.objective, mode=intent.mode,
+                            approval_policy=config.approval_policy, interactive=True,
+                            model=model_state.selected_model,
+                            provider=model_state.selected_provider,
+                            config=config,
+                        ),
                     )
                 if outcome.status == "completed" and outcome.summary:
                     last_response_text = outcome.summary

@@ -66,6 +66,23 @@ class FakeToolCallDetectionTests(unittest.TestCase):
             "The execute_command tool has executed the npm test command."
         ))
 
+    def test_cli_flag_style_fake_call_is_detected(self):
+        self.assertTrue(_looks_like_fake_tool_call(
+            'execute_command --command="cat > file.ts << \'EOF\'\\nconst x = 1;\\nEOF"'
+        ))
+
+    def test_cli_flag_style_fake_call_with_space_before_equals_is_detected(self):
+        self.assertTrue(_looks_like_fake_tool_call('list_directory --path = "."'))
+
+    def test_dangling_tool_call_xml_closing_tags_are_detected(self):
+        self.assertTrue(_looks_like_fake_tool_call("</parameter>\n</function>\n</tool_call>"))
+
+    def test_tool_call_xml_function_open_tag_is_detected(self):
+        self.assertTrue(_looks_like_fake_tool_call('<tool_call><function=execute_command>{"command": "ls"}'))
+
+    def test_plain_prose_with_double_dash_flag_unrelated_to_a_tool_is_not_flagged(self):
+        self.assertFalse(_looks_like_fake_tool_call("Run the build with npm run build --silent=true."))
+
 
 class NarratedToolIntentDetectionTests(unittest.TestCase):
     def test_let_me_check_is_detected(self):

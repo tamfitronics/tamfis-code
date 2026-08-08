@@ -10,14 +10,17 @@ from click.testing import CliRunner
 from tamfis_code import config as config_module
 from tamfis_code import state as state_module
 from tamfis_code.cli import (
+    _apply_pending_update_after_login,
     _explicit_absolute_paths,
+    _offer_recent_session_picker,
     _print_bg_hint,
     _project_root_for_target,
     _session_for_primary,
     _use_remote,
     cli,
 )
-from tamfis_code.config import Config
+from tamfis_code.config import Config, Credentials
+from rich.console import Console
 
 
 class ExplicitAbsolutePathsTests(unittest.TestCase):
@@ -36,6 +39,12 @@ class ExplicitAbsolutePathsTests(unittest.TestCase):
 
     def test_relative_looking_path_is_not_matched(self):
         self.assertEqual(_explicit_absolute_paths("edit src/app.py"), [])
+
+    def test_pasted_slash_command_is_not_a_filesystem_target(self):
+        self.assertEqual(
+            _explicit_absolute_paths("ready · /status for session, task, cwd"),
+            [],
+        )
 
 
 class ProjectRootForTargetTests(unittest.TestCase):
@@ -99,6 +108,71 @@ class SessionForPrimaryTests(unittest.TestCase):
             self.assertEqual(_session_for_primary(root), 2)
 
 
+class OfferRecentSessionPickerTests(unittest.TestCase):
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        from io import StringIO
+
+        self._console = Console(no_color=True, file=StringIO())
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        self.tmp.cleanup()
+
+    def test_skips_entirely_when_not_an_interactive_tty(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            with patch("sys.stdin.isatty", return_value=False), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt") as prompt:
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
+        prompt.assert_not_called()
+
+    def test_returns_none_with_nothing_to_offer(self):
+        with tempfile.TemporaryDirectory() as proj:
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt") as prompt:
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
+        prompt.assert_not_called()
+
+    def test_default_choice_declines_and_starts_a_new_session(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt", return_value="n"):
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
+
+    def test_numeric_choice_returns_the_matching_session_id(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(1, workspace_root=root)
+            state_module.save_session_state(2, workspace_root=root)
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt", return_value="1"):
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        # Most-recently-updated session is listed first (session 2).
+        self.assertEqual(result, 2)
+
+    def test_out_of_range_choice_falls_back_to_a_new_session(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt", return_value="9"):
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertIsNone(result)
+
+
 class PrintBgHintTests(unittest.TestCase):
     def test_prints_session_and_task_hints(self):
         from io import StringIO
@@ -156,6 +230,41 @@ class LoginCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertIn("Logged in", result.output)
         self.assertIn("dev@example.com", result.output)
 
+    @patch("tamfis_code.self_update.apply_update", return_value=(True, "Updated to 9.9.9."))
+    @patch("tamfis_code.self_update.check_update_available", return_value="9.9.9")
+    def test_login_applies_available_update_after_credentials_are_saved(self, _check, apply):
+        fake_client = AsyncMock()
+        fake_client.me = AsyncMock(return_value={
+            "authenticated": True,
+            "user": {"id": "u1", "email": "dev@example.com"},
+        })
+        fake_client.__aenter__ = AsyncMock(return_value=fake_client)
+        fake_client.__aexit__ = AsyncMock(return_value=False)
+        with patch("tamfis_code.cli.RemoteAPIClient", return_value=fake_client):
+            result = self.runner.invoke(cli, ["login", "--token", "sometoken123"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertTrue(config_module.CREDENTIALS_PATH.exists())
+        apply.assert_called_once_with()
+        self.assertIn("next command will use the new version", result.output)
+
+    @patch("tamfis_code.self_update.apply_update", return_value=(False, "Update failed: offline"))
+    @patch("tamfis_code.self_update.check_update_available", return_value="9.9.9")
+    def test_update_failure_is_nonfatal_after_login(self, _check, _apply):
+        from rich.console import Console
+        from io import StringIO
+
+        stream = StringIO()
+        _apply_pending_update_after_login(Console(file=stream, force_terminal=False))
+        self.assertIn("Login succeeded", stream.getvalue())
+
+    @patch.dict(os.environ, {"TAMFIS_CODE_AUTO_UPDATE": "0"})
+    @patch("tamfis_code.self_update.check_update_available")
+    def test_managed_install_can_disable_login_update(self, check):
+        from rich.console import Console
+
+        _apply_pending_update_after_login(Console(force_terminal=False))
+        check.assert_not_called()
+
     def test_login_with_invalid_token_exits_with_auth_failure(self):
         from tamfis_code.api_client import RemoteAPIError
 
@@ -190,9 +299,7 @@ class LogoutCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
 
 
 class UseRemoteHelperTests(unittest.TestCase):
-    """The --remote flag always wins; otherwise a paid tenant's persistent
-    config.toml `default_backend = "remote"` makes every command use the
-    legacy backend without needing --remote on each invocation."""
+    """Subscription login never changes the local execution boundary."""
 
     def test_flag_true_is_remote_regardless_of_config(self):
         self.assertTrue(_use_remote(Config(default_backend="standalone"), True))
@@ -202,6 +309,14 @@ class UseRemoteHelperTests(unittest.TestCase):
 
     def test_flag_false_defers_to_config_remote(self):
         self.assertTrue(_use_remote(Config(default_backend="remote"), False))
+
+    @patch("tamfis_code.cli.load_credentials", return_value=Credentials(access_token="tok"))
+    def test_auto_stays_standalone_when_logged_in(self, _credentials):
+        self.assertFalse(_use_remote(Config(default_backend="auto"), False))
+
+    @patch("tamfis_code.cli.load_credentials", return_value=None)
+    def test_auto_uses_standalone_when_logged_out(self, _credentials):
+        self.assertFalse(_use_remote(Config(default_backend="auto"), False))
 
 
 class WorkspaceGroupCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
@@ -250,15 +365,28 @@ class ConfigCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
 class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase):
     """ask/agent/exec/chat/audit/plan default to the standalone local loop
     (runner_local.py) now -- --remote is required to reach the legacy
-    RemoteAPIClient path, and --bg (server-side background execution) only
-    makes sense with --remote since a standalone process has no server to
-    keep a task alive after it exits."""
+    RemoteAPIClient path. --bg spawns a real detached background process for
+    standalone runs too (see background.py); execute-plan's --bg is still
+    remote-only (unchanged, separate flow)."""
 
-    def test_bg_without_remote_is_rejected(self):
+    def test_bg_without_remote_spawns_a_detached_background_job(self):
+        """--bg now works standalone too: it spawns a real detached OS
+        process (see background.py) instead of requiring the legacy Remote
+        Workspace backend to keep the task alive after this process exits."""
+        from tamfis_code.background import BackgroundJob
+
+        fake_job = BackgroundJob(
+            id="bg-test1234", pid=999999, session_id=1, workspace_root="/tmp",
+            mode="coding", objective_preview="do something", log_path="/tmp/x.log",
+            prompt_path="/tmp/x.prompt", started_at=0.0,
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            result = self.runner.invoke(cli, ["--cwd", tmp, "ask", "do something", "--bg"])
-        self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("--bg requires --remote", result.output)
+            with patch("tamfis_code.background.spawn_background_task", return_value=fake_job) as fake_spawn:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "ask", "do something", "--bg"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Started in background", result.output)
+        self.assertIn(fake_job.id, result.output)
+        fake_spawn.assert_called_once()
 
     def test_execute_plan_bg_without_remote_is_rejected(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -442,6 +570,17 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn(str(Path(tmp).resolve()), result.output)
 
+    def test_agents_lists_local_sessions_without_nested_event_loop(self):
+        """The standalone agents alias must not invoke the async Click
+        wrapper for ``sessions`` from inside its own event loop."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = str(Path(tmp).resolve())
+            state_module.save_session_state(5, workspace_root=root)
+            result = self.runner.invoke(cli, ["--cwd", tmp, "agents"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Standalone sessions", result.output)
+        self.assertIn(root, result.output)
+
     def test_sessions_hides_swarm_child_sessions_unless_all(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = str(Path(tmp).resolve())
@@ -549,6 +688,14 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         fake_run.assert_called_once()
         self.assertEqual(fake_run.call_args.args[0], str(Path(tmp)))
 
+    def test_acp_command_runs_stdio_adapter_scoped_to_workspace(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.acp.run_acp_server", new=AsyncMock(return_value=None)) as fake_run:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "acp"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        fake_run.assert_awaited_once()
+        self.assertEqual(fake_run.call_args.args[0], Path(tmp))
+
     def test_run_executes_locally_without_remote_client(self):
         with tempfile.TemporaryDirectory() as tmp:
             with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
@@ -568,7 +715,16 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
             with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
                 result = self.runner.invoke(cli, ["--cwd", tmp, "doctor"])
             fake_client.assert_not_called()
-        self.assertIn("PROVIDER", result.output)
+        self.assertIn("TamfisGPT model service", result.output)
+        self.assertNotIn("nvidia", result.output.lower())
+
+    def test_providers_table_has_one_status_column(self):
+        status = {"available": [{"name": "private-route"}]}
+        with patch("tamfis_code.providers.get_provider_status", return_value=status):
+            result = self.runner.invoke(cli, ["providers"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertEqual(result.output.count("Status"), 1)
+        self.assertIn("TamfisGPT Auto", result.output)
 
     def test_doctor_reports_local_session_diagnostics_by_default(self):
         # `doctor` (no --remote) used to stop at the provider connectivity

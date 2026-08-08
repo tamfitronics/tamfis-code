@@ -1,25 +1,33 @@
 """Provider integrations for Tamfis-Code.
 
-Supports Ollama Cloud, NVIDIA NIM, Hugging Face, OpenRouter, the TamfisGPT
-subscription API, and the internal Tier IV orchestration service through a
-canonical OpenAI-compatible client interface.
+Supports Ollama Cloud, xAI Grok, NVIDIA NIM, Hugging Face, OpenRouter, the
+TamfisGPT subscription API, and the internal Tier IV orchestration service
+through a canonical OpenAI-compatible client interface.
 
 Automatic standalone routing:
     1. Ollama Cloud
        - Current/default: gemma4:cloud
-       - Premium coding: kimi-k2.7-code:cloud
-       - Premium agent: minimax-m2.7:cloud
+       - Priority coding/agent: kimi-k2.7-code:cloud
+       - Free/included-plan alternates: glm-5.2:cloud, kimi-k3:cloud (opt-in),
+         minimax-m3:cloud
     2. NVIDIA NIM
     3. Hugging Face
     4. OpenRouter
+    5. xAI Grok (direct native endpoint, api.x.ai/v1) -- last resort, on cost
+       grounds. Enabled by setting GROK_API_KEY in .env. Deliberately placed
+       behind every other paid provider (2026-08-06, operator request: xAI
+       usage was running real billed spend within the first week) so Ollama
+       Cloud's included models get first crack at everything, then the
+       cheaper/free-tier NIM, HF, and OpenRouter routes, before Grok is ever
+       touched. Still directly selectable by name at any time.
 
 Ollama Cloud is accessed through the signed-in local Ollama daemon at
 ``http://127.0.0.1:11434/v1``. The daemon forwards ``:cloud`` models to
 Ollama Cloud while preserving the OpenAI-compatible tools/streaming contract
 already used throughout Tamfis-Code.
 
-Canonical project environment file:
-    /home/tamfiscode/.env
+In a source checkout, a sibling ``.env`` is loaded for development. Installed
+packages use process/user configuration and never assume a builder's path.
 """
 
 from __future__ import annotations
@@ -41,7 +49,7 @@ def _load_project_env() -> None:
     """
 
     default_root = Path(
-        os.environ.get("TAMFIS_CODE_ROOT", "/home/tamfiscode")
+        os.environ.get("TAMFIS_CODE_ROOT") or Path(__file__).resolve().parents[1]
     ).expanduser()
     env_path = Path(
         os.environ.get(
@@ -96,6 +104,7 @@ class ProviderType(str, Enum):
     TIER_IV = "tier_iv"
     TAMFIS = "tamfis"
     OLLAMA_CLOUD = "ollama_cloud"
+    GROK = "grok"
     HF = "hf"
     NVIDIA = "nvidia"
     OPENROUTER = "openrouter"
@@ -126,15 +135,19 @@ def reasoning_effort_capable(provider: ProviderType, model: str) -> bool:
     instruct models NVIDIA also hosts -- meta/llama-3.1-*, moonshotai/
     kimi-k2.6, mistralai/mistral-large-2-123b, google/gemma-2-27b-it,
     microsoft/phi-3-medium-128k-instruct -- HANG indefinitely when given
-    it: a real streaming call to meta/llama-3.1-70b-instruct (NVIDIA's own
-    current default_model, below) with reasoning_effort="high" produced
-    zero chunks in 40+ seconds, while the identical call without it
-    returned in well under a second. REASONING_EFFORT_CAPABLE_PROVIDERS
-    alone silently broke the moment NVIDIA's default_model moved off
-    nemotron (the v0.4.39 kimi-k2.6-404 fix) -- nobody had re-verified
-    reasoning_effort against the new default, since the original "confirmed
-    live" note only ever tested nemotron. OpenRouter/Tier IV are left as
-    provider-level (unverified per-model here; no live evidence either way).
+    it: a real streaming call to meta/llama-3.1-70b-instruct (NVIDIA's
+    default_model at the time, briefly, per the v0.4.39 kimi-k2.6-404 fix)
+    with reasoning_effort="high" produced zero chunks in 40+ seconds, while
+    the identical call without it returned in well under a second.
+    REASONING_EFFORT_CAPABLE_PROVIDERS alone silently broke the moment
+    NVIDIA's default_model moved off nemotron that time -- nobody had
+    re-verified reasoning_effort against the new default, since the
+    original "confirmed live" note only ever tested nemotron. This
+    model-name substring check is why later default_model changes within
+    the nemotron family (2026-07-26: nemotron-3-ultra-550b-a55b) stay
+    correctly gated without needing another update here. OpenRouter/Tier IV
+    are left as provider-level (unverified per-model here; no live evidence
+    either way).
     """
     if provider not in REASONING_EFFORT_CAPABLE_PROVIDERS:
         return False
@@ -223,11 +236,21 @@ class ProviderConfig:
 class ProviderManager:
     """Initialise, inspect, rank, and access configured AI providers."""
 
+    # NIM first (2026-08-08, was Ollama Cloud first): Ollama Cloud's weekly
+    # usage limit is a real multi-day-reset HTTP 429, not transient -- being
+    # first here meant it absorbed the bulk of auto-routed traffic and
+    # burned that quota out repeatedly. This tuple, not the `.priority`
+    # field on each ProviderConfig, is what routing_order/fallback_chain_names
+    # actually iterate, so it has to move here, not just there.
     PRIORITY_ORDER: tuple[ProviderType, ...] = (
-        ProviderType.OLLAMA_CLOUD,
         ProviderType.NVIDIA,
+        ProviderType.OLLAMA_CLOUD,
         ProviderType.HF,
         ProviderType.OPENROUTER,
+        # Grok last: real billed xAI spend showed up within the first week
+        # of enabling it (2026-08-06). Ollama Cloud's included models and
+        # the free/cheap NIM+HF+OpenRouter tiers now all get tried first.
+        ProviderType.GROK,
         ProviderType.TAMFIS,
         ProviderType.TIER_IV,
     )
@@ -249,19 +272,106 @@ class ProviderManager:
             ),
             models=[
                 "gemma4:cloud",
+                # Moonshot AI's newest Ollama Cloud model as of 2026-07-28:
+                # 2.81T-param native multimodal agentic MoE, 1M-token
+                # context, tools/thinking/vision confirmed on the model's
+                # own ollama.com/library/kimi-k3 page before wiring this in.
+                # It remains available for explicit operator-approved heavy
+                # jobs, but is not an automatic/default route because it can
+                # consume Ollama extra usage.
+                "kimi-k3:cloud",
                 "kimi-k2.7-code:cloud",
-                "minimax-m2.7:cloud",
+                # GLM cloud route kept directly behind the current
+                # included-plan Kimi coding default. This makes it available
+                # as an explicit Ollama Cloud priority without unexpectedly
+                # changing the automatic model for every task.
+                "glm-5.2:cloud",
+                # Replaces the prior minimax-m2.7:cloud route outright
+                # (2026-08-03): same MiniMax family already routed via
+                # Ollama Cloud, now the latest generation with a 1M-token
+                # context window (vs. m2.7's 204800) -- see also
+                # minimaxai/minimax-m3 already selectable on NVIDIA NIM
+                # above. Not the default -- explicit-select route for
+                # long-context coding work.
+                "minimax-m3:cloud",
+                # DeepSeek-V4-Flash-0731 (2026-08-04): Ollama's announced
+                # agentic-capability refresh of the DeepSeek V4 Flash line --
+                # reliable tool calling at long contexts, three selectable
+                # reasoning_effort tiers (low/high/max), hosted US+EU with
+                # zero data retention. Explicit-select route like glm-5.2 and
+                # minimax-m3 above, not the default, since it hasn't been
+                # live-verified against this CLI's own tool-calling loop yet.
+                "deepseek-v4-flash:0731-cloud",
             ],
-            priority=0,
+            # priority=3 (2026-08-08, was 0/first): Ollama Cloud's weekly
+            # usage limit is a real multi-day-reset 429, not a transient
+            # blip -- being priority 0 meant every auto-routed request hit
+            # that quota first and burned it out. NVIDIA NIM is now
+            # priority 0 (see ProviderType.NVIDIA below) as the reliable
+            # free-tier default across all subscription tiers/model groups.
+            priority=3,
             weight=10,
             reasoning_supported=True,
             vision_supported=True,
+            # NOTE: this budget is shared by the whole provider bucket
+            # (gemma4:cloud, minimax-m3:cloud too, not just kimi-k3), and
+            # gates real request-size/truncation logic in runner_local.py --
+            # left at the existing conservative value rather than raised to
+            # kimi-k3's real 1M window, since that would misrepresent the
+            # other two models' actual limits.
             context_window=262144,
             coding_quality=5,
             tool_calling=True,
             structured_output=True,
             long_context=True,
             local_only=False,
+        ),
+        # xAI Grok -- direct native endpoint (api.x.ai/v1). Last-resort
+        # provider for Tamfis-Code, tried only after Ollama Cloud, NVIDIA
+        # NIM, Hugging Face, and OpenRouter have all been exhausted or ruled
+        # out (2026-08-06: demoted from priority 2 after real billed xAI
+        # spend showed up within the first week of enabling it -- see the
+        # PRIORITY_ORDER comment above). Enabled by the operator setting
+        # GROK_API_KEY in .env; when unset, the provider is simply not
+        # initialised and routing falls through the remaining chain (which
+        # still carries the x-ai/grok-4.5 OpenRouter relay as a selectable
+        # model, ahead of this direct route). Grok's native API accepts bare
+        # model names (grok-4.5, grok-4.3, grok-4-fast) and is
+        # OpenAI-compatible for chat, tools, streaming, and structured
+        # outputs. Image (grok-imagine) and video (grok-imagine-video)
+        # generation are exposed through the same endpoint. Still directly
+        # selectable by name at any time, regardless of automatic order.
+        ProviderType.GROK: ProviderConfig(
+            name="xAI Grok",
+            base_url=os.environ.get(
+                "GROK_BASE_URL",
+                "https://api.x.ai/v1",
+            ).rstrip("/"),
+            api_key_env="GROK_API_KEY",
+            default_model=os.environ.get("TAMFIS_CODE_GROK_MODEL", "grok-4.5"),
+            models=[
+                "grok-4.5",
+                "grok-4.3",
+                "grok-4",
+                "grok-4-fast",
+                "grok-2-vision",
+                "grok-imagine",
+                "grok-imagine-video",
+            ],
+            # priority=6: last among the auto-routing chain (after
+            # OpenRouter's 5) -- see the class-level comment above `.priority`
+            # feeds provider selection directly via min(..., key=priority),
+            # so this number, not just PRIORITY_ORDER's tuple position, is
+            # what actually keeps Grok as the last-tried paid route.
+            priority=6,
+            weight=4,
+            reasoning_supported=True,
+            vision_supported=True,
+            context_window=256000,
+            coding_quality=5,
+            tool_calling=True,
+            structured_output=True,
+            long_context=True,
         ),
         # Public subscription API. Unlike TIER_IV this endpoint is intended
         # for portable installs and authenticates with a user-owned key.
@@ -331,28 +441,59 @@ class ProviderManager:
             name="NVIDIA NIM",
             base_url="https://integrate.api.nvidia.com/v1",
             api_key_env="NVIDIA_API_KEY",
-            # The plain Llama instruct route can answer fluently but has
-            # repeatedly narrated/fabricated local tool results in this CLI.
-            # This NVIDIA reasoning model was verified to return genuine
-            # tool_calls and to accept reasoning parameters without the
-            # indefinite stream stall seen on the plain instruct models.
-            # Keep the older models selectable for accounts where this route
-            # is not enabled, but do not make them the automatic coding path.
-            default_model="nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            # 2026-07-26: re-prioritized after nemotron-3-nano-omni-30b-a3b-
+            # reasoning (the prior default) was caught live wrapping a fake
+            # tool call in CLI-flag/XML-ish text under real agentic use (see
+            # runner_local.py's _FAKE_TOOL_CALL_FLAG_RE/_FAKE_TOOL_CALL_XML_RE
+            # fix) -- a failure mode a plain single-call smoke test doesn't
+            # surface, since that model also returns clean real tool_calls
+            # on simple prompts. Re-verified all candidates below live
+            # against this account immediately before reordering (real
+            # chat-completions calls with tools attached, real tool_calls
+            # returned, not guessed from NVIDIA's public catalog page):
+            # nemotron-3-ultra-550b-a55b (1.8s), nemotron-3-super-120b-a12b
+            # (6.1s), nemotron-3-nano-30b-a3b, llama-3.3-nemotron-super-49b-
+            # v1.5, llama-3.3-nemotron-super-49b-v1, minimaxai/minimax-m3
+            # all returned genuine tool_calls. ultra-550b-a55b is NVIDIA's
+            # largest/most capable hybrid Mamba-Transformer MoE for agentic
+            # reasoning, coding, planning, and tool calling and was fast in
+            # the live check, so it is now the default; super-120b-a12b
+            # (already separately confirmed to handle reasoning_effort
+            # without hanging) is the next fallback. The nano-omni-reasoning
+            # route stays selectable -- do not remove it entirely, since an
+            # account without ultra/super entitlement still needs a working
+            # route -- but it is no longer the automatic coding path.
+            default_model="nvidia/nemotron-3-ultra-550b-a55b",
             models=[
-                "nvidia/nemotron-3-super-120b-a12b",
                 "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3-nano-30b-a3b",
+                # NVIDIA-hosted, live-verified real tool_calls on this
+                # account; high accuracy on reasoning/tool-calling per
+                # NVIDIA's own catalog, kept as mid-tier fallbacks below the
+                # newer nemotron-3 family.
+                "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+                "nvidia/llama-3.3-nemotron-super-49b-v1",
+                # Third-party (MiniMax AI) multimodal MoE hosted on NVIDIA
+                # NIM, live-verified real tool_calls on this account.
+                # Marketplace models have previously turned out to be a
+                # per-account entitlement gap disguised as a working route
+                # (see the kimi-k2.6 404 fix) -- kept selectable, not
+                # promoted to default, until it has more real-world use.
+                "minimaxai/minimax-m3",
                 # Confirmed live: real tool_calls response (not narrated
                 # text), reasoning_effort and reasoning_budget both work
-                # without hanging (unlike the plain instruct models below).
+                # without hanging. Demoted from default after the fake-
+                # tool-call-as-text incident above; still selectable.
                 "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-                "nvidia/nemotron-3-nano-30b-a3b",
                 # NVIDIA currently exposes these DeepSeek V4 hosted routes
                 # as mature coding/agent models. They remain selectable
-                # fallbacks; the verified Nemotron route stays the default
+                # fallbacks; the verified Nemotron routes stay the default
                 # until an account-specific smoke test proves otherwise.
+                # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached
+                # NVIDIA NIM end-of-life 2026-08-07 (HTTP 410 confirmed live
+                # in tamgpt6's intent classifier), no longer callable.
                 "deepseek-ai/deepseek-v4-pro",
-                "deepseek-ai/deepseek-v4-flash",
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
                 "moonshotai/kimi-k2.6",
@@ -360,10 +501,11 @@ class ProviderManager:
                 "google/gemma-2-27b-it",
                 "microsoft/phi-3-medium-128k-instruct",
             ],
-            # HF is the preferred external coding route: its automatic model
-            # is the official Qwen 3.6 coding model. NVIDIA remains the first
-            # mature fallback when HF is unavailable or its account is out.
-            priority=1,
+            # priority=0 (2026-08-08, was 3): NIM made the top-priority
+            # auto-routed provider -- reliable free tier vs. Ollama Cloud's
+            # multi-day weekly-quota 429s. See ProviderType.OLLAMA_CLOUD's
+            # priority comment above for the incident this responds to.
+            priority=0,
             weight=4,
             reasoning_supported=True,
             vision_supported=False,
@@ -402,7 +544,7 @@ class ProviderManager:
                 # have to mean losing access to this model entirely.
                 "moonshotai/Kimi-K2.6",
             ],
-            priority=2,
+            priority=4,
             weight=3,
             reasoning_supported=False,
             vision_supported=True,
@@ -452,11 +594,22 @@ class ProviderManager:
                 # entitlement gap, see providers.py's NVIDIA default_model
                 # comment).
                 "moonshotai/kimi-k2.6",
+                # Real xAI-hosted Grok, via OpenRouter -- same ids already
+                # live-verified against OpenRouter's /v1/models catalog for
+                # TamfisGPT's own Tier IV routing (see tamgpt6's
+                # orchestration.yaml grok-4.5-or/grok-4.3-or entries, added
+                # 2026-08-03). xAI does not distribute Grok weights for
+                # local/Ollama use, so OpenRouter is the only
+                # policy-permitted route to the genuine model (standing
+                # policy: never call a vendor's native API directly -- see
+                # providers.py module docstring / PRIORITY_ORDER comment).
+                "x-ai/grok-4.5",
+                "x-ai/grok-4.3",
             ],
             # OpenRouter is last in AUTO because paid coding routes can fail
             # with HTTP 402 when the account has no credits. It remains
             # explicitly selectable and is still tried after HF/NVIDIA.
-            priority=3,
+            priority=5,
             weight=2,
             reasoning_supported=True,
             vision_supported=True,
@@ -502,12 +655,27 @@ class ProviderManager:
     def paid_fallback_enabled(self) -> bool:
         return os.environ.get("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false").strip().lower() == "true"
 
+    def ollama_cloud_is_premium_primary(self) -> bool:
+        """Whether Ollama Cloud is explicitly forced as AUTO's primary.
+
+        Subscription entitlement and AUTO routing are independent.  The
+        premium flag keeps paid-plan features/models available; only the
+        dedicated AUTO-primary flag may bypass the normal provider order.
+        """
+        return (
+            self.provider_allowed(ProviderType.OLLAMA_CLOUD)
+            and os.environ.get("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true").strip().lower() == "true"
+            and os.environ.get("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "false").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+
     def _fallback_provider_allowed(self, provider: ProviderType) -> bool:
         # These are the agreed automatic recovery providers. OpenRouter is
         # permitted automatically only where a free route exists, unless paid
         # fallback is explicitly enabled.
         if provider in {
             ProviderType.OLLAMA_CLOUD,
+            ProviderType.GROK,
             ProviderType.NVIDIA,
             ProviderType.HF,
         }:
@@ -550,6 +718,22 @@ class ProviderManager:
             # but the local Ollama endpoint ignores it. Preserve the real key
             # in the environment for direct native API use elsewhere.
             return os.environ.get(config.api_key_env, "").strip() or "ollama"
+
+        if provider_type == ProviderType.TAMFIS:
+            # An explicitly supplied developer key wins.  Otherwise reuse
+            # the renewable credential created by `tamfis-code login`; the
+            # subscription gateway accepts either credential type while all
+            # tools and orchestration remain in this local runtime.
+            developer_key = os.environ.get(config.api_key_env, "").strip()
+            if developer_key:
+                return developer_key
+            try:
+                from .api_client import load_secure_credentials
+
+                credentials = load_secure_credentials()
+            except Exception:
+                credentials = None
+            return str(getattr(credentials, "access_token", "") or "").strip() or None
 
         key = os.environ.get(config.api_key_env, "").strip()
         return key or None
@@ -694,33 +878,48 @@ class ProviderManager:
         ordinary chat/inspection turns don't spend credits at all.
         """
         if config.name == "Ollama Cloud":
+            # FIX 2026-08-08: TAMFIS_CODE_OLLAMA_PREMIUM used to gate BOTH
+            # (a) whether AUTO is allowed to force Ollama Cloud as its
+            # exclusive primary and (b) which model gets
+            # picked once Ollama Cloud IS being called. Those are unrelated
+            # concerns: kimi-k2.7-code:cloud is the included-plan coding
+            # route (confirmed not an extra-usage cost, unlike kimi-k3
+            # below), so there is no reason to withhold it just because
+            # Ollama isn't forced as AUTO's primary. It is now always the
+            # default model whenever Ollama Cloud is used -- via automatic
+            # fallback after NIM, or explicit --provider selection -- while
+            # the genuinely extra-cost kimi-k3 escalation stays gated
+            # behind TAMFIS_CODE_OLLAMA_PREMIUM + TAMFIS_CODE_OLLAMA_EXTRA_USAGE
+            # exactly as before.
             premium_enabled = os.environ.get(
                 "TAMFIS_CODE_OLLAMA_PREMIUM",
                 "false",
             ).strip().lower() in {"1", "true", "yes", "on"}
 
             if premium_enabled:
-                task_type = getattr(task_profile, "task_type", None)
-                task_value = (
-                    getattr(task_type, "value", None)
-                    or str(task_type or "")
-                )
-
-                if task_value in {"audit", "debug", "edit", "test"}:
+                # Kimi K3 consumes Ollama "extra usage" on accounts where it
+                # is not included in plan usage. Never select it merely
+                # because Ollama Cloud is being used. A machine
+                # administrator must explicitly enable extra usage, and the
+                # task must independently qualify as heavy.
+                extra_usage_enabled = os.environ.get(
+                    "TAMFIS_CODE_OLLAMA_EXTRA_USAGE",
+                    "false",
+                ).strip().lower() in {"1", "true", "yes", "on"}
+                if extra_usage_enabled and _task_needs_paid_tier(task_profile):
                     return os.environ.get(
-                        "TAMFIS_CODE_OLLAMA_CODING_MODEL",
-                        "kimi-k2.7-code:cloud",
+                        "TAMFIS_CODE_OLLAMA_HEAVY_MODEL",
+                        "kimi-k3:cloud",
                     )
 
-                if _task_needs_paid_tier(task_profile):
-                    return os.environ.get(
-                        "TAMFIS_CODE_OLLAMA_AGENT_MODEL",
-                        "minimax-m2.7:cloud",
-                    )
-
+            # The included-plan Kimi coding route is the all-round default
+            # whenever Ollama Cloud handles the request, whether or not
+            # Ollama is AUTO's forced primary. It handles routine and heavy
+            # coding without silently escalating to an extra-usage-only
+            # model.
             return os.environ.get(
-                "TAMFIS_CODE_OLLAMA_GENERAL_MODEL",
-                config.default_model,
+                "TAMFIS_CODE_OLLAMA_CODING_MODEL",
+                "kimi-k2.7-code:cloud",
             )
 
         if config.free_model and not _task_needs_paid_tier(task_profile):
@@ -736,17 +935,26 @@ class ProviderManager:
     ) -> tuple[ProviderType, ProviderConfig]:
         """Resolve AUTO to a concrete provider and configuration."""
 
-        resolved = (
-            self._select_best_provider(
-                task_profile, quality_mode=quality_mode,
-                allowed_providers=(
-                    tuple(provider for provider in self.routing_order if self._fallback_provider_allowed(provider))
-                    if provider == ProviderType.AUTO else None
-                ),
+        if provider == ProviderType.AUTO and self.ollama_cloud_is_premium_primary():
+            resolved = ProviderType.OLLAMA_CLOUD
+            if resolved not in self.clients:
+                raise ValueError(
+                    "Ollama Cloud is enabled as the AUTO primary route, but its local daemon is unavailable "
+                    f"at {self.PROVIDERS[resolved].base_url}. Start/sign in to Ollama Cloud, or explicitly "
+                    "select another provider with --provider."
+                )
+        else:
+            resolved = (
+                self._select_best_provider(
+                    task_profile, quality_mode=quality_mode,
+                    allowed_providers=(
+                        tuple(provider for provider in self.routing_order if self._fallback_provider_allowed(provider))
+                        if provider == ProviderType.AUTO else None
+                    ),
+                )
+                if provider == ProviderType.AUTO
+                else provider
             )
-            if provider == ProviderType.AUTO
-            else provider
-        )
 
         if not self.provider_allowed(resolved):
             raise ValueError(
@@ -920,12 +1128,51 @@ class ProviderManager:
         )
         return any(marker in message for marker in retryable_markers)
 
+    @classmethod
+    def is_quota_or_rate_limit_error(cls, exc: Exception) -> bool:
+        """True specifically for quota-exhaustion/rate-limit failures.
+
+        FIX 2026-08-07: narrower than is_retryable_provider_error, which also
+        returns True for daemon-unavailability-class errors (connection
+        refused, timeouts). ollama_cloud_is_premium_primary's fallback-block
+        in fallback_candidates() was written specifically for the
+        daemon-down case ("caller receives a concrete Ollama availability
+        error instead") -- a 429 weekly-quota exhaustion is a different
+        failure mode where that reasoning doesn't apply, and callers need to
+        distinguish the two to pass allow_premium_primary correctly.
+        """
+        status = cls.provider_error_status(exc)
+        if status is not None:
+            return status in {402, 429}
+
+        message = str(exc).lower()
+        quota_markers = (
+            "insufficient credits",
+            "payment required",
+            "quota",
+            "rate limit",
+            "weekly usage limit",
+            "resourceexhausted",
+            "resource_exhausted",
+            "total request limit reached",
+        )
+        return any(marker in message for marker in quota_markers)
+
     def fallback_candidates(
         self,
         current: ProviderType,
         task_profile: Optional["TaskProfile"] = None,
+        *,
+        allow_premium_primary: bool = False,
     ) -> List[ProviderType]:
         """Return usable alternatives in canonical policy order."""
+
+        if (
+            self.ollama_cloud_is_premium_primary()
+            and ProviderType.OLLAMA_CLOUD in self.clients
+            and not allow_premium_primary
+        ):
+            return []
 
         requires_tools = bool(
             getattr(task_profile, "requires_tools", False)
@@ -1030,7 +1277,14 @@ class ProviderManager:
         if client is None:
             raise ValueError(f"Provider {resolved.value} is not available")
 
-        selected_model = model or (
+        from .public_identity import resolve_public_model_alias
+
+        selected_model = resolve_public_model_alias(
+            model,
+            models=config.models,
+            default_model=config.default_model,
+            free_model=config.free_model,
+        ) or (
             self.select_model(config, task_profile)
             if resolved == ProviderType.OLLAMA_CLOUD
             else (
@@ -1094,10 +1348,22 @@ class ProviderManager:
             return
 
         except Exception as exc:
+            # FIX 2026-08-07: `provider != ProviderType.AUTO` used to block
+            # fallback entirely whenever a specific provider was resolved
+            # (including the app's ordinary configured default, not just an
+            # explicit --provider override) -- confirmed live 2026-08-06: a
+            # turn died with "Error code: 429 ... you (tamfitron) have
+            # reached your weekly usage limit" on the default provider, with
+            # zero attempt to retry on a different configured provider, even
+            # though is_retryable_provider_error already correctly classifies
+            # 429 as retryable. Standing expectation (this is the same class
+            # of issue as Remote-outage auto-fallback) is that infra-side
+            # failures degrade-and-continue regardless of how the provider
+            # was selected. auto_fallback_enabled() (TAMFIS_CODE_DISABLE_PROVIDER_FALLBACK)
+            # remains the one on/off switch for this behavior.
             if (
                 not allow_fallback
                 or not self.auto_fallback_enabled()
-                or provider != ProviderType.AUTO
                 or not self.is_retryable_provider_error(exc)
             ):
                 raise
@@ -1106,6 +1372,15 @@ class ProviderManager:
             for fallback in self.fallback_candidates(
                 resolved,
                 task_profile,
+                # FIX 2026-08-07: ollama_cloud_is_premium_primary's guard in
+                # fallback_candidates() was written for the LOCAL DAEMON
+                # UNAVAILABLE case, not quota exhaustion -- passing True
+                # unconditionally here would silently mask real daemon-down
+                # errors behind other providers instead of surfacing the
+                # concrete Ollama availability error that guard exists to
+                # produce. Only bypass it for the specific failure mode it
+                # was never meant to cover.
+                allow_premium_primary=self.is_quota_or_rate_limit_error(exc),
             ):
                 try:
                     # Do not carry a model identifier across providers.
@@ -1163,6 +1438,19 @@ async def chat_with_ollama_cloud(
     manager = ProviderManager()
     async for chunk in manager.chat_completion(
         ProviderType.OLLAMA_CLOUD,
+        messages,
+        **kwargs,
+    ):
+        yield chunk
+
+
+async def chat_with_grok(
+    messages: List[Dict[str, Any]],
+    **kwargs: Any,
+) -> AsyncIterator[str]:
+    manager = ProviderManager()
+    async for chunk in manager.chat_completion(
+        ProviderType.GROK,
         messages,
         **kwargs,
     ):
