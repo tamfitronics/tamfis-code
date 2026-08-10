@@ -1,8 +1,5 @@
-import os
-from unittest.mock import patch
-
 from tamfis_code.providers import ProviderManager, ProviderType
-from tamfis_code.routing import TaskType, classify_task
+from tamfis_code.routing import TaskType, classify_task, is_explicit_read_only_request
 from tamfis_code.orchestrator.planner import should_plan
 from tamfis_code.tool_policy import allowed_tools
 
@@ -51,6 +48,15 @@ def test_explicit_no_edit_status_review_is_inspection_even_when_filename_contain
     assert not profile.requires_validation
     assert not should_plan(profile)
     assert "edit_file" not in allowed_tools(profile, read_only=False)
+
+
+def test_exact_background_status_prompt_has_shared_read_only_intent():
+    text = (
+        "read tamgpt6/ATTACHMENT_PIPELINE_FIX_PROGRESS.md and check against hte "
+        "TamfsiGPT status and provide recommendationd. no file edit. workin in the backgorund"
+    )
+    assert is_explicit_read_only_request(text)
+    assert classify_task(text).task_type == TaskType.INSPECT
 
 
 def test_read_only_fix_recommendations_do_not_become_a_debug_task():

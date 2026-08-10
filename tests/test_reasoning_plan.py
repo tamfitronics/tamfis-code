@@ -18,7 +18,6 @@ from rich.console import Console
 
 from tamfis_code import state as state_module
 from tamfis_code.orchestrator.planner import (
-    ExecutionPlan,
     build_reasoning_plan_prompt,
     create_plan,
     parse_reasoning_plan,
@@ -513,6 +512,7 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             ))
 
             self.assertEqual(outcome.status, "completed")
+            self.assertNotIn("No files were changed", outcome.summary)
             self.assertFalse(forbidden_path.exists())
             self.assertFalse([e for e in renderer.events if e["event_type"] == "plan_created"])
             rendered_errors = [

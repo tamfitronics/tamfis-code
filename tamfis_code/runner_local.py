@@ -50,6 +50,7 @@ from .render import (
     suspend_live_async_if_active,
     suspend_live_if_active,
 )
+from .routing import is_explicit_read_only_request
 from .orchestrator import (
     AgentOrchestrator,
     ApprovalAction,
@@ -2701,6 +2702,8 @@ _CHANGE_REQUEST_VERBS = (
 
 def _looks_like_change_request(text: str) -> bool:
     value = (text or "").lower()
+    if is_explicit_read_only_request(value):
+        return False
     # Inspection requests often mention defects "to be fixed" or "for
     # fixing" as the subject of a later turn. Those are not current mutation
     # instructions. The old substring check also treated "fixed" and

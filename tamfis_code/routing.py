@@ -75,6 +75,17 @@ _EXPLICIT_READ_ONLY_RE = re.compile(
 )
 
 
+def is_explicit_read_only_request(text: str) -> bool:
+    """Return whether the user explicitly prohibited repository mutation.
+
+    This is shared by task routing and downstream honesty/completion guards;
+    keeping the interpretation in one place prevents a read-only inspection
+    from later being reclassified as an unfinished edit merely because it
+    mentions a fix report or says "no file edit".
+    """
+    return _EXPLICIT_READ_ONLY_RE.search(text or "") is not None
+
+
 def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
     raw = (text or "").strip().lower()
     if not raw or raw in _GREETINGS or raw.startswith(("who are you", "what can you do", "tell me about yourself")):
@@ -89,7 +100,7 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
     # ATTACHMENT_PIPELINE_FIX_PROGRESS.md. The old substring-first DEBUG
     # check treated the incidental "fix" in that filename as an instruction
     # to mutate the repository despite an explicit "no file edit" constraint.
-    if _EXPLICIT_READ_ONLY_RE.search(raw):
+    if is_explicit_read_only_request(raw):
         if has(("audit", "entire stack", "whole repository", "whole repo", "end-to-end", "end to end")):
             return TaskProfile(TaskType.AUDIT, "high", True, True, True, False, "frontier")
         return TaskProfile(TaskType.INSPECT, "medium", True, True, False, False, "high")
