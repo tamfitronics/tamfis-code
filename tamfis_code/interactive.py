@@ -357,8 +357,13 @@ class Intent:
 MAX_STANDALONE_HISTORY_TURNS = 30
 
 
-async def _wait_for_background_reinjection(session_id: int) -> None:
-    """Wake an idle prompt when a detached task posts its synthetic result."""
+async def _wait_for_background_reinjection(session_id: int, prompt_session: PromptSession) -> None:
+    """Exit the active prompt when a detached task posts synthetic input.
+
+    ``prompt_async`` itself must remain the directly awaited foreground
+    coroutine. Running it in a child task causes prompt_toolkit's
+    ``KeyboardInterrupt`` to escape that task as an unretrieved exception.
+    """
     while True:
         queued = local_state.get_session_state(session_id).queued_user_instructions
         if any(
@@ -366,7 +371,14 @@ async def _wait_for_background_reinjection(session_id: int) -> None:
             and str(item.get("text") or "").startswith("[Background ")
             for item in queued
         ):
-            return
+            app = getattr(prompt_session, "app", None)
+            if app is not None and getattr(app, "is_running", False):
+                app.exit(result="")
+                return
+            # The result may arrive in the small window after the watcher is
+            # created but before prompt_toolkit marks its application active.
+            await asyncio.sleep(0.05)
+            continue
         await asyncio.sleep(0.5)
 
 
@@ -841,25 +853,18 @@ async def run_interactive(
             pending_pastes.clear()
             paste_counter = 0
             try:
-                prompt_task = asyncio.create_task(session.prompt_async(
-                    _prompt_message, show_frame=True,
-                    pre_run=lambda: _seed_next_message_suggestion(session, last_response_text),
-                ))
                 notification_task = asyncio.create_task(
-                    _wait_for_background_reinjection(workspace.session_id)
+                    _wait_for_background_reinjection(workspace.session_id, session)
                 )
-                done, _pending = await asyncio.wait(
-                    {prompt_task, notification_task}, return_when=asyncio.FIRST_COMPLETED,
-                )
-                if notification_task in done and prompt_task not in done:
-                    prompt_task.cancel()
+                try:
+                    text = await session.prompt_async(
+                        _prompt_message, show_frame=True,
+                        pre_run=lambda: _seed_next_message_suggestion(session, last_response_text),
+                    )
+                finally:
+                    notification_task.cancel()
                     with suppress(asyncio.CancelledError):
-                        await prompt_task
-                    continue
-                notification_task.cancel()
-                with suppress(asyncio.CancelledError):
-                    await notification_task
-                text = await prompt_task
+                        await notification_task
             except KeyboardInterrupt:
             # NOTE: this used to just `continue`, silently redrawing the
             # prompt -- Ctrl+C appeared to do nothing at all, with no

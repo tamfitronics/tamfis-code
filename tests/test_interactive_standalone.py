@@ -26,6 +26,7 @@ from tamfis_code.interactive import (
     _NextMessageAutoSuggest,
     _SlashCommandCompleter,
     _seed_next_message_suggestion,
+    _wait_for_background_reinjection,
     next_message_suggestion,
     paste_placeholder,
 )
@@ -225,6 +226,25 @@ def run_interactive_import(**kwargs):
 
 
 class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
+    def test_background_result_exits_active_prompt_for_reinjection(self):
+        state_module.enqueue_instruction(
+            1, "[Background task bg-test finished with status=completed]",
+            classification="follow_up",
+        )
+        prompt_session = MagicMock()
+        prompt_session.app.is_running = True
+
+        asyncio.run(_wait_for_background_reinjection(1, prompt_session))
+
+        prompt_session.app.exit.assert_called_once_with(result="")
+
+    def test_idle_prompt_keyboard_interrupt_exits_without_child_task_exception(self):
+        # prompt_async must be awaited directly. When it was wrapped in an
+        # asyncio child task, prompt_toolkit's KeyboardInterrupt escaped as
+        # "Task exception was never retrieved" instead of reaching this
+        # normal idle-prompt exit path.
+        _run([KeyboardInterrupt()])
+
     def test_message_prompt_does_not_duplicate_mode_before_input(self):
         from tamfis_code.interactive import message_prompt
 
