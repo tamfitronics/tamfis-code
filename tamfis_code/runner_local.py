@@ -4186,7 +4186,12 @@ async def _run_local_agent_turn_impl(
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
     )
-    if tools:
+    # Extension tools are not implicitly safe merely because they expose an
+    # OpenAI/MCP schema. Until Tamfis Code has a verified per-tool read-only
+    # annotation contract, keep every plugin and external MCP tool out of an
+    # explicitly read-only turn. This also avoids advertising a capability
+    # that the runtime would later classify as unknown/dangerous and reject.
+    if tools and not turn_read_only:
         plugin_tool_names = [
             str(tool.get("name")) for plugin in mcp_server.plugins for tool in plugin.tools
             if tool.get("name") in mcp_server.tools

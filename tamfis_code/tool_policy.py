@@ -3,7 +3,13 @@ from __future__ import annotations
 
 from .routing import TaskProfile, TaskType
 
-# Available in every tool-calling task type, including read-only ones --
+# Built-in tools proven non-mutating and available in read-only turns. A
+# general shell is deliberately absent: advertising execute_command and then
+# rejecting Python/read pipelines at dispatch produced repeated permission
+# failures instead of useful inspection. Plugin/external MCP tools are filtered
+# separately because their schemas alone do not prove read-only behavior.
+#
+# ask_user_question is available in every tool-calling task type --
 # asking a clarifying question has no side effects on the workspace, and is
 # exactly the kind of thing a read-only audit/plan task benefits from most
 # (confirmed user request: the agent should be able to pause and ask instead
@@ -11,10 +17,11 @@ from .routing import TaskProfile, TaskType
 # type it can't otherwise verify).
 READ_TOOLS = [
     "list_directory", "search_code", "find_references", "read_file",
-    "get_git_info", "ask_user_question", "execute_command", "inspect_artifact",
+    "get_git_info", "ask_user_question", "inspect_artifact",
 ]
 EDIT_TOOLS = [
     *READ_TOOLS,
+    "execute_command",
     "write_file",
     "edit_file",
     "extract_archive",

@@ -12,7 +12,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
@@ -501,18 +501,36 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             manager = _FakeManager(client)
             renderer = _RecordingRenderer()
 
-            outcome = asyncio.run(run_local_agent_turn(
-                manager, ProviderType.NVIDIA, None,
-                [{"role": "user", "content": (
-                    "read ATTACHMENT_PIPELINE_FIX_PROGRESS.md, check status, and provide "
-                    "recommendations only; no file edits"
-                )}],
-                self._console(), renderer,
-                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
-            ))
+            with patch(
+                "tamfis_code.mcp.MCPServer.external_tool_schemas_openai",
+                new=AsyncMock(return_value=[{
+                    "type": "function",
+                    "function": {
+                        "name": "mcp__demo__mutate",
+                        "description": "untrusted extension tool",
+                        "parameters": {"type": "object", "properties": {}},
+                    },
+                }]),
+            ) as external_schemas:
+                outcome = asyncio.run(run_local_agent_turn(
+                    manager, ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": (
+                        "read ATTACHMENT_PIPELINE_FIX_PROGRESS.md, check status, and provide "
+                        "recommendations only; no file edits"
+                    )}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                ))
+                external_schemas.assert_not_awaited()
 
             self.assertEqual(outcome.status, "completed")
             self.assertNotIn("No files were changed", outcome.summary)
+            offered_names = {
+                tool["function"]["name"]
+                for call in client.calls for tool in call.get("tools", [])
+            }
+            self.assertNotIn("execute_command", offered_names)
+            self.assertNotIn("mcp__demo__mutate", offered_names)
             self.assertFalse(forbidden_path.exists())
             self.assertFalse([e for e in renderer.events if e["event_type"] == "plan_created"])
             rendered_errors = [

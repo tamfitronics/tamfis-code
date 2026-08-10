@@ -55,15 +55,8 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ws = self._js_workspace(tmp)
             write_args = json.dumps({"path": str(ws / "app.ts"), "content": "export const x = 1;\n"})
-            plan_response = json.dumps({"steps": ["Add app.ts"]})
-
             rounds = [
-                [_chunk(_delta(content=plan_response))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="write_file", arguments=write_args)]))],
-                # A real tool result triggers one plan-revision round (expects
-                # JSON); non-JSON here just falls back to the existing plan
-                # silently -- see test_reasoning_plan.py's own malformed-
-                # response test for the same behavior.
                 [_chunk(_delta(content="Added app.ts."))],
                 [_chunk(_delta(content="Added app.ts."))],
                 [_chunk(_delta(content="Added app.ts."))],
@@ -102,15 +95,9 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
         satisfiable -- a real command lets the turn complete."""
         with tempfile.TemporaryDirectory() as tmp:
             write_args = json.dumps({"path": str(Path(tmp) / "app.py"), "content": "x = 1\n"})
-            plan_response = json.dumps({"steps": ["Add app.py"]})
             verify_args = json.dumps({"command": "python3 app.py"})
             rounds = [
-                [_chunk(_delta(content=plan_response))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="write_file", arguments=write_args)]))],
-                # The first successful tool call triggers one automatic
-                # plan-revision round (see test_reasoning_plan.py's
-                # identical pattern); non-JSON here just falls back to the
-                # existing plan silently.
                 [_chunk(_delta(content="Added app.py."))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_2", name="execute_command", arguments=verify_args)]))],
                 [_chunk(_delta(content="Added app.py."))],
@@ -135,9 +122,7 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
         checking" gap this closes."""
         with tempfile.TemporaryDirectory() as tmp:
             write_args = json.dumps({"path": str(Path(tmp) / "app.py"), "content": "x = 1\n"})
-            plan_response = json.dumps({"steps": ["Add app.py"]})
             rounds = [
-                [_chunk(_delta(content=plan_response))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="write_file", arguments=write_args)]))],
                 [_chunk(_delta(content="Added app.py."))],
                 [_chunk(_delta(content="Added app.py."))],
