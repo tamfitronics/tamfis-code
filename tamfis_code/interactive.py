@@ -382,8 +382,16 @@ async def _wait_for_background_reinjection(session_id: int, prompt_session: Prom
         await asyncio.sleep(0.5)
 
 
-def next_message_suggestion(answer: Optional[str]) -> Optional[str]:
-    """Derive a concise, editable next action from the last assistant turn."""
+def next_message_suggestion(
+    answer: Optional[str], previous_objective: Optional[str] = None,
+) -> Optional[str]:
+    """Derive a grounded next action from the answer and prior objective.
+
+    Suggestions are deliberately deterministic: ghost text must never invent
+    an operation the assistant did not recommend. When the response contains
+    no actionable continuation, return ``None`` instead of displaying the
+    same generic sentence after every turn.
+    """
     if not answer:
         return None
     lines = [line.strip() for line in answer.splitlines() if line.strip()]
@@ -403,23 +411,67 @@ def next_message_suggestion(answer: Optional[str]) -> Optional[str]:
                     break
         if candidate:
             return candidate[:240]
-    return "Continue with the next recommended step"
+
+    plain = re.sub(r"[`*_#]", "", answer).strip()
+    lowered = plain.lower()
+    objective = (previous_objective or "").strip()
+    objective_lower = objective.lower()
+
+    # Strong operational state signals are more reliable than guessing from
+    # the original objective. Order matters: an unpushed commit is more
+    # specific than the generic fact that a fix was completed.
+    if re.search(r"\b(?:ahead of (?:the )?remote|not (?:yet )?pushed|push (?:was|is) blocked)\b", lowered):
+        return "Push the latest commit to the configured remote and verify the branch is synchronized"
+    if re.search(r"\b(?:no commit was created|changes remain uncommitted|uncommitted changes remain)\b", lowered):
+        return "Commit only the verified task changes and preserve unrelated work"
+    if re.search(r"\b(?:restart|relaunch)\b.{0,100}\b(?:load|activate|pick up|apply)\b", lowered, re.DOTALL):
+        return "Restart the affected process and verify the updated behavior end to end"
+    if re.search(r"\b(?:permission|ownership|write access|authentication|network|dependency)\b.{0,100}\b(?:blocked|denied|required|missing|not writable)\b", lowered, re.DOTALL):
+        return "Recheck the reported blocker, then continue the original task when it is resolved"
+
+    # Preserve direct actionable language from the response when present.
+    imperative = re.compile(
+        r"(?i)^(?:[-*]\s*)?(?:please\s+)?"
+        r"(run|restart|retry|verify|test|review|check|push|commit|deploy|install|"
+        r"configure|fix|implement|continue|open)\b(.+)$"
+    )
+    for line in reversed(lines):
+        cleaned = re.sub(r"^[-*\d.)\s]+", "", line).strip().strip("`")
+        match = imperative.match(cleaned)
+        if match and not cleaned.endswith(":"):
+            return cleaned[:240]
+
+    if re.search(r"\b(?:implemented|fixed|resolved|completed)\b", lowered):
+        if any(word in objective_lower for word in ("fix", "repair", "implement", "change", "update")):
+            subject = re.sub(r"\s+", " ", objective).strip(" .")
+            if subject:
+                return f"Verify this result end to end: {subject}"[:240]
+        return "Verify the completed result end to end and report any remaining issue"
+    if re.search(r"\btests?\b.{0,40}\bpassed\b", lowered):
+        return "Run the remaining integration checks, then commit the verified changes"
+    return None
 
 
 class _NextMessageAutoSuggest(AutoSuggest):
-    def __init__(self, get_answer: Callable[[], Optional[str]]) -> None:
+    def __init__(
+        self,
+        get_answer: Callable[[], Optional[str]],
+        get_objective: Optional[Callable[[], Optional[str]]] = None,
+    ) -> None:
         self._get_answer = get_answer
+        self._get_objective = get_objective or (lambda: None)
 
     def get_suggestion(self, buffer, document: Document) -> Optional[Suggestion]:
         if document.text:
             return None
-        value = next_message_suggestion(self._get_answer())
+        value = next_message_suggestion(self._get_answer(), self._get_objective())
         return Suggestion(value) if value else None
 
 
 def _seed_next_message_suggestion(
     session: PromptSession,
     answer: Optional[str],
+    previous_objective: Optional[str] = None,
 ) -> None:
     """Prime ghost text for an untouched, newly opened empty composer.
 
@@ -429,7 +481,7 @@ def _seed_next_message_suggestion(
     character. Seeding Buffer.suggestion in pre_run makes the ghost visible
     immediately.
     """
-    value = next_message_suggestion(answer)
+    value = next_message_suggestion(answer, previous_objective)
     session.default_buffer.suggestion = Suggestion(value) if value else None
 
 
@@ -693,7 +745,9 @@ async def run_interactive(
     @bindings.add("tab")
     def _accept_next_suggestion(event) -> None:
         buffer = event.current_buffer
-        suggestion = next_message_suggestion(last_response_text)
+        suggestion = next_message_suggestion(
+            last_response_text, last_turn[0] if last_turn else None,
+        )
         if not buffer.text and suggestion:
             buffer.insert_text(suggestion)
             return
@@ -755,10 +809,15 @@ async def run_interactive(
             workspace.session_id,
             provider=provider,
             model=model,
-            has_suggestion=bool(next_message_suggestion(last_response_text)),
+            has_suggestion=bool(next_message_suggestion(
+                last_response_text, last_turn[0] if last_turn else None,
+            )),
             active_agents=idle_active_agents,
         ),
-        auto_suggest=_NextMessageAutoSuggest(lambda: last_response_text),
+        auto_suggest=_NextMessageAutoSuggest(
+            lambda: last_response_text,
+            lambda: last_turn[0] if last_turn else None,
+        ),
         style=composer_style(),
         reserve_space_for_menu=0,
         # prompt-toolkit supplies a real dynamic Frame around the entire
@@ -859,7 +918,10 @@ async def run_interactive(
                 try:
                     text = await session.prompt_async(
                         _prompt_message, show_frame=True,
-                        pre_run=lambda: _seed_next_message_suggestion(session, last_response_text),
+                        pre_run=lambda: _seed_next_message_suggestion(
+                            session, last_response_text,
+                            last_turn[0] if last_turn else None,
+                        ),
                     )
                 finally:
                     notification_task.cancel()

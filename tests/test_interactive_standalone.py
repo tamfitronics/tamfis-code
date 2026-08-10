@@ -117,11 +117,26 @@ class NextMessageSuggestionTests(unittest.TestCase):
             "Run the integration tests",
         )
 
-    def test_answer_without_explicit_next_step_gets_safe_fallback(self):
+    def test_completed_fix_uses_previous_objective_as_context(self):
         self.assertEqual(
-            next_message_suggestion("The issue is fixed."),
-            "Continue with the next recommended step",
+            next_message_suggestion("The issue is fixed.", "Fix the retry loop"),
+            "Verify this result end to end: Fix the retry loop",
         )
+
+    def test_unpushed_commit_suggests_push_and_verification(self):
+        self.assertEqual(
+            next_message_suggestion("The branch is ahead of the remote by one commit."),
+            "Push the latest commit to the configured remote and verify the branch is synchronized",
+        )
+
+    def test_restart_instruction_is_adaptive(self):
+        self.assertEqual(
+            next_message_suggestion("Restart Tamfis Code to load the updated module."),
+            "Restart the affected process and verify the updated behavior end to end",
+        )
+
+    def test_no_grounded_next_action_means_no_suggestion(self):
+        self.assertIsNone(next_message_suggestion("Python is a programming language."))
 
     def test_ghost_suggestion_only_appears_for_empty_composer(self):
         suggest = _NextMessageAutoSuggest(lambda: "Next step: Verify production")
