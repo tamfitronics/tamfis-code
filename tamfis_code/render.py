@@ -512,6 +512,7 @@ class StreamRenderer:
         self._assistant_line_buffer = ""
         self._tool_names_by_call_id: dict[str, str] = {}
         self._selected_provider: Optional[str] = None
+        self._announced_route: Optional[tuple[str, str]] = None
         # Model displayed in the persistent PTY/TTY footer. It must be
         # initialised even before routing emits a model_selected event.
         self._model: Optional[str] = None
@@ -667,6 +668,7 @@ class StreamRenderer:
             # them. This is the real point at which a fresh tool-usage
             # tally should begin.
             self._round_tool_counts = {}
+            self._announced_route = None
         elif event_type in {"context_reused", "context_rescanned"}:
             self._status_detail = "Preparing repository context"
         elif event_type in {"routing_started", "model_selected"}:
@@ -1445,6 +1447,11 @@ class StreamRenderer:
             # in --debug output -- misleading, since nothing is actually
             # unknown here; the provider is just resolving its own default.
             model = payload.get("model") or "(provider default)"
+            self._model = public_model_name(model)
+            route = (str(provider), str(model))
+            if self._announced_route == route:
+                return
+            self._announced_route = route
             reason = payload.get("selection_reason") or "explicit selection or orchestration routing"
             if self.debug:
                 self.console.print(

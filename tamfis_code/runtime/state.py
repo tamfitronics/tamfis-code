@@ -39,6 +39,7 @@ class RuntimeSnapshot:
     plan_revisions: int = 0
     repair_rounds: int = 0
     evidence_items: int = 0
+    novel_observations: int = 0
     repeated_actions: int = 0
     runtime_extensions: int = 0
     repair_extensions: int = 0

@@ -78,6 +78,10 @@ BEHAVIOR_SCENARIOS = (
     ("simple fixes skip formal planning", "tests/test_reasoning_plan.py::ReasoningPlanIntegrationTests::test_simple_single_file_fix_skips_formal_planning"),
     ("failed plans replan once", "tests/test_reasoning_plan.py::ReasoningPlanIntegrationTests::test_plan_is_revised_once_tool_evidence_invalidates_it"),
     ("plan progress uses semantic evidence", "tests/test_orchestrator.py"),
+    ("large-file reads paginate by line", "tests/test_mcp.py::TestMCPServer::test_read_file_supports_line_pagination_and_continuation_hint"),
+    ("read-only inspection pipelines stay usable", "tests/test_safety.py::ClassifyToolCallRiskTests::test_common_inspection_pipelines_are_read_only"),
+    ("duplicate evidence terminates reconnaissance loops", "tests/test_runtime_controller.py::test_different_actions_returning_duplicate_evidence_trigger_stall"),
+    ("provider route is announced once per task", "tests/test_tamfis_code_render.py::StreamRendererTests::test_same_route_is_announced_only_once_per_task"),
 )
 
 

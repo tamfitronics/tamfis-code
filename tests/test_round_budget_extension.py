@@ -23,7 +23,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from tamfis_code.providers import ProviderType
-from tamfis_code.runner_local import run_local_agent_turn
+from tamfis_code.runner_local import _insufficient_novel_evidence, run_local_agent_turn
 
 from test_reasoning_plan import (
     _FakeClient,
@@ -37,6 +37,13 @@ from test_reasoning_plan import (
 
 
 class RoundBudgetExtensionTests(_StatePatchMixin, unittest.TestCase):
+    def test_round_extension_requires_enough_novel_evidence(self):
+        self.assertFalse(_insufficient_novel_evidence(19, 0))
+        self.assertTrue(_insufficient_novel_evidence(20, 3))
+        self.assertFalse(_insufficient_novel_evidence(20, 4))
+        self.assertTrue(_insufficient_novel_evidence(40, 7))
+        self.assertFalse(_insufficient_novel_evidence(40, 8))
+
     def _console(self):
         from io import StringIO
         from rich.console import Console

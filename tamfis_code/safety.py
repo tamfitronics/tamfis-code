@@ -105,6 +105,7 @@ def classify_command_risk(command: str) -> str:
 _READ_ONLY_COMMANDS = {
     "cat", "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
     "uniq", "wc", "stat", "file", "du", "tree", "realpath", "readlink",
+    "awk", "sed",
 }
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
 
@@ -115,16 +116,35 @@ def _is_read_only_command(command: str) -> bool:
     # commands. Every other redirection/control/substitution construct is
     # treated as mutating/unknown and therefore not allowed in read-only mode.
     normalized = re.sub(r"(?:^|\s)2?>\s*/dev/null(?:\s|$)", " ", command).strip()
-    if not normalized or re.search(r"[;&|<>`]", normalized):
+    if not normalized or "`" in normalized:
         return False
     if "$(`" in normalized or "$(" in normalized or "${" in normalized:
         return False
     try:
-        argv = shlex.split(normalized)
+        lexer = shlex.shlex(normalized, posix=True, punctuation_chars="|;&<>")
+        lexer.whitespace_split = True
+        argv = list(lexer)
     except ValueError:
         return False
     if not argv:
         return False
+    if any(token in {"||", ";", "&", "&&", "<", ">", "<<", ">>"} for token in argv):
+        return False
+    segments: list[list[str]] = [[]]
+    for token in argv:
+        if token == "|":
+            if not segments[-1]:
+                return False
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    if not segments[-1]:
+        return False
+    return all(_is_read_only_command_segment(segment) for segment in segments)
+
+
+def _is_read_only_command_segment(argv: list[str]) -> bool:
+    """Classify one command in an already-tokenized shell pipeline."""
     executable = Path(argv[0]).name
     if executable == "git":
         return (
@@ -146,6 +166,17 @@ def _is_read_only_command(command: str) -> bool:
         return False
     if executable == "rg" and any(arg == "--pre" or arg.startswith("--pre=") for arg in argv[1:]):
         return False
+    if executable == "sed":
+        if any(arg in {"-i", "--in-place"} or arg.startswith(("-i", "--in-place=")) for arg in argv[1:]):
+            return False
+        scripts = [arg for arg in argv[1:] if not arg.startswith("-")]
+        return bool(scripts) and bool(re.fullmatch(r"\d+(?:,\d+)?p", scripts[0]))
+    if executable == "awk":
+        program = next((arg for arg in argv[1:] if not arg.startswith("-")), "")
+        return bool(program) and not re.search(
+            r"[{};]|\b(?:system|getline|print|printf|close)\b", program,
+            re.IGNORECASE,
+        ) and bool(re.fullmatch(r"[\sNR0-9<>=!&|()]+", program))
     if executable in {"sort", "tree"} and any(
         arg in {"-o", "--output"} or arg.startswith("--output=")
         for arg in argv[1:]

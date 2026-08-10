@@ -21,10 +21,14 @@ READ_ONLY_TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "read_file",
-            "description": "Read the contents of a local file (read-only).",
+            "description": "Read a local text file, optionally by 1-based line range (read-only).",
             "parameters": {
                 "type": "object",
-                "properties": {"path": {"type": "string", "description": "File path"}},
+                "properties": {
+                    "path": {"type": "string", "description": "File path"},
+                    "offset": {"type": "integer", "minimum": 1, "description": "First line"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 2000},
+                },
                 "required": ["path"],
             },
         },

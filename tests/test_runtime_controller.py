@@ -42,9 +42,13 @@ def test_tool_failures_are_actionable_evidence_not_empty_stalls():
             "execute_command", args,
             {"success": False, "error": "Command path is outside the resolved task scope"},
         )
-        assert decision.useful
+        if index == 0:
+            assert decision.useful
+        else:
+            assert not decision.useful
+            assert "Duplicate evidence" in decision.reason
         assert not decision.terminal
-    assert controller.snapshot.consecutive_empty_observations == 0
+    assert controller.snapshot.consecutive_empty_observations == 2
 
 
 def test_identical_action_is_blocked_after_two_attempts():
@@ -56,6 +60,21 @@ def test_identical_action_is_blocked_after_two_attempts():
     third = controller.guard_action("search_code", args)
     assert not third.allowed
     assert "repeated action" in third.reason.casefold()
+
+
+def test_different_actions_returning_duplicate_evidence_trigger_stall():
+    controller = ExecutionController(
+        RuntimeBudgets(max_consecutive_empty_observations=3, max_runtime_seconds=60)
+    )
+    for index in range(4):
+        args = {"command": f"grep variant-{index} app.py"}
+        assert controller.guard_action("execute_command", args).allowed
+        decision = controller.observe(
+            "execute_command", args, _result("the same already-known line"),
+        )
+    assert decision.terminal
+    assert "no new evidence" in decision.reason
+    assert controller.snapshot.novel_observations == 1
 
 
 def test_novel_evidence_allows_a_reasonable_follow_up_check():

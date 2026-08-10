@@ -198,6 +198,39 @@ class ClassifyToolCallRiskTests(unittest.TestCase):
                 RISK_READ_ONLY,
             )
 
+    def test_common_inspection_pipelines_are_read_only(self):
+        with tempfile.TemporaryDirectory() as root:
+            commands = (
+                "grep -n artifact app.py | head -20",
+                "rg 'async def' app.py | head -50",
+                "sed -n '570,700p' app.py",
+                "awk 'NR>=5562 && NR<=6000' app.py",
+            )
+            for command in commands:
+                self.assertEqual(
+                    classify_tool_call_risk(
+                        "execute_command", {"command": command}, workspace_root=root,
+                    ),
+                    RISK_READ_ONLY,
+                    command,
+                )
+
+    def test_potentially_mutating_inspection_lookalikes_remain_gated(self):
+        with tempfile.TemporaryDirectory() as root:
+            for command in (
+                "python3 -c \"open('x', 'w').write('x')\"",
+                "sed -i 's/a/b/' app.py",
+                "awk '{ system(\"touch x\") }' app.py",
+                "grep x app.py || touch x",
+            ):
+                self.assertNotEqual(
+                    classify_tool_call_risk(
+                        "execute_command", {"command": command}, workspace_root=root,
+                    ),
+                    RISK_READ_ONLY,
+                    command,
+                )
+
     def test_unknown_tool_fails_safe_to_dangerous(self):
         with tempfile.TemporaryDirectory() as root:
             self.assertEqual(classify_tool_call_risk("mystery_tool", {}, workspace_root=root), RISK_DANGEROUS)

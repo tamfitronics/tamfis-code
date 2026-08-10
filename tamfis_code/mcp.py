@@ -336,10 +336,10 @@ class MCPServer:
         self.register_tool(
             name="read_file",
             description=(
-                "Read the full text contents of one file. Returns the whole file every call -- "
-                "there is no offset/line-range/pagination support, so for a very large file, "
-                "prefer search_code (or find_references for a known symbol) to locate the "
-                "relevant region first rather than reading it whole speculatively. Fails with a "
+                "Read text from one file. For large files, use 1-based offset and limit to read "
+                "only the relevant line range; an unpaged large read returns the first page with "
+                "an explicit continuation offset. Prefer search_code (or find_references for a "
+                "known symbol) to locate the relevant region first. Fails with a "
                 "clear error on a binary file (detected by a null byte in the first 8000 bytes) "
                 "instead of returning corrupted text -- do not call this on an attached image; "
                 "its content is already visible directly in this conversation for vision-capable "
@@ -349,7 +349,15 @@ class MCPServer:
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "File path"}
+                    "path": {"type": "string", "description": "File path"},
+                    "offset": {
+                        "type": "integer", "minimum": 1,
+                        "description": "Optional 1-based first line to return",
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 2000,
+                        "description": "Optional maximum number of lines to return",
+                    },
                 },
                 "required": ["path"]
             },
@@ -900,7 +908,9 @@ class MCPServer:
             if absent(str(key))
         ]
     
-    async def _read_file(self, path: str) -> str:
+    async def _read_file(
+        self, path: str, offset: Optional[int] = None, limit: Optional[int] = None,
+    ) -> str:
         p = self._resolve_readable_input(path)
         if not p.exists():
             return f"Error: File '{path}' not found"
@@ -927,7 +937,31 @@ class MCPServer:
                 "models -- look at it there instead of calling read_file. For an archive, use "
                 "extract_archive."
             )
-        return p.read_text(encoding='utf-8', errors='ignore')
+        content = p.read_text(encoding='utf-8', errors='ignore')
+        lines = content.splitlines(keepends=True)
+        default_page_lines = 800
+        requested_page = offset is not None or limit is not None
+        if not requested_page and len(lines) <= default_page_lines:
+            return content
+        try:
+            start = max(1, int(offset or 1))
+            page_size = min(2000, max(1, int(limit or default_page_lines)))
+        except (TypeError, ValueError):
+            return "Error: read_file offset and limit must be positive integers"
+        if start > len(lines) and lines:
+            return f"[Offset {start} is beyond the end of {path} ({len(lines)} lines).]"
+        selected = lines[start - 1:start - 1 + page_size]
+        end = start + len(selected) - 1
+        numbered = "".join(
+            f"{line_number}: {line}" for line_number, line in enumerate(selected, start=start)
+        )
+        if selected and not selected[-1].endswith(("\n", "\r")):
+            numbered += "\n"
+        continuation = (
+            f" Continue with offset={end + 1}, limit={page_size}."
+            if end < len(lines) else " End of file."
+        )
+        return f"[Showing lines {start}-{max(end, start)} of {len(lines)}.{continuation}]\n{numbered}"
 
     def _resolve_readable_input(self, path: str) -> Path:
         """Resolve a workspace file or one exact, user-supplied attachment.

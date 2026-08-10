@@ -14,7 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from tamfis_code.mcp import MCPServer, ToolDefinition, _parse_duckduckgo_html
+from tamfis_code.mcp import MCPServer, _parse_duckduckgo_html
 
 
 class TestArchiveTools:
@@ -116,6 +116,28 @@ class TestMCPServer:
         assert result['success'] is True  # the tool call itself succeeded
         assert 'binary file' in result['result']
         assert 'vision-capable models' in result['result']
+
+    @pytest.mark.asyncio
+    async def test_read_file_supports_line_pagination_and_continuation_hint(self):
+        test_file = Path(self.temp_dir) / "large.py"
+        test_file.write_text("".join(f"line {index}\n" for index in range(1, 1001)))
+
+        first = await self.server.call_tool("read_file", {"path": str(test_file)})
+        page = await self.server.call_tool(
+            "read_file", {"path": str(test_file), "offset": 556, "limit": 3},
+        )
+
+        assert "Continue with offset=801" in first["result"]
+        assert "[Showing lines 556-558 of 1000." in page["result"]
+        assert "556: line 556" in page["result"]
+        assert "558: line 558" in page["result"]
+        assert "555: line 555" not in page["result"]
+
+    def test_read_file_schema_advertises_pagination(self):
+        schema = self.server.tool_schemas_openai(names=["read_file"])[0]["function"]
+        properties = schema["parameters"]["properties"]
+        assert properties["offset"]["minimum"] == 1
+        assert properties["limit"]["maximum"] == 2000
 
     @pytest.mark.asyncio
     async def test_write_file(self):

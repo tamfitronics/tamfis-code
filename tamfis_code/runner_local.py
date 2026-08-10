@@ -3144,6 +3144,11 @@ def _is_cycling(history: list[tuple[tuple[str, str], ...]]) -> bool:
     return False
 
 
+def _insufficient_novel_evidence(rounds: int, novel_observations: int) -> bool:
+    """Keep large-task extensions for productive work, not reconnaissance loops."""
+    return rounds >= 20 and novel_observations < max(4, rounds // 5)
+
+
 async def _stream_one_completion(
     client, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     renderer: StreamRenderer, reasoning_effort: Optional[str] = None, emit: bool = True,
@@ -4818,8 +4823,9 @@ async def _run_local_agent_turn_impl(
             working_messages.append({
                 "role": "system",
                 "content": (
-                    f"You just repeated {stuck_reason}, without making progress -- the calls above "
-                    "were refused rather than executed again. Do not repeat them. Instead: act on a "
+                    f"You just repeated {stuck_reason}, without making progress. "
+                    + ("The calls above were refused rather than executed again. " if tool_calls else "")
+                    + "Do not repeat the same approach. Instead: act on a "
                     "SPECIFIC result you already have (read_file a specific file, list_directory a "
                     "specific subdirectory, search_code for a concrete pattern), or, if the original "
                     "request is too broad to make that concrete choice at all, stop calling tools now "
@@ -4899,6 +4905,23 @@ async def _run_local_agent_turn_impl(
     while True:
         _round += 1
         if _round >= max_rounds:
+            snapshot = orchestrator.run.runtime.snapshot if orchestrator.run is not None else None
+            if snapshot is not None and _insufficient_novel_evidence(
+                _round, snapshot.novel_observations,
+            ):
+                stalled_reason = (
+                    f"too little new evidence ({snapshot.novel_observations} novel observations "
+                    f"across {_round} rounds)"
+                )
+                # Grant exactly one model round after the normal loop nudge;
+                # if it still cannot produce new evidence, _handle_stuck_loop
+                # switches to a tools-disabled summary on the next cap check.
+                if loop_nudge_count < MAX_LOOP_NUDGE_RETRIES:
+                    max_rounds += 1
+                outcome = await _handle_stuck_loop(stalled_reason, [])
+                if outcome is not None:
+                    return outcome
+                continue
             if _round_extensions_used >= MAX_AGENT_ROUND_EXTENSIONS:
                 break
             _round_extensions_used += 1
@@ -6247,8 +6270,18 @@ async def _run_local_agent_turn_impl(
             permission_decision = _turn_permission_decisions.get(tc.call_id)
 
             if turn_read_only and risk != "read_only":
+                hint = ""
+                if tc.name == "execute_command":
+                    hint = (
+                        " Use read_file with offset/limit, search_code, or a recognized read-only "
+                        "pipeline (for example grep/rg piped to head, sed -n, or bounded awk) "
+                        "instead of retrying Python or another general-purpose command."
+                    )
                 result = {
-                    "error": f"'{tc.name}' is not available in read-only mode with these arguments.",
+                    "error": (
+                        f"'{tc.name}' is not available in read-only mode with these arguments."
+                        + hint
+                    ),
                     "success": False,
                 }
                 working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})

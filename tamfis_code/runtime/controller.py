@@ -166,22 +166,28 @@ class ExecutionController:
         self.snapshot.observation_counts[fingerprint] = observation_count
         self._last_observation = fingerprint
 
-        if empty:
+        duplicate = observation_count > 1
+        if empty or duplicate:
             self.snapshot.empty_observations += 1
             self.snapshot.consecutive_empty_observations += 1
             count = self.snapshot.consecutive_empty_observations
             if count >= self.budgets.max_consecutive_empty_observations:
                 reason = (
-                    f"Agent stalled after {count} consecutive tool results produced no useful evidence. "
+                    f"Agent stalled after {count} consecutive tool results produced no new evidence. "
                     "The runtime stopped the loop instead of repeating reconnaissance."
                 )
                 self._fail(reason)
                 return ObservationDecision(False, True, reason)
             self.snapshot.transition(RuntimePhase.EXECUTE)
-            return ObservationDecision(False, False, f"No useful evidence gained ({count}/{self.budgets.max_consecutive_empty_observations}).")
+            detail = "Duplicate evidence" if duplicate else "No useful evidence"
+            return ObservationDecision(
+                False, False,
+                f"{detail} gained ({count}/{self.budgets.max_consecutive_empty_observations}).",
+            )
 
         labels = tuple(evidence_labels(tool_name, arguments, result))
         self.snapshot.evidence_items += len(labels) or 1
+        self.snapshot.novel_observations += 1
         self.snapshot.consecutive_empty_observations = 0
         # An action is only a loop when it repeats without changing the
         # evidence state.  Keep the guard strict for identical observations,

@@ -16,11 +16,12 @@ python3 benchmarks/feature_parity.py --verify
 ```
 
 Pass 1 scans the current source tree for implementation evidence. Pass 2 runs
-focused tests plus seven named behavioral regression scenarios. Those scenarios
+focused tests plus eleven named behavioral regression scenarios. Those scenarios
 exercise persistent permission precedence and protected paths, exactly-once
 background result reinjection, natural-language background and goal controls,
 read-only enforcement, proportional planning, failure-triggered replanning,
-and semantic plan progress. The executable matrix is the source of truth for
+semantic plan progress, paginated reads, usable read-only inspection pipelines,
+duplicate-evidence loop termination, and route-banner deduplication. The executable matrix is the source of truth for
 feature-presence scores; the behavioral pass is reported separately.
 
 Current result: TamfisGPT Code scores **24/24 (100%)** against the combined

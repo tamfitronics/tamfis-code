@@ -76,6 +76,20 @@ class ToolActionLabelSecretRedactionTests(unittest.TestCase):
 
 
 class StreamRendererTests(unittest.TestCase):
+    def test_same_route_is_announced_only_once_per_task(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({"event_type": "task_started", "payload": {}})
+        event = {
+            "event_type": "model_selected",
+            "payload": {"provider": "ollama_cloud", "model": "auto"},
+        }
+        renderer.handle_event(event)
+        renderer.handle_event(event)
+        renderer.handle_event(event)
+
+        self.assertEqual(console.file.getvalue().count("Using TamfisGPT"), 1)
+
     def test_read_tools_show_only_a_compact_progress_line(self):
         console = _console()
         renderer = StreamRenderer(console)
@@ -222,7 +236,6 @@ class StreamRendererTests(unittest.TestCase):
         renderer = StreamRenderer(console)
         renderer._task_start = _time.monotonic() - 6  # past the tip start threshold
         status = renderer._build_status()
-        rendered = console.render_str  # not used; just checking the Group's text content
         # The status is a Group of renderables when a tip is present -- print
         # it to the console and inspect captured output.
         console.print(status)
