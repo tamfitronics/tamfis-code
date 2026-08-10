@@ -7,6 +7,7 @@ management.
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 import inspect
 import re
 from pathlib import Path
@@ -61,6 +62,7 @@ from .runner import (
     retry_task_and_stream,
     run_ai_task_and_stream,
     run_shell_command,
+    submit_ai_task_background,
 )
 from .runner_local import run_local_agent_turn, run_local_shell_command
 from .pty import LocalPtyBroker
@@ -69,7 +71,7 @@ from .safety import revert_transaction as local_revert_transaction
 from .tasks import find_recent_task
 from .workspace import (
     WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository,
-    find_resumable_session, resolve_local_workspace,
+    find_resumable_session,
 )
 
 # A pasted block strictly longer than this many lines is collapsed to a
@@ -188,6 +190,8 @@ $ <command>            explicit shell command
 /execute-plan [plan_id]  execute a saved plan (latest/active if omitted)
 /agent <objective>       full coding-agent mode (inspect + edit + verify)
 /execute <objective>     AI execute mode (tools + approval policy)
+/background <objective>  start a detached agent task and return to this prompt
+/goal <objective>        run a supervised persistent objective in the background
 
 /help                show this help
 /status              show session/workspace/approval status
@@ -296,6 +300,8 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/execute-plan", "execute a saved plan"),
     ("/agent", "full coding-agent mode (inspect + edit + verify)"),
     ("/execute", "AI execute mode (tools + approval policy)"),
+    ("/background", "start a detached agent task"),
+    ("/goal", "start a supervised background objective"),
 )
 
 
@@ -331,11 +337,16 @@ class _SlashCommandCompleter(Completer):
 
 
 class Intent:
-    def __init__(self, kind: str, *, command: str = "", objective: str = "", mode: str = "coding"):
+    def __init__(
+        self, kind: str, *, command: str = "", objective: str = "",
+        mode: str = "coding", background: bool = False, goal: bool = False,
+    ):
         self.kind = kind
         self.command = command
         self.objective = objective
         self.mode = mode
+        self.background = background
+        self.goal = goal
 
 
 # Bounds standalone in-session conversation history (see run_interactive's
@@ -344,6 +355,19 @@ class Intent:
 # this just stops one very long-lived REPL process from growing the list
 # forever in memory.
 MAX_STANDALONE_HISTORY_TURNS = 30
+
+
+async def _wait_for_background_reinjection(session_id: int) -> None:
+    """Wake an idle prompt when a detached task posts its synthetic result."""
+    while True:
+        queued = local_state.get_session_state(session_id).queued_user_instructions
+        if any(
+            item.get("status") == "queued"
+            and str(item.get("text") or "").startswith("[Background ")
+            for item in queued
+        ):
+            return
+        await asyncio.sleep(0.5)
 
 
 def next_message_suggestion(answer: Optional[str]) -> Optional[str]:
@@ -513,6 +537,15 @@ def parse_intent(raw: str, custom_commands: Optional[dict[str, CustomCommand]] =
         return Intent("ai", objective=text[9:].strip(), mode="execute")
     if text.startswith("/ask "):
         return Intent("ai", objective=text[5:].strip(), mode="coding")
+    if text.startswith("/background "):
+        return Intent("ai", objective=text[len("/background "):].strip(), mode="coding", background=True)
+    if text == "/goal" or text in {"/goal status", "/goal pause", "/goal cancel", "/goal resume"}:
+        return Intent("goal_control", command=text[len("/goal"):].strip() or "status")
+    if text.startswith("/goal "):
+        return Intent(
+            "ai", objective=text[len("/goal "):].strip(), mode="coding",
+            background=True, goal=True,
+        )
     # User-defined custom commands (custom_commands.py) -- checked last, so
     # every built-in slash command above always wins on a name collision.
     # Only a real "/<name>" shape is eligible (not a bare natural-language
@@ -522,7 +555,17 @@ def parse_intent(raw: str, custom_commands: Optional[dict[str, CustomCommand]] =
         command = custom_commands.get(name)
         if command is not None:
             return Intent("ai", objective=expand_custom_command(command, arguments.strip()), mode="coding")
-    return Intent("ai", objective=text, mode="coding")
+    # Match a direct run-control instruction at the end of an objective,
+    # including the common misspellings from natural terminal input. Do not
+    # match explanatory questions such as "how do background jobs work?".
+    background_requested = bool(re.search(
+        r"(?:^|[.!?]\s+|\s+)(?:please\s+)?(?:run|work|working|workin|continue)"
+        r"(?:\s+(?:on\s+)?(?:this|it))?\s+in\s+(?:the\s+)?"
+        r"(?:background|backgorund)\s*[.!]?\s*$",
+        text,
+        re.IGNORECASE,
+    ))
+    return Intent("ai", objective=text, mode="coding", background=background_requested)
 
 
 async def run_interactive(
@@ -798,14 +841,25 @@ async def run_interactive(
             pending_pastes.clear()
             paste_counter = 0
             try:
-                text = await session.prompt_async(
-                    _prompt_message,
-                    show_frame=True,
-                    pre_run=lambda: _seed_next_message_suggestion(
-                        session,
-                        last_response_text,
-                    ),
+                prompt_task = asyncio.create_task(session.prompt_async(
+                    _prompt_message, show_frame=True,
+                    pre_run=lambda: _seed_next_message_suggestion(session, last_response_text),
+                ))
+                notification_task = asyncio.create_task(
+                    _wait_for_background_reinjection(workspace.session_id)
                 )
+                done, _pending = await asyncio.wait(
+                    {prompt_task, notification_task}, return_when=asyncio.FIRST_COMPLETED,
+                )
+                if notification_task in done and prompt_task not in done:
+                    prompt_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await prompt_task
+                    continue
+                notification_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await notification_task
+                text = await prompt_task
             except KeyboardInterrupt:
             # NOTE: this used to just `continue`, silently redrawing the
             # prompt -- Ctrl+C appeared to do nothing at all, with no
@@ -1115,7 +1169,7 @@ async def run_interactive(
                     continue
                 try:
                     provider_type = _resolve_provider_type(parts[0])
-                except ValueError as exc:
+                except ValueError:
                     print_error(console, "Unknown model. Use /model list to view TamfisGPT models.")
                     continue
                 model_id = parts[1] if len(parts) > 1 else "auto"
@@ -1364,7 +1418,14 @@ async def run_interactive(
             continue
         if text == "/permissions":
             console.print(f"approval_policy={config.approval_policy}")
-            console.print("[dim]Server safeguards always enforce workspace scope, command risk classification, ownership, and approval state; client policy cannot widen them.[/dim]")
+            for action in ("deny", "ask", "allow"):
+                rules = getattr(config, f"permission_{action}")
+                console.print(f"{action}: {', '.join(rules) if rules else '(none)'}")
+            console.print(
+                "[dim]Configure persistent rules under [permissions] in config.toml. "
+                "Syntax: Tool or Tool(pattern). Deny wins over ask, which wins over allow; "
+                "protected repository/configuration paths always require explicit approval.[/dim]"
+            )
             continue
         if text == "/mode" or text.startswith("/mode "):
             arg = text[len("/mode"):].strip().lower()
@@ -1791,8 +1852,91 @@ async def run_interactive(
                     )
             elif intent.kind == "saved_plan":
                 await _run_saved_plan(intent.command)
+            elif intent.kind == "goal_control":
+                if not standalone:
+                    console.print("[dim]Remote goals are visible through /agents; local /goal controls apply to detached standalone goals.[/dim]")
+                    continue
+                from .background import list_jobs, spawn_background_task, stop_job
+
+                goals = [
+                    job for job in list_jobs()
+                    if job.get("goal") and int(job.get("session_id", -1)) == workspace.session_id
+                ]
+                latest_goal = max(goals, key=lambda job: float(job.get("started_at", 0)), default=None)
+                if intent.command == "status":
+                    if latest_goal is None:
+                        console.print("[dim]No goal has been started in this session.[/dim]")
+                    else:
+                        console.print(
+                            f"[bold]{latest_goal['id']}[/bold] · {latest_goal['status']} · "
+                            f"{latest_goal['objective_preview']}"
+                        )
+                    continue
+                if intent.command in {"pause", "cancel"}:
+                    if latest_goal is None or not stop_job(str(latest_goal["id"])):
+                        console.print("[dim]No running goal to stop.[/dim]")
+                    else:
+                        verb = "Paused" if intent.command == "pause" else "Cancelled"
+                        console.print(f"[yellow]{verb}[/yellow] goal {latest_goal['id']}.")
+                    continue
+                if latest_goal is None:
+                    console.print("[dim]No previous goal to resume.[/dim]")
+                    continue
+                try:
+                    goal_objective = Path(str(latest_goal["prompt_path"])).read_text(encoding="utf-8")
+                except OSError as exc:
+                    print_error(console, f"Cannot resume goal: {exc}")
+                    continue
+                resumed = spawn_background_task(
+                    session_id=workspace.session_id,
+                    workspace_root=Path(workspace.workspace_root),
+                    mode=str(latest_goal.get("mode") or "coding"),
+                    objective=goal_objective,
+                    model=model or "auto",
+                    provider=(provider_type.value if provider_type else None),
+                    approval_policy=config.approval_policy,
+                    goal=True,
+                )
+                console.print(f"[green]Resumed goal[/green] · {resumed.id} (pid {resumed.pid})")
+                continue
             else:
                 if not intent.objective:
+                    continue
+                if intent.background:
+                    if standalone:
+                        from .background import spawn_background_task
+
+                        job = spawn_background_task(
+                            session_id=workspace.session_id,
+                            workspace_root=Path(workspace.workspace_root),
+                            mode=intent.mode,
+                            objective=intent.objective,
+                            model=model or "auto",
+                            provider=(provider_type.value if provider_type else None),
+                            approval_policy=config.approval_policy,
+                            goal=intent.goal,
+                        )
+                        console.print(
+                            f"[green]Started in background[/green] · job {job.id} (pid {job.pid})"
+                        )
+                    else:
+                        task = await submit_ai_task_background(
+                            client,
+                            session_id=workspace.session_id,
+                            objective=intent.objective,
+                            mode=intent.mode,
+                            model=model or "auto",
+                            provider=(provider_type.value if provider_type else None),
+                        )
+                        console.print(
+                            f"[green]backgrounded[/green] · session {workspace.session_id} · "
+                            f"task {task['task_id']}"
+                        )
+                    _append_turn_to_history(
+                        conversation_history, objective=intent.objective, answer=None,
+                    )
+                    last_turn = (intent.objective, intent.mode)
+                    console.print()
                     continue
                 if intent.mode == "execute":
                     repo_state = local_state.get_session_state(workspace.session_id).repository_context

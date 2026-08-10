@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from pathlib import PurePath
+import re
 from typing import Any, Callable
 
 from .. import state as local_state
@@ -248,28 +250,89 @@ class AgentOrchestrator:
                 "runtime": self.run.runtime.snapshot.to_dict(),
             },
         )
-        self._advance_plan_step(decision)
+        self._advance_plan_step(decision, envelope)
         if decision.terminal:
             self.fail(decision.reason)
         return decision
 
-    def _advance_plan_step(self, decision: ObservationDecision) -> None:
-        """Advance only when a successful observation gained useful evidence."""
+    @staticmethod
+    def _tool_matches_plan_step(tool: ToolEnvelope, step_name: str) -> bool:
+        """Return whether a useful tool result is evidence for this step.
+
+        Sequential observations do not necessarily map one-to-one to plan
+        steps. Keep unmatched evidence in the ledger without letting it claim
+        an unrelated milestone.
+        """
+        name = tool.tool_name.casefold()
+        step = step_name.casefold()
+        # Keep real extensions (``status.json``) together without treating
+        # sentence-ending punctuation (``components.``) as a filename.
+        words = set(re.findall(r"[a-z0-9_]+(?:\.[a-z0-9_]+)*", step))
+        target = ""
+        for key in ("path", "directory", "destination", "output_path", "query", "symbol"):
+            value = tool.arguments.get(key)
+            if isinstance(value, str) and value.strip():
+                target = value.strip().casefold()
+                break
+        target_name = PurePath(target).name if target else ""
+        target_words = set(re.findall(r"[a-z0-9_-]+", target_name))
+        target_matches = bool(
+            target and (
+                target in step
+                or (target_name and target_name in words)
+                or (target_name and target_name in step)
+                or any(word in words for word in target_words if len(word) >= 3)
+            )
+        )
+        names_a_file_kind = any("." in word for word in words) or bool(
+            words & {"json", "yaml", "yml", "toml", "markdown", "md", "txt", "log", "pdf", "docx", "file"}
+        )
+
+        if name in {"read_file", "inspect_artifact"}:
+            return target_matches or (
+                bool(words & {"read", "review", "inspect", "examine"}) and not names_a_file_kind
+            )
+        if name == "list_directory":
+            return bool(words & {"list", "inventory", "directory", "folder", "contents", "locate", "discover"}) and (
+                not target or target_matches or not names_a_file_kind
+            )
+        if name in {"search_code", "find_references"}:
+            return bool(words & {"search", "find", "locate", "identify", "references", "usages"})
+        if name == "get_git_info":
+            return bool(words & {"git", "branch", "commit", "repository", "status"})
+        if name in {"write_file", "create_file", "create_artifact"}:
+            return target_matches or bool(words & {"write", "create", "add", "generate"})
+        if name in {"edit_file", "patch_file"}:
+            return target_matches or bool(words & {"edit", "change", "modify", "fix", "patch", "update", "refactor"})
+        if name in {"extract_archive", "repackage_archive"}:
+            return target_matches or bool(words & {"extract", "archive", "package", "repackage"})
+        if name == "execute_command":
+            return bool(words & {"run", "execute", "test", "verify", "validate", "check", "build", "lint", "typecheck", "install"})
+        if name == "ask_user_question":
+            return bool(words & {"ask", "clarify", "confirm"})
+        return False
+
+    def _advance_plan_step(self, decision: ObservationDecision, tool: ToolEnvelope) -> None:
+        """Advance only when useful evidence corresponds to the active step."""
         assert self.run is not None
         if self.run.plan is None or not self.run.plan.steps:
             return
+        changed = False
         active = next((step for step in self.run.plan.steps if step.status == "in_progress"), None)
         if active is None:
             active = next((step for step in self.run.plan.steps if step.status == "pending"), None)
             if active is not None:
                 active.status = "in_progress"
-        if active is not None and decision.useful:
+                changed = True
+        if active is not None and decision.useful and self._tool_matches_plan_step(tool, active.name):
             active.status = "completed"
             active.evidence.extend(item for item in decision.evidence if item not in active.evidence)
+            changed = True
             nxt = next((step for step in self.run.plan.steps if step.status == "pending"), None)
             if nxt is not None:
                 nxt.status = "in_progress"
-        self._sync_plan_progress()
+        if changed:
+            self._sync_plan_progress()
 
     def mark_repair(self, reason: str) -> None:
         assert self.run is not None

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import Iterable
 
 
@@ -64,6 +65,15 @@ _CLOSURE_SIGNALS = (
     "that worked", "no need for further",
 )
 
+_EXPLICIT_READ_ONLY_RE = re.compile(
+    r"(?:\bread[ -]?only\b|\bno\s+(?:file\s+)?edits?\b|"
+    r"\bdo\s+not\s+(?:edit|modify|change|write|patch)\b|"
+    r"\bdon['’]?t\s+(?:edit|modify|change|write|patch)\b|"
+    r"\bwithout\s+(?:editing|modifying|changing|writing|patching)\b|"
+    r"\brecommendations?\s+only\b)",
+    re.IGNORECASE,
+)
+
 
 def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
     raw = (text or "").strip().lower()
@@ -75,6 +85,14 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
 
     if has(_CLOSURE_SIGNALS):
         return TaskProfile(TaskType.CONVERSATION, "low", False, False, False, False, "economy")
+    # A report/status request often names an artefact such as
+    # ATTACHMENT_PIPELINE_FIX_PROGRESS.md. The old substring-first DEBUG
+    # check treated the incidental "fix" in that filename as an instruction
+    # to mutate the repository despite an explicit "no file edit" constraint.
+    if _EXPLICIT_READ_ONLY_RE.search(raw):
+        if has(("audit", "entire stack", "whole repository", "whole repo", "end-to-end", "end to end")):
+            return TaskProfile(TaskType.AUDIT, "high", True, True, True, False, "frontier")
+        return TaskProfile(TaskType.INSPECT, "medium", True, True, False, False, "high")
     if has(("audit", "entire stack", "whole repository", "whole repo", "end-to-end", "end to end")):
         return TaskProfile(TaskType.AUDIT, "high", True, True, True, True, "frontier")
     if has(("debug", "fix", "repair", "bug", "traceback", "exception", "failing")):

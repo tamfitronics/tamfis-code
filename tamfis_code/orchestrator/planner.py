@@ -272,14 +272,33 @@ class PlannerEvidence:
         )
 
 
-def should_plan(profile: TaskProfile) -> bool:
-    return profile.complexity == "high" or profile.task_type in {
-        TaskType.AUDIT,
-        TaskType.EDIT,
-        TaskType.DEBUG,
-        TaskType.TEST,
-        TaskType.MIXED,
-    }
+_FORMAL_PLAN_RE = re.compile(
+    r"\b(?:multi[- ]file|multiple files|several files|across (?:the )?(?:repo|repository|stack)|"
+    r"end[- ]to[- ]end|architecture|architectural|migrat(?:e|ion)|redesign|large[- ]scale|"
+    r"whole (?:repo|repository|stack)|entire (?:repo|repository|stack)|complex|roadmap)\b",
+    re.IGNORECASE,
+)
+_FILE_REFERENCE_RE = re.compile(r"(?<![\w.-])[\w@+-]+(?:/[\w@+.-]+)*\.[A-Za-z0-9]{1,10}\b")
+
+
+def should_plan(profile: TaskProfile, objective: str | None = None) -> bool:
+    """Use formal plans only when task shape warrants their latency/noise.
+
+    ``objective=None`` preserves the legacy profile-only API for callers that
+    genuinely have no request text. Runtime callers always provide it.
+    """
+    if objective is None:
+        return profile.complexity == "high" or profile.task_type in {
+            TaskType.AUDIT, TaskType.EDIT, TaskType.DEBUG, TaskType.TEST, TaskType.MIXED,
+        }
+    if profile.task_type in {TaskType.PLAN, TaskType.AUDIT, TaskType.MIXED}:
+        return True
+    text = objective.strip()
+    if profile.task_type not in {TaskType.EDIT, TaskType.DEBUG, TaskType.TEST}:
+        return False
+    if _FORMAL_PLAN_RE.search(text) or len(text) >= 320:
+        return True
+    return len(set(_FILE_REFERENCE_RE.findall(text))) >= 2
 
 
 def create_plan(
@@ -290,7 +309,7 @@ def create_plan(
     workspace_summary: Optional[dict[str, Any]] = None,
 ) -> ExecutionPlan | None:
     """Create a safe deterministic fallback plan without guessed technology."""
-    if not should_plan(profile):
+    if not should_plan(profile, objective):
         return None
 
     evidence = build_planner_evidence(

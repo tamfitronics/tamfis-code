@@ -49,6 +49,9 @@ class BackgroundJob:
     status: str = "running"  # running | completed | failed | stopped
     finished_at: Optional[float] = None
     exit_code: Optional[int] = None
+    goal: bool = False
+    notification_delivered: bool = False
+    result_tail: str = ""
 
 
 def _job_path(job_id: str) -> Path:
@@ -120,6 +123,29 @@ def update_job_status(job_id: str, status: str, *, exit_code: Optional[int] = No
     record["status"] = status
     record["finished_at"] = time.time()
     record["exit_code"] = exit_code
+    try:
+        record["result_tail"] = Path(record["log_path"]).read_text(
+            encoding="utf-8", errors="replace",
+        )[-12_000:]
+    except OSError:
+        record["result_tail"] = ""
+    if not record.get("notification_delivered"):
+        from . import state as local_state
+
+        tail = str(record.get("result_tail") or "").strip()
+        local_state.enqueue_instruction(
+            int(record["session_id"]),
+            (
+                f"[Background {'goal' if record.get('goal') else 'task'} {job_id} finished "
+                f"with status={status} and exit_code={exit_code}.] "
+                "Use this completion as new evidence. Summarize the outcome, identify any "
+                "remaining work, and continue only if the original objective is not complete."
+                + (f"\n\nOutput tail:\n{tail}" if tail else "")
+            ),
+            classification="follow_up",
+            priority=20,
+        )
+        record["notification_delivered"] = True
     _write_job(BackgroundJob(**record))
 
 
@@ -153,6 +179,7 @@ def spawn_background_task(
     provider: Optional[str],
     approval_policy: str,
     attachment_paths: tuple[str, ...] = (),
+    goal: bool = False,
 ) -> BackgroundJob:
     """Launch objective as a detached standalone `ask` invocation and return
     immediately. The child is its own session leader (start_new_session),
@@ -195,6 +222,7 @@ def spawn_background_task(
         id=job_id, pid=proc.pid, session_id=session_id, workspace_root=str(workspace_root),
         mode=mode, objective_preview=objective[:200], log_path=str(log_path),
         prompt_path=str(prompt_path), started_at=time.time(),
+        goal=goal,
     )
     _write_job(job)
     return job

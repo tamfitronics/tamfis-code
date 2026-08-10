@@ -151,6 +151,53 @@ class OrchestratorTests(unittest.TestCase):
             self.assertTrue(any(e.get("event_type") == "plan_step_progress" for e in events))
             self.assertFalse(any(e.get("event_type") == "plan_created" for e in events))
 
+    def test_unrelated_directory_listing_does_not_complete_a_file_read_step(self):
+        from tamfis_code.orchestrator import ExecutionPlan
+        from tamfis_code.orchestrator.planner import PlanStep
+
+        with tempfile.TemporaryDirectory() as root:
+            events = []
+            engine = AgentOrchestrator(session_id=90025, workspace_root=root, emit=events.append)
+            run = engine.begin(
+                objective="fix the status reader",
+                messages=[{"role": "user", "content": "fix the status reader"}],
+                read_only=False,
+            )
+            plan = ExecutionPlan(
+                objective="fix the status reader", assumptions=[], components=[],
+                steps=[
+                    PlanStep(1, "Read tamfis health readiness JSON"),
+                    PlanStep(2, "Apply the fix"),
+                ],
+                validation_criteria=[], risks=[],
+            )
+            engine.replace_plan(plan)
+
+            listing = ToolEnvelope("c1", "list_directory", {"path": root}, "locate status")
+            listing.finish(result={"success": True, "result": "status.json"}, success=True)
+            engine.record_tool(listing)
+
+            self.assertEqual(run.plan.steps[0].status, "in_progress")
+            self.assertEqual(run.plan.steps[1].status, "pending")
+            progress_count = sum(e.get("event_type") == "plan_step_progress" for e in events)
+
+            another_listing = ToolEnvelope("c1b", "list_directory", {"path": root}, "locate status")
+            another_listing.finish(result={"success": True, "result": "other.json"}, success=True)
+            engine.record_tool(another_listing)
+            self.assertEqual(
+                sum(e.get("event_type") == "plan_step_progress" for e in events),
+                progress_count,
+                "unchanged plan state must not reprint an identical progress panel",
+            )
+
+            status_read = ToolEnvelope(
+                "c2", "read_file", {"path": str(Path(root, "tamfis_health_readiness.json"))}, "read status"
+            )
+            status_read.finish(result={"success": True, "result": "{}"}, success=True)
+            engine.record_tool(status_read)
+            self.assertEqual(run.plan.steps[0].status, "completed")
+            self.assertEqual(run.plan.steps[1].status, "in_progress")
+
     def test_complete_marks_all_plan_steps_completed_on_pass(self):
         with tempfile.TemporaryDirectory() as root:
             engine = AgentOrchestrator(session_id=90022, workspace_root=root, emit=lambda event: None)

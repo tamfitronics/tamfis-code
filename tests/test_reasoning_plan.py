@@ -174,7 +174,11 @@ class GroundedFallbackPlanTests(unittest.TestCase):
                 "  manifests: pyproject.toml\n"
                 "  objective_matching_paths: services/mission_pipeline.py\n"
             )
-            plan = create_plan("fix the mission pipeline", profile, reconnaissance_summary=reconnaissance)
+            plan = create_plan(
+                "fix the multi-file mission pipeline across the service and its integration tests",
+                profile,
+                reconnaissance_summary=reconnaissance,
+            )
 
         self.assertIsNotNone(plan)
         rendered = "\n".join(step.name for step in plan.steps)
@@ -365,10 +369,6 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             rounds = [
                 [_chunk(_delta(content=plan_response))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="edit_file", arguments=edit_args)]))],
-                # The first successful tool call triggers one automatic
-                # plan revision round (see runner_local.py's "Adaptive
-                # replanning") before the turn continues.
-                [_chunk(_delta(content=plan_response))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_2", name="execute_command", arguments=verify_args)]))],
                 [_chunk(_delta(content="Fixed."))],
             ]
@@ -379,14 +379,14 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             with self._no_real_validation_commands():
                 outcome = asyncio.run(run_local_agent_turn(
                     manager, ProviderType.NVIDIA, None,
-                    [{"role": "user", "content": "fix the bug in calc.py"}],
+                    [{"role": "user", "content": "fix the multi-file bug involving calc.py and totals.py"}],
                     self._console(), renderer,
                     workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
                 ))
 
             self.assertEqual(outcome.status, "completed")
             plan_events = [e for e in renderer.events if e["event_type"] == "plan_created"]
-            self.assertEqual(len(plan_events), 2, "expected the initial plan plus one evidence-triggered revision")
+            self.assertEqual(len(plan_events), 1, "successful work must not trigger a redundant replan")
             steps = [item["step"] for item in plan_events[0]["payload"]["items"]]
             self.assertIn("Open calc.py and locate the addition in the total() function", steps)
             self.assertNotIn("Inspect the relevant repository context and manifests", steps)
@@ -411,11 +411,6 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             rounds = [
                 [_chunk(_delta(content="I am not JSON, I am just talking."))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="edit_file", arguments=edit_args)]))],
-                # The first successful tool call triggers one automatic
-                # plan revision round; keep it malformed too so this stays
-                # a test of "the fallback holds even when nothing ever
-                # parses as a real plan."
-                [_chunk(_delta(content="Still not JSON."))],
                 [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_2", name="execute_command", arguments=verify_args)]))],
                 [_chunk(_delta(content="Fixed anyway."))],
             ]
@@ -426,7 +421,7 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             with self._no_real_validation_commands():
                 outcome = asyncio.run(run_local_agent_turn(
                     manager, ProviderType.NVIDIA, None,
-                    [{"role": "user", "content": "fix the bug in calc.py"}],
+                    [{"role": "user", "content": "fix the multi-file bug involving calc.py and totals.py"}],
                     self._console(), renderer,
                     workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
                 ))
@@ -456,15 +451,83 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(len(client.calls), 1)
             self.assertFalse([e for e in renderer.events if e["event_type"] == "plan_created"])
 
-    def test_plan_is_revised_once_real_tool_evidence_exists(self):
-        """The initial plan is necessarily a guess (made before any tool has
-        run) -- once a real tool result exists, it must be revised, grounded
-        in what was actually found, not left as the original guess for the
-        rest of the turn."""
+    def test_simple_single_file_fix_skips_formal_planning(self):
         with tempfile.TemporaryDirectory() as ws:
             calc_path = Path(ws) / "calc.py"
             calc_path.write_text("def total(n):\n    return n + 2\n")
-            read_args = json.dumps({"path": str(calc_path)})
+            edit_args = json.dumps({
+                "path": str(calc_path),
+                "old_string": "return n + 2", "new_string": "return n + 1",
+            })
+            verify_args = json.dumps({"command": "true"})
+            rounds = [
+                [_chunk(_delta(tool_calls=[_tool_call_delta(
+                    0, call_id="call_1", name="edit_file", arguments=edit_args,
+                )]))],
+                [_chunk(_delta(tool_calls=[_tool_call_delta(
+                    0, call_id="call_2", name="execute_command", arguments=verify_args,
+                )]))],
+                [_chunk(_delta(content="Fixed."))],
+            ]
+            client = _FakeClient(rounds)
+            renderer = _RecordingRenderer()
+
+            with self._no_real_validation_commands():
+                outcome = asyncio.run(run_local_agent_turn(
+                    _FakeManager(client), ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": "fix the bug in calc.py"}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertEqual(len(client.calls), 3)
+            self.assertFalse([e for e in renderer.events if e["event_type"] == "plan_created"])
+
+    def test_natural_language_no_edit_constraint_blocks_mutating_shell_calls(self):
+        with tempfile.TemporaryDirectory() as ws:
+            report_path = Path(ws) / "ATTACHMENT_PIPELINE_FIX_PROGRESS.md"
+            report_path.write_text("status: pending\n")
+            forbidden_path = Path(ws) / "must-not-exist"
+            command_args = json.dumps({"command": f"touch {forbidden_path}"})
+            read_args = json.dumps({"path": str(report_path)})
+            rounds = [
+                [_chunk(_delta(tool_calls=[
+                    _tool_call_delta(0, call_id="call_1", name="execute_command", arguments=command_args),
+                    _tool_call_delta(1, call_id="call_2", name="read_file", arguments=read_args),
+                ]))],
+                [_chunk(_delta(content="Recommendation: keep the pipeline fix pending until validation completes."))],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": (
+                    "read ATTACHMENT_PIPELINE_FIX_PROGRESS.md, check status, and provide "
+                    "recommendations only; no file edits"
+                )}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertFalse(forbidden_path.exists())
+            self.assertFalse([e for e in renderer.events if e["event_type"] == "plan_created"])
+            rendered_errors = [
+                e["payload"].get("result", {}).get("error", "")
+                for e in renderer.events if e["event_type"] == "tool_output"
+            ]
+            self.assertTrue(any("read-only mode" in error for error in rendered_errors))
+
+    def test_plan_is_revised_once_tool_evidence_invalidates_it(self):
+        """A failed tool call is evidence that the current plan needs revision;
+        successful routine progress must not cause plan churn."""
+        with tempfile.TemporaryDirectory() as ws:
+            calc_path = Path(ws) / "calc.py"
+            calc_path.write_text("def total(n):\n    return n + 2\n")
+            read_args = json.dumps({"path": str(Path(ws) / "missing.py")})
             edit_args = json.dumps({
                 "path": str(calc_path),
                 "old_string": "return n + 2", "new_string": "return n + 1",
@@ -489,7 +552,7 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             with self._no_real_validation_commands():
                 outcome = asyncio.run(run_local_agent_turn(
                     manager, ProviderType.NVIDIA, None,
-                    [{"role": "user", "content": "fix the bug in calc.py"}],
+                    [{"role": "user", "content": "fix the multi-file bug involving calc.py and totals.py"}],
                     self._console(), renderer,
                     workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
                 ))

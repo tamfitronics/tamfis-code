@@ -1214,7 +1214,7 @@ class StreamRenderer:
                     self._tool_names_by_call_id[str(call_id)] = tool
                 args = payload.get("arguments") or {}
                 if _is_read_only_tool(tool):
-                    self.console.print(f"[dim]Read {escape(_read_target(args))}[/dim]")
+                    self.console.print(f"[dim]Reading {escape(_read_target(args))}[/dim]")
                     return
                 arg_text = ", ".join(f"{k}={v}" for k, v in args.items() if v not in (None, "")) if isinstance(args, dict) else ""
                 label = f"[bold yellow]→ {_tool_action_label(tool, args)}[/bold yellow]"
@@ -1237,7 +1237,7 @@ class StreamRenderer:
             name = str(payload.get("name") or payload.get("tool") or "tool")
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
             if _is_read_only_tool(name):
-                self.console.print(f"[dim]Read {escape(_read_target(args))}[/dim]")
+                self.console.print(f"[dim]Reading {escape(_read_target(args))}[/dim]")
                 return
             # On an interactive terminal the persistent live status line is
             # the progress indicator.  Printing a second arrow line for an

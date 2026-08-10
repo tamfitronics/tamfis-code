@@ -1,7 +1,7 @@
 """Model Context Protocol (MCP) integration for tools"""
 
 from typing import Dict, Any, List, Optional, Callable
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import contextlib
 import html
 import json
@@ -11,8 +11,6 @@ import signal
 import subprocess
 import fnmatch
 import asyncio
-import os
-import tempfile
 import sys
 import shutil
 import tarfile
@@ -1126,18 +1124,28 @@ class MCPServer:
             if file_pattern:
                 cmd.extend(['--glob', file_pattern])
 
-            # Off the event loop: this blocks for however long ripgrep takes
-            # (up to the 30s timeout) on a large/slow tree, and search_code is
-            # one of the most frequently invoked tools -- running it inline
-            # here froze prompt_toolkit's live input loop (same event loop)
-            # for that whole span, making the message box unresponsive while
-            # a search was in flight.
-            result = await asyncio.to_thread(
-                subprocess.run, cmd, capture_output=True, text=True, timeout=30
+            # Use asyncio's subprocess transport directly. Running
+            # subprocess.run inside asyncio.to_thread can deadlock during
+            # process creation on some Python/runtime combinations, leaving
+            # both search_code and find_references stuck until their caller
+            # is killed. A separate process group also lets timeout cleanup
+            # reach any unexpected descendants.
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                start_new_session=True,
             )
+            try:
+                stdout_bytes, _ = await asyncio.wait_for(proc.communicate(), timeout=30)
+            except asyncio.TimeoutError:
+                await self._kill_process_group(proc)
+                return [{"error": "Search timed out"}]
+            stdout = stdout_bytes.decode("utf-8", errors="replace")
             matches = []
 
-            for line in result.stdout.split('\n'):
+            for line in stdout.split('\n'):
                 if not line.strip():
                     continue
                 if len(matches) >= MAX_SEARCH_RESULTS:
@@ -1166,8 +1174,6 @@ class MCPServer:
                 })
 
             return matches
-        except subprocess.TimeoutExpired:
-            return [{"error": "Search timed out"}]
         except FileNotFoundError:
             # `rg` is fast and preferred, but it is not part of Python and is
             # absent from some minimal servers and hosted CI images. A
@@ -1675,7 +1681,7 @@ class MCPServer:
             # Get status
             result = await _git('status', '--porcelain')
             info["has_changes"] = bool(result.stdout.strip())
-            info["changed_files"] = len([l for l in result.stdout.split('\n') if l.strip()])
+            info["changed_files"] = len([line for line in result.stdout.split('\n') if line.strip()])
             
         except Exception as e:
             info["git_error"] = str(e)

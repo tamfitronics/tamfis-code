@@ -181,6 +181,9 @@ class Config:
     sandbox_network_access: bool = False
     sandbox_writable_roots: list[str] = field(default_factory=list)
     sandbox_fail_if_unavailable: bool = False
+    permission_allow: list[str] = field(default_factory=list)
+    permission_ask: list[str] = field(default_factory=list)
+    permission_deny: list[str] = field(default_factory=list)
     sources: dict[str, str] = field(default_factory=dict)  # field -> where it came from, for `doctor`/`config`
 
     def as_dict(self) -> dict[str, Any]:
@@ -202,6 +205,9 @@ class Config:
             "sandbox_network_access": self.sandbox_network_access,
             "sandbox_writable_roots": self.sandbox_writable_roots,
             "sandbox_fail_if_unavailable": self.sandbox_fail_if_unavailable,
+            "permission_allow": self.permission_allow,
+            "permission_ask": self.permission_ask,
+            "permission_deny": self.permission_deny,
         }
 
 
@@ -273,6 +279,17 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "sandbox_fail_if_unavailable" in data:
             cfg.sandbox_fail_if_unavailable = bool(data["sandbox_fail_if_unavailable"])
             cfg.sources["sandbox_fail_if_unavailable"] = source_name
+        permissions = data.get("permissions")
+        if isinstance(permissions, dict):
+            for action in ("allow", "ask", "deny"):
+                values = permissions.get(action)
+                if isinstance(values, list):
+                    field_name = f"permission_{action}"
+                    combined = [*getattr(cfg, field_name), *(
+                        str(value) for value in values if str(value).strip()
+                    )]
+                    setattr(cfg, field_name, list(dict.fromkeys(combined)))
+                    cfg.sources[field_name] = source_name
 
     env_api_base = os.environ.get("TAMFIS_CODE_API_BASE")
     if env_api_base:

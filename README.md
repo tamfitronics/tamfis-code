@@ -83,6 +83,17 @@ tamfis-code bg-logs bg-a1b2c3d4 --follow # tail its output live
 tamfis-code bg-stop bg-a1b2c3d4          # terminate it
 ```
 
+From the interactive prompt, use `/background <objective>` or end a request
+with a direct instruction such as “work in the background”. Tamfis Code starts
+the same detached job and immediately returns control to the prompt. When the
+job finishes, its result is injected once into the originating session; an idle
+prompt wakes automatically so the agent can summarize the result or continue
+unfinished work.
+
+Use `/goal <objective>` for a persistent background objective. `/goal status`,
+`/goal pause`, `/goal resume`, and `/goal cancel` control the latest goal in the
+current local session.
+
 Job status is one of `running`, `completed`, `failed`, or `stopped`. `--bg`
 is not available for `plan` (the plan needs the invoking process attached to
 save it locally).
@@ -117,6 +128,24 @@ Session memory is stored below that resolved directory in
 `.memory/session-<id>.json`. No runtime state is written into the source
 checkout or installed package directory, and no VPS/home path is compiled
 into the wheel.
+
+## Fine-grained permissions
+
+User `config.toml` and `<project>/.tamfis/config.toml` may contain persistent
+tool rules. Project values extend user values. Rules use `Tool` or
+`Tool(pattern)` syntax with shell-style wildcards:
+
+```toml
+[permissions]
+allow = ["execute_command(pytest *)", "read_file(*)"]
+ask = ["execute_command(git push *)"]
+deny = ["execute_command(* --force*)", "write_file(*.pem)"]
+```
+
+Precedence is `deny`, protected-path approval, `ask`, then `allow`. Writes to
+security-sensitive paths such as `.git`, `.env`, `.tamfis`, shell startup
+files, and IDE configuration always require explicit approval even in auto
+mode. Run `/permissions` to inspect the effective rules.
 
 ## Hooks
 

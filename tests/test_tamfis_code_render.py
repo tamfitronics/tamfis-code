@@ -88,7 +88,7 @@ class StreamRendererTests(unittest.TestCase):
             "payload": {"tool": "read_file", "arguments": {"path": "src/app.ts"}, "content": "secret implementation\n"},
         })
         output = console.file.getvalue()
-        self.assertIn("Read src/app.ts", output)
+        self.assertIn("Reading src/app.ts", output)
         self.assertNotIn("secret implementation", output)
         self.assertNotIn("→", output)
 

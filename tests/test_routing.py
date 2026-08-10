@@ -3,6 +3,8 @@ from unittest.mock import patch
 
 from tamfis_code.providers import ProviderManager, ProviderType
 from tamfis_code.routing import TaskType, classify_task
+from tamfis_code.orchestrator.planner import should_plan
+from tamfis_code.tool_policy import allowed_tools
 
 
 def test_greeting_requires_no_tools_or_repo_context():
@@ -37,6 +39,28 @@ def test_genuine_debug_request_is_unaffected():
     profile = classify_task("please fix the bug in calc.py")
     assert profile.task_type == TaskType.DEBUG
     assert profile.requires_tools
+
+
+def test_explicit_no_edit_status_review_is_inspection_even_when_filename_contains_fix():
+    profile = classify_task(
+        "read tamgpt6/ATTACHMENT_PIPELINE_FIX_PROGRESS.md and check against "
+        "the TamfisGPT status and provide recommendations. no file edit"
+    )
+    assert profile.task_type == TaskType.INSPECT
+    assert profile.requires_tools
+    assert not profile.requires_validation
+    assert not should_plan(profile)
+    assert "edit_file" not in allowed_tools(profile, read_only=False)
+
+
+def test_read_only_fix_recommendations_do_not_become_a_debug_task():
+    for text in (
+        "review the fix progress and provide recommendations only",
+        "inspect the reported bug without editing anything",
+        "check the repair status; don't modify files",
+        "read-only review of the failing pipeline",
+    ):
+        assert classify_task(text).task_type == TaskType.INSPECT, text
 
 
 def test_audit_requires_frontier_long_context_tools():

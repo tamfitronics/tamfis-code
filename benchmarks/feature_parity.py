@@ -32,9 +32,9 @@ class Feature:
 FEATURES = (
     Feature("Interactive terminal agent", "tamfis_code/interactive.py", r"run_interactive"),
     Feature("Read, edit, and execute tools", "tamfis_code/mcp.py", r"execute_command"),
-    Feature("Approval modes", "tamfis_code/config.py", r"APPROVAL_MODES"),
+    Feature("Approval modes", "tamfis_code/permissions.py", r"def decide_permission"),
     Feature("Workspace sandbox", "tamfis_code/sandbox.py", r"SandboxPolicy"),
-    Feature("Plans and visible progress", "tamfis_code/render.py", r"plan_step_progress"),
+    Feature("Plans and visible progress", "tamfis_code/orchestrator/engine.py", r"_tool_matches_plan_step"),
     Feature("Durable resume", "tamfis_code/state.py", r"turn_checkpoint"),
     Feature("Context compaction", "tamfis_code/state.py", r"context_checkpoints"),
     Feature("Image input", "tamfis_code/runner_local.py", r"build_vision_content_blocks"),
@@ -46,7 +46,7 @@ FEATURES = (
     Feature("Lifecycle hooks", "tamfis_code/hooks.py", r"run_tool_hooks"),
     Feature("Custom agent definitions", "tamfis_code/agent_definitions.py", r"load_agent_definitions"),
     Feature("Parallel subagents / swarm", "tamfis_code/swarm.py", r"run_swarm"),
-    Feature("Background jobs and PTY", "tamfis_code/mcp.py", r"read_background_job"),
+    Feature("Background jobs and PTY", "tamfis_code/background.py", r"notification_delivered"),
     Feature("JSON and JSONL output", "tamfis_code/render.py", r"StructuredRenderer"),
     Feature("IDE-native integration", "tamfis_code/acp.py", r"class ACPAgent"),
     Feature("Remote/background tasks", "tamfis_code/runner.py", r"submit_ai_task_background", kimi="partial", claude="partial"),
@@ -66,6 +66,18 @@ VERIFY_TESTS = (
     "tests/test_acp.py",
     "tests/test_automation_commands.py",
     "tests/test_github_automation.py",
+)
+
+# These are regression scenarios rather than source-presence proxies. Keep the
+# list explicit so the report says what behavior was exercised.
+BEHAVIOR_SCENARIOS = (
+    ("permission precedence and protected paths", "tests/test_permissions.py"),
+    ("background result reinjection exactly once", "tests/test_background_lifecycle.py"),
+    ("natural-language background and goal controls", "tests/test_tamfis_code_intent.py"),
+    ("read-only request enforcement", "tests/test_reasoning_plan.py::ReasoningPlanIntegrationTests::test_natural_language_no_edit_constraint_blocks_mutating_shell_calls"),
+    ("simple fixes skip formal planning", "tests/test_reasoning_plan.py::ReasoningPlanIntegrationTests::test_simple_single_file_fix_skips_formal_planning"),
+    ("failed plans replan once", "tests/test_reasoning_plan.py::ReasoningPlanIntegrationTests::test_plan_is_revised_once_tool_evidence_invalidates_it"),
+    ("plan progress uses semantic evidence", "tests/test_orchestrator.py"),
 )
 
 
@@ -107,10 +119,16 @@ def main() -> int:
         print("Missing evidence: " + ", ".join(failures))
         return 1
     if args.verify:
+        scenario_tests = [node_id for _, node_id in BEHAVIOR_SCENARIOS]
         completed = subprocess.run(
-            ["python3", "-m", "pytest", "-q", *VERIFY_TESTS], cwd=ROOT, check=False,
+            ["python3", "-m", "pytest", "-q", *VERIFY_TESTS, *scenario_tests],
+            cwd=ROOT,
+            check=False,
         )
-        print(f"Behavioral verification: {'PASS' if completed.returncode == 0 else 'FAIL'}")
+        result = "PASS" if completed.returncode == 0 else "FAIL"
+        print(f"Behavioral verification: {result} ({len(BEHAVIOR_SCENARIOS)} named scenarios)")
+        for name, _ in BEHAVIOR_SCENARIOS:
+            print(f"  - {name}")
         return completed.returncode
     return 0
 

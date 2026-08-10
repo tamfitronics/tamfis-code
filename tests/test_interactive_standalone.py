@@ -533,6 +533,56 @@ class StandaloneAiDispatchTests(_StatePatchMixin, unittest.TestCase):
             output = _run(["fix the bug", EOFError()])
         self.assertIn("Done.", output)
 
+    def test_natural_language_background_request_spawns_detached_job(self):
+        from tamfis_code.background import BackgroundJob
+
+        fake_job = BackgroundJob(
+            id="bg-interactive", pid=1234, session_id=1, workspace_root="/tmp",
+            mode="coding", objective_preview="inspect status", log_path="/tmp/job.log",
+            prompt_path="/tmp/job.prompt", started_at=0.0,
+        )
+        with patch(
+            "tamfis_code.background.spawn_background_task", return_value=fake_job,
+        ) as spawn, patch("tamfis_code.interactive.run_local_agent_turn", new=AsyncMock()) as turn:
+            output = _run(["inspect status and work in the background", EOFError()])
+
+        self.assertIn("Started in background", output)
+        self.assertIn("bg-interactive", output)
+        spawn.assert_called_once()
+        turn.assert_not_awaited()
+
+    def test_goal_objective_spawns_a_goal_job(self):
+        from tamfis_code.background import BackgroundJob
+
+        fake_job = BackgroundJob(
+            id="bg-goal", pid=1234, session_id=1, workspace_root="/tmp",
+            mode="coding", objective_preview="migrate", log_path="/tmp/job.log",
+            prompt_path="/tmp/job.prompt", started_at=0.0, goal=True,
+        )
+        with patch(
+            "tamfis_code.background.spawn_background_task", return_value=fake_job,
+        ) as spawn:
+            output = _run(["/goal migrate the service and pass all tests", EOFError()])
+
+        self.assertIn("Started in background", output)
+        self.assertTrue(spawn.call_args.kwargs["goal"])
+
+    def test_goal_pause_controls_latest_session_goal(self):
+        goal = {
+            "id": "bg-goal", "pid": 1234, "session_id": 1,
+            "workspace_root": "/tmp", "mode": "coding",
+            "objective_preview": "migrate", "log_path": "/tmp/job.log",
+            "prompt_path": "/tmp/job.prompt", "started_at": 2.0,
+            "status": "running", "goal": True,
+        }
+        with patch("tamfis_code.background.list_jobs", return_value=[goal]), patch(
+            "tamfis_code.background.stop_job", return_value=True,
+        ) as stop:
+            output = _run(["/goal pause", EOFError()])
+
+        self.assertIn("Paused", output)
+        stop.assert_called_once_with("bg-goal")
+
     def test_retry_with_no_previous_turn(self):
         output = _run(["/retry", EOFError()])
         self.assertIn("No previous turn", output)

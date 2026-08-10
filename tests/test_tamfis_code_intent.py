@@ -60,6 +60,33 @@ class ParseIntentTests(unittest.TestCase):
         self.assertEqual(intent.mode, "coding")
         self.assertEqual(intent.objective, "hello there, please help")
 
+    def test_background_command_creates_background_ai_intent(self):
+        intent = parse_intent("/background inspect the attachment pipeline")
+        self.assertEqual(intent.kind, "ai")
+        self.assertEqual(intent.objective, "inspect the attachment pipeline")
+        self.assertTrue(intent.background)
+
+    def test_natural_language_background_directive_is_honoured(self):
+        for text in (
+            "inspect status and work in the background",
+            "read the report. working in the background",
+            "check the pipeline. workin in the backgorund",
+        ):
+            self.assertTrue(parse_intent(text).background, text)
+
+    def test_background_discussion_is_not_mistaken_for_run_control(self):
+        self.assertFalse(parse_intent("explain how background jobs work").background)
+
+    def test_goal_objective_and_controls_are_distinct(self):
+        objective = parse_intent("/goal migrate the service and pass all tests")
+        self.assertTrue(objective.background)
+        self.assertTrue(objective.goal)
+        self.assertEqual(objective.objective, "migrate the service and pass all tests")
+        for command in ("status", "pause", "cancel", "resume"):
+            control = parse_intent(f"/goal {command}")
+            self.assertEqual(control.kind, "goal_control")
+            self.assertEqual(control.command, command)
+
     def test_unrecognised_slash_command_falls_through_to_ai_not_shell(self):
         # A typo'd slash command must not silently become a shell
         # execution attempt -- unrecognised prefixes fall through to the

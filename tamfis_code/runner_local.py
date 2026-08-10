@@ -50,7 +50,6 @@ from .render import (
     suspend_live_async_if_active,
     suspend_live_if_active,
 )
-from .routing import classify_task
 from .orchestrator import (
     AgentOrchestrator,
     ApprovalAction,
@@ -66,9 +65,9 @@ from .orchestrator.planner import create_plan
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk
+from .permissions import decide_permission
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import (
-    READ_ONLY_TOOLS,
     _unified_diff,
     classify_tool_call_risk,
     redact_secrets,
@@ -192,7 +191,7 @@ FABRICATED_RESULT_CORRECTION = (
 # Threshold for _round_tool_outcome's failure-streak guard, above.
 CONSECUTIVE_FAILED_ROUNDS_BEFORE_DIAGNOSIS_NUDGE = 3
 FAILURE_DIAGNOSIS_CORRECTION = (
-    f"Every tool call has failed for {{count}} rounds in a row, each with a different attempt "
+    "Every tool call has failed for {count} rounds in a row, each with a different attempt "
     "that still didn't work. Stop trying another fix blind. Before changing anything else: "
     "re-read the exact error/output text already returned by the last failed call(s) -- the "
     "real cause is usually stated there -- and, if relevant, inspect actual evidence (a log "
@@ -4172,7 +4171,10 @@ async def _run_local_agent_turn_impl(
     )
     orchestration = orchestrator.begin(objective=objective, messages=messages, read_only=read_only)
     task_profile = orchestration.profile
-    selected_tool_names = allowed_tools(task_profile, read_only=read_only)
+    turn_read_only = read_only or getattr(task_profile.task_type, "value", "") in {
+        "inspect", "audit", "plan",
+    }
+    selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
     )
@@ -4190,7 +4192,7 @@ async def _run_local_agent_turn_impl(
     # never has to be told about them mid-turn.
     if tools:
         tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA, READ_BACKGROUND_JOB_TOOL_SCHEMA]
-        if allow_swarm_tool and not read_only and cli_config is not None and cli_config.enable_subagent_delegation:
+        if allow_swarm_tool and not turn_read_only and cli_config is not None and cli_config.enable_subagent_delegation:
             tools = [*tools, SWARM_TOOL_SCHEMA]
 
     working_messages = list(orchestration.context.messages if orchestration.context else messages)
@@ -4240,7 +4242,7 @@ async def _run_local_agent_turn_impl(
             },
         })
         local_state.save_turn_checkpoint(
-            session_id, objective=objective, mode=("read_only" if read_only else "execute"),
+            session_id, objective=objective, mode=("read_only" if turn_read_only else "execute"),
             messages=messages, status="failed", last_error=message,
         )
         return TaskOutcome(status="failed", error=message)
@@ -4274,7 +4276,7 @@ async def _run_local_agent_turn_impl(
     })
     if resumed_from_checkpoint or resumed_from_legacy or _requests_autonomous_execution(incoming_objective):
         working_messages.insert(insert_at + 1, {"role": "system", "content": RESUME_EXECUTION_INSTRUCTION})
-    checkpoint_mode = str(prior_checkpoint.get("mode") or ("read_only" if read_only else "execute"))
+    checkpoint_mode = str(prior_checkpoint.get("mode") or ("read_only" if turn_read_only else "execute"))
     checkpoint_partial_parts: list[str] = []
     last_checkpoint_at = 0.0
 
@@ -4471,7 +4473,7 @@ async def _run_local_agent_turn_impl(
     # Repair / Validate / Report" text for a one-line typo fix and a
     # full-stack audit alike. A failure here (bad JSON, provider error)
     # silently keeps the template; the turn is never blocked on this.
-    if should_plan(task_profile):
+    if should_plan(task_profile, objective):
         planning_reconnaissance = _build_planning_reconnaissance(
             workspace_root, scope_roots, objective,
         )
@@ -4561,7 +4563,7 @@ async def _run_local_agent_turn_impl(
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
-    validation_commands = [] if read_only else detect_validation_commands(Path(workspace_root))
+    validation_commands = [] if turn_read_only else detect_validation_commands(Path(workspace_root))
     validation_confirmed: set[str] = set()
     validation_retries: dict[str, int] = {}
     validation_errors: dict[str, str] = {}
@@ -4678,7 +4680,7 @@ async def _run_local_agent_turn_impl(
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
         elif (
-            not read_only
+            not turn_read_only
             and not any_mutation
             and _looks_like_change_request(_latest_user_text(messages))
             and not verified_no_change_completion(
@@ -5984,12 +5986,19 @@ async def _run_local_agent_turn_impl(
         # to the existing per-call prompt below unchanged.
         _turn_batch = ApprovalBatch()
         _turn_batch_args: dict[str, dict[str, Any]] = {}
+        _turn_permission_decisions = {}
         for _tc in tool_calls:
             try:
                 _tc_args = json.loads(_tc.arguments or "{}")
             except json.JSONDecodeError:
                 _tc_args = {}
             _turn_batch_args[_tc.call_id] = _tc_args
+            _turn_permission_decisions[_tc.call_id] = decide_permission(
+                _tc.name, _tc_args, workspace_root=workspace_root,
+                allow=effective_config.permission_allow,
+                ask=effective_config.permission_ask,
+                deny=effective_config.permission_deny,
+            )
             _tc_risk = classify_tool_call_risk(_tc.name, _tc_args, workspace_root=workspace_root)
             _turn_batch.add(ApprovalAction(
                 _tc.name, _tc_args, purpose=f"Execute {_tc.name}", risk=_tc_risk,
@@ -6000,8 +6009,9 @@ async def _run_local_agent_turn_impl(
         _risky_batch_actions = _turn_batch.risky_actions
         if (
             len(_risky_batch_actions) > 1
-            and not read_only
+            and not turn_read_only
             and _turn_batch.highest_risk not in session_approved_risks
+            and not any(_turn_permission_decisions.values())
         ):
             combined_text = describe_batch(_turn_batch)
             await suspend_live_async_if_active(renderer)
@@ -6231,12 +6241,19 @@ async def _run_local_agent_turn_impl(
                 continue
 
             risk = classify_tool_call_risk(tc.name, arguments, workspace_root=workspace_root)
+            permission_decision = _turn_permission_decisions.get(tc.call_id)
 
-            if read_only and risk != "read_only":
+            if turn_read_only and risk != "read_only":
                 result = {
                     "error": f"'{tc.name}' is not available in read-only mode with these arguments.",
                     "success": False,
                 }
+                working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
+                renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                continue
+
+            if permission_decision is not None and permission_decision.action == "deny":
+                result = {"error": permission_decision.reason, "success": False, "permission_rule": permission_decision.rule}
                 working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                 continue
@@ -6248,7 +6265,12 @@ async def _run_local_agent_turn_impl(
                 continue
 
             if (
-                risk != "read_only" and risk not in session_approved_risks
+                risk != "read_only"
+                and (permission_decision is None or permission_decision.action != "allow")
+                and (
+                    permission_decision is not None and permission_decision.action == "ask"
+                    or risk not in session_approved_risks
+                )
                 and tc.call_id not in _batch_approved_once_ids
             ):
                 # The live status line redraws on its own timer (independent
@@ -6264,6 +6286,8 @@ async def _run_local_agent_turn_impl(
                 await suspend_live_async_if_active(renderer)
                 orchestrator.waiting_for_approval(f"Approve {tc.name}")
                 reason = "The agent requested this command."
+                if permission_decision is not None:
+                    reason = permission_decision.reason
                 external_scope_paths = list(arguments.get(_EXTERNAL_SCOPE_PATHS_KEY) or [])
                 if external_scope_paths:
                     reason = (
@@ -6316,7 +6340,9 @@ async def _run_local_agent_turn_impl(
                 # (matches runner.py's remote-path fix for the same trap).
                 try:
                     decision = await resolve_approval_decision_async(
-                        console, display_command, risk, _effective_approval_policy(), interactive,
+                        console, display_command, risk,
+                        "ask" if permission_decision is not None and permission_decision.action == "ask" else _effective_approval_policy(),
+                        interactive,
                         display_preview=False, config=cli_config,
                     )
                 finally:
@@ -6562,16 +6588,14 @@ async def _run_local_agent_turn_impl(
                 },
             })
 
-        # Adaptive replanning: the plan above (whether reasoning-based or
-        # the deterministic template) was necessarily made before any tool
-        # had actually run -- a guess. Once real evidence exists (this
-        # round executed at least one tool call), revise it once, grounded
-        # in what was actually found, rather than letting the turn keep
-        # working off a guess for its whole duration. Bounded to once per
-        # turn -- this is a course-correction, not continuous re-planning.
+        # Adaptive replanning is recovery, not routine narration. Revise at
+        # most once when a tool failure provides concrete evidence that the
+        # current plan is wrong or incomplete; successful progress continues
+        # against the existing plan without a redundant planning round.
         if (
-            tool_calls and not replanned_after_evidence and should_plan(task_profile)
+            tool_calls and not replanned_after_evidence and should_plan(task_profile, objective)
             and orchestrator.run is not None and orchestrator.run.plan is not None
+            and any(outcome is False for outcome in _round_outcomes)
         ):
             replanned_after_evidence = True
             revised_plan = await _attempt_reasoning_plan(

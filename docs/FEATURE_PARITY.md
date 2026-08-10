@@ -1,6 +1,6 @@
 # Coding-agent feature parity benchmark
 
-Snapshot date: 2026-08-03.
+Snapshot date: 2026-08-10.
 
 This is a feature-presence benchmark, not a model-quality benchmark. A `yes`
 means the feature is implemented in TamfisGPT Code or documented by the named
@@ -16,8 +16,12 @@ python3 benchmarks/feature_parity.py --verify
 ```
 
 Pass 1 scans the current source tree for implementation evidence. Pass 2 runs
-focused behavioral tests covering custom agents, hooks, MCP, swarms, safety,
-and public rendering. The executable matrix is the source of truth for scores.
+focused tests plus seven named behavioral regression scenarios. Those scenarios
+exercise persistent permission precedence and protected paths, exactly-once
+background result reinjection, natural-language background and goal controls,
+read-only enforcement, proportional planning, failure-triggered replanning,
+and semantic plan progress. The executable matrix is the source of truth for
+feature-presence scores; the behavioral pass is reported separately.
 
 Current result: TamfisGPT Code scores **24/24 (100%)** against the combined
 feature union. The former material gaps now have executable surfaces:
@@ -31,6 +35,10 @@ feature union. The former material gaps now have executable surfaces:
 
 This score remains a feature-presence result. It does not mean every vendor's
 UI or proprietary hosted service has been cloned.
+
+The behavioral result is intentionally not converted into a competitor score:
+vendor documentation can establish that a surface exists, but not that another
+implementation passes the same local scenarios.
 
 The competitor entries are grounded in vendor documentation:
 

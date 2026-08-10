@@ -140,6 +140,30 @@ class LoadConfigTests(unittest.TestCase):
         cfg = config_module.load_config()
         self.assertFalse(cfg.enable_subagent_delegation)
 
+    def test_permission_rules_load_from_user_config(self):
+        config_module.USER_CONFIG_PATH.write_text(
+            '[permissions]\nallow = ["execute_command(pytest *)"]\n'
+            'ask = ["edit_file(src/*)"]\ndeny = ["execute_command(*push*)"]\n'
+        )
+        cfg = config_module.load_config()
+        self.assertEqual(cfg.permission_allow, ["execute_command(pytest *)"])
+        self.assertEqual(cfg.permission_ask, ["edit_file(src/*)"])
+        self.assertEqual(cfg.permission_deny, ["execute_command(*push*)"])
+
+    def test_project_permission_rules_extend_user_rules(self):
+        config_module.USER_CONFIG_PATH.write_text(
+            '[permissions]\nallow = ["execute_command(pytest *)"]\n'
+        )
+        project_root = Path(self.tmpdir.name) / "project"
+        (project_root / ".tamfis").mkdir(parents=True)
+        (project_root / ".tamfis" / "config.toml").write_text(
+            '[permissions]\nallow = ["execute_command(npm test*)"]\n'
+        )
+        cfg = config_module.load_config(project_root=project_root)
+        self.assertEqual(cfg.permission_allow, [
+            "execute_command(pytest *)", "execute_command(npm test*)",
+        ])
+
     def test_subagent_delegation_enabled_via_config_file(self):
         config_module.USER_CONFIG_PATH.write_text('enable_subagent_delegation = true\n')
         cfg = config_module.load_config()
