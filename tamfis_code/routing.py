@@ -74,6 +74,19 @@ _EXPLICIT_READ_ONLY_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Checkpoint recovery appends the newest instruction using this marker (see
+# runner_local.py). A prior objective may legitimately say "no file edits",
+# while the user later changes direction with "fix it". Treating the combined
+# text as one timeless instruction made that stale restriction permanently
+# sticky and stripped write/test tools from every resumed turn.
+_ADDITIONAL_CONTEXT_MARKER = "additional user context:"
+_EXPLICIT_MUTATION_RE = re.compile(
+    r"(?:\bfix\b|\brepair\b|\bpatch\b|\bimplement\b|\bapply\b.{0,24}\bfix\b|"
+    r"\bmake\b.{0,24}\bchanges?\b|\bedit\b|\bmodify\b|\brewrite\b|"
+    r"\bwrite\b.{0,24}\bfiles?\b|\bcommit\b|\bpush\b|\brestart\b|\binstall\b)",
+    re.IGNORECASE,
+)
+
 
 def is_explicit_read_only_request(text: str) -> bool:
     """Return whether the user explicitly prohibited repository mutation.
@@ -83,7 +96,16 @@ def is_explicit_read_only_request(text: str) -> bool:
     from later being reclassified as an unfinished edit merely because it
     mentions a fix report or says "no file edit".
     """
-    return _EXPLICIT_READ_ONLY_RE.search(text or "") is not None
+    value = text or ""
+    lowered = value.lower()
+    if _ADDITIONAL_CONTEXT_MARKER in lowered:
+        latest = lowered.rsplit(_ADDITIONAL_CONTEXT_MARKER, 1)[-1]
+        # The latest instruction is authoritative when it explicitly asks
+        # for mutation. A bare "continue" still inherits the recovered
+        # objective's read-only constraint.
+        if _EXPLICIT_MUTATION_RE.search(latest) and not _EXPLICIT_READ_ONLY_RE.search(latest):
+            return False
+    return _EXPLICIT_READ_ONLY_RE.search(value) is not None
 
 
 def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:

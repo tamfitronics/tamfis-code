@@ -60,6 +60,32 @@ def test_exact_background_status_prompt_has_shared_read_only_intent():
     assert classify_task(text).task_type == TaskType.INSPECT
 
 
+def test_latest_fix_request_overrides_recovered_read_only_constraint():
+    text = (
+        "Review the repository and provide recommendations. No file edits."
+        "\n\nAdditional user context: Fix it, run the tests, and commit the changes."
+    )
+
+    assert is_explicit_read_only_request(text) is False
+    profile = classify_task(text)
+    assert profile.task_type == TaskType.DEBUG
+    assert profile.requires_validation
+    assert "edit_file" in allowed_tools(profile, read_only=False)
+    assert "execute_command" in allowed_tools(profile, read_only=False)
+
+
+def test_terse_continue_inherits_recovered_read_only_constraint():
+    text = (
+        "Review the repository and provide recommendations. No file edits."
+        "\n\nAdditional user context: Continue."
+    )
+
+    assert is_explicit_read_only_request(text) is True
+    profile = classify_task(text)
+    assert profile.task_type == TaskType.INSPECT
+    assert "edit_file" not in allowed_tools(profile, read_only=False)
+
+
 def test_read_only_fix_recommendations_do_not_become_a_debug_task():
     for text in (
         "review the fix progress and provide recommendations only",
