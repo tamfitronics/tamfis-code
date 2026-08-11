@@ -181,6 +181,45 @@ _SESSION_STATUS_LABEL = {
 }
 
 
+def _replaceable_session_ids(workspace_root: Path) -> list[int]:
+    """Old local sessions that may be erased behind an explicit user gate.
+
+    Recheck liveness both when presenting the gate and immediately before
+    deletion: a session that another process has started using must never be
+    erased because it happened to be stale when the picker first rendered.
+    """
+    root = str(workspace_root.resolve())
+    replaceable: list[int] = []
+    for session_id in local_state.all_known_session_ids():
+        state = local_state.get_session_state(session_id)
+        if state.is_swarm_child:
+            continue
+        if (state.primary_workspace or state.workspace_root) != root:
+            continue
+        if local_state.is_session_actively_running(state):
+            continue
+        replaceable.append(session_id)
+    return replaceable
+
+
+def _approve_new_session_replacement(
+    console: Console, workspace_root: Path, candidates,
+) -> int:
+    replaceable = _replaceable_session_ids(workspace_root)
+    if replaceable and not click.confirm(
+        "Start a new session and erase old local session"
+        f"{'s' if len(replaceable) != 1 else ''} "
+        f"{', '.join(str(item) for item in replaceable)} from active listings? "
+        "Recovery checkpoints and evidence will be retained.",
+        default=False,
+    ):
+        console.print(
+            f"[dim]New session cancelled; resuming session {candidates[0].session_id}.[/dim]"
+        )
+        return candidates[0].session_id
+    return 0
+
+
 def _offer_recent_session_picker(console: Console, workspace_root: Path) -> Optional[int]:
     """On a bare `tamfis-code` launch, show up to 3 of the most recently
     touched local sessions already pointed at this workspace and let the
@@ -190,8 +229,8 @@ def _offer_recent_session_picker(console: Console, workspace_root: Path) -> Opti
     Each entry's status distinguishes a session actively running in another
     terminal right now from one a killed process/crash left interrupted, so
     the user isn't guessing which is safe to pick back up. Returns the
-    chosen session id, or None to fall through to the normal resolve/reuse
-    flow (a fresh session, or the one idle match if there is exactly one).
+    chosen session id, ``0`` when the user explicitly asks to start new, or
+    None to fall through to the normal non-interactive resolve/reuse flow.
 
     Skipped outright for non-interactive invocations (piped stdin/stdout,
     CI, scripted `--output-mode json`) and when there is nothing to offer.
@@ -214,15 +253,15 @@ def _offer_recent_session_picker(console: Console, workspace_root: Path) -> Opti
         "Resume which session?", default="n", show_default=False,
     ).strip().lower()
     if choice in ("", "n", "new"):
-        return None
+        return _approve_new_session_replacement(console, workspace_root, candidates)
     try:
         index = int(choice)
     except ValueError:
         console.print(f"[dim]'{choice}' not recognised -- starting a new session.[/dim]")
-        return None
+        return _approve_new_session_replacement(console, workspace_root, candidates)
     if not (1 <= index <= len(candidates)):
         console.print(f"[dim]No option {choice} -- starting a new session.[/dim]")
-        return None
+        return _approve_new_session_replacement(console, workspace_root, candidates)
     return candidates[index - 1].session_id
 
 
@@ -236,7 +275,31 @@ async def _interactive_entry(
 
     if not _use_remote(config, remote):
         chosen_session_id = _offer_recent_session_picker(console, workspace_root)
-        workspace = resolve_local_workspace(workspace_root, session_id=chosen_session_id)
+        replaced_session_ids = (
+            _replaceable_session_ids(workspace_root)
+            if chosen_session_id == 0 else []
+        )
+        workspace = resolve_local_workspace(
+            workspace_root,
+            session_id=chosen_session_id or None,
+            force_new=chosen_session_id == 0,
+        )
+        cleared_session_ids = []
+        for old_session_id in replaced_session_ids:
+            # Liveness is deliberately checked again after the approval gate
+            # to close the race where another terminal resumes the old row.
+            old_state = local_state.get_session_state(old_session_id)
+            if local_state.is_session_actively_running(old_state):
+                continue
+            if local_state.clear_session_state(old_session_id):
+                cleared_session_ids.append(old_session_id)
+        if cleared_session_ids:
+            console.print(
+                "[dim]Cleared replaced local session"
+                f"{'s' if len(cleared_session_ids) != 1 else ''}: "
+                f"{', '.join(str(item) for item in cleared_session_ids)}. "
+                "Recovery archives retained.[/dim]"
+            )
         await run_interactive(None, config, workspace, provider=provider, model=model)
         return
 
@@ -884,6 +947,38 @@ async def sessions(ctx: click.Context, remote: bool, show_all: bool):
     for row in rows:
         table.add_row(str(row.get("id")), str(row.get("server_name")), str(row.get("status")), str(row.get("working_directory") or ""), str(row.get("command_count")))
     console.print(table)
+
+
+@cli.command(name="clear-session")
+@click.argument("session_id", type=int)
+@click.option(
+    "--force", is_flag=True, default=False,
+    help="Clear even if another local process appears to be actively using the session.",
+)
+@click.pass_context
+def clear_session(ctx: click.Context, session_id: int, force: bool):
+    """Remove a local session from active listings and workspace reuse.
+
+    Recovery checkpoints, evidence, and the last memory snapshot are kept.
+    Remote-backend sessions are not affected.
+    """
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+    if session_id not in local_state.all_known_session_ids():
+        print_error(console, f"No known local session {session_id}.")
+        raise SystemExit(EXIT_TASK_FAILED)
+    state = local_state.get_session_state(session_id)
+    if local_state.is_session_actively_running(state) and not force:
+        print_error(
+            console,
+            f"Session {session_id} appears active. Stop its task first, or rerun with --force.",
+        )
+        raise SystemExit(EXIT_TASK_FAILED)
+    local_state.clear_session_state(session_id)
+    console.print(
+        f"[green]Cleared local session {session_id}.[/green] "
+        "[dim]Recovery checkpoints and evidence were retained.[/dim]"
+    )
 
 
 @cli.command()

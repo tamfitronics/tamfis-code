@@ -101,6 +101,15 @@ operation is available non-interactively with `tamfis-code fork [session_id]`;
 resume the new ID printed by the command. Conversation and repository context
 are copied, while in-flight tasks and queued instructions are deliberately not.
 
+Use `tamfis-code clear-session <session_id>` to remove a stopped or stale local
+session from active listings and prevent it from being reused for that
+workspace. A session that still appears live is protected unless `--force` is
+given. Recovery checkpoints, evidence, and the last `.memory` snapshot are
+retained. Choosing **Start a new session** at the interactive startup picker
+shows a separate confirmation gate naming the replaceable old session IDs. If
+approved, those old sessions are erased from active listings after the new
+session is created; declining the gate resumes the most recent old session.
+
 Job status is one of `running`, `completed`, `failed`, or `stopped`. `--bg`
 is not available while creating a plan (the completed plan must first be
 saved locally), but a saved plan can be launched with `execute-plan --bg`.

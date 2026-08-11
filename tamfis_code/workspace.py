@@ -414,7 +414,7 @@ def _next_local_session_id() -> int:
 
 def resolve_local_workspace(
     cwd: Optional[Path] = None, *, discover: bool = True,
-    session_id: Optional[int] = None,
+    session_id: Optional[int] = None, force_new: bool = False,
 ) -> WorkspaceContext:
     """Resolve a launch directory into a purely local session -- no network
     calls, no RemoteAPIClient, no remote-assigned session/server id.
@@ -448,7 +448,7 @@ def resolve_local_workspace(
     """
     workspace_root = str((cwd or Path.cwd()).resolve())
 
-    if session_id is None:
+    if session_id is None and not force_new:
         local_match = next((
             sid for sid in reversed(local_state.all_known_session_ids())
             if (candidate := local_state.get_session_state(sid)).primary_workspace == workspace_root
@@ -456,6 +456,20 @@ def resolve_local_workspace(
             and not local_state.is_session_actively_running(candidate)
         ), None)
         session_id = local_match if local_match is not None else _next_local_session_id()
+    elif session_id is None:
+        session_id = _next_local_session_id()
+
+    # Reopening a crashed session used to refresh updated_at while preserving
+    # execution_status="running", making a dead task look newly live forever.
+    # Reconcile the stale lifecycle before workspace bookkeeping touches it.
+    existing = local_state.get_session_state(session_id)
+    if (
+        existing.execution_status in {"running", "backgrounded"}
+        and not local_state.is_session_actively_running(existing)
+    ):
+        local_state.save_session_state(
+            session_id, execution_status="interrupted", running_action=None,
+        )
 
     configured_roots = load_config(project_root=Path(workspace_root)).workspace_roots
     allowed_roots = list(dict.fromkeys([workspace_root, *configured_roots]))
@@ -464,6 +478,18 @@ def resolve_local_workspace(
         workspace_root=workspace_root,
         allowed_workspaces=allowed_roots,
     )
+    if force_new:
+        for prior_id in local_state.all_known_session_ids():
+            if prior_id == session_id:
+                continue
+            prior = local_state.get_session_state(prior_id)
+            if (
+                not prior.is_swarm_child
+                and (prior.primary_workspace or prior.workspace_root) == workspace_root
+            ):
+                local_state.mark_stale_session_superseded(
+                    prior_id, replacement_session_id=session_id,
+                )
     if discover:
         discover_local_repository(session_id, Path(workspace_root))
     return WorkspaceContext(session_id=session_id, workspace_root=workspace_root)

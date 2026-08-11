@@ -358,6 +358,42 @@ class ResolveLocalWorkspaceTests(unittest.TestCase):
             state_module._save_raw(data)
             second = resolve_local_workspace(cwd=Path(proj), discover=False)
         self.assertEqual(first.session_id, second.session_id)
+        reconciled = state_module.get_session_state(first.session_id)
+        self.assertEqual(reconciled.execution_status, "interrupted")
+        self.assertIsNone(reconciled.running_action)
+
+    def test_force_new_supersedes_stale_task_but_preserves_checkpoint(self):
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id,
+                execution_status="running",
+                active_task={"objective": "old task"},
+                running_action={"purpose": "old action"},
+                turn_checkpoint={"status": "running", "objective": "old task"},
+            )
+            data = state_module._load_raw()
+            data[str(first.session_id)]["updated_at"] = (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            ).isoformat()
+            state_module._save_raw(data)
+
+            replacement = resolve_local_workspace(
+                cwd=Path(proj), discover=False, force_new=True,
+            )
+
+        self.assertNotEqual(first.session_id, replacement.session_id)
+        superseded = state_module.get_session_state(first.session_id)
+        self.assertEqual(superseded.execution_status, "superseded")
+        self.assertIsNone(superseded.active_task)
+        self.assertIsNone(superseded.running_action)
+        self.assertEqual(superseded.turn_checkpoint["status"], "superseded")
+        self.assertEqual(
+            superseded.turn_checkpoint["superseded_by_session_id"],
+            replacement.session_id,
+        )
 
     def test_idle_session_is_still_reused(self):
         with tempfile.TemporaryDirectory() as proj:

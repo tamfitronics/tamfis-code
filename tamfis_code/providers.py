@@ -4,22 +4,11 @@ Supports Ollama Cloud, xAI Grok, NVIDIA NIM, Hugging Face, OpenRouter, the
 TamfisGPT subscription API, and the internal Tier IV orchestration service
 through a canonical OpenAI-compatible client interface.
 
-Automatic standalone routing:
-    1. Ollama Cloud
-       - Current/default: gemma4:cloud
-       - Priority coding/agent: kimi-k2.7-code:cloud
-       - Free/included-plan alternates: glm-5.2:cloud, kimi-k3:cloud (opt-in),
-         minimax-m3:cloud
-    2. NVIDIA NIM
-    3. Hugging Face
-    4. OpenRouter
-    5. xAI Grok (direct native endpoint, api.x.ai/v1) -- last resort, on cost
-       grounds. Enabled by setting GROK_API_KEY in .env. Deliberately placed
-       behind every other paid provider (2026-08-06, operator request: xAI
-       usage was running real billed spend within the first week) so Ollama
-       Cloud's included models get first crack at everything, then the
-       cheaper/free-tier NIM, HF, and OpenRouter routes, before Grok is ever
-       touched. Still directly selectable by name at any time.
+Automatic standalone routing uses an operator-approved weighted pool after
+capability/availability filtering: NVIDIA NIM 40%; Ollama Cloud, Hugging Face,
+OpenRouter, and xAI Grok 15% each. Missing/ineligible routes are removed and
+the remaining weights are naturally renormalized. Tamfis/Tier IV/local routes
+remain explicitly selectable compatibility routes, not AUTO candidates.
 
 Ollama Cloud is accessed through the signed-in local Ollama daemon at
 ``http://127.0.0.1:11434/v1``. The daemon forwards ``:cloud`` models to
@@ -33,6 +22,7 @@ packages use process/user configuration and never assume a builder's path.
 from __future__ import annotations
 
 import os
+import random
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -236,12 +226,8 @@ class ProviderConfig:
 class ProviderManager:
     """Initialise, inspect, rank, and access configured AI providers."""
 
-    # NIM first (2026-08-08, was Ollama Cloud first): Ollama Cloud's weekly
-    # usage limit is a real multi-day-reset HTTP 429, not transient -- being
-    # first here meant it absorbed the bulk of auto-routed traffic and
-    # burned that quota out repeatedly. This tuple, not the `.priority`
-    # field on each ProviderConfig, is what routing_order/fallback_chain_names
-    # actually iterate, so it has to move here, not just there.
+    # Deterministic fallback order after an already-selected route fails.
+    # Initial AUTO selection uses AUTO_PROVIDER_WEIGHTS below instead.
     PRIORITY_ORDER: tuple[ProviderType, ...] = (
         ProviderType.NVIDIA,
         ProviderType.OLLAMA_CLOUD,
@@ -254,6 +240,19 @@ class ProviderManager:
         ProviderType.TAMFIS,
         ProviderType.TIER_IV,
     )
+
+    # AUTO is a weighted pool, not the fixed fallback order above. These
+    # operator-approved shares total exactly 100 when every route is healthy:
+    # NIM gets the larger 40% share; the four remaining cloud providers get
+    # equal 15% shares. TAMFIS/TIER_IV/LOCAL remain explicitly selectable but
+    # are not part of standalone automatic routing.
+    AUTO_PROVIDER_WEIGHTS: dict[ProviderType, int] = {
+        ProviderType.NVIDIA: 40,
+        ProviderType.OLLAMA_CLOUD: 15,
+        ProviderType.HF: 15,
+        ProviderType.OPENROUTER: 15,
+        ProviderType.GROK: 15,
+    }
 
     PROVIDERS: Dict[ProviderType, ProviderConfig] = {
         ProviderType.OLLAMA_CLOUD: ProviderConfig(
@@ -310,7 +309,7 @@ class ProviderManager:
             # priority 0 (see ProviderType.NVIDIA below) as the reliable
             # free-tier default across all subscription tiers/model groups.
             priority=3,
-            weight=10,
+            weight=15,
             reasoning_supported=True,
             vision_supported=True,
             # NOTE: this budget is shared by the whole provider bucket
@@ -364,7 +363,7 @@ class ProviderManager:
             # so this number, not just PRIORITY_ORDER's tuple position, is
             # what actually keeps Grok as the last-tried paid route.
             priority=6,
-            weight=4,
+            weight=15,
             reasoning_supported=True,
             vision_supported=True,
             context_window=256000,
@@ -406,7 +405,7 @@ class ProviderManager:
                 "tamfis-gpt-ultima",
             ],
             priority=4,
-            weight=6,
+            weight=0,  # explicit-only compatibility route; excluded from AUTO
             context_window=128000,
             coding_quality=5,
             tool_calling=True,
@@ -419,9 +418,8 @@ class ProviderManager:
         # agentic/tool-calling flows. Exposed only as an OpenAI-compatible
         # /v1/chat/completions endpoint (confirmed live: no separate
         # routing-decision endpoint exists) -- treated as one more execution
-        # provider rather than a pre-flight routing advisor. Tried
-        # automatically whenever reachable -- see _check_tier_iv_available
-        # -- with TAMFIS_TIER_IV_ENABLED=false as the explicit opt-out.
+        # provider rather than a pre-flight routing advisor. Retained as an
+        # explicit remote compatibility route, not part of weighted AUTO.
         ProviderType.TIER_IV: ProviderConfig(
             name="TamfisGPT Tier IV",
             base_url=f"{os.environ.get('TAMFIS_TIER_IV_URL', 'http://127.0.0.1:9555').rstrip('/')}/v1",
@@ -429,7 +427,7 @@ class ProviderManager:
             default_model="",  # empty -- let Tier IV's own orchestrator pick, same as tamgpt6's own callers do when no model is pinned.
             models=[],
             priority=5,
-            weight=5,
+            weight=0,  # explicit-only compatibility route; excluded from AUTO
             reasoning_supported=True,
             vision_supported=False,
             context_window=128000,
@@ -525,7 +523,7 @@ class ProviderManager:
             # multi-day weekly-quota 429s. See ProviderType.OLLAMA_CLOUD's
             # priority comment above for the incident this responds to.
             priority=0,
-            weight=4,
+            weight=40,
             reasoning_supported=True,
             vision_supported=False,
             context_window=128000,
@@ -564,7 +562,7 @@ class ProviderManager:
                 "moonshotai/Kimi-K2.6",
             ],
             priority=4,
-            weight=3,
+            weight=15,
             reasoning_supported=False,
             vision_supported=True,
             context_window=262144,
@@ -629,7 +627,7 @@ class ProviderManager:
             # with HTTP 402 when the account has no credits. It remains
             # explicitly selectable and is still tried after HF/NVIDIA.
             priority=5,
-            weight=2,
+            weight=15,
             reasoning_supported=True,
             vision_supported=True,
             context_window=200000,
@@ -675,30 +673,27 @@ class ProviderManager:
         return os.environ.get("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false").strip().lower() == "true"
 
     def ollama_cloud_is_premium_primary(self) -> bool:
-        """Whether Ollama Cloud is explicitly forced as AUTO's primary.
+        """Deprecated compatibility hook; AUTO is always weighted now.
 
-        Subscription entitlement and AUTO routing are independent.  The
-        premium flag keeps paid-plan features/models available; only the
-        dedicated AUTO-primary flag may bypass the normal provider order.
+        Premium entitlement still controls Ollama model access, but no
+        environment flag may bypass the operator-approved 40/15/15/15/15
+        provider distribution. Explicit ``--provider ollama_cloud`` remains
+        available when a caller genuinely wants to pin that route.
         """
-        return (
-            self.provider_allowed(ProviderType.OLLAMA_CLOUD)
-            and os.environ.get("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true").strip().lower() == "true"
-            and os.environ.get("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "false").strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        return False
 
     def _fallback_provider_allowed(self, provider: ProviderType) -> bool:
         # These are the agreed automatic recovery providers. OpenRouter is
         # permitted automatically only where a free route exists, unless paid
         # fallback is explicitly enabled.
-        if provider in {
-            ProviderType.OLLAMA_CLOUD,
-            ProviderType.GROK,
-            ProviderType.NVIDIA,
-            ProviderType.HF,
-        }:
+        if provider in self.AUTO_PROVIDER_WEIGHTS:
             return True
+
+        # The Tamfis subscription/local service is retained for explicit
+        # compatibility only. It is not one of the operator-approved cloud
+        # AUTO/fallback routes and must not dilute their 100% distribution.
+        if provider in {ProviderType.TAMFIS, ProviderType.TIER_IV, ProviderType.LOCAL}:
+            return False
 
         config = self.PROVIDERS.get(provider)
         return bool(config and config.free_model) or self.paid_fallback_enabled()
@@ -992,11 +987,12 @@ class ProviderManager:
         quality_mode: str = "quality",
         allowed_providers: Optional[tuple[ProviderType, ...]] = None,
     ) -> ProviderType:
-        """Select the strongest eligible configured provider."""
+        """Select from the capability-eligible weighted AUTO pool."""
 
         available = [
             provider
             for provider in self.routing_order
+            if provider in self.AUTO_PROVIDER_WEIGHTS
             if allowed_providers is None or provider in allowed_providers
             if provider in self.clients and self._has_valid_api_key(provider)
         ]
@@ -1010,10 +1006,6 @@ class ProviderManager:
         requires_long_context = bool(
             getattr(task_profile, "requires_long_context", False)
         )
-        preferred_tier = str(
-            getattr(task_profile, "preferred_quality_tier", quality_mode)
-        )
-
         candidates = available
 
         eligible: List[ProviderType] = []
@@ -1030,35 +1022,9 @@ class ProviderManager:
         if not eligible:
             eligible = candidates
 
-        if quality_mode == "economy" or preferred_tier == "economy":
-            return min(
-                eligible,
-                key=lambda provider: (
-                    self.PROVIDERS[provider].priority,
-                    -self.PROVIDERS[provider].coding_quality,
-                ),
-            )
-
-        if quality_mode == "balanced" or preferred_tier == "balanced":
-            return min(
-                eligible,
-                key=lambda provider: (
-                    self.PROVIDERS[provider].priority,
-                    -self.PROVIDERS[provider].coding_quality,
-                ),
-            )
-
-        # Capability filtering has already happened above. Honour the
-        # explicitly agreed provider order instead of allowing equal quality
-        # scores or context-window size to override priority 1.
-        return min(
-            eligible,
-            key=lambda provider: (
-                self.PROVIDERS[provider].priority,
-                -self.PROVIDERS[provider].coding_quality,
-                -self.PROVIDERS[provider].context_window,
-            ),
-        )
+        del quality_mode  # retained in the public signature for compatibility
+        weights = [self.AUTO_PROVIDER_WEIGHTS[provider] for provider in eligible]
+        return random.choices(eligible, weights=weights, k=1)[0]
 
     @staticmethod
     def provider_error_status(exc: Exception) -> Optional[int]:

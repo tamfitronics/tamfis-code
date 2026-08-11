@@ -12,6 +12,7 @@ from tamfis_code import state as state_module
 from tamfis_code.cli import (
     _apply_pending_update_after_login,
     _explicit_absolute_paths,
+    _interactive_entry,
     _offer_recent_session_picker,
     _print_bg_hint,
     _project_root_for_target,
@@ -147,9 +148,21 @@ class OfferRecentSessionPickerTests(unittest.TestCase):
             state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
             with patch("sys.stdin.isatty", return_value=True), \
                  patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt", return_value="n"):
+                 patch("click.prompt", return_value="n"), \
+                 patch("click.confirm", return_value=True) as confirm:
                 result = _offer_recent_session_picker(self._console, Path(proj))
-        self.assertIsNone(result)
+        self.assertEqual(result, 0)
+        confirm.assert_called_once()
+
+    def test_declining_erase_gate_resumes_old_session_instead(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(7, workspace_root=str(Path(proj).resolve()))
+            with patch("sys.stdin.isatty", return_value=True), \
+                 patch("sys.stdout.isatty", return_value=True), \
+                 patch("click.prompt", return_value="n"), \
+                 patch("click.confirm", return_value=False):
+                result = _offer_recent_session_picker(self._console, Path(proj))
+        self.assertEqual(result, 7)
 
     def test_numeric_choice_returns_the_matching_session_id(self):
         with tempfile.TemporaryDirectory() as proj:
@@ -168,9 +181,22 @@ class OfferRecentSessionPickerTests(unittest.TestCase):
             state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
             with patch("sys.stdin.isatty", return_value=True), \
                  patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt", return_value="9"):
+                 patch("click.prompt", return_value="9"), \
+                 patch("click.confirm", return_value=True):
                 result = _offer_recent_session_picker(self._console, Path(proj))
-        self.assertIsNone(result)
+        self.assertEqual(result, 0)
+
+    def test_approved_new_session_erases_replaced_hot_state(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(1, workspace_root=str(root))
+            run_interactive = AsyncMock()
+            with patch("tamfis_code.cli._offer_recent_session_picker", return_value=0), \
+                 patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+                asyncio.run(_interactive_entry(Config(), root))
+
+        self.assertEqual(state_module.all_known_session_ids(), [2])
+        run_interactive.assert_awaited_once()
 
 
 class PrintBgHintTests(unittest.TestCase):
@@ -213,6 +239,32 @@ class _CliConfigIsolationMixin:
         self.tmp.cleanup()
         if self._env_token is not None:
             os.environ["TAMFIS_CODE_TOKEN"] = self._env_token
+
+
+class ClearSessionCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
+    def test_clears_stale_session_and_keeps_recovery_archive(self):
+        state_module.save_session_state(
+            9004, workspace_root="/home", execution_status="interrupted",
+        )
+        snapshot = state_module.CONFIG_DIR / ".memory" / "session-9004.json"
+
+        result = self.runner.invoke(cli, ["clear-session", "9004"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertNotIn(9004, state_module.all_known_session_ids())
+        self.assertTrue(snapshot.is_file())
+        self.assertIn("Cleared local session 9004", result.output)
+
+    def test_refuses_to_clear_live_session_without_force(self):
+        state_module.save_session_state(
+            7, workspace_root="/repo", execution_status="running",
+        )
+
+        result = self.runner.invoke(cli, ["clear-session", "7"])
+
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn(7, state_module.all_known_session_ids())
+        self.assertIn("appears active", result.output)
 
 
 class LoginCommandTests(_CliConfigIsolationMixin, unittest.TestCase):

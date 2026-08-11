@@ -865,6 +865,51 @@ def all_known_session_ids() -> list[int]:
     return sorted(ids)
 
 
+def clear_session_state(session_id: int) -> bool:
+    """Remove a session from the active local-session registry.
+
+    The realtime ``state.json`` row and in-process copy are removed, which
+    makes the session disappear from ``tamfis-code sessions`` and prevents
+    workspace resolution from reusing it. Checkpoints, evidence, and the
+    human-readable ``.memory`` snapshot are retained as a recovery archive.
+    """
+    data = _load_raw()
+    key = str(int(session_id))
+    existed = key in data or _volatile_key(session_id) in _VOLATILE_STATE
+    if not existed:
+        return False
+    data.pop(key, None)
+    _VOLATILE_STATE.pop(_volatile_key(session_id), None)
+    _save_raw(data)
+    return True
+
+
+def mark_stale_session_superseded(session_id: int, *, replacement_session_id: int) -> bool:
+    """Clear a dead task marker after the user starts a replacement session.
+
+    A session whose timestamp is still inside the liveness window is owned by
+    another process and is left untouched. Conversation and checkpoint data
+    remain available for an explicit later resume.
+    """
+    state = get_session_state(session_id)
+    if state.execution_status not in {"running", "backgrounded"}:
+        return False
+    if is_session_actively_running(state):
+        return False
+    state.execution_status = "superseded"
+    state.current_phase = "idle"
+    state.active_task = None
+    state.running_action = None
+    if state.turn_checkpoint:
+        checkpoint = dict(state.turn_checkpoint)
+        checkpoint["status"] = "superseded"
+        checkpoint["superseded_by_session_id"] = int(replacement_session_id)
+        checkpoint["updated_at"] = _now()
+        state.turn_checkpoint = checkpoint
+    put_session_state(state)
+    return True
+
+
 def fork_session_state(source_session_id: int, target_session_id: Optional[int] = None) -> SessionState:
     """Clone a durable local conversation into a fresh, idle session.
 

@@ -137,23 +137,43 @@ def _manager_with(*providers):
     return manager
 
 
-def test_auto_prefers_nvidia_over_hf_for_audit():
-    # Prior to the Ollama Cloud priority routing change, HF's Qwen 3.6 route
-    # was preferred for audits. PRIORITY_ORDER now ranks NVIDIA (priority=1)
-    # above HF (priority=2) unconditionally, so selection among these three
-    # is purely priority-based regardless of task type -- there is no
-    # audit-specific override in _select_best_provider.
-    manager = _manager_with(ProviderType.HF, ProviderType.NVIDIA, ProviderType.OPENROUTER)
-    assert manager._select_best_provider(classify_task("audit the whole repository")) == ProviderType.NVIDIA
+def test_auto_uses_operator_approved_100_percent_weight_pool(monkeypatch):
+    manager = _manager_with(
+        ProviderType.NVIDIA, ProviderType.OLLAMA_CLOUD, ProviderType.HF,
+        ProviderType.OPENROUTER, ProviderType.GROK, ProviderType.TAMFIS,
+    )
+    observed = {}
+
+    def choose(population, *, weights, k):
+        observed.update(population=list(population), weights=list(weights), k=k)
+        return [ProviderType.NVIDIA]
+
+    monkeypatch.setattr("tamfis_code.providers.random.choices", choose)
+    selected = manager._select_best_provider(classify_task("audit the whole repository"))
+
+    assert selected == ProviderType.NVIDIA
+    assert observed == {
+        "population": [
+            ProviderType.NVIDIA, ProviderType.OLLAMA_CLOUD, ProviderType.HF,
+            ProviderType.OPENROUTER, ProviderType.GROK,
+        ],
+        "weights": [40, 15, 15, 15, 15],
+        "k": 1,
+    }
+    assert sum(observed["weights"]) == 100
 
 
-def test_premium_ollama_is_authoritative_for_auto(monkeypatch):
+def test_legacy_ollama_auto_primary_flag_cannot_bypass_weighted_auto(monkeypatch):
     monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
     manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+    monkeypatch.setattr(
+        "tamfis_code.providers.random.choices",
+        lambda population, **_: [ProviderType.NVIDIA],
+    )
     resolved, _ = manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
-    assert resolved == ProviderType.OLLAMA_CLOUD
+    assert resolved == ProviderType.NVIDIA
 
 
 def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
@@ -190,12 +210,16 @@ def test_premium_ollama_remains_enabled_without_auto_primary(monkeypatch):
             manager.PROVIDERS[ProviderType.OLLAMA_CLOUD], profile
         ) == "kimi-k2.7-code:cloud"
 
-    # But AUTO still must not force Ollama Cloud as primary with the flag
-    # off -- when NVIDIA is also available, NIM (priority 0) wins, not
-    # Ollama Cloud (priority 3), confirming the AUTO-forcing behavior this
-    # dedicated AUTO-primary flag stays off.
+    # AUTO must use the weighted pool rather than force Ollama when this flag
+    # is off. Pin the random draw to NIM to verify resolve_route honours it.
     manager_with_nim = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
-    resolved, _ = manager_with_nim.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    monkeypatch.setattr(
+        "tamfis_code.providers.random.choices",
+        lambda population, **_: [ProviderType.NVIDIA],
+    )
+    resolved, _ = manager_with_nim.resolve_route(
+        ProviderType.AUTO, classify_task("fix the API"),
+    )
     assert resolved == ProviderType.NVIDIA
 
 
@@ -225,30 +249,37 @@ def test_ollama_extra_usage_requires_operator_opt_in_and_heavy_task(monkeypatch)
     ) == "kimi-k3:cloud"
 
 
-def test_premium_ollama_does_not_fallback_to_nvidia(monkeypatch):
+def test_premium_ollama_can_fallback_to_nvidia(monkeypatch):
     monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
     manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
-    assert manager.fallback_candidates(ProviderType.OLLAMA_CLOUD) == []
+    assert manager.fallback_candidates(ProviderType.OLLAMA_CLOUD) == [ProviderType.NVIDIA]
 
 
-def test_unavailable_premium_ollama_fails_explicitly_in_auto(monkeypatch):
+def test_unavailable_premium_ollama_is_removed_from_weighted_auto(monkeypatch):
     monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
     manager = _manager_with(ProviderType.NVIDIA)
-    try:
-        manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
-    except ValueError as exc:
-        assert "Ollama Cloud is enabled as the AUTO primary route" in str(exc)
-    else:
-        raise AssertionError("AUTO silently selected a non-Ollama provider")
+    resolved, _ = manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
+    assert resolved == ProviderType.NVIDIA
 
 
-def test_auto_prefers_openrouter_for_edit_when_nvidia_unavailable():
+def test_auto_renormalizes_equal_weights_when_only_hf_and_openrouter_are_available(monkeypatch):
     manager = _manager_with(ProviderType.OPENROUTER, ProviderType.HF)
-    assert manager._select_best_provider(classify_task("fix and refactor the code")) == ProviderType.HF
+    observed = {}
+
+    def choose(population, *, weights, k):
+        observed.update(population=list(population), weights=list(weights), k=k)
+        return [ProviderType.OPENROUTER]
+
+    monkeypatch.setattr("tamfis_code.providers.random.choices", choose)
+    assert manager._select_best_provider(
+        classify_task("fix and refactor the code"),
+    ) == ProviderType.OPENROUTER
+    assert observed["population"] == [ProviderType.HF, ProviderType.OPENROUTER]
+    assert observed["weights"] == [15, 15]
 
 
 def test_openrouter_default_is_not_openai_family():

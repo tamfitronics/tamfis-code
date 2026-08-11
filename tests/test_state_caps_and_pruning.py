@@ -118,5 +118,18 @@ class LoadRawCacheTests(_StateDirFixture, unittest.TestCase):
         self.assertIn("32", reloaded)
 
 
+class ClearSessionStateTests(_StateDirFixture, unittest.TestCase):
+    def test_clear_removes_hot_state_but_retains_recovery_snapshot(self):
+        state_module.save_session_state(40, workspace_root="/repo")
+        snapshot = state_module.CONFIG_DIR / ".memory" / "session-40.json"
+        self.assertTrue(snapshot.is_file())
+
+        self.assertTrue(state_module.clear_session_state(40))
+
+        self.assertNotIn(40, state_module.all_known_session_ids())
+        self.assertTrue(snapshot.is_file())
+        self.assertFalse(state_module.clear_session_state(40))
+
+
 if __name__ == "__main__":
     unittest.main()
