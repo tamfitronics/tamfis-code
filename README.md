@@ -251,9 +251,12 @@ installable theme archive in one task.
 External MCP servers stay under the local Tamfis Code runtime. Configure them
 in the personal `mcp.json`, project `.mcp.json`, or `.tamfis/mcp.json` using the
 standard `mcpServers` shape; discovered tools are namespaced and enter the same
-approval policy as native tools. Installed Python packages can contribute tools
-and skill roots through the `tamfis_code.plugins` entry-point group. Use
-`tamfis-code plugins` to inspect them.
+approval policy as native tools. Both transports are supported: a local
+stdio server (`{"command": ..., "args": [...]}`) and a remote Streamable
+HTTP server (`{"type": "http", "url": ..., "headers": {...}}`, headers
+optional -- use it for a bearer/API-key token). Installed Python packages
+can contribute tools and skill roots through the `tamfis_code.plugins`
+entry-point group. Use `tamfis-code plugins` to inspect them.
 
 Pass global `--output-mode json` for a single machine-readable event document,
 or `--output-mode jsonl` for streaming events suitable for CI and editors.
