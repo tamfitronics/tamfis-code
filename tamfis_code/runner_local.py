@@ -81,6 +81,7 @@ from .runtime.workspace_authority import (
     auto_grant_explicit_targets,
     resolve_workspace_targets,
 )
+from .orchestrator.repair import choose_repair, classify_failure
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
 # was appropriate for a read-only Q&A loop; a real coding-agent task
@@ -4576,6 +4577,11 @@ async def _run_local_agent_turn_impl(
     # repeated -- this is a course-correction, not a running scold.
     consecutive_failed_rounds = 0
     failure_diagnosis_nudged = False
+    # The deterministic repair classifier describes a safe next move for
+    # concrete tool failures. Track each tool/failure class independently so
+    # a model gets a small, useful repair budget without receiving the same
+    # instruction forever.
+    repair_attempts: dict[tuple[str, str], int] = {}
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
     plan_completion_retries = 0
@@ -6466,6 +6472,32 @@ async def _run_local_agent_turn_impl(
                 "tool_call_id": tc.call_id,
                 "content": json.dumps(result, default=str),
             })
+            if result.get("success") is False:
+                failure = classify_failure(tool_name=tc.name, result=result)
+                repair_key = (tc.name, failure.value)
+                attempt = repair_attempts.get(repair_key, 0)
+                repair = choose_repair(
+                    tool_name=tc.name,
+                    result=result,
+                    attempt=attempt,
+                )
+                repair_attempts[repair_key] = attempt + 1
+                if repair.retry_allowed:
+                    directive = (
+                        f"Tool repair guidance after {tc.name} failed "
+                        f"({repair.failure_class.value}): {repair.strategy}."
+                    )
+                    if repair.force_different_tool:
+                        directive += (
+                            " Do not repeat the same tool call; choose a "
+                            "materially different tool or arguments."
+                        )
+                    working_messages.append({"role": "system", "content": directive})
+                    orchestrator.mark_repair(directive)
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": directive},
+                    })
             if tc.name == "execute_command" and _has_port_conflict(result):
                 port_conflict_seen = True
                 working_messages.append({"role": "system", "content": PORT_CONFLICT_CORRECTION})

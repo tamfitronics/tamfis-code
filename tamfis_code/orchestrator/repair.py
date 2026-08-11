@@ -32,7 +32,11 @@ def classify_failure(*, tool_name: str, result: dict[str, Any] | str) -> Failure
         return FailureClass.TOOL_SCHEMA_ERROR
     if "syntax error near unexpected token" in text or (tool_name == "execute_command" and "printf" in text):
         return FailureClass.SHELL_QUOTING_ERROR
-    if "file not found" in text or "no such file" in text:
+    if (
+        "file not found" in text
+        or "no such file" in text
+        or ("file" in text and "not found" in text)
+    ):
         return FailureClass.FILE_NOT_FOUND
     if "permission denied" in text:
         return FailureClass.PERMISSION_DENIED

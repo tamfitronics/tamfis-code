@@ -295,6 +295,12 @@ class LiveInputListener:
     async def _stop_async(self) -> None:
         """Stop input ownership and wait until prompt-toolkit releases stdin."""
         self._active = False
+        if self._outcome_status and hasattr(self.renderer, "conclude"):
+            # Clear the accumulated "Reading N files..." activity before
+            # prompt-toolkit draws its last teardown frame. Cancellation
+            # bypasses the normal task-completed/failed renderer events, so
+            # this is the only common finalization point for every outcome.
+            self.renderer.conclude(self._outcome_status)
         ticker = self._ticker_task
         self._ticker_task = None
         if ticker is not None and not ticker.done():

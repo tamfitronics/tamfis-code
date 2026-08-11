@@ -563,6 +563,7 @@ class StreamRenderer:
         self._reasoning_start: Optional[float] = None
         self._reasoning_last: Optional[float] = None
         self._thought_seconds: Optional[float] = None
+        self._terminal_status: Optional[str] = None
         self._spinner = Spinner("dots", style="cyan")
         self._is_tty = bool(getattr(console, "is_terminal", False))
         self._live: Optional[Live] = None
@@ -631,6 +632,9 @@ class StreamRenderer:
         details = elapsed
         if tokens:
             details += f" · {_format_token_count(tokens)} tokens"
+        if self._terminal_status is not None:
+            model = self._model or "auto"
+            return f"{self._terminal_status} · {model} · {details}"
         activities = _ACTIVITY_VARIANTS_BY_PHASE.get(
             self._phase,
             (_VERB_BY_PHASE.get(self._phase, self._phase).capitalize(),),
@@ -656,6 +660,20 @@ class StreamRenderer:
             highlight=False,
         )
 
+    def conclude(self, status: str) -> None:
+        """Clear transient activity before the terminal returns to the REPL."""
+        self._round_tool_counts = {}
+        self._running_command = None
+        self._running_command_started = None
+        self._terminal_status = (
+            "Completed" if status == "completed"
+            else "Stopped" if status in {"cancelled", "exited"}
+            else "Failed"
+        )
+        self._refresh_live()
+        if self.live_input_listener is not None and hasattr(self.live_input_listener, "invalidate"):
+            self.live_input_listener.invalidate()
+
     def _update_status_detail(self, event_type: str, payload: dict[str, Any]) -> None:
         """Turn structured stream events into human-readable footer detail."""
         if event_type in {"task_submitting", "task_submitted"}:
@@ -669,6 +687,7 @@ class StreamRenderer:
             # tally should begin.
             self._round_tool_counts = {}
             self._announced_route = None
+            self._terminal_status = None
         elif event_type in {"context_reused", "context_rescanned"}:
             self._status_detail = "Preparing repository context"
         elif event_type in {"routing_started", "model_selected"}:
@@ -706,6 +725,7 @@ class StreamRenderer:
             self._status_detail = "Checking the work and updating context"
         elif event_type in {"ai_task_completed", "ai_task_failed"}:
             self._status_detail = "Finishing the response"
+            self.conclude("completed" if event_type == "ai_task_completed" else "failed")
 
     def _live_input_title(self) -> str:
         """"Input", or "Input — session N" once other agents are running

@@ -115,6 +115,40 @@ class FailureDiagnosisNudgeTests(_StatePatchMixin, unittest.TestCase):
                 f"a successful round in between should reset the streak, got: {diagnostics}",
             )
 
+    def test_failed_tool_receives_bounded_failure_specific_repair_guidance(self):
+        with tempfile.TemporaryDirectory() as ws:
+            rounds = [
+                self._failing_read_round(0),
+                [_chunk(_delta(content="I could not find the requested file."))],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "inspect a missing file"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            guidance = "refresh workspace inventory and resolve the canonical path"
+            self.assertTrue(
+                any(
+                    event["event_type"] == "diagnostics"
+                    and guidance in str(event["payload"].get("content"))
+                    for event in renderer.events
+                ),
+                "expected failure-specific repair guidance in diagnostics",
+            )
+            self.assertTrue(
+                any(
+                    message.get("role") == "system" and guidance in str(message.get("content"))
+                    for call in client.calls for message in call.get("messages", [])
+                ),
+                "expected failure-specific repair guidance in the next model request",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

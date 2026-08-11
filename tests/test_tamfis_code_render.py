@@ -197,6 +197,18 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("✻ Worked for 1m 5s", output)
         self.assertIn("kimi-k2.7-code:cloud", output)
 
+    def test_terminal_outcome_clears_activity_and_stops_busy_footer(self):
+        renderer = StreamRenderer(_console())
+        renderer._phase = "report"
+        renderer._model = "kimi-k2.7-code:cloud"
+        renderer._round_tool_counts = {"read_file": 25, "search_code": 2}
+
+        renderer.conclude("cancelled")
+
+        self.assertIsNone(renderer.live_input_activity_line())
+        self.assertIn("Stopped", renderer.live_input_status("⠼"))
+        self.assertNotIn("Reading", renderer.live_input_status("⠼"))
+
     def test_status_line_shows_no_mode_tag_by_default(self):
         console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
         renderer = StreamRenderer(console)
