@@ -68,7 +68,8 @@ is not required for ordinary entitled subscribers.
 
 ## Running tasks in the background
 
-Add `--bg` to `ask`/`chat`/`audit`/`agent`/`exec` to start a task and return
+Add `--bg` to `ask`/`chat`/`audit`/`agent`/`exec`, `execute-plan`, or `run`
+to start work and return
 immediately. The task runs in a detached process (its own OS session, not a
 child of your terminal), so it keeps running to completion even after you
 close the terminal or disconnect:
@@ -94,9 +95,15 @@ Use `/goal <objective>` for a persistent background objective. `/goal status`,
 `/goal pause`, `/goal resume`, and `/goal cancel` control the latest goal in the
 current local session.
 
+Use `/fork` in the interactive REPL to branch the current conversation into a
+new independent local session while leaving the original unchanged. The same
+operation is available non-interactively with `tamfis-code fork [session_id]`;
+resume the new ID printed by the command. Conversation and repository context
+are copied, while in-flight tasks and queued instructions are deliberately not.
+
 Job status is one of `running`, `completed`, `failed`, or `stopped`. `--bg`
-is not available for `plan` (the plan needs the invoking process attached to
-save it locally).
+is not available while creating a plan (the completed plan must first be
+saved locally), but a saved plan can be launched with `execute-plan --bg`.
 
 ## TamfisGPT models
 

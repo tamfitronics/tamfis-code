@@ -366,8 +366,7 @@ class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase
     """ask/agent/exec/chat/audit/plan default to the standalone local loop
     (runner_local.py) now -- --remote is required to reach the legacy
     RemoteAPIClient path. --bg spawns a real detached background process for
-    standalone runs too (see background.py); execute-plan's --bg is still
-    remote-only (unchanged, separate flow)."""
+    standalone agent, saved-plan, and explicit shell-command runs."""
 
     def test_bg_without_remote_spawns_a_detached_background_job(self):
         """--bg now works standalone too: it spawns a real detached OS
@@ -388,11 +387,24 @@ class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase
         self.assertIn(fake_job.id, result.output)
         fake_spawn.assert_called_once()
 
-    def test_execute_plan_bg_without_remote_is_rejected(self):
+    def test_execute_plan_bg_without_remote_spawns_a_detached_job(self):
+        from tamfis_code.background import BackgroundJob
+
+        fake_job = BackgroundJob(
+            id="bg-plan123", pid=999999, session_id=1, workspace_root="/tmp",
+            mode="execute-plan", objective_preview="Execute plan", log_path="/tmp/x.log",
+            prompt_path="", started_at=0.0,
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            result = self.runner.invoke(cli, ["--cwd", tmp, "execute-plan", "--bg"])
-        self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("--bg requires --remote", result.output)
+            root = str(Path(tmp).resolve())
+            state_module.save_session_state(1, workspace_root=root, primary_workspace=root)
+            plan = state_module.save_plan(1, objective="Fix it", content="1. Edit the file")
+            with patch("tamfis_code.background.spawn_background_cli_job", return_value=fake_job) as spawn:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "execute-plan", plan.id, "--bg"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Started in background", result.output)
+        self.assertIn(fake_job.id, result.output)
+        spawn.assert_called_once()
 
     def test_ask_without_remote_never_constructs_a_remote_client(self):
         from tamfis_code.runner import TaskOutcome
@@ -704,11 +716,21 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertIn("hi", result.output)
 
-    def test_run_bg_without_remote_is_rejected(self):
+    def test_run_bg_without_remote_spawns_a_detached_job(self):
+        from tamfis_code.background import BackgroundJob
+
+        fake_job = BackgroundJob(
+            id="bg-shell123", pid=999999, session_id=1, workspace_root="/tmp",
+            mode="shell", objective_preview="echo hi", log_path="/tmp/x.log",
+            prompt_path="", started_at=0.0,
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            result = self.runner.invoke(cli, ["--cwd", tmp, "run", "echo hi", "--bg"])
-        self.assertNotEqual(result.exit_code, 0)
-        self.assertIn("--bg requires --remote", result.output)
+            with patch("tamfis_code.background.spawn_background_cli_job", return_value=fake_job) as spawn:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "run", "echo hi", "--bg"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Started in background", result.output)
+        self.assertIn(fake_job.id, result.output)
+        spawn.assert_called_once()
 
     def test_doctor_reports_provider_status_without_remote_client(self):
         with tempfile.TemporaryDirectory() as tmp:

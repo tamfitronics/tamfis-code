@@ -272,6 +272,33 @@ class RotatingChipIsSituationAwareTests(_StatePatchMixin, unittest.TestCase):
 
 
 class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCase):
+    def test_up_recalls_latest_queued_follow_up_for_editing(self):
+        first = state_module.enqueue_instruction(42, "check login", classification="follow_up")
+        latest = state_module.enqueue_instruction(42, "then inspect billing", classification="follow_up")
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=42, renderer=renderer, cli_config=_config())
+        buffer = SimpleNamespace(text="", cursor_position=0)
+
+        self.assertTrue(listener._recall_latest_queued(buffer))
+        self.assertEqual(buffer.text, "then inspect billing")
+        self.assertEqual(buffer.cursor_position, len(buffer.text))
+        self.assertEqual(listener._editing_instruction_id, latest.id)
+        self.assertNotEqual(listener._editing_instruction_id, first.id)
+
+    def test_submitting_recalled_text_updates_queue_without_duplication(self):
+        item = state_module.enqueue_instruction(42, "check login", classification="follow_up")
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=42, renderer=renderer, cli_config=_config())
+        listener._editing_instruction_id = item.id
+
+        listener._enqueue("check login and logout")
+
+        queued = state_module.get_session_state(42).queued_user_instructions
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["text"], "check login and logout")
+        self.assertIsNone(listener._editing_instruction_id)
+        self.assertIn("Updated queued instruction", renderer.console.file.getvalue())
+
     def test_agent_count_ignores_stale_top_level_sessions(self):
         stale = state_module.get_session_state(41)
         stale.execution_status = "running"

@@ -257,6 +257,7 @@ class LiveInputListener:
         self._status_tick = 0
         self._ticker_task: Optional[asyncio.Task] = None
         self._outcome_status: Optional[str] = None
+        self._editing_instruction_id: Optional[str] = None
         # A footer callback runs for every redraw and keystroke. Snapshot the
         # count once per listener instead of touching the multi-megabyte
         # session-state file from prompt-toolkit's latency-sensitive path.
@@ -456,7 +457,7 @@ class LiveInputListener:
         spinner = _STATUS_SPINNER_FRAMES[self._status_tick]
         status = self.renderer.live_input_status(spinner)
         left = (
-            f" <ansigray>{status} · esc to interrupt ·</ansigray> "
+            f" <ansigray>{status} · ↑ edit queued · esc to interrupt ·</ansigray> "
             f"{_mode_and_agents_html(
                 self.cli_config,
                 self.session_id,
@@ -507,6 +508,16 @@ class LiveInputListener:
             # recreate the prompt (or enqueue a blank follow-up) on Enter.
             if event.current_buffer.text.strip():
                 event.current_buffer.validate_and_handle()
+
+        @bindings.add("up")
+        def _edit_latest_queued_instruction(event) -> None:
+            # With an empty live composer, Up recalls the newest follow-up
+            # that is still queued so Enter can replace it instead of adding
+            # a duplicate. Once text is present, retain prompt-toolkit's
+            # normal multiline/history navigation.
+            if not event.current_buffer.text and self._recall_latest_queued(event.current_buffer):
+                return
+            event.current_buffer.auto_up(count=1)
 
         @bindings.add("c-b")
         def _background_running_command(event) -> None:
@@ -742,6 +753,21 @@ class LiveInputListener:
             if self._active and not self._paused:
                 self._schedule_prompt()
             return
+        editing_id = self._editing_instruction_id
+        self._editing_instruction_id = None
+        if editing_id and local_state.edit_queued_instruction(self.session_id, editing_id, text):
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"◆ Updated queued instruction {editing_id}: {text} "
+                        "-- applied at the next safe round boundary."
+                    ),
+                },
+            })
+            if self._active and not self._paused:
+                self._schedule_prompt()
+            return
         item = local_state.enqueue_instruction(
             self.session_id, text, classification="follow_up",
         )
@@ -760,6 +786,23 @@ class LiveInputListener:
         })
         if self._active and not self._paused:
             self._schedule_prompt()
+
+    def _recall_latest_queued(self, buffer) -> bool:
+        """Load the newest editable queue item into an empty live composer."""
+        items = local_state.get_session_state(self.session_id).queued_user_instructions
+        editable = next((
+            item for item in reversed(items)
+            if item.get("status") == "queued"
+            and item.get("classification") in {"append", "follow_up"}
+            and str(item.get("text") or "").strip()
+        ), None)
+        if editable is None:
+            return False
+        text = str(editable["text"])
+        buffer.text = text
+        buffer.cursor_position = len(text)
+        self._editing_instruction_id = str(editable["id"])
+        return True
 
     async def _interject(self) -> None:
         """Compatibility helper for callers/tests that submit one line."""

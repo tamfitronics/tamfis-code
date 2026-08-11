@@ -447,6 +447,26 @@ def _session_for_primary(root: Path) -> Optional[int]:
     return matches[-1] if matches else None
 
 
+@cli.command(name="fork")
+@click.argument("session_id", required=False, type=int)
+@click.pass_context
+def fork_command(ctx: click.Context, session_id: Optional[int]):
+    """Branch a local conversation into a new independent session."""
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+    source_id = session_id if session_id is not None else _session_for_primary(ctx.obj["workspace_root"])
+    if source_id is None:
+        print_error(console, "No known local session for this workspace; run `tamfis-code init` first.")
+        raise SystemExit(EXIT_TASK_FAILED)
+    try:
+        forked = local_state.fork_session_state(source_id)
+    except ValueError as exc:
+        print_error(console, str(exc))
+        raise SystemExit(EXIT_TASK_FAILED)
+    console.print(f"[green]Forked local session {source_id} -> {forked.session_id}.[/green]")
+    console.print(f"Resume it with: tamfis-code resume {forked.session_id}")
+
+
 _ABS_PATH_RE = re.compile(r"(?<![\w.])(/[A-Za-z0-9_./+@%:=-]+)")
 
 
@@ -1489,7 +1509,7 @@ def _ai_command(mode: str, help_text: str):
     @click.option("--stdin", "read_stdin", is_flag=True, default=False, help="Read the objective from standard input (recommended for very large pasted text).")
     @click.option("--prompt-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Read the objective from a UTF-8 text file.")
     @click.option("--attach", "attachment_paths", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach an image or document (repeatable; up to 10 files, 10 MB each).")
-    @click.option("--bg", "background", is_flag=True, default=False, help="Submit and return immediately; the task keeps running server-side. Use `tamfis-code agents`/`attach`/`logs` to check on it.")
+    @click.option("--bg", "background", is_flag=True, default=False, help="Start in the background and return immediately. Local jobs use `bg-list`/`bg-logs`/`bg-stop`; remote jobs use `agents`/`attach`/`logs`.")
     @click.option("--model", default="auto", show_default=True, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
     @click.option("--mode", "mode_override", type=click.Choice(["auto", "coding", "chat", "audit", "plan", "agent", "execute"]), default=None, help="Override this command's task mode.")
     @click.option("--provider", type=click.Choice(_PROVIDER_CHOICES), default=None, hidden=True)
@@ -1568,22 +1588,20 @@ cli.command(name="exec")(_ai_command("execute", "Run a tool-using engineering ta
 
 @cli.command(name="execute-plan")
 @click.argument("plan_id", required=False)
-@click.option("--bg", "background", is_flag=True, default=False, help="Execute the plan server-side and return immediately (requires --remote).")
+@click.option("--bg", "background", is_flag=True, default=False, help="Execute the saved plan in the background and return immediately.")
 @click.option("--model", default="auto", show_default=True)
 @click.option("--provider", type=click.Choice(_PROVIDER_CHOICES), default=None, hidden=True)
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend.")
+@click.option("--_bg-job-id", "bg_job_id", default=None, hidden=True, help="Internal background-job completion handle.")
 @click.pass_context
 def execute_plan_command(
     ctx: click.Context, plan_id: Optional[str], background: bool,
-    model: str, provider: Optional[str], remote: bool,
+    model: str, provider: Optional[str], remote: bool, bg_job_id: Optional[str],
 ):
     """Execute a saved plan (latest/active plan when no id is supplied)."""
     config: Config = ctx.obj["config"]
     root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
-    if background and not _use_remote(config, remote):
-        print_error(console, "--bg requires --remote (or default_backend = \"remote\" in config.toml): a standalone local run has no server to keep the task alive once this process exits.")
-        raise SystemExit(EXIT_INVALID_ARGS)
     matching = [sid for sid in local_state.all_known_session_ids()
                 if local_state.get_session_state(sid).workspace_root == str(root)]
     if not matching:
@@ -1596,11 +1614,40 @@ def execute_plan_command(
         raise SystemExit(EXIT_TASK_FAILED)
     selected_id = str(plan["id"])
     local_state.update_plan(session_id, selected_id, status="executing")
+    if background and not _use_remote(config, remote):
+        from .background import spawn_background_cli_job
+
+        command_args = ["execute-plan", selected_id, "--model", model]
+        if provider:
+            command_args += ["--provider", provider]
+        try:
+            job = spawn_background_cli_job(
+                session_id=session_id,
+                workspace_root=root,
+                mode="execute-plan",
+                objective_preview=f"Execute saved plan {selected_id}",
+                approval_policy=config.approval_policy,
+                command_args=command_args,
+            )
+        except BaseException:
+            local_state.update_plan(session_id, selected_id, status="failed")
+            raise
+        console.print(f"[green]Started in background[/green] · job {job.id} (pid {job.pid})")
+        console.print(f"  tamfis-code bg-logs {job.id} --follow")
+        console.print("  tamfis-code bg-list")
+        console.print(f"  tamfis-code bg-stop {job.id}")
+        return
     objective = local_state.plan_execution_objective(plan)
-    if _use_remote(config, remote):
-        exit_code = _run_async(_run_ai_command(config, root, objective, "execute", background, model, provider))
-    else:
-        exit_code = _run_async(_run_local_ai_command(config, root, objective, "execute", model, provider, ()))
+    try:
+        if _use_remote(config, remote):
+            exit_code = _run_async(_run_ai_command(config, root, objective, "execute", background, model, provider))
+        else:
+            exit_code = _run_async(_run_local_ai_command(config, root, objective, "execute", model, provider, ()))
+    except BaseException:
+        if bg_job_id:
+            from .background import update_job_status
+            update_job_status(bg_job_id, "failed", exit_code=1)
+        raise
     refreshed = local_state.get_session_state(session_id)
     local_state.update_plan(
         session_id, selected_id,
@@ -1609,17 +1656,21 @@ def execute_plan_command(
         ),
         execution_task_id=refreshed.last_task_id,
     )
+    if bg_job_id:
+        from .background import update_job_status
+        update_job_status(bg_job_id, "completed" if exit_code == EXIT_OK else "failed", exit_code=exit_code)
     if exit_code != EXIT_OK:
         raise SystemExit(exit_code)
 
 
 @cli.command()
 @click.argument("command")
-@click.option("--bg", "background", is_flag=True, default=False, help="Submit and return immediately; the command keeps running server-side.")
+@click.option("--bg", "background", is_flag=True, default=False, help="Run the command in the background and return immediately.")
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend instead of running the command directly.")
+@click.option("--_bg-job-id", "bg_job_id", default=None, hidden=True, help="Internal background-job completion handle.")
 @click.pass_context
 @async_command
-async def run(ctx: click.Context, command: str, background: bool, remote: bool):
+async def run(ctx: click.Context, command: str, background: bool, remote: bool, bg_job_id: Optional[str]):
     """Run an explicit shell command (locally by default, or --remote)."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
@@ -1627,21 +1678,48 @@ async def run(ctx: click.Context, command: str, background: bool, remote: bool):
 
     if not _use_remote(config, remote):
         if background:
-            print_error(console, "--bg requires --remote: a standalone local run has no server to keep the command alive once this process exits.")
-            raise SystemExit(EXIT_INVALID_ARGS)
+            from .background import spawn_background_cli_job
+            from .workspace import resolve_local_workspace
+
+            workspace = resolve_local_workspace(workspace_root, discover=False)
+            job = spawn_background_cli_job(
+                session_id=workspace.session_id,
+                workspace_root=Path(workspace.workspace_root),
+                mode="shell",
+                objective_preview=command,
+                approval_policy=config.approval_policy,
+                command_args=["run", command],
+            )
+            console.print(f"[green]Started in background[/green] · job {job.id} (pid {job.pid})")
+            console.print(f"  tamfis-code bg-logs {job.id} --follow")
+            console.print("  tamfis-code bg-list")
+            console.print(f"  tamfis-code bg-stop {job.id}")
+            return
         from .runner_local import run_local_shell_command
         from .workspace import resolve_local_workspace
 
         workspace = resolve_local_workspace(workspace_root, discover=False)
-        outcome = await run_local_shell_command(
-            console, workspace_root=workspace.workspace_root, session_id=workspace.session_id,
-            # See the matching comment in _run_ai_command -- a one-shot
-            # command is still an attended terminal unless stdin is
-            # redirected/piped.
-            command=command, approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
-        )
+        try:
+            outcome = await run_local_shell_command(
+                console, workspace_root=workspace.workspace_root, session_id=workspace.session_id,
+                # See the matching comment in _run_ai_command -- a one-shot
+                # command is still an attended terminal unless stdin is
+                # redirected/piped.
+                command=command, approval_policy=config.approval_policy, interactive=sys.stdin.isatty(),
+            )
+        except BaseException:
+            if bg_job_id:
+                from .background import update_job_status
+                update_job_status(bg_job_id, "failed", exit_code=1)
+            raise
         if outcome.status != "completed":
+            if bg_job_id:
+                from .background import update_job_status
+                update_job_status(bg_job_id, "failed", exit_code=EXIT_TASK_FAILED)
             raise SystemExit(EXIT_TASK_FAILED)
+        if bg_job_id:
+            from .background import update_job_status
+            update_job_status(bg_job_id, "completed", exit_code=EXIT_OK)
         return
 
     creds = load_credentials()

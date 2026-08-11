@@ -30,6 +30,19 @@ PUBLIC_MODEL_PRO = "TamfisGPT Pro"
 PUBLIC_MODEL_ULTRA = "TamfisGPT Ultra"
 PUBLIC_MODEL_ULTIMA = "TamfisGPT Ultima"
 
+# FIX 2026-08-11: the TAMFIS provider's real per-tier catalog ids (see
+# providers.py's ProviderConfig.models for ProviderType.TAMFIS) -- added
+# so public_model_name() can match them directly instead of falling through
+# to the coarse keyword heuristic at the bottom of that function, which
+# had no rule that would ever produce PUBLIC_MODEL_SMART/PRO/ULTRA/ULTIMA
+# for these exact strings.
+_TAMFIS_ID_TO_TIER = {
+    "tamfis-gpt-smart": PUBLIC_MODEL_SMART,
+    "tamfis-gpt-pro": PUBLIC_MODEL_PRO,
+    "tamfis-gpt-ultra": PUBLIC_MODEL_ULTRA,
+    "tamfis-gpt-ultima": PUBLIC_MODEL_ULTIMA,
+}
+
 PUBLIC_MODEL_ALIASES = (
     PUBLIC_MODEL_AUTO,
     PUBLIC_MODEL_SMART,
@@ -115,6 +128,9 @@ def public_model_name(model: Any = None) -> str:
     parsed = parse_public_model_alias(value)
     if parsed:
         return parsed
+    by_tamfis_id = _TAMFIS_ID_TO_TIER.get(lowered)
+    if by_tamfis_id:
+        return by_tamfis_id
     by_capability = _tier_from_registry(value)
     if by_capability:
         return by_capability

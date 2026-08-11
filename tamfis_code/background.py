@@ -118,6 +118,14 @@ def list_jobs() -> list[dict[str, Any]]:
 def update_job_status(job_id: str, status: str, *, exit_code: Optional[int] = None) -> None:
     """Called by the background child itself right before it exits."""
     record = read_job(job_id)
+    # A very short command can finish before the parent has persisted the
+    # job record immediately after Popen. Give that hand-off a bounded grace
+    # period so successful jobs are not later misreported as merely stopped.
+    for _ in range(20):
+        if record is not None:
+            break
+        time.sleep(0.05)
+        record = read_job(job_id)
     if record is None:
         return
     record["status"] = status
@@ -223,6 +231,63 @@ def spawn_background_task(
         mode=mode, objective_preview=objective[:200], log_path=str(log_path),
         prompt_path=str(prompt_path), started_at=time.time(),
         goal=goal,
+    )
+    _write_job(job)
+    return job
+
+
+def spawn_background_cli_job(
+    *,
+    session_id: int,
+    workspace_root: Path,
+    mode: str,
+    objective_preview: str,
+    approval_policy: str,
+    command_args: list[str],
+) -> BackgroundJob:
+    """Launch another CLI command as a tracked detached local job.
+
+    ``spawn_background_task`` is optimized for free-form agent objectives and
+    therefore persists the prompt in a private file. Saved-plan execution and
+    explicit shell commands already have compact, structured CLI arguments;
+    this sibling keeps those native command paths while giving them the same
+    lifecycle, logs, stop controls, and completion reinjection as agent jobs.
+    """
+    JOBS_DIR.mkdir(parents=True, exist_ok=True)
+    job_id = f"bg-{uuid.uuid4().hex[:8]}"
+    log_path = JOBS_DIR / f"{job_id}.log"
+    argv = [
+        sys.executable, "-m", "tamfis_code",
+        "--cwd", str(workspace_root),
+        "--approval", approval_policy,
+        *command_args,
+        "--_bg-job-id", job_id,
+    ]
+
+    log_fh = open(log_path, "ab", buffering=0)
+    try:
+        proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.DEVNULL,
+            stdout=log_fh,
+            stderr=log_fh,
+            cwd=str(workspace_root),
+            start_new_session=True,
+            close_fds=True,
+        )
+    finally:
+        log_fh.close()
+
+    job = BackgroundJob(
+        id=job_id,
+        pid=proc.pid,
+        session_id=session_id,
+        workspace_root=str(workspace_root),
+        mode=mode,
+        objective_preview=objective_preview[:200],
+        log_path=str(log_path),
+        prompt_path="",
+        started_at=time.time(),
     )
     _write_job(job)
     return job

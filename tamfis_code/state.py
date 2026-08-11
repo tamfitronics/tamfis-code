@@ -23,6 +23,7 @@ import stat
 import sys
 import tempfile
 import uuid
+from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -254,6 +255,11 @@ class SessionState:
     # child process's own memory for the duration of the swarm run.
     swarm_worktree_path: Optional[str] = None
     swarm_worktree_branch: Optional[str] = None
+    # A fork copies the durable conversation/repository context into a new
+    # independent session while leaving the source untouched.  Keep explicit
+    # lineage so session listings and future UIs can group branches without
+    # overloading parent_session_id, which is reserved for swarm children.
+    forked_from_session_id: Optional[int] = None
 
 
 # In-process cache of the parsed state.json, keyed by the file's mtime. A
@@ -730,6 +736,20 @@ def update_instruction(session_id: int, instruction_id: str, status: str) -> boo
     return False
 
 
+def edit_queued_instruction(session_id: int, instruction_id: str, text: str) -> bool:
+    """Replace the text of an instruction that has not started yet."""
+    replacement = text.strip()
+    if not replacement:
+        return False
+    state = get_session_state(session_id)
+    for item in state.queued_user_instructions:
+        if item.get("id") == instruction_id and item.get("status") == "queued":
+            item["text"] = replacement
+            put_session_state(state)
+            return True
+    return False
+
+
 def checkpoint(session_id: int, *, reason: str, summary: str = "") -> None:
     state = get_session_state(session_id)
     state.context_checkpoints = (state.context_checkpoints + [{
@@ -843,6 +863,47 @@ def all_known_session_ids() -> list[int]:
         except ValueError:
             continue
     return sorted(ids)
+
+
+def fork_session_state(source_session_id: int, target_session_id: Optional[int] = None) -> SessionState:
+    """Clone a durable local conversation into a fresh, idle session.
+
+    Conversation, repository knowledge, plans, and mutation evidence are
+    copied by value.  Process/task lifecycle state is deliberately cleared:
+    a branch must not inherit an in-flight tool call, queued instruction,
+    background task cursor, or swarm identity from its source.
+    """
+    known = all_known_session_ids()
+    if source_session_id not in known:
+        raise ValueError(f"No known local session {source_session_id}.")
+    if target_session_id is None:
+        target_session_id = (max(known) + 1) if known else 1
+    if target_session_id in known:
+        raise ValueError(f"Local session {target_session_id} already exists.")
+
+    values = deepcopy(asdict(get_session_state(source_session_id)))
+    values.update({
+        "session_id": target_session_id,
+        "last_event_id": 0,
+        "last_task_id": None,
+        "active_task": None,
+        "current_phase": "idle",
+        "execution_status": "idle",
+        "pending_actions": [],
+        "queued_user_instructions": [],
+        "running_action": None,
+        "turn_checkpoint": None,
+        "parent_session_id": None,
+        "is_swarm_child": False,
+        "swarm_label": "",
+        "swarm_worktree_path": None,
+        "swarm_worktree_branch": None,
+        "forked_from_session_id": source_session_id,
+        "updated_at": "",
+    })
+    forked = SessionState(**values)
+    put_session_state(forked)
+    return forked
 
 
 # --- Thread compression / summarization -------------------------------------

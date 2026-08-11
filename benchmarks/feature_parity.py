@@ -36,6 +36,7 @@ FEATURES = (
     Feature("Workspace sandbox", "tamfis_code/sandbox.py", r"SandboxPolicy"),
     Feature("Plans and visible progress", "tamfis_code/orchestrator/engine.py", r"_tool_matches_plan_step"),
     Feature("Durable resume", "tamfis_code/state.py", r"turn_checkpoint"),
+    Feature("Session branching / fork", "tamfis_code/state.py", r"def fork_session_state"),
     Feature("Context compaction", "tamfis_code/state.py", r"context_checkpoints"),
     Feature("Image input", "tamfis_code/runner_local.py", r"build_vision_content_blocks"),
     Feature("Browser and screenshots", "tamfis_code/cli.py", r"screenshot_cmd"),
@@ -82,6 +83,10 @@ BEHAVIOR_SCENARIOS = (
     ("read-only inspection pipelines stay usable", "tests/test_safety.py::ClassifyToolCallRiskTests::test_common_inspection_pipelines_are_read_only"),
     ("duplicate evidence terminates reconnaissance loops", "tests/test_runtime_controller.py::test_different_actions_returning_duplicate_evidence_trigger_stall"),
     ("provider route is announced once per task", "tests/test_tamfis_code_render.py::StreamRendererTests::test_same_route_is_announced_only_once_per_task"),
+    ("session forks isolate subsequent conversation", "tests/test_session_fork.py"),
+    ("saved plans support detached local execution", "tests/test_cli_commands.py::StandaloneDefaultDispatchTests::test_execute_plan_bg_without_remote_spawns_a_detached_job"),
+    ("shell commands support detached local execution", "tests/test_cli_commands.py::StandaloneInfoCommandTests::test_run_bg_without_remote_spawns_a_detached_job"),
+    ("queued follow-ups can be recalled and edited", "tests/test_live_input.py::CtrlTInjectsFollowUpTests::test_submitting_recalled_text_updates_queue_without_duplication"),
 )
 
 
@@ -99,7 +104,7 @@ def source_pass() -> list[str]:
 
 
 def print_report() -> None:
-    headers = ("Feature", "Tamfis", "Kimi", "Claude", "Codex")
+    headers = ("Feature", "TAMFIS-CODE", "Kimi", "Claude", "Codex")
     rows = [(f.name, f.tamfis, f.kimi, f.claude, f.codex) for f in FEATURES]
     widths = [max(len(headers[i]), *(len(row[i]) for row in rows)) for i in range(len(headers))]
     print("  ".join(headers[i].ljust(widths[i]) for i in range(len(headers))))
@@ -107,9 +112,10 @@ def print_report() -> None:
     for row in rows:
         print("  ".join(row[i].ljust(widths[i]) for i in range(len(headers))))
     print()
+    labels = {"tamfis": "TAMFIS-CODE", "kimi": "Kimi", "claude": "Claude", "codex": "Codex"}
     for column in ("tamfis", "kimi", "claude", "codex"):
         total = sum(score(getattr(feature, column)) for feature in FEATURES)
-        print(f"{column.title():7}: {total:g}/{len(FEATURES)} ({total / len(FEATURES):.1%})")
+        print(f"{labels[column]:11}: {total:g}/{len(FEATURES)} ({total / len(FEATURES):.1%})")
 
 
 def main() -> int:

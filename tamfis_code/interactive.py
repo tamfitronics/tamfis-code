@@ -207,6 +207,7 @@ $ <command>            explicit shell command
                       works over plain SSH, no X11/Wayland/xclip required)
 /doctor              run connectivity/auth checks
 /resume [session_id]  switch to another session (most recent if omitted)
+/fork                 branch this local conversation into a new independent session
 /retry [task_id]      retry a failed task (most recent failure if omitted)
 /agents              list sessions and their latest task status
 /delegate <a> | <b>  run objectives a, b, ... as concurrent delegated sub-tasks
@@ -270,6 +271,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/copy", "copy the last assistant response to the clipboard"),
     ("/doctor", "run connectivity/auth checks"),
     ("/resume", "switch to another session"),
+    ("/fork", "branch this conversation into a new independent session"),
     ("/retry", "retry a failed task"),
     ("/agents", "list sessions and their latest task status"),
     ("/delegate", "run objectives as concurrent delegated sub-tasks"),
@@ -660,12 +662,15 @@ async def run_interactive(
     # long session shouldn't grow this list forever); oversized individual
     # messages within it are still handled by runner_local.py's existing
     # compaction (including old user-turn compaction) and rollover.
-    saved_history = local_state.get_session_state(workspace.session_id).conversation_history if standalone else []
-    conversation_history: list[dict[str, str]] = [
-        {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
-        for item in saved_history
-        if item.get("role") in {"user", "assistant"} and item.get("content")
-    ][-MAX_STANDALONE_HISTORY_TURNS * 2:]
+    def _standalone_history(session_id: int) -> list[dict[str, str]]:
+        saved = local_state.get_session_state(session_id).conversation_history
+        return [
+            {"role": str(item.get("role") or ""), "content": str(item.get("content") or "")}
+            for item in saved
+            if item.get("role") in {"user", "assistant"} and item.get("content")
+        ][-MAX_STANDALONE_HISTORY_TURNS * 2:]
+
+    conversation_history = _standalone_history(workspace.session_id) if standalone else []
 
     if standalone:
         from .local_chat import resolve_provider_type
@@ -688,7 +693,8 @@ async def run_interactive(
     console.print(
         "[dim]Type /help for commands. Paste up to 1,000,000 characters; Alt+Enter adds a newline. "
         "While a task runs, a normal message prompt remains available: type and press Enter; "
-        "your text is queued without a special shortcut. Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
+        "your text is queued without a special shortcut, and Up edits the latest queued message. "
+        "Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
 
     from .self_update import check_update_available
@@ -1779,6 +1785,12 @@ async def run_interactive(
                     session_id=target_id,
                     workspace_root=target_state.workspace_root or target_state.primary_workspace,
                 )
+                # The provider transcript is held in memory for the active
+                # REPL. Switching only WorkspaceContext used to leak the old
+                # session's conversation into the first turn after /resume.
+                conversation_history[:] = _standalone_history(target_id)
+                last_turn = None
+                last_response_text = None
                 console.print(f"[green]Resumed session {workspace.session_id}[/green]  workspace_root={workspace.workspace_root}")
                 if target_state.conversation_summary:
                     console.print(f"[dim]{target_state.conversation_summary[-1000:]}[/dim]")
@@ -1807,6 +1819,28 @@ async def run_interactive(
                 print_recent_thread(console, thread.get("messages") or [])
             except (AuthRequiredError, RemoteAPIError):
                 pass
+            continue
+        if text == "/fork":
+            if not standalone:
+                print_error(console, "/fork is currently available for standalone local sessions only.")
+                continue
+            source_id = workspace.session_id
+            try:
+                forked = local_state.fork_session_state(source_id)
+            except ValueError as e:
+                print_error(console, str(e))
+                continue
+            workspace = WorkspaceContext(
+                session_id=forked.session_id,
+                workspace_root=forked.workspace_root or forked.primary_workspace,
+            )
+            conversation_history[:] = _standalone_history(forked.session_id)
+            last_turn = None
+            last_response_text = None
+            console.print(
+                f"[green]Forked session {source_id} -> {forked.session_id}.[/green] "
+                "The original remains unchanged; this prompt now uses the new branch."
+            )
             continue
         if text == "/retry" or text.startswith("/retry "):
             if standalone:

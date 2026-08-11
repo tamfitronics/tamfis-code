@@ -385,7 +385,26 @@ class ProviderManager:
             ).rstrip("/"),
             api_key_env="TAMFIS_API_KEY",
             default_model="tamfis-gpt-auto",
-            models=["tamfis-gpt-auto"],
+            # FIX 2026-08-11: this list used to be just ["tamfis-gpt-auto"],
+            # a single placeholder id. resolve_public_model_alias() matches
+            # a requested tier (e.g. "TamfisGPT Ultima") against
+            # public_model_name(candidate) for each entry in `models` --
+            # with only one placeholder candidate that could never equal
+            # "TamfisGPT Ultima", every tier selection (Smart/Pro/Ultra/
+            # Ultima) silently fell through to default_model and sent the
+            # literal string "tamfis-gpt-auto" to the server regardless of
+            # what --model was actually requested. The server-side gateway
+            # (tier_ii_gateway/api/openai_compat.py's
+            # _get_actual_model_from_registry, see its matching 2026-08-11
+            # fix) now recognizes these exact ids and maps them to a real
+            # model_tier/escalate request instead of always resolving via
+            # generic mode="chat" auto-selection.
+            models=[
+                "tamfis-gpt-smart",
+                "tamfis-gpt-pro",
+                "tamfis-gpt-ultra",
+                "tamfis-gpt-ultima",
+            ],
             priority=4,
             weight=6,
             context_window=128000,

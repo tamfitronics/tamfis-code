@@ -45,6 +45,22 @@ def test_public_alias_resolves_to_private_catalog_id_only_at_request_edge():
     assert selected == "qwen/qwen3-coder"
 
 
+def test_subscription_tier_ids_round_trip_without_collapsing_to_auto():
+    expected = {
+        "tamfis-gpt-smart": PUBLIC_MODEL_SMART,
+        "tamfis-gpt-pro": PUBLIC_MODEL_PRO,
+        "tamfis-gpt-ultra": PUBLIC_MODEL_ULTRA,
+        "tamfis-gpt-ultima": PUBLIC_MODEL_ULTIMA,
+    }
+    for model_id, public_name in expected.items():
+        assert public_model_name(model_id) == public_name
+        assert resolve_public_model_alias(
+            public_name,
+            models=tuple(expected),
+            default_model="tamfis-gpt-auto",
+        ) == model_id
+
+
 def test_structured_routing_event_contains_only_tamfisgpt_identity():
     stream = StringIO()
     renderer = StructuredRenderer(mode="jsonl", stream=stream)
