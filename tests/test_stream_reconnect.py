@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 
 from tamfis_code.providers import ProviderType
-from tamfis_code.runner_local import _stream_completion_with_reconnect
+from tamfis_code.runner_local import _same_route_reconnectable, _stream_completion_with_reconnect
 
 
 class _FakeManager:
@@ -13,7 +13,7 @@ class _FakeManager:
         return True
 
     def provider_error_status(self, exc: Exception):
-        return 503
+        return getattr(exc, "status_code", 503)
 
 
 class _EventCollectingRenderer:
@@ -31,6 +31,14 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
     single retry regardless of outcome, which announced normal, working
     continuation as if it were a repeating failure. It should only ever be
     visible under debug."""
+
+    def test_404_skips_same_route_delay_and_moves_to_provider_fallback(self):
+        class NotFoundError(Exception):
+            status_code = 404
+
+        self.assertFalse(
+            _same_route_reconnectable(_FakeManager(), NotFoundError("Error code: 404"))
+        )
 
     def _run_one_retry_then_succeed(self, *, debug: bool) -> _EventCollectingRenderer:
         renderer = _EventCollectingRenderer(debug=debug)

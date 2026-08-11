@@ -393,14 +393,15 @@ def test_nim_account_entitlement_404_is_retryable():
     assert ProviderManager.is_retryable_provider_error(exc)
 
 
-def test_plain_404_without_the_entitlement_shape_is_not_retryable():
-    # A generic 404 (bad endpoint path, genuinely missing resource) must
-    # not be swallowed into an infinite fallback loop -- only the specific
-    # NIM account-entitlement message shape above is treated as retryable.
+def test_plain_provider_404_without_response_detail_is_retryable():
+    # Live NVIDIA NIM failure shape: the SDK exposes only "Error code: 404"
+    # when a routed deployment has disappeared. The endpoint itself comes
+    # from static provider configuration, so the runner should move to the
+    # next provider instead of failing the user's turn.
     class NotFoundError(Exception):
         status_code = 404
 
-    assert not ProviderManager.is_retryable_provider_error(NotFoundError("not found"))
+    assert ProviderManager.is_retryable_provider_error(NotFoundError("Error code: 404"))
 
 
 def test_check_status_is_an_inspection_requiring_tools():

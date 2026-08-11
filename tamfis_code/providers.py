@@ -1074,6 +1074,14 @@ class ProviderManager:
                 401,
                 402,
                 403,
+                # Inference APIs use 404 for a model/deployment that was
+                # removed or is unavailable to the current account. Some
+                # providers (notably NVIDIA NIM) return no response detail
+                # beyond ``Error code: 404``, so message-shape matching
+                # cannot reliably identify that live failure. Endpoint
+                # paths are owned by our static provider config; at request
+                # time the useful recovery is the next provider/model.
+                404,
                 408,
                 409,
                 425,
@@ -1114,14 +1122,10 @@ class ProviderManager:
             "authentication",
             "unauthorized",
             "forbidden",
-            # NVIDIA NIM's real shape for "this account has no deployment
-            # access to this specific model" (confirmed live: a genuine,
-            # permanent 404 for moonshotai/kimi-k2.6 on an ordinary API
-            # key, despite the model being listed in the general
-            # /v1/models catalog). Retrying the exact same model would
-            # never help, but AUTO mode falling back to the next candidate
-            # provider/model is exactly the right response -- this is an
-            # account-entitlement failure, not a bad request.
+            # NVIDIA NIM's detailed shape for "this account has no
+            # deployment access to this specific model". Kept for SDK
+            # wrappers that lose the numeric HTTP status but preserve the
+            # response text.
             "not found for account",
             "degraded function cannot be invoked",
             "function cannot be invoked",

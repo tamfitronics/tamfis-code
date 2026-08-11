@@ -1275,7 +1275,10 @@ def _same_route_reconnectable(manager: Any, exc: Exception) -> bool:
     status = manager.provider_error_status(exc) if hasattr(manager, "provider_error_status") else None
     # Credentials/payment will not repair themselves after a sleep.  AUTO can
     # move to the next external route immediately for these statuses.
-    return status not in {401, 402, 403}
+    # A missing/retired deployment will not repair itself by repeating the
+    # identical route. Move directly to cross-provider fallback, avoiding
+    # several silent reconnect delays before reporting or recovering.
+    return status not in {401, 402, 403, 404}
 
 
 async def _stream_completion_with_reconnect(
