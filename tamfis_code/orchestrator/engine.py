@@ -334,7 +334,7 @@ class AgentOrchestrator:
         if changed:
             self._sync_plan_progress()
 
-    def mark_repair(self, reason: str) -> None:
+    def mark_repair(self, reason: str, *, provider_switch: bool = False) -> None:
         assert self.run is not None
         self.run.repair_attempts += 1
         if not self.run.runtime.record_repair():
@@ -361,6 +361,18 @@ class AgentOrchestrator:
             else:
                 self.fail(self.run.runtime.snapshot.failure_reason)
                 return
+        # A successful switch to a genuinely untested provider is progress,
+        # not a repeat of whatever the previous provider kept getting wrong
+        # -- it hasn't had a single attempt charged against it yet. Without
+        # this, a run configured with many fallback candidates could still
+        # exhaust the shared repair counter (and its limited extensions)
+        # purely from cycling through providers, before any of the later,
+        # untried ones ever got a real shot. Reset the round counter (not
+        # the capped extensions counter) so each newly-adopted provider
+        # starts its own attempts from zero, same as the very first
+        # provider of the run did.
+        if provider_switch:
+            self.run.runtime.snapshot.repair_rounds = 0
         self.transition(AgentPhase.REPAIR, action=reason)
 
     def validate(self, *, final_text: str, any_mutation: bool) -> ValidationReport:

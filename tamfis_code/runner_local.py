@@ -5248,7 +5248,7 @@ async def _run_local_agent_turn_impl(
                     # candidate has already been exhausted. Before this,
                     # repair_attempts/AgentPhase.REPAIR never reflected this
                     # fallback chain at all, even when it succeeded.
-                    orchestrator.mark_repair(f"Falling back from {failed_provider.value} to {candidate.value} ({reason})")
+                    orchestrator.mark_repair(f"Falling back from {failed_provider.value} to {candidate.value} ({reason})", provider_switch=True)
                     renderer.handle_event({
                         "event_type": "diagnostics",
                         "payload": {
@@ -5390,7 +5390,8 @@ async def _run_local_agent_turn_impl(
                     client = candidate_client
                     resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
                     orchestrator.mark_repair(
-                        f"Discarding invalid output from {failed_quality_provider.value}; retrying on {candidate.value}"
+                        f"Discarding invalid output from {failed_quality_provider.value}; retrying on {candidate.value}",
+                        provider_switch=True,
                     )
                     orchestrator.record_route(
                         provider=resolved_provider.value,
@@ -5582,7 +5583,8 @@ async def _run_local_agent_turn_impl(
                         client = candidate_client
                         resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
                         orchestrator.mark_repair(
-                            f"Falling back from {old_provider.value}: model repeatedly narrated tools without calling them"
+                            f"Falling back from {old_provider.value}: model repeatedly narrated tools without calling them",
+                            provider_switch=True,
                         )
                         orchestrator.record_route(
                             provider=resolved_provider.value,
@@ -5652,7 +5654,8 @@ async def _run_local_agent_turn_impl(
                         client = candidate_client
                         resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
                         orchestrator.mark_repair(
-                            f"Falling back from {old_provider.value}: model repeatedly wrote fake tool calls as text"
+                            f"Falling back from {old_provider.value}: model repeatedly wrote fake tool calls as text",
+                            provider_switch=True,
                         )
                         orchestrator.record_route(
                             provider=resolved_provider.value,
@@ -5722,7 +5725,8 @@ async def _run_local_agent_turn_impl(
                         client = candidate_client
                         resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
                         orchestrator.mark_repair(
-                            f"Falling back from {old_provider.value}: model fabricated a tool result/refusal without calling it"
+                            f"Falling back from {old_provider.value}: model fabricated a tool result/refusal without calling it",
+                            provider_switch=True,
                         )
                         orchestrator.record_route(
                             provider=resolved_provider.value,
@@ -5800,7 +5804,8 @@ async def _run_local_agent_turn_impl(
                         client = candidate_client
                         resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
                         orchestrator.mark_repair(
-                            f"Falling back from {old_provider.value}: model gave up without trying a tool"
+                            f"Falling back from {old_provider.value}: model gave up without trying a tool",
+                            provider_switch=True,
                         )
                         orchestrator.record_route(
                             provider=resolved_provider.value,
