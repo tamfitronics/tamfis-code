@@ -300,7 +300,11 @@ class ProviderManager:
                 # zero data retention. Explicit-select route like glm-5.2 and
                 # minimax-m3 above, not the default, since it hasn't been
                 # live-verified against this CLI's own tool-calling loop yet.
-                "deepseek-v4-flash:0731-cloud",
+                # RENAMED 2026-08-11: Ollama made "deepseek-v4-flash:cloud"
+                # (no dated suffix) the rolling tag for this release,
+                # replacing the dated "deepseek-v4-flash:0731-cloud" id --
+                # same not-yet-live-verified caveat still applies.
+                "deepseek-v4-flash:cloud",
             ],
             # priority=3 (2026-08-08, was 0/first): Ollama Cloud's weekly
             # usage limit is a real multi-day-reset 429, not a transient
