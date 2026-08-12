@@ -226,10 +226,12 @@ class StandaloneMCPBridge:
         # with an empty body. The response is still awaited (not
         # fire-and-forget) so a transport-level failure surfaces here
         # rather than silently vanishing.
-        await conn.client.post(
+        response = await conn.client.post(
             conn.url, json=payload, headers=self._http_request_headers(conn),
             timeout=_HTTP_REQUEST_TIMEOUT_SECONDS,
         )
+        if response.status_code >= 400:
+            raise RuntimeError(f"MCP server '{name}' returned HTTP {response.status_code} during {method}")
 
     # ── transport-agnostic surface ───────────────────────────────────
     async def _request(self, name: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
@@ -259,11 +261,11 @@ class StandaloneMCPBridge:
         del background
         if self._processes or self._http:
             return self.available
-        for name, config in self.servers.items():
-            if config.transport == "http":
-                await self._initialize_http_server(name, config)
-            else:
-                await self._initialize_stdio_server(name, config)
+        await asyncio.gather(*(
+            self._initialize_http_server(name, config) if config.transport == "http"
+            else self._initialize_stdio_server(name, config)
+            for name, config in self.servers.items()
+        ))
         return self.available
 
     async def _initialize_stdio_server(self, name: str, config: MCPServerConfig) -> None:
