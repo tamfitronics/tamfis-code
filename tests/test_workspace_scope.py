@@ -210,6 +210,24 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             self.assertEqual(scoped["path"], str(target.resolve()))
             self.assertEqual(scoped["_tamfis_external_scope_paths"], [str(target.resolve())])
 
+    def test_relative_file_tool_path_is_resolved_inside_single_nested_scope(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            focused = project / "src" / "feature"
+            focused.mkdir(parents=True)
+
+            scoped, error = _scope_tool_arguments(
+                "read_file",
+                {"path": "handler.py"},
+                workspace_root=str(root),
+                scope_roots=[focused.resolve()],
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(scoped["path"], str(focused / "handler.py"))
+            self.assertNotIn("_tamfis_external_scope_paths", scoped)
+
     def test_heredoc_source_is_not_parsed_as_command_paths(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)

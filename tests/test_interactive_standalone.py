@@ -301,6 +301,59 @@ class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
         self.assertIn("Standalone mode", output)
         self.assertIn("/pty", output)
 
+    def test_usage_without_login_tells_user_to_log_in(self):
+        # client=None (standalone) with no stored credentials -- the
+        # temporary RemoteAPIClient /usage constructs internally will hit
+        # AuthRequiredError from the real GET /billing/balance call.
+        from tamfis_code.api_client import AuthRequiredError
+
+        with patch(
+            "tamfis_code.interactive.RemoteAPIClient.get_billing_balance",
+            AsyncMock(side_effect=AuthRequiredError(401, "Not authenticated")),
+        ), patch("tamfis_code.interactive.RemoteAPIClient.aclose", AsyncMock()):
+            output = _run(["/usage", EOFError()])
+        self.assertIn("tamfis-code login", output)
+
+    def test_usage_shows_real_day_week_month_balance(self):
+        fake_balance = {
+            "tier": "pro",
+            "low_credit_warning": False,
+            "balances": {
+                "chat": {
+                    "allotted": 10000, "used": 500, "remaining": 9500,
+                    "low_credit_warning": False, "unlimited": False,
+                    "day": {"allotted": 1000, "used": 50, "remaining": 950},
+                    "week": {"allotted": 3300, "used": 200, "remaining": 3100},
+                },
+            },
+        }
+        with patch(
+            "tamfis_code.interactive.RemoteAPIClient.get_billing_balance",
+            AsyncMock(return_value=fake_balance),
+        ), patch("tamfis_code.interactive.RemoteAPIClient.aclose", AsyncMock()):
+            output = _run(["/usage", EOFError()])
+        self.assertIn("pro", output)
+        self.assertIn("950/1,000", output)   # day
+        self.assertIn("3,100/3,300", output)  # week
+        self.assertIn("9,500/10,000", output)  # month
+
+    def test_usage_admin_shows_unlimited_not_a_crash(self):
+        fake_balance = {
+            "tier": "enterprise",
+            "low_credit_warning": False,
+            "balances": {
+                "chat": {"allotted": None, "used": 0, "remaining": None, "unlimited": True,
+                          "day": {"allotted": None, "used": 0, "remaining": None},
+                          "week": {"allotted": None, "used": 0, "remaining": None}},
+            },
+        }
+        with patch(
+            "tamfis_code.interactive.RemoteAPIClient.get_billing_balance",
+            AsyncMock(return_value=fake_balance),
+        ), patch("tamfis_code.interactive.RemoteAPIClient.aclose", AsyncMock()):
+            output = _run(["/usage", EOFError()])
+        self.assertIn("unlimited", output)
+
 
 class StandaloneDiffsAndRevertTests(_StatePatchMixin, unittest.TestCase):
     def test_diffs_empty_session_prints_dim_message(self):

@@ -195,6 +195,7 @@ $ <command>            explicit shell command
 
 /help                show this help
 /status              show session/workspace/approval status
+/usage               show your TamfisGPT credit balance (day/week/month)
 /context             show cached repository/task context
 /reports             show the repository report index
 /queue               show queued instructions
@@ -263,6 +264,7 @@ Not yet implemented in this pass: /notifications.
 SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show this help"),
     ("/status", "show session/workspace/approval status"),
+    ("/usage", "show your TamfisGPT credit balance (day/week/month)"),
     ("/context", "show cached repository/task context"),
     ("/reports", "show the repository report index"),
     ("/queue", "show or append queued instructions"),
@@ -1104,6 +1106,64 @@ async def run_interactive(
                 f"{backend_line}\n"
                 f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
             )
+            continue
+        if text == "/usage":
+            # Real per-feature credit balance from the SAME ledger the
+            # TamfisGPT web app's Settings > Billing page reads -- day/week/
+            # month, not just a monthly total, matching the enforcement
+            # windows the server actually applies (see credit_ledger.py's
+            # check_and_reserve). Requires a real login (`tamfis-code
+            # login`); a bare TAMFIS_API_KEY developer key has no
+            # subscription/plan to check a balance against.
+            #
+            # `client` is None in standalone mode (this REPL's local-only
+            # execution path has no server connection at all -- see
+            # run_interactive's `standalone = client is None`), but a
+            # subscription balance is a property of the logged-in account,
+            # independent of whether THIS session executes locally or
+            # remotely -- so a short-lived client is created just for this
+            # one call rather than gating /usage on standalone/remote mode.
+            temp_usage_client = client is None
+            usage_client = client if not temp_usage_client else RemoteAPIClient(config)
+            try:
+                usage = await usage_client.get_billing_balance()
+            except AuthRequiredError:
+                print_error(
+                    console,
+                    "Not logged in to a TamfisGPT subscription -- run `tamfis-code login` to see your "
+                    "credit balance. (A bare TAMFIS_API_KEY developer key works for model routing but "
+                    "has no subscription/plan to check a balance against.)",
+                )
+                continue
+            except RemoteAPIError as e:
+                print_error(console, f"Couldn't fetch usage: {e}")
+                continue
+            finally:
+                if temp_usage_client:
+                    await usage_client.aclose()
+
+            tier = usage.get("tier", "free")
+            console.print(f"[bold]TamfisGPT plan:[/bold] {tier}")
+            if usage.get("low_credit_warning"):
+                console.print("[yellow]⚠ One or more categories are running low this month.[/yellow]")
+            balances = usage.get("balances") or {}
+            console.print(f"{'category':<12}{'day':>18}{'week':>18}{'month':>18}")
+            for feature, b in balances.items():
+                if b.get("unlimited"):
+                    console.print(f"{feature:<12}{'unlimited':>18}{'unlimited':>18}{'unlimited':>18}")
+                    continue
+
+                def _cell(window: dict) -> str:
+                    remaining, allotted = window.get("remaining"), window.get("allotted")
+                    if remaining is None or allotted is None:
+                        return "-"
+                    return f"{remaining:,}/{allotted:,}"
+
+                day_cell = _cell(b.get("day") or {})
+                week_cell = _cell(b.get("week") or {})
+                month_cell = f"{b.get('remaining', 0):,}/{b.get('allotted', 0):,}"
+                warn = " ⚠" if b.get("low_credit_warning") else ""
+                console.print(f"{feature:<12}{day_cell:>18}{week_cell:>18}{month_cell:>18}{warn}")
             continue
         if text == "/context":
             context = discover_local_repository(workspace.session_id, Path(workspace.workspace_root))

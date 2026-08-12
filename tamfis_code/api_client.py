@@ -279,6 +279,20 @@ class RemoteAPIClient:
     async def list_sessions(self) -> list[dict[str, Any]]:
         return await self.request("GET", "/remote/sessions")
 
+    # -- billing / subscription --------------------------------------------
+
+    async def get_billing_balance(self) -> dict[str, Any]:
+        """Real per-feature credit balance (day/week/month) for the
+        logged-in TamfisGPT subscription this CLI is authenticated as --
+        the SAME account/plan/credit ledger the web app's Settings > Billing
+        page reads, via tier_ii_gateway/api/billing.py's GET /billing/balance
+        (credit_ledger.get_balance). Requires a real login (`tamfis-code
+        login`), not just a bare TAMFIS_API_KEY -- a raw developer key has
+        no subscription/plan attached to check a balance against. Powers
+        `/usage` in interactive.py.
+        """
+        return await self.request("GET", "/billing/balance")
+
     async def create_session(
         self, server_id: int, working_directory: Optional[str] = None,
         workspace_id: Optional[str] = None,

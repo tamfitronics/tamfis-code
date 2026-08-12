@@ -60,11 +60,42 @@ def test_explicit_granted_external_path_is_selected(tmp_path: Path):
     assert result.roots == (other.resolve(),)
 
 
-def test_unrelated_absolute_file_does_not_expand_to_sibling(tmp_path: Path):
+def test_explicit_file_remains_an_exact_target(tmp_path: Path):
     current = _project(tmp_path / "tamfisseo")
     target = current / "README.md"
     target.write_text("x", encoding="utf-8")
-    assert explicit_absolute_targets(f"read {target}") == (current.resolve(),)
+    assert explicit_absolute_targets(f"read {target}") == (target.resolve(),)
+
+
+def test_restrictive_nested_directory_scope_is_not_promoted_to_project_root(tmp_path: Path):
+    current = _project(tmp_path / "tamfisseo")
+    focused = current / "apps" / "frontend"
+    focused.mkdir(parents=True)
+    incidental = current / "README.md"
+    incidental.write_text("x", encoding="utf-8")
+
+    objective = f"Concentrate only on {focused}; {incidental} is background context."
+    assert explicit_absolute_targets(objective) == (focused.resolve(),)
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective=objective,
+        allowed_roots=[current],
+    )
+    assert result.roots == (focused.resolve(),)
+
+
+def test_restrictive_relative_directory_scope_is_resolved_from_launch_root(tmp_path: Path):
+    current = _project(tmp_path / "tamfisseo")
+    focused = current / "apps" / "frontend"
+    focused.mkdir(parents=True)
+
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective="Focus only within apps/frontend.",
+        allowed_roots=[current],
+    )
+
+    assert result.roots == (focused.resolve(),)
 
 
 def test_pasted_status_hint_is_not_an_absolute_target(tmp_path: Path):
@@ -91,14 +122,14 @@ def test_explicit_external_path_is_automatically_added_to_grant(tmp_path: Path):
         allowed_roots=[current],
     )
 
-    assert added == (other.resolve(),)
-    assert allowed == (current.resolve(), other.resolve())
+    assert added == (target.resolve(),)
+    assert allowed == (current.resolve(), target.resolve())
     result = resolve_workspace_targets(
         launch_root=current,
         objective=f"read {target}",
         allowed_roots=allowed,
     )
-    assert result.roots == (other.resolve(),)
+    assert result.roots == (target.resolve(),)
 
 
 def test_pasted_api_routes_and_error_text_are_not_absolute_targets(tmp_path: Path):

@@ -1045,7 +1045,13 @@ def _scope_tool_arguments(
     if path_key is None:
         return scoped, None
 
-    requested = _resolve_argument_path(scoped.get(path_key), workspace_root)
+    requested_value = scoped.get(path_key)
+    requested_base = (
+        str(scope_roots[0])
+        if len(scope_roots) == 1 and requested_value and not Path(str(requested_value)).expanduser().is_absolute()
+        else workspace_root
+    )
+    requested = _resolve_argument_path(requested_value, requested_base)
     if requested is None:
         if len(scope_roots) == 1:
             scoped[path_key] = str(scope_roots[0])

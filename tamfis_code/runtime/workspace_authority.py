@@ -67,24 +67,50 @@ class WorkspaceResolution:
     denied_targets: tuple[Path, ...] = field(default_factory=tuple)
 
 
-def _project_root(path: Path) -> Path:
-    candidate = path.resolve()
-    start = candidate if candidate.is_dir() else candidate.parent
-    for root in (start, *start.parents):
-        if any(
-            (root / marker).exists()
-            for marker in (".git", "pyproject.toml", "package.json", "Cargo.toml", "go.mod")
-        ):
-            return root
-    return start
+_RESTRICTIVE_SCOPE_RE = re.compile(
+    r"\b(?:operate|work|focus|concentrate|restrict|limit|confine|stay)\s+"
+    r"(?:only\s+)?(?:inside|within|on|to)\s+"
+    r"(?P<path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)"
+    r"|\b(?:directory\s+scope|workspace\s+scope|working\s+directory|cwd|scope)\s*"
+    r"(?:is|:)\s*(?P<named_path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)",
+    re.IGNORECASE,
+)
+_RESTRICTIVE_RELATIVE_SCOPE_RE = re.compile(
+    r"\b(?:operate|work|focus|concentrate|restrict|limit|confine|stay)\s+"
+    r"(?:only\s+)?(?:inside|within|on|to)\s+"
+    r"(?P<path>(?!/)[A-Za-z0-9._~+\-]+(?:/[A-Za-z0-9._~+\-]+)*)",
+    re.IGNORECASE,
+)
+
+
+def _existing_path(raw: str) -> Path | None:
+    candidate = Path(raw.rstrip(".,;:)]}")).expanduser()
+    if not candidate.exists():
+        return None
+    try:
+        return candidate.resolve()
+    except OSError:
+        return None
 
 
 def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
+    """Return exact existing paths the user named as filesystem targets.
+
+    Do not promote a nested directory to its enclosing repository. A narrow
+    directory is an intentional boundary, not a hint to inspect every sibling
+    below the project root. Restrictive scope language wins over incidental
+    paths quoted elsewhere in the same objective.
+    """
     targets: list[Path] = []
     seen: set[str] = set()
     scrubbed = _URL_RE.sub(" ", objective or "")
-    for raw in _ABSOLUTE_PATH_RE.findall(scrubbed):
-        candidate = Path(raw.rstrip(".,;:)]}")).expanduser()
+    restrictive_paths = [
+        match.group("path") or match.group("named_path")
+        for match in _RESTRICTIVE_SCOPE_RE.finditer(scrubbed)
+    ]
+    raw_paths = restrictive_paths or _ABSOLUTE_PATH_RE.findall(scrubbed)
+    for raw in raw_paths:
+        candidate = _existing_path(raw)
         # Terminal hints, pasted transcripts, and pasted error logs commonly
         # contain absolute-looking tokens that are not filesystem paths at
         # all: slash commands (`/status`), REST/API routes copied from a
@@ -94,11 +120,26 @@ def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
         # grant" the moment a user pasted an error message containing one.
         # A token only becomes an actionable workspace target once it
         # resolves to something that actually exists on disk.
-        if not candidate.exists():
+        if candidate is None:
             continue
+        key = str(candidate)
+        if key not in seen:
+            seen.add(key)
+            targets.append(candidate)
+    return tuple(targets)
+
+
+def restrictive_relative_targets(launch_root: str | Path, objective: str) -> tuple[Path, ...]:
+    """Resolve narrow, relative scope directives against the launch directory."""
+    launch = Path(launch_root).expanduser().resolve()
+    targets: list[Path] = []
+    seen: set[str] = set()
+    for match in _RESTRICTIVE_RELATIVE_SCOPE_RE.finditer(objective or ""):
         try:
-            candidate = _project_root(candidate)
+            candidate = (launch / match.group("path").rstrip(".,;:)]}")).resolve()
         except OSError:
+            continue
+        if not candidate.exists():
             continue
         key = str(candidate)
         if key not in seen:
@@ -113,15 +154,15 @@ def auto_grant_explicit_targets(
     """Add explicit, usable targets to a local session grant.
 
     Naming an absolute path in the current user objective is direct scope
-    authorization. Only a resolved directory that already exists is added;
-    inferred names, pasted slash commands, and unresolved root-level tokens
-    cannot widen the grant.
+    authorization. The exact resolved file or directory is added; inferred
+    names, pasted slash commands, and unresolved root-level tokens cannot
+    widen the grant.
     """
     grant = WorkspaceGrant.create(launch_root, allowed_roots)
     roots = list(grant.allowed_roots)
     added: list[Path] = []
     for target in explicit_absolute_targets(objective):
-        if grant.contains(target) or not target.is_dir():
+        if grant.contains(target):
             continue
         roots.append(target)
         added.append(target)
@@ -185,7 +226,7 @@ def resolve_workspace_targets(
     *, launch_root: str | Path, objective: str, allowed_roots: Iterable[str | Path] = ()
 ) -> WorkspaceResolution:
     grant = WorkspaceGrant.create(launch_root, allowed_roots)
-    explicit = explicit_absolute_targets(objective)
+    explicit = restrictive_relative_targets(launch_root, objective) or explicit_absolute_targets(objective)
     denied = tuple(path for path in explicit if not grant.contains(path))
     if denied:
         rendered = ", ".join(str(path) for path in denied)
