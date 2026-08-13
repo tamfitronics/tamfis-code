@@ -39,6 +39,22 @@ try:
 except (TypeError, ValueError):
     MAX_TASK_STREAM_RECONNECTS = 12
 
+# _stream_task recurses one Python frame per reconnect attempt (it is not
+# tail-call optimized), so an interactive session's much longer reconnect
+# window is still a bounded number of attempts, not truly infinite -- a
+# genuinely unbounded retry loop here would eventually hit the interpreter's
+# recursion limit and crash with RecursionError, which is a far worse "cut
+# off" than the one this is meant to fix. ~360 attempts, capped at 8s of
+# backoff each once ramped up, tolerates on the order of tens of minutes of
+# continuous backend downtime (a redeploy, a stuck worker) while staying
+# far below the default 1000-frame recursion limit.
+try:
+    _INTERACTIVE_STREAM_RECONNECT_CEILING = max(
+        MAX_TASK_STREAM_RECONNECTS, int(os.getenv("TAMFIS_CODE_INTERACTIVE_STREAM_RECONNECTS", "360"))
+    )
+except (TypeError, ValueError):
+    _INTERACTIVE_STREAM_RECONNECT_CEILING = 360
+
 # How long a reattached event stream may sit completely silent before it's
 # treated as dead rather than merely slow. Confirmed live: a task reattached
 # via cli.py's startup `_resume_interrupted_task_if_any` (or the explicit
@@ -808,11 +824,26 @@ async def _stream_task(
         if status == "completed":
             outcome = TaskOutcome(status="completed", summary=task_status.get("final_answer") or "")
         elif status in ACTIVE_TASK_STATUSES:
-            if reconnect_attempt < MAX_TASK_STREAM_RECONNECTS:
-                delay = min(8.0, 0.5 * (2 ** reconnect_attempt))
+            # An interactive session never shows the user a "cut off, run
+            # `attach` yourself" wall for an ordinary backend blip (a
+            # recycled gunicorn worker, a model provider hiccup) -- it stays
+            # visibly connected and keeps reconnecting from the last
+            # checkpoint, capped by _INTERACTIVE_STREAM_RECONNECT_CEILING
+            # (~50 minutes of retries) rather than MAX_TASK_STREAM_RECONNECTS'
+            # handful of attempts. That ceiling is a stack-depth safety limit,
+            # not a UX one -- each retry recurses one Python frame deeper and
+            # this must stay well under the interpreter's recursion limit,
+            # not a real judgement that 50 minutes is "long enough". Ctrl+C
+            # (interrupt_task, above) is still the only way out before then.
+            # A non-interactive/automation caller (a script, a CI step) keeps
+            # the short bounded ceiling -- it must not hang indefinitely on a
+            # dead backend with no one watching.
+            reconnect_ceiling = _INTERACTIVE_STREAM_RECONNECT_CEILING if interactive else MAX_TASK_STREAM_RECONNECTS
+            if reconnect_attempt < reconnect_ceiling:
+                delay = min(8.0, 0.5 * (2 ** min(reconnect_attempt, 4)))
                 console.print(
                     f"[dim]· Event stream closed; reconnecting from the last checkpoint "
-                    f"({reconnect_attempt + 1}/{MAX_TASK_STREAM_RECONNECTS})...[/dim]"
+                    f"({reconnect_attempt + 1}/{reconnect_ceiling})...[/dim]"
                 )
                 await asyncio.sleep(delay)
                 cursor = local_state.get_session_state(session_id).last_event_id

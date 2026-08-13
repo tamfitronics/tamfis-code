@@ -22,6 +22,20 @@ class UnwrapTests(unittest.TestCase):
     def test_unwraps_data_envelope(self):
         self.assertEqual(_unwrap({"data": {"id": 1}, "success": True}), {"id": 1})
 
+    def test_unwraps_the_real_gateway_envelope_shape(self):
+        # Regression: tier_ii_gateway/schemas/schemas.py's APIResponse
+        # always serializes all five fields (success/data/error/message/
+        # meta), including the unset ones as null -- e.g. GET
+        # /billing/balance. An exact-subset check against a narrower
+        # {data,success,message} key set silently failed to unwrap this,
+        # leaving callers like /usage reading fields off the wrong JSON
+        # level (the envelope itself, not payload["data"]).
+        payload = {
+            "success": True, "data": {"tier": "pro", "balances": {}},
+            "error": None, "message": None, "meta": None,
+        }
+        self.assertEqual(_unwrap(payload), {"tier": "pro", "balances": {}})
+
     def test_passes_through_flat_dict_with_extra_keys(self):
         payload = {"access_token": "x", "user": {}}
         self.assertEqual(_unwrap(payload), payload)

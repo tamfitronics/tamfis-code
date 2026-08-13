@@ -228,6 +228,49 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             self.assertEqual(scoped["path"], str(focused / "handler.py"))
             self.assertNotIn("_tamfis_external_scope_paths", scoped)
 
+    def test_execute_command_cwd_uses_parent_directory_when_scope_root_is_a_file(self):
+        # Regression: an explicitly named file now stays an exact scope
+        # target (not promoted to its enclosing directory -- see
+        # workspace_authority.py's explicit_absolute_targets). A single
+        # scope root can therefore be a FILE, not a directory, but
+        # execute_command's default cwd still needs a real directory to
+        # cd into -- using the file itself broke every shell command that
+        # didn't supply its own cwd.
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            target_file = project / "src" / "handler.py"
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            target_file.write_text("x", encoding="utf-8")
+
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {"command": "ls"},
+                workspace_root=str(root),
+                scope_roots=[target_file.resolve()],
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(target_file.parent.resolve()))
+
+    def test_relative_path_resolves_against_parent_when_scope_root_is_a_file(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            target_file = project / "src" / "handler.py"
+            target_file.parent.mkdir(parents=True, exist_ok=True)
+            target_file.write_text("x", encoding="utf-8")
+
+            scoped, error = _scope_tool_arguments(
+                "read_file",
+                {"path": "sibling.py"},
+                workspace_root=str(root),
+                scope_roots=[target_file.resolve()],
+            )
+
+            self.assertIsNone(error)
+            self.assertEqual(scoped["path"], str(target_file.parent / "sibling.py"))
+
     def test_heredoc_source_is_not_parsed_as_command_paths(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)

@@ -67,17 +67,25 @@ class WorkspaceResolution:
     denied_targets: tuple[Path, ...] = field(default_factory=tuple)
 
 
+# Shared verb+preposition fragment for both patterns below -- "keep"/"scope"
+# cover the common "keep it to X" / "scope this to X" phrasings that the
+# original operate/work/focus/... list silently missed (no match meant no
+# error either, just a silent fall-back to granting the whole project).
+_RESTRICTIVE_SCOPE_VERB = (
+    r"(?:operate|work|focus|concentrate|restrict|limit|confine|stay"
+    r"|keep(?:\s+(?:it|this))?|scope(?:\s+(?:it|this))?)"
+)
+_RESTRICTIVE_SCOPE_PREP = r"(?:only\s+)?(?:inside|within|on|to)\s+"
+
 _RESTRICTIVE_SCOPE_RE = re.compile(
-    r"\b(?:operate|work|focus|concentrate|restrict|limit|confine|stay)\s+"
-    r"(?:only\s+)?(?:inside|within|on|to)\s+"
+    rf"\b{_RESTRICTIVE_SCOPE_VERB}\s+{_RESTRICTIVE_SCOPE_PREP}"
     r"(?P<path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)"
     r"|\b(?:directory\s+scope|workspace\s+scope|working\s+directory|cwd|scope)\s*"
     r"(?:is|:)\s*(?P<named_path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)",
     re.IGNORECASE,
 )
 _RESTRICTIVE_RELATIVE_SCOPE_RE = re.compile(
-    r"\b(?:operate|work|focus|concentrate|restrict|limit|confine|stay)\s+"
-    r"(?:only\s+)?(?:inside|within|on|to)\s+"
+    rf"\b{_RESTRICTIVE_SCOPE_VERB}\s+{_RESTRICTIVE_SCOPE_PREP}"
     r"(?P<path>(?!/)[A-Za-z0-9._~+\-]+(?:/[A-Za-z0-9._~+\-]+)*)",
     re.IGNORECASE,
 )

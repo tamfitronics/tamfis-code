@@ -505,7 +505,13 @@ class RemoteAPIClient:
 
 
 def _unwrap(payload: Any) -> Any:
-    if isinstance(payload, dict) and "data" in payload and set(payload.keys()) <= {"data", "success", "message"}:
+    # tier_ii_gateway/schemas/schemas.py's APIResponse always serializes
+    # all five fields (success/data/error/message/meta), including the
+    # unset ones as null -- an exact-subset check against a narrower key
+    # set silently failed to unwrap real responses that happened to also
+    # carry error/meta (e.g. GET /billing/balance), leaving every caller
+    # reading fields off the wrong JSON level instead of payload["data"].
+    if isinstance(payload, dict) and "data" in payload and set(payload.keys()) <= {"data", "success", "message", "error", "meta"}:
         return payload["data"]
     return payload
 

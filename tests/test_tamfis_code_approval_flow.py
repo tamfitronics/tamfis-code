@@ -14,6 +14,7 @@ fix already got, just a way to make sure it can't silently regress.
 import asyncio
 import tempfile
 import unittest
+import unittest.mock
 from io import StringIO
 from pathlib import Path
 
@@ -238,6 +239,74 @@ class StreamTaskApprovalTests(unittest.TestCase):
 
         self.assertEqual(client.approve_calls, [])
         self.assertEqual(outcome.status, "completed")
+
+    def test_interactive_session_reconnects_past_the_noninteractive_ceiling(self):
+        # Regression: an interactive session used to give up and dump the
+        # user into a manual `tamfis-code attach` flow after
+        # MAX_TASK_STREAM_RECONNECTS (a handful of attempts) -- an ordinary
+        # backend blip (a recycled gunicorn worker, a model provider hiccup)
+        # felt like a hard cutoff. Interactive sessions now keep reconnecting
+        # up to the much larger _INTERACTIVE_STREAM_RECONNECT_CEILING.
+        class FlakyThenRecoversClient(FakeStreamClient):
+            def __init__(self):
+                super().__init__([])
+                self.stream_calls = 0
+
+            async def stream_session(self, session_id, last_event_id, *, idle_timeout=None):
+                self.stream_calls += 1
+                if self.stream_calls < 4:
+                    return
+                yield {
+                    "task_id": "t1", "sequence": 1,
+                    "event_type": "ai_task_completed", "payload": {"status": "completed"},
+                }
+
+            async def get_task(self, task_id):
+                return {"id": task_id, "status": "running"}
+
+        client = FlakyThenRecoversClient()
+        console = Console(file=StringIO(), no_color=True, width=200)
+        renderer = StreamRenderer(console)
+
+        with unittest.mock.patch("tamfis_code.runner.MAX_TASK_STREAM_RECONNECTS", 1), \
+             unittest.mock.patch("tamfis_code.runner._INTERACTIVE_STREAM_RECONNECT_CEILING", 3):
+            outcome = asyncio.run(asyncio.wait_for(_stream_task(
+                client, renderer, console,
+                session_id=1, task_id="t1", approval_policy="ask", interactive=True,
+            ), timeout=15))
+
+        # Recovered on the 4th stream_session call -- one more reconnect
+        # than the patched non-interactive ceiling (1) would have allowed.
+        self.assertEqual(client.stream_calls, 4)
+        self.assertEqual(outcome.status, "completed")
+
+    def test_noninteractive_session_still_gives_up_at_the_bounded_ceiling(self):
+        class NeverCompletesClient(FakeStreamClient):
+            def __init__(self):
+                super().__init__([])
+                self.stream_calls = 0
+
+            async def stream_session(self, session_id, last_event_id, *, idle_timeout=None):
+                self.stream_calls += 1
+                return
+                yield  # pragma: no cover -- makes this an async generator
+
+            async def get_task(self, task_id):
+                return {"id": task_id, "status": "running"}
+
+        client = NeverCompletesClient()
+        console = Console(file=StringIO(), no_color=True, width=200)
+        renderer = StreamRenderer(console)
+
+        with unittest.mock.patch("tamfis_code.runner.MAX_TASK_STREAM_RECONNECTS", 1), \
+             unittest.mock.patch("tamfis_code.runner._INTERACTIVE_STREAM_RECONNECT_CEILING", 3):
+            outcome = asyncio.run(asyncio.wait_for(_stream_task(
+                client, renderer, console,
+                session_id=1, task_id="t1", approval_policy="ask", interactive=False,
+            ), timeout=15))
+
+        self.assertEqual(client.stream_calls, 2)
+        self.assertEqual(outcome.status, "detached")
 
     def test_reprioritise_instruction_cancels_current_task_at_safe_boundary(self):
         class WaitingClient(FakeStreamClient):
