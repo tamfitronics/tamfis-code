@@ -672,13 +672,28 @@ def validate_plan_step(
     validated_evidence: list[str] = []
     resolved_targets: list[Path] = []
 
+    # A partial credit: an unverified entry in the structured `targets` list
+    # (metadata, not prose the step's action text asserts) is dropped on its
+    # own rather than discarding a step that also names other, genuinely
+    # grounded targets -- one bad target field entry among several good ones
+    # doesn't mean the whole step is a hallucination. Only when EVERY
+    # supplied target fails does that signal the step is really about
+    # something unverifiable, so the whole-step rejection still applies then.
+    # Paths/commands asserted inside the action text itself (below) keep the
+    # strict all-or-nothing rule -- there's no way to "drop" a claim that's
+    # baked into the prose the user will actually read.
+    dropped_targets: list[str] = []
     for raw_target in targets:
         target = _safe_resolve(Path(str(raw_target)).expanduser())
         if target is None or not evidence.path_was_discovered(target):
-            _reject(f"target path not in discovered evidence: {raw_target!r}")
-            return None
+            dropped_targets.append(str(raw_target))
+            continue
         resolved_targets.append(target)
         validated_evidence.append(f"path:{target}")
+
+    if targets and not resolved_targets:
+        _reject(f"no supplied target was in discovered evidence: {dropped_targets!r}")
+        return None
 
     for raw_path in _ABSOLUTE_PATH_RE.findall(clean_name):
         target = _safe_resolve(Path(raw_path.rstrip(".,;:)]}")))

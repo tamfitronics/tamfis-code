@@ -145,6 +145,23 @@ class ParseReasoningPlanStrictEvidenceTests(unittest.TestCase):
         plan = parse_reasoning_plan(raw, objective="x", scope_roots=[self.root])
         self.assertIsNone(plan)
 
+    def test_one_unverified_target_among_several_no_longer_drops_the_whole_step(self):
+        # Regression: a step naming both a real target and one unverified
+        # target (e.g. a stray/inaccurate path the model added alongside a
+        # correct one) used to lose ALL grounding for that step and get
+        # rejected outright, even though the other target was genuinely
+        # discovered evidence. Only the unverified entry is dropped now.
+        outside = Path(tempfile.gettempdir()) / "definitely-not-authorised-elsewhere.py"
+        raw = json.dumps({"steps": [{
+            "action": "Update main.py",
+            "targets": [str(self.root / "main.py"), str(outside)],
+        }]})
+        plan = parse_reasoning_plan(raw, objective="x", scope_roots=[self.root])
+        self.assertIsNotNone(plan)
+        self.assertEqual(len(plan.steps), 1)
+        self.assertIn(f"path:{self.root / 'main.py'}", plan.steps[0].evidence)
+        self.assertFalse(any("elsewhere" in item for item in plan.steps[0].evidence))
+
 
 class PlanningReconnaissanceValidationCommandTests(unittest.TestCase):
     """Regression coverage for the "always the same generic plan" bug on
