@@ -1199,15 +1199,24 @@ class StreamRenderer:
             return
 
         if event_type == "plan_step_progress":
-            # Update both the live view and durable scrollback. The live view
-            # may already have been stopped when assistant output began, so
-            # refreshing it alone makes progress appear to disappear.
+            # Step markers update in place inside the live view, matching
+            # engine.py's _sync_plan_progress contract: "no banner reprint,
+            # no spinner phase change, every round" -- this fires on every
+            # advanced/edited/added step, so printing a fresh durable panel
+            # here (like plan_created does) would spam scrollback with a
+            # near-duplicate of the same plan on every round.
+            # Only fall back to a durable print when the live view is not
+            # currently on screen (self._live is None -- e.g. assistant text
+            # already stopped it), since refreshing a stopped Live is a
+            # no-op and the update would otherwise be silently lost.
             self._close_assistant()
             items = payload.get("items") if isinstance(payload.get("items"), list) else []
             if items:
                 self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
-                self._refresh_live()
-                self._print_plan_snapshot(self._plan_steps, title=payload.get("title") or "Plan progress")
+                if self._live is not None:
+                    self._refresh_live()
+                else:
+                    self._print_plan_snapshot(self._plan_steps, title=payload.get("title") or "Plan progress")
             return
 
         if event_type == "plan_created":
