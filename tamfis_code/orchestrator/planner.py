@@ -537,11 +537,18 @@ def parse_reasoning_plan(
     reconnaissance_summary: Optional[str] = None,
     workspace_summary: Optional[dict[str, Any]] = None,
     scope_roots: Optional[Sequence[str | Path]] = None,
+    rejection_log: Optional[list[str]] = None,
 ) -> Optional[ExecutionPlan]:
     """Parse and evidence-validate a reasoning plan.
 
     Unsupported, invented, non-existent, or out-of-scope steps are removed.
     Returns None when no usable steps remain.
+
+    `rejection_log`, when supplied, is appended with one short reason per
+    dropped raw step -- purely diagnostic, so callers can tell whether a
+    fallback to the generic template happened because the model proposed
+    nothing usable at all vs. because grounding evidence was too thin to
+    verify what it proposed (see _attempt_reasoning_plan's diagnostics).
     """
     data = _load_json_object(raw_content)
     if data is None:
@@ -569,18 +576,25 @@ def parse_reasoning_plan(
     for raw_step in raw_steps[:MAX_REASONING_PLAN_STEPS]:
         candidate = _parse_step_candidate(raw_step)
         if candidate is None:
+            if rejection_log is not None:
+                rejection_log.append(f"unparseable step: {raw_step!r}"[:200])
             continue
 
         name, targets, command, declared_evidence = candidate
 
         if strict_evidence:
+            step_rejection_reasons: list[str] = []
             validated = validate_plan_step(
                 name=name,
                 targets=targets,
                 command=command,
                 evidence=evidence,
+                rejection_reasons=step_rejection_reasons if rejection_log is not None else None,
             )
             if validated is None:
+                if rejection_log is not None:
+                    reason = step_rejection_reasons[0] if step_rejection_reasons else "unverified claim"
+                    rejection_log.append(f"{reason}: {name!r}"[:200])
                 continue
             rendered_name, validated_evidence = validated
         else:
@@ -637,10 +651,22 @@ def validate_plan_step(
     targets: Sequence[str],
     command: Optional[str],
     evidence: PlannerEvidence,
+    rejection_reasons: Optional[list[str]] = None,
 ) -> Optional[tuple[str, list[str]]]:
-    """Return a grounded step, or None when it contains unsupported claims."""
+    """Return a grounded step, or None when it contains unsupported claims.
+
+    `rejection_reasons`, when supplied, gets exactly one short diagnostic
+    string appended at the point of rejection -- for _sync_plan_progress-
+    style observability into why a plan collapsed to the generic template,
+    not for control flow.
+    """
+    def _reject(reason: str) -> None:
+        if rejection_reasons is not None:
+            rejection_reasons.append(reason)
+
     clean_name = " ".join(str(name or "").split())
     if not clean_name:
+        _reject("empty action text")
         return None
 
     validated_evidence: list[str] = []
@@ -649,6 +675,7 @@ def validate_plan_step(
     for raw_target in targets:
         target = _safe_resolve(Path(str(raw_target)).expanduser())
         if target is None or not evidence.path_was_discovered(target):
+            _reject(f"target path not in discovered evidence: {raw_target!r}")
             return None
         resolved_targets.append(target)
         validated_evidence.append(f"path:{target}")
@@ -656,6 +683,7 @@ def validate_plan_step(
     for raw_path in _ABSOLUTE_PATH_RE.findall(clean_name):
         target = _safe_resolve(Path(raw_path.rstrip(".,;:)]}")))
         if target is None or not evidence.path_was_discovered(target):
+            _reject(f"path mentioned in action not in discovered evidence: {raw_path!r}")
             return None
         if target not in resolved_targets:
             resolved_targets.append(target)
@@ -667,11 +695,13 @@ def validate_plan_step(
             manifest_name in lowered_name
             and not evidence.manifest_name_was_discovered(manifest_name)
         ):
+            _reject(f"manifest named but not discovered: {manifest_name!r}")
             return None
 
     clean_command = _normalise_command(command or "")
     if clean_command:
         if not evidence.command_is_verified(clean_command):
+            _reject(f"command not verified: {clean_command!r}")
             return None
         validated_evidence.append(f"command:{clean_command}")
     else:
@@ -682,6 +712,7 @@ def validate_plan_step(
         ]
         for embedded in embedded_commands:
             if not evidence.command_is_verified(embedded):
+                _reject(f"embedded command not verified: {embedded!r}")
                 return None
             validated_evidence.append(f"command:{_normalise_command(embedded)}")
 
@@ -690,6 +721,7 @@ def validate_plan_step(
             and not _READ_ONLY_INTENT_RE.search(clean_name)
             and not embedded_commands
         ):
+            _reject("command-intent language with no verified/embedded command")
             return None
 
     rendered = clean_name

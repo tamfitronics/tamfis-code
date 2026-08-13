@@ -146,6 +146,59 @@ class ParseReasoningPlanStrictEvidenceTests(unittest.TestCase):
         self.assertIsNone(plan)
 
 
+class PlanningReconnaissanceValidationCommandTests(unittest.TestCase):
+    """Regression coverage for the "always the same generic plan" bug on
+    non-Node repositories: _build_planning_reconnaissance only extracted
+    verified commands from package.json scripts, so a Python/Go/Rust/etc.
+    repo's reconnaissance always reported "manifest_backed_commands: none
+    found" even when a conventional test command (pytest, go test, cargo
+    test, ...) was fully determinable from real manifest files.
+    validate_plan_step then rejected ANY plan step containing command-intent
+    language (run/test/build/lint/...) with no verified command, so a
+    reasoning plan's validation step -- and, on short plans, the whole plan
+    -- silently collapsed to the generic template on every non-JS repo.
+    Confirmed live and by direct reproduction before the fix. Now
+    _build_planning_reconnaissance reuses detect_validation_commands (the
+    same deterministic, manifest-backed detection runner.py's own post-edit
+    validation gate already relies on) instead of only parsing package.json.
+    """
+
+    def test_python_repo_validation_step_is_no_longer_dropped(self):
+        from tamfis_code.runner_local import _build_planning_reconnaissance
+
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            (root / "auth").mkdir()
+            (root / "auth" / "session.py").write_text("def login(): pass\n")
+            (root / "pyproject.toml").write_text("[tool.poetry]\nname = 'x'\n")
+            (root / "tests").mkdir()
+
+            reconnaissance = _build_planning_reconnaissance(str(root), [root], "fix the login bug")
+            self.assertIn("pytest", reconnaissance)
+
+            raw = json.dumps({"steps": [
+                {
+                    "action": "Fix login() in auth/session.py",
+                    "targets": [str(root / "auth" / "session.py")],
+                },
+                {
+                    "action": "Run the test suite to confirm the fix",
+                    "command": "pytest -q",
+                },
+            ]})
+            rejection_log: list[str] = []
+            plan = parse_reasoning_plan(
+                raw, objective="fix the login bug",
+                reconnaissance_summary=reconnaissance,
+                workspace_summary={},
+                scope_roots=[root],
+                rejection_log=rejection_log,
+            )
+            self.assertIsNotNone(plan)
+            self.assertEqual(len(plan.steps), 2)
+            self.assertEqual(rejection_log, [])
+
+
 class GroundedFallbackPlanTests(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()

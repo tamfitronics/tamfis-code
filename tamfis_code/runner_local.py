@@ -3853,6 +3853,21 @@ def _build_planning_reconnaissance(
                 if len(relevant_paths) < 60:
                     relevant_paths.append(relative)
 
+        # package.json script parsing above is the only source of verified
+        # commands otherwise -- a Python/Go/Rust/Java/PHP/C# project's
+        # reconnaissance always reported "manifest_backed_commands: none
+        # found" even when a conventional test/build command is fully
+        # determinable from its real manifest files, so validate_plan_step
+        # rejected every plan step with command-intent language (run/test/
+        # build/lint/...) on any non-Node repo -- confirmed by reproduction:
+        # a step "Run the test suite to confirm the fix" against a
+        # pyproject.toml-only repo was silently dropped. detect_validation_
+        # commands already does this deterministic, manifest-backed
+        # detection (workspace.py) for every language runner.py's own
+        # post-edit validation gate uses -- reuse it here instead of
+        # duplicating language convention logic.
+        verified_commands.extend(command for _, command in detect_validation_commands(root))
+
         lines.append("  manifests: " + (", ".join(manifests) if manifests else "none found"))
         if declared_scripts:
             lines.append("  declared_scripts: " + ", ".join(declared_scripts[:40]))
@@ -3920,13 +3935,30 @@ async def _attempt_reasoning_plan(
             },
         })
         return None
+    rejection_log: list[str] = []
     plan = parse_reasoning_plan(
         content,
         objective=objective,
         reconnaissance_summary=reconnaissance_summary,
         workspace_summary=repository_context,
         scope_roots=scope_roots,
+        rejection_log=rejection_log,
     )
+    if rejection_log:
+        # Purely observational: shows whether a plan collapsed to the
+        # generic template (or lost steps) because the model proposed
+        # nothing usable, or because grounding evidence was too thin to
+        # verify what it proposed -- the two look identical to the user
+        # ("generic plan again") without this.
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {
+                "content": (
+                    f"Reasoning-plan step rejections ({len(rejection_log)}): "
+                    + "; ".join(rejection_log[:8])
+                ),
+            },
+        })
     if plan is None:
         renderer.handle_event({
             "event_type": "diagnostics",
