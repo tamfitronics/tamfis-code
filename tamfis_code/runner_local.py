@@ -816,6 +816,18 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+def _scope_root_directory(root: Path) -> Path:
+    """The directory a scope root resolves to for cwd/base-path purposes.
+
+    A scope root can now be an exact file (naming a file keeps it exact
+    rather than promoting it to its enclosing directory), but every use of
+    a scope root as a *directory* -- a command's cwd, the base a relative
+    tool-call path resolves against, a default extraction destination --
+    needs a real directory. Use the file's parent in that case.
+    """
+    return root if root.is_dir() else root.parent
+
+
 def _mark_external_scope(scoped: dict[str, Any], paths: list[Path]) -> None:
     """Record a boundary crossing for the approval gate and dispatcher.
 
@@ -857,7 +869,7 @@ def _scope_tool_arguments(
                 suffixes = (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz", ".tbz2", ".txz", ".tar", ".zip")
                 source_name = source.name.lower()
                 suffix = next((item for item in suffixes if source_name.endswith(item)), "")
-                destination_root = scope_roots[0] if len(scope_roots) == 1 else workspace
+                destination_root = _scope_root_directory(scope_roots[0]) if len(scope_roots) == 1 else workspace
                 destination = destination_root / f"{source.name[:-len(suffix)] if suffix else source.stem}_extracted"
             scoped["path"] = str(source)
             scoped["destination"] = str(destination)
@@ -1000,8 +1012,8 @@ def _scope_tool_arguments(
             and cwd == workspace
             and workspace != scope_roots[0]
         ):
-            scoped["cwd"] = str(scope_roots[0])
-            cwd = scope_roots[0]
+            cwd = _scope_root_directory(scope_roots[0])
+            scoped["cwd"] = str(cwd)
 
         if (
             broad_scan
@@ -1047,7 +1059,7 @@ def _scope_tool_arguments(
 
     requested_value = scoped.get(path_key)
     requested_base = (
-        str(scope_roots[0])
+        str(_scope_root_directory(scope_roots[0]))
         if len(scope_roots) == 1 and requested_value and not Path(str(requested_value)).expanduser().is_absolute()
         else workspace_root
     )
@@ -6096,6 +6108,297 @@ async def _run_local_agent_turn_impl(
             else:
                 _batch_approved_once_ids |= _risky_ids
 
+        # Independent tool calls requested in one turn (several read_file
+        # calls, or a read alongside an unrelated write, or several
+        # execute_command calls that don't touch the same path) are
+        # dispatched together via asyncio.gather instead of one at a time --
+        # a slow call no longer blocks every other call queued behind it in
+        # the same round. Every call still runs its guard/scope/approval/
+        # PreToolUse checks in original order first (all short-circuit
+        # results below are unchanged); only the final dispatch is grouped.
+        # Two calls are kept out of the same group -- and everything already
+        # queued is flushed before either -- whenever running them out of
+        # strict order could change the outcome: same explicit `path`
+        # argument (a write racing a read/write of the same file), or an
+        # execute_command paired with a concrete-path mutation (a shell
+        # command's real filesystem/process side effects can't be
+        # statically proven independent of a write_file/edit_file target).
+        # Multiple execute_command calls ARE grouped together -- each gets
+        # its own background_signal Event, fanned out from the single
+        # Ctrl+B renderer signal, so backgrounding still reaches every
+        # command actually running in that group.
+        _dispatch_queue: list[tuple[Any, dict[str, Any], "ToolEnvelope", Optional[dict[str, Any]], str]] = []
+
+        # Same key mapping safety.py's classify_tool_call_risk uses -- a call
+        # can touch more than one path (repackage_archive reads source_dir
+        # AND writes output_path), so every relevant key is checked, not
+        # just "path" (which extract_archive/repackage_archive don't even
+        # use).
+        _TOOL_PATH_KEYS = {
+            "extract_archive": ("destination", "path"),
+            "repackage_archive": ("output_path", "source_dir"),
+        }
+
+        def _touched_paths(entry: tuple[Any, dict[str, Any], Any, Any, str]) -> set[str]:
+            tc, arguments = entry[0], entry[1]
+            keys = _TOOL_PATH_KEYS.get(tc.name, ("path",))
+            return {str(arguments[key]) for key in keys if arguments.get(key)}
+
+        def _conflicts(a: tuple[Any, dict[str, Any], Any, Any, str], b: tuple[Any, dict[str, Any], Any, Any, str]) -> bool:
+            a_tc, b_tc = a[0], b[0]
+            a_risk, b_risk = a[4], b[4]
+            a_is_cmd, b_is_cmd = a_tc.name == "execute_command", b_tc.name == "execute_command"
+            if a_is_cmd != b_is_cmd:
+                # A shell command paired with an explicit-path mutation --
+                # not with a read, which has no side effect of its own.
+                other_risk = b_risk if a_is_cmd else a_risk
+                if other_risk != "read_only":
+                    return True
+            if (a_risk != "read_only" or b_risk != "read_only") and (_touched_paths(a) & _touched_paths(b)):
+                return True
+            return False
+
+        async def _finish_tool_call(
+            tc: Any, arguments: dict[str, Any], envelope: "ToolEnvelope", result: dict[str, Any],
+        ) -> Optional[TaskOutcome]:
+            nonlocal any_mutation, any_execute_command_since_mutation, port_conflict_seen
+            result = _normalise_tool_result(tc.name, arguments, result, workspace_root)
+            envelope.finish(result=result, success=bool(result.get("success")))
+            observation = orchestrator.record_tool(envelope)
+            if observation.terminal:
+                working_messages.append({
+                    "role": "tool",
+                    "tool_call_id": tc.call_id,
+                    "content": json.dumps(result, default=str),
+                })
+                _persist_turn_checkpoint(status="failed", last_error=observation.reason)
+                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": observation.reason}})
+                return TaskOutcome(status="failed", error=observation.reason)
+            renderer.handle_event({
+                "event_type": "tool_output",
+                "payload": {"tool": tc.name, "result": _tool_output_for_render(result)},
+            })
+            working_messages.append({
+                "role": "tool",
+                "tool_call_id": tc.call_id,
+                "content": json.dumps(result, default=str),
+            })
+            if result.get("success") is False:
+                failure = classify_failure(tool_name=tc.name, result=result)
+                repair_key = (tc.name, failure.value)
+                attempt = repair_attempts.get(repair_key, 0)
+                repair = choose_repair(
+                    tool_name=tc.name,
+                    result=result,
+                    attempt=attempt,
+                )
+                repair_attempts[repair_key] = attempt + 1
+                if repair.retry_allowed:
+                    directive = (
+                        f"Tool repair guidance after {tc.name} failed "
+                        f"({repair.failure_class.value}): {repair.strategy}."
+                    )
+                    if repair.force_different_tool:
+                        directive += (
+                            " Do not repeat the same tool call; choose a "
+                            "materially different tool or arguments."
+                        )
+                    working_messages.append({"role": "system", "content": directive})
+                    orchestrator.mark_repair(directive)
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": directive},
+                    })
+            if tc.name == "execute_command" and _has_port_conflict(result):
+                port_conflict_seen = True
+                working_messages.append({"role": "system", "content": PORT_CONFLICT_CORRECTION})
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "Port conflict detected -- preserving the existing listener and "
+                            "requesting ownership plus health checks instead of another start/kill cycle."
+                        ),
+                    },
+                })
+            if (
+                result.get("success") is False
+                and "permission denied" in json.dumps(result, default=str).lower()
+            ):
+                # Keep a single EACCES from turning into a long
+                # sudo/password/chown/copy-the-repository monologue.
+                working_messages.append({
+                    "role": "system",
+                    "content": PERMISSION_BOUNDARY_CORRECTION,
+                })
+            if _is_old_string_not_found(tc.name, result):
+                refresh_path = str(arguments.get("path") or "")
+                if refresh_path:
+                    refresh_path = _update_unresolved_edit_paths(
+                        unresolved_edit_paths,
+                        path=refresh_path,
+                        workspace_root=workspace_root,
+                        failed=True,
+                    )
+                    refresh_call_id = f"fresh_read_{_round}_{len(working_messages)}"
+                    renderer.handle_event({"event_type": "tool_call_requested", "payload": {
+                        "name": "read_file", "arguments": {"path": refresh_path},
+                    }})
+                    fresh_read = await mcp_server.call_tool("read_file", {"path": refresh_path})
+                    fresh_read = _normalise_tool_result(
+                        "read_file", {"path": refresh_path}, fresh_read, workspace_root,
+                    )
+                    working_messages.append({
+                        "role": "assistant", "tool_calls": [{
+                            "id": refresh_call_id, "type": "function",
+                            "function": {"name": "read_file", "arguments": json.dumps({"path": refresh_path})},
+                        }],
+                    })
+                    working_messages.append({
+                        "role": "tool", "tool_call_id": refresh_call_id,
+                        "content": json.dumps(fresh_read, default=str),
+                    })
+                    working_messages.append({
+                        "role": "system",
+                        "content": (
+                            f"Fresh read_file completed for {refresh_path!r} after edit_file failed. "
+                            "Do not retry the same old_string/edit arguments; use the refreshed content "
+                            "or report Edit failed."
+                        ),
+                    })
+                    renderer.handle_event({"event_type": "tool_output", "payload": {
+                        "tool": "read_file", "result": _tool_output_for_render(fresh_read),
+                    }})
+            # A batch may contain several tools. Flush after each completed
+            # result so a kill/network loss between tools cannot make resume
+            # treat an already-applied mutation as still in flight.
+            _persist_turn_checkpoint()
+
+            if configured_hooks:
+                post_hook_results = await run_tool_hooks(
+                    configured_hooks, "post_tool_use", tool_name=tc.name, tool_input=arguments,
+                    tool_output=result, session_id=session_id, workspace_root=workspace_root,
+                )
+                for hook_result in post_hook_results:
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
+                    })
+                    working_messages.append({
+                        "role": "system",
+                        "content": f"Hook feedback after {tc.name}: {hook_result.message}",
+                    })
+
+            if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"} and result.get("success"):
+                any_mutation = True
+                if tc.name in {"write_file", "edit_file"} and arguments.get("path"):
+                    _update_unresolved_edit_paths(
+                        unresolved_edit_paths,
+                        path=str(arguments["path"]),
+                        workspace_root=workspace_root,
+                        failed=False,
+                    )
+                # A further edit after a clean verify run invalidates that
+                # result -- require re-verifying against the latest code,
+                # not whatever was true before this change.
+                validation_confirmed.clear()
+                any_execute_command_since_mutation = False
+                state = local_state.get_session_state(session_id)
+                if state.modified_files:
+                    # Not modified_files[-1] -- when two different-path
+                    # mutations land in the same concurrent dispatch group
+                    # (see _conflicts/_flush_dispatch_queue), both append to
+                    # this shared ledger before either call's postprocessing
+                    # runs, so the globally-last entry can belong to the
+                    # OTHER call. Match this call's own target path instead.
+                    call_path = arguments.get("path")
+                    call_path_resolved = (
+                        str(Path(str(call_path)).expanduser().resolve()) if call_path else None
+                    )
+                    mutation = next(
+                        (
+                            m for m in reversed(state.modified_files)
+                            if call_path_resolved is None
+                            or str(m.get("path") or "") == call_path_resolved
+                            or str(m.get("path") or "") == str(call_path)
+                        ),
+                        state.modified_files[-1],
+                    )
+                    renderer.handle_event({"event_type": "file_mutation", "payload": {
+                        "path": mutation["path"], "lines_added": mutation["lines_added"],
+                        "lines_removed": mutation["lines_removed"], "mutation_id": mutation["mutation_id"],
+                    }})
+
+            if tc.name == "execute_command" and result.get("success"):
+                any_execute_command_since_mutation = True
+                executed_command = str(arguments.get("command") or "")
+                for _, validation_command in validation_commands:
+                    if validation_command in executed_command:
+                        validation_confirmed.add(validation_command)
+            elif tc.name == "execute_command":
+                executed_command = str(arguments.get("command") or "")
+                for _, validation_command in validation_commands:
+                    if validation_command in executed_command:
+                        validation_errors[validation_command] = str(
+                            result.get("error") or result.get("result") or result.get("message") or "validation failed"
+                        )
+            return None
+
+        async def _flush_dispatch_queue() -> Optional[TaskOutcome]:
+            if not _dispatch_queue:
+                return None
+            pending = list(_dispatch_queue)
+            _dispatch_queue.clear()
+
+            # Split into maximal conflict-free groups, in original order --
+            # a new group starts as soon as the next call conflicts with
+            # anything already in the current group.
+            groups: list[list[tuple[Any, dict[str, Any], Any, Any, str]]] = []
+            for entry in pending:
+                placed = False
+                if groups and not any(_conflicts(entry, member) for member in groups[-1]):
+                    groups[-1].append(entry)
+                    placed = True
+                if not placed:
+                    groups.append([entry])
+
+            for group in groups:
+                cmd_entries = [e for e in group if e[0].name == "execute_command"]
+                fanout_events: list[asyncio.Event] = []
+                fanout_task: Optional[asyncio.Task] = None
+                dispatch_kwargs: dict[int, Optional[dict[str, Any]]] = {id(e): e[3] for e in group}
+                if cmd_entries:
+                    # Cleared right before this group's command(s) actually
+                    # start, not at enqueue time -- a Ctrl+B press that
+                    # arrived earlier (while this group was still sitting
+                    # behind another one in the queue) must not immediately
+                    # background a command the user never meant to target.
+                    renderer.background_requested.clear()
+                    for e in cmd_entries:
+                        ev = asyncio.Event()
+                        fanout_events.append(ev)
+                        dispatch_kwargs[id(e)] = {"background_signal": ev}
+
+                    async def _fanout_background_signal() -> None:
+                        await renderer.background_requested.wait()
+                        for ev in fanout_events:
+                            ev.set()
+
+                    fanout_task = asyncio.create_task(_fanout_background_signal())
+                try:
+                    raw_results = await asyncio.gather(*(
+                        mcp_server.call_tool(e[0].name, e[1], extra_kwargs=dispatch_kwargs[id(e)])
+                        for e in group
+                    ))
+                finally:
+                    if fanout_task is not None:
+                        fanout_task.cancel()
+                for (b_tc, b_args, b_envelope, _kwargs, _risk), raw_result in zip(group, raw_results):
+                    outcome = await _finish_tool_call(b_tc, b_args, b_envelope, raw_result)
+                    if outcome is not None:
+                        return outcome
+            return None
+
         for tc in tool_calls:
             try:
                 arguments = json.loads(tc.arguments or "{}")
@@ -6119,6 +6422,13 @@ async def _run_local_agent_turn_impl(
                     "payload": {"tool": tc.name, "result": result},
                 })
                 if guard.terminal:
+                    # Calls already queued from earlier in this same round
+                    # must still run and get a matching tool response before
+                    # the round ends -- every tool_call_id this round's
+                    # assistant message named needs one either way.
+                    _flush_outcome = await _flush_dispatch_queue()
+                    if _flush_outcome is not None:
+                        return _flush_outcome
                     _persist_turn_checkpoint(status="failed", last_error=guard.reason)
                     orchestrator.fail(guard.reason)
                     renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": guard.reason}})
@@ -6254,6 +6564,9 @@ async def _run_local_agent_turn_impl(
                     "payload": {"tool": tc.name, "result": result},
                 })
                 if consecutive_scope_errors >= 3:
+                    _flush_outcome = await _flush_dispatch_queue()
+                    if _flush_outcome is not None:
+                        return _flush_outcome
                     message = (
                         "Stopped after three invalid commands were rejected by the workspace scope guard. "
                         "The task is not complete; use a command rooted under the allowed project directory."
@@ -6264,6 +6577,26 @@ async def _run_local_agent_turn_impl(
                 continue
 
             consecutive_scope_errors = 0
+
+            # port_conflict_seen/any_mutation (read just below and further
+            # down for the approval-reason augmentation) are only set once a
+            # tool call's deferred postprocessing runs -- see
+            # _flush_dispatch_queue. A call already sitting in
+            # _dispatch_queue from earlier in this same round hasn't run
+            # yet, so these flags could still be stale for a call whose
+            # outcome actually depends on them. Only flush -- forcing
+            # earlier-queued calls to actually execute first -- when this
+            # specific call's decision could depend on that fresher state;
+            # an ordinary command that isn't itself a listener-reclamation
+            # or service-restart attempt stays fully eligible for the
+            # concurrent dispatch group it's already scoped/approved into.
+            if tc.name == "execute_command" and (
+                _looks_like_forced_listener_reclamation(str(arguments.get("command") or ""))
+                or _looks_like_service_restart(str(arguments.get("command") or ""))
+            ):
+                _flush_outcome = await _flush_dispatch_queue()
+                if _flush_outcome is not None:
+                    return _flush_outcome
 
             if (
                 port_conflict_seen
@@ -6447,183 +6780,23 @@ async def _run_local_agent_turn_impl(
                 purpose=f"Execute {tc.name} for: {objective[:160]}", risk=risk,
                 requires_approval=risk != "read_only", cwd=str(arguments.get("cwd") or workspace_root),
             )
-            tool_extra_kwargs: Optional[dict[str, Any]] = None
-            if tc.name == "execute_command":
-                # Cleared right before each command starts, not just once
-                # per turn -- a Ctrl+B press that arrived after the PREVIOUS
-                # command already finished (or during model "thinking" time
-                # between rounds) must not immediately background the next,
-                # unrelated command the moment it starts.
-                renderer.background_requested.clear()
-                tool_extra_kwargs = {"background_signal": renderer.background_requested}
-            result = await mcp_server.call_tool(tc.name, arguments, extra_kwargs=tool_extra_kwargs)
-            result = _normalise_tool_result(tc.name, arguments, result, workspace_root)
-            envelope.finish(result=result, success=bool(result.get("success")))
-            observation = orchestrator.record_tool(envelope)
-            if observation.terminal:
-                working_messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.call_id,
-                    "content": json.dumps(result, default=str),
-                })
-                _persist_turn_checkpoint(status="failed", last_error=observation.reason)
-                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": observation.reason}})
-                return TaskOutcome(status="failed", error=observation.reason)
-            renderer.handle_event({
-                "event_type": "tool_output",
-                "payload": {"tool": tc.name, "result": _tool_output_for_render(result)},
-            })
-            working_messages.append({
-                "role": "tool",
-                "tool_call_id": tc.call_id,
-                "content": json.dumps(result, default=str),
-            })
-            if result.get("success") is False:
-                failure = classify_failure(tool_name=tc.name, result=result)
-                repair_key = (tc.name, failure.value)
-                attempt = repair_attempts.get(repair_key, 0)
-                repair = choose_repair(
-                    tool_name=tc.name,
-                    result=result,
-                    attempt=attempt,
-                )
-                repair_attempts[repair_key] = attempt + 1
-                if repair.retry_allowed:
-                    directive = (
-                        f"Tool repair guidance after {tc.name} failed "
-                        f"({repair.failure_class.value}): {repair.strategy}."
-                    )
-                    if repair.force_different_tool:
-                        directive += (
-                            " Do not repeat the same tool call; choose a "
-                            "materially different tool or arguments."
-                        )
-                    working_messages.append({"role": "system", "content": directive})
-                    orchestrator.mark_repair(directive)
-                    renderer.handle_event({
-                        "event_type": "diagnostics",
-                        "payload": {"content": directive},
-                    })
-            if tc.name == "execute_command" and _has_port_conflict(result):
-                port_conflict_seen = True
-                working_messages.append({"role": "system", "content": PORT_CONFLICT_CORRECTION})
-                renderer.handle_event({
-                    "event_type": "diagnostics",
-                    "payload": {
-                        "content": (
-                            "Port conflict detected -- preserving the existing listener and "
-                            "requesting ownership plus health checks instead of another start/kill cycle."
-                        ),
-                    },
-                })
-            if (
-                result.get("success") is False
-                and "permission denied" in json.dumps(result, default=str).lower()
-            ):
-                # Keep a single EACCES from turning into a long
-                # sudo/password/chown/copy-the-repository monologue.
-                working_messages.append({
-                    "role": "system",
-                    "content": PERMISSION_BOUNDARY_CORRECTION,
-                })
-            if _is_old_string_not_found(tc.name, result):
-                refresh_path = str(arguments.get("path") or "")
-                if refresh_path:
-                    refresh_path = _update_unresolved_edit_paths(
-                        unresolved_edit_paths,
-                        path=refresh_path,
-                        workspace_root=workspace_root,
-                        failed=True,
-                    )
-                    refresh_call_id = f"fresh_read_{_round}_{len(working_messages)}"
-                    renderer.handle_event({"event_type": "tool_call_requested", "payload": {
-                        "name": "read_file", "arguments": {"path": refresh_path},
-                    }})
-                    fresh_read = await mcp_server.call_tool("read_file", {"path": refresh_path})
-                    fresh_read = _normalise_tool_result(
-                        "read_file", {"path": refresh_path}, fresh_read, workspace_root,
-                    )
-                    working_messages.append({
-                        "role": "assistant", "tool_calls": [{
-                            "id": refresh_call_id, "type": "function",
-                            "function": {"name": "read_file", "arguments": json.dumps({"path": refresh_path})},
-                        }],
-                    })
-                    working_messages.append({
-                        "role": "tool", "tool_call_id": refresh_call_id,
-                        "content": json.dumps(fresh_read, default=str),
-                    })
-                    working_messages.append({
-                        "role": "system",
-                        "content": (
-                            f"Fresh read_file completed for {refresh_path!r} after edit_file failed. "
-                            "Do not retry the same old_string/edit arguments; use the refreshed content "
-                            "or report Edit failed."
-                        ),
-                    })
-                    renderer.handle_event({"event_type": "tool_output", "payload": {
-                        "tool": "read_file", "result": _tool_output_for_render(fresh_read),
-                    }})
-            # A batch may contain several tools. Flush after each completed
-            # result so a kill/network loss between tools cannot make resume
-            # treat an already-applied mutation as still in flight.
-            _persist_turn_checkpoint()
-
-            if configured_hooks:
-                post_hook_results = await run_tool_hooks(
-                    configured_hooks, "post_tool_use", tool_name=tc.name, tool_input=arguments,
-                    tool_output=result, session_id=session_id, workspace_root=workspace_root,
-                )
-                for hook_result in post_hook_results:
-                    renderer.handle_event({
-                        "event_type": "diagnostics",
-                        "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
-                    })
-                    working_messages.append({
-                        "role": "system",
-                        "content": f"Hook feedback after {tc.name}: {hook_result.message}",
-                    })
-
-            if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"} and result.get("success"):
-                any_mutation = True
-                if tc.name in {"write_file", "edit_file"} and arguments.get("path"):
-                    _update_unresolved_edit_paths(
-                        unresolved_edit_paths,
-                        path=str(arguments["path"]),
-                        workspace_root=workspace_root,
-                        failed=False,
-                    )
-                # A further edit after a clean verify run invalidates that
-                # result -- require re-verifying against the latest code,
-                # not whatever was true before this change.
-                validation_confirmed.clear()
-                any_execute_command_since_mutation = False
-                state = local_state.get_session_state(session_id)
-                if state.modified_files:
-                    mutation = state.modified_files[-1]
-                    renderer.handle_event({"event_type": "file_mutation", "payload": {
-                        "path": mutation["path"], "lines_added": mutation["lines_added"],
-                        "lines_removed": mutation["lines_removed"], "mutation_id": mutation["mutation_id"],
-                    }})
-
-            if tc.name == "execute_command" and result.get("success"):
-                any_execute_command_since_mutation = True
-                executed_command = str(arguments.get("command") or "")
-                for _, validation_command in validation_commands:
-                    if validation_command in executed_command:
-                        validation_confirmed.add(validation_command)
-            elif tc.name == "execute_command":
-                executed_command = str(arguments.get("command") or "")
-                for _, validation_command in validation_commands:
-                    if validation_command in executed_command:
-                        validation_errors[validation_command] = str(
-                            result.get("error") or result.get("result") or result.get("message") or "validation failed"
-                        )
+            # background_signal is deliberately NOT built here: a queued
+            # call can sit in _dispatch_queue for a while (behind other
+            # groups) before it actually runs, so "cleared right before it
+            # starts" has to happen at dispatch time in
+            # _flush_dispatch_queue, not at enqueue time -- otherwise a
+            # Ctrl+B press between enqueue and dispatch is silently lost, or
+            # a stale press from before enqueue instantly backgrounds a
+            # command the user never meant to target.
+            _dispatch_queue.append((tc, arguments, envelope, None, risk))
 
         # The assistant tool-call message and every matching tool result are
         # now protocol-complete.  Save immediately before any optional
         # replanning/provider request so a kill here never repeats a tool
         # that already ran (especially a file mutation or command).
+        _flush_outcome = await _flush_dispatch_queue()
+        if _flush_outcome is not None:
+            return _flush_outcome
         _persist_turn_checkpoint()
 
         # Failure-streak stall guard (see consecutive_failed_rounds above).
