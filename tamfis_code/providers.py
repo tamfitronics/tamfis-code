@@ -333,9 +333,9 @@ class ProviderManager:
         # PRIORITY_ORDER comment above). Enabled by the operator setting
         # GROK_API_KEY in .env; when unset, the provider is simply not
         # initialised and routing falls through the remaining chain (which
-        # still carries the x-ai/grok-4.5 OpenRouter relay as a selectable
+        # still carries the x-ai/grok-4.6 OpenRouter relay as a selectable
         # model, ahead of this direct route). Grok's native API accepts bare
-        # model names (grok-4.5, grok-4.3, grok-4-fast) and is
+        # model names (grok-4.6, grok-4.3, grok-4-fast) and is
         # OpenAI-compatible for chat, tools, streaming, and structured
         # outputs. Image (grok-imagine) and video (grok-imagine-video)
         # generation are exposed through the same endpoint. Still directly
@@ -347,11 +347,10 @@ class ProviderManager:
                 "https://api.x.ai/v1",
             ).rstrip("/"),
             api_key_env="GROK_API_KEY",
-            default_model=os.environ.get("TAMFIS_CODE_GROK_MODEL", "grok-4.5"),
+            default_model=os.environ.get("TAMFIS_CODE_GROK_MODEL", "grok-4.6"),
             models=[
-                "grok-4.5",
+                "grok-4.6",
                 "grok-4.3",
-                "grok-4",
                 "grok-4-fast",
                 "grok-2-vision",
                 "grok-imagine",
@@ -614,13 +613,13 @@ class ProviderManager:
                 # Real xAI-hosted Grok, via OpenRouter -- same ids already
                 # live-verified against OpenRouter's /v1/models catalog for
                 # TamfisGPT's own Tier IV routing (see tamgpt6's
-                # orchestration.yaml grok-4.5-or/grok-4.3-or entries, added
+                # orchestration.yaml grok-4.6-or/grok-4.3-or entries, added
                 # 2026-08-03). xAI does not distribute Grok weights for
                 # local/Ollama use, so OpenRouter is the only
                 # policy-permitted route to the genuine model (standing
                 # policy: never call a vendor's native API directly -- see
                 # providers.py module docstring / PRIORITY_ORDER comment).
-                "x-ai/grok-4.5",
+                "x-ai/grok-4.6",
                 "x-ai/grok-4.3",
             ],
             # OpenRouter is last in AUTO because paid coding routes can fail
