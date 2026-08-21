@@ -28,13 +28,20 @@ class TestStreamMetrics:
         assert metrics.response_time_ms == 500
 
     def test_estimate_cost(self):
-        """Test cost estimation"""
+        """Test cost estimation, matched by substring against a real model name"""
         metrics = StreamMetrics()
         metrics.tokens_used = 1000
-        
-        cost = metrics.estimate_cost('claude-3.5')
-        # 1000 * 0.020 / 1000 = 0.02
-        assert cost == pytest.approx(0.02, 0.001)
+
+        cost = metrics.estimate_cost('claude-sonnet-5')
+        # 1000 * 0.015 / 1000 = 0.015 ('sonnet' substring match)
+        assert cost == pytest.approx(0.015, 0.001)
+
+    def test_estimate_cost_unknown_model_uses_default_rate(self):
+        metrics = StreamMetrics()
+        metrics.tokens_used = 1000
+
+        cost = metrics.estimate_cost('some-totally-unrecognized-model')
+        assert cost == pytest.approx(0.010, 0.001)
 
     def test_format_display(self):
         """Test display formatting"""
@@ -71,10 +78,41 @@ class TestMetricsTracker:
         """Test getting metrics summary"""
         tracker = MetricsTracker()
         tracker.record(100, 500)
-        
+
         summary = tracker.get_summary()
         assert 'tokens_used' in summary
         assert summary['tokens_used'] == 100
+
+    def test_cost_cap_disabled_by_default(self):
+        """No cap configured -> never warns, regardless of spend"""
+        tracker = MetricsTracker(cost_cap_usd=None)
+        tracker.record(1_000_000, 500, 'gpt-5')
+        assert tracker.check_cost_cap() is None
+
+    def test_cost_cap_warns_once_when_crossed(self):
+        tracker = MetricsTracker(cost_cap_usd=1.0)
+        # gpt-5 rate is 0.030/1000 -> 40000 tokens = $1.20, over the $1.00 cap
+        tracker.record(40_000, 500, 'gpt-5.6-sol')
+        first = tracker.check_cost_cap()
+        assert first is not None
+        assert '$1.00' in first
+        # Must not warn again on subsequent calls, even with more spend.
+        tracker.record(10_000, 500, 'gpt-5.6-sol')
+        assert tracker.check_cost_cap() is None
+
+    def test_cost_cap_not_triggered_under_threshold(self):
+        tracker = MetricsTracker(cost_cap_usd=100.0)
+        tracker.record(100, 500, 'gpt-5.6-sol')
+        assert tracker.check_cost_cap() is None
+
+    def test_cost_cap_zero_or_negative_disables(self):
+        tracker = MetricsTracker(cost_cap_usd=0)
+        tracker.record(1_000_000, 500, 'gpt-5')
+        assert tracker.check_cost_cap() is None
+
+        tracker2 = MetricsTracker(cost_cap_usd=-5)
+        tracker2.record(1_000_000, 500, 'gpt-5')
+        assert tracker2.check_cost_cap() is None
 
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])

@@ -53,3 +53,43 @@ def test_missing_required_backend_fails_closed(tmp_path):
                 command="true", shell="bash", cwd=tmp_path, workspace_root=tmp_path,
                 policy=SandboxPolicy(fail_if_unavailable=True),
             )
+
+
+def test_default_policy_fails_closed_on_linux_without_bwrap(tmp_path):
+    """FIX (2026-08-21): SandboxPolicy.fail_if_unavailable now defaults to
+    True. Before this, a Linux host without bwrap installed silently ran
+    every "sandboxed" command with zero kernel isolation by default."""
+    with patch("tamfis_code.sandbox.sys.platform", "linux"), \
+         patch("tamfis_code.sandbox.shutil.which", return_value=None):
+        with pytest.raises(RuntimeError, match="sandbox unavailable"):
+            build_sandbox_command(
+                command="true", shell="bash", cwd=tmp_path, workspace_root=tmp_path,
+                policy=SandboxPolicy(),  # no explicit fail_if_unavailable -- exercises the default
+            )
+
+
+def test_explicit_opt_out_still_runs_unsandboxed_with_warning(tmp_path):
+    with patch("tamfis_code.sandbox.sys.platform", "linux"), \
+         patch("tamfis_code.sandbox.shutil.which", return_value=None):
+        result = build_sandbox_command(
+            command="true", shell="bash", cwd=tmp_path, workspace_root=tmp_path,
+            policy=SandboxPolicy(fail_if_unavailable=False),
+        )
+    assert result.active is False
+    assert result.backend == "unavailable"
+    assert result.warning is not None
+
+
+def test_non_linux_never_fails_closed_even_with_fail_if_unavailable_true(tmp_path):
+    """No sandbox-exec/AppContainer backend exists for macOS/Windows yet --
+    failing closed there would just break the tool outright, not protect
+    anything, so the (now-default-True) flag must have no effect off
+    Linux until a real backend exists for those platforms."""
+    with patch("tamfis_code.sandbox.sys.platform", "darwin"):
+        result = build_sandbox_command(
+            command="true", shell="bash", cwd=tmp_path, workspace_root=tmp_path,
+            policy=SandboxPolicy(fail_if_unavailable=True),
+        )
+    assert result.active is False
+    assert result.backend == "unavailable"
+    assert result.warning is not None

@@ -28,6 +28,7 @@ from rich.spinner import Spinner
 from rich.text import Text
 
 from . import __version__
+from .config import load_config
 from .metrics import MetricsTracker
 from .public_identity import (
     PUBLIC_PROVIDER_NAME,
@@ -554,7 +555,15 @@ class StreamRenderer:
         self.background_requested = asyncio.Event()
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
-        self._metrics = MetricsTracker()
+        try:
+            cost_cap = load_config().session_cost_cap_usd
+        except Exception:
+            # Config loading must never be able to break rendering --
+            # falls back to the dataclass default rather than disabling
+            # the warning outright, so a config-load hiccup doesn't
+            # silently turn off a safety rail either.
+            cost_cap = 5.0
+        self._metrics = MetricsTracker(cost_cap_usd=cost_cap)
         # Real reasoning-phase timing (see provider_protocols.py's
         # reasoning_content extraction) -- None/None until a reasoning delta
         # actually arrives; _thought_seconds freezes once real answer
@@ -1003,7 +1012,10 @@ class StreamRenderer:
             return
         estimated_tokens = max(1, len(content) // _CHARS_PER_TOKEN_ESTIMATE)
         elapsed_ms = (time.monotonic() - self._task_start) * 1000
-        self._metrics.record(estimated_tokens, elapsed_ms)
+        self._metrics.record(estimated_tokens, elapsed_ms, model=self._model or "default")
+        cost_warning = self._metrics.check_cost_cap()
+        if cost_warning:
+            self.console.print(f"\n[yellow]{escape(cost_warning)}[/yellow]")
 
     def _flush_assistant(self, *, force: bool = False) -> None:
         """Flush buffered assistant text in coherent blocks.

@@ -17,7 +17,12 @@ class SandboxPolicy:
     mode: str = "workspace-write"
     network_access: bool = False
     writable_roots: tuple[str, ...] = field(default_factory=tuple)
-    fail_if_unavailable: bool = False
+    # Defaults to fail-closed on Linux (see build_sandbox_command's
+    # docstring for why this has no effect on macOS/Windows, which have no
+    # sandbox backend to fail closed into yet). Previously defaulted to
+    # False, meaning a Linux host without bwrap installed silently ran
+    # every "sandboxed" command with zero kernel isolation.
+    fail_if_unavailable: bool = True
 
 
 @dataclass(frozen=True)
@@ -34,19 +39,32 @@ def build_sandbox_command(
 ) -> SandboxCommand:
     """Return the executable argv and an auditable description of isolation.
 
-    Linux uses bubblewrap when available. Other platforms fail closed when
-    configured to do so, otherwise they retain compatibility but return a
-    warning that is surfaced in the tool result.
+    Linux uses bubblewrap when available. `policy.fail_if_unavailable`
+    (default True as of 2026-08-21 -- previously defaulted to False,
+    meaning every command on a Linux host without bwrap installed silently
+    ran with zero kernel isolation) only applies on Linux: there is no
+    sandbox-exec/AppContainer backend for macOS/Windows yet, so failing
+    closed there would just break the tool outright rather than protect
+    anything -- those platforms always retain the permissive fallback
+    (with its warning still surfaced in the tool result) until a real
+    backend exists for them.
     """
     direct = (shell, "-lc", command)
     if require_escalated or policy.mode == "danger-full-access":
         return SandboxCommand(direct, False, "none")
 
-    bwrap = shutil.which("bwrap") if sys.platform.startswith("linux") else None
+    is_linux = sys.platform.startswith("linux")
+    bwrap = shutil.which("bwrap") if is_linux else None
     if not bwrap:
         warning = "OS sandbox unavailable; command ran without kernel isolation"
-        if policy.fail_if_unavailable:
-            raise RuntimeError(warning)
+        if is_linux and policy.fail_if_unavailable:
+            raise RuntimeError(
+                f"{warning}. Install bubblewrap (`apt install bubblewrap` / "
+                f"`dnf install bubblewrap`) for real kernel-level command "
+                f"isolation, or set sandbox_fail_if_unavailable: false in "
+                f"config (or TAMFIS_CODE_SANDBOX_FAIL_IF_UNAVAILABLE=false) "
+                f"to run commands unsandboxed instead of failing here."
+            )
         return SandboxCommand(direct, False, "unavailable", warning)
 
     argv = [

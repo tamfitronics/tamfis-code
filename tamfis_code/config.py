@@ -180,7 +180,17 @@ class Config:
     sandbox_mode: str = "workspace-write"
     sandbox_network_access: bool = False
     sandbox_writable_roots: list[str] = field(default_factory=list)
-    sandbox_fail_if_unavailable: bool = False
+    # Defaults to fail-closed on Linux as of 2026-08-21 (see sandbox.py's
+    # build_sandbox_command docstring -- has no effect on macOS/Windows,
+    # which have no sandbox backend to fail closed into yet). Previously
+    # False, meaning a Linux host without bwrap installed silently ran
+    # every "sandboxed" command with zero kernel isolation.
+    sandbox_fail_if_unavailable: bool = True
+    # Warns (never blocks -- see metrics.py's SessionCostGuard docstring for
+    # why a CLI tool where the user pays for their own usage warrants a
+    # softer rail than a hosted multi-tenant product would) once estimated
+    # session spend crosses this many dollars. <= 0 disables the warning.
+    session_cost_cap_usd: float = 5.0
     permission_allow: list[str] = field(default_factory=list)
     permission_ask: list[str] = field(default_factory=list)
     permission_deny: list[str] = field(default_factory=list)
@@ -205,6 +215,7 @@ class Config:
             "sandbox_network_access": self.sandbox_network_access,
             "sandbox_writable_roots": self.sandbox_writable_roots,
             "sandbox_fail_if_unavailable": self.sandbox_fail_if_unavailable,
+            "session_cost_cap_usd": self.session_cost_cap_usd,
             "permission_allow": self.permission_allow,
             "permission_ask": self.permission_ask,
             "permission_deny": self.permission_deny,
@@ -279,6 +290,9 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "sandbox_fail_if_unavailable" in data:
             cfg.sandbox_fail_if_unavailable = bool(data["sandbox_fail_if_unavailable"])
             cfg.sources["sandbox_fail_if_unavailable"] = source_name
+        if "session_cost_cap_usd" in data:
+            cfg.session_cost_cap_usd = float(data["session_cost_cap_usd"])
+            cfg.sources["session_cost_cap_usd"] = source_name
         permissions = data.get("permissions")
         if isinstance(permissions, dict):
             for action in ("allow", "ask", "deny"):
@@ -349,6 +363,16 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_sandbox_network is not None:
         cfg.sandbox_network_access = env_sandbox_network.lower() in {"1", "true", "yes"}
         cfg.sources["sandbox_network_access"] = "env TAMFIS_CODE_SANDBOX_NETWORK_ACCESS"
+
+    env_sandbox_fail = os.environ.get("TAMFIS_CODE_SANDBOX_FAIL_IF_UNAVAILABLE")
+    if env_sandbox_fail is not None:
+        cfg.sandbox_fail_if_unavailable = env_sandbox_fail.lower() in {"1", "true", "yes"}
+        cfg.sources["sandbox_fail_if_unavailable"] = "env TAMFIS_CODE_SANDBOX_FAIL_IF_UNAVAILABLE"
+
+    env_cost_cap = os.environ.get("TAMFIS_CODE_SESSION_COST_CAP_USD")
+    if env_cost_cap:
+        cfg.session_cost_cap_usd = float(env_cost_cap)
+        cfg.sources["session_cost_cap_usd"] = "env TAMFIS_CODE_SESSION_COST_CAP_USD"
 
     env_sandbox_roots = os.environ.get("TAMFIS_CODE_SANDBOX_WRITABLE_ROOTS")
     if env_sandbox_roots:
