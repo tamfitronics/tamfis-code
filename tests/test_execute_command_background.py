@@ -157,7 +157,7 @@ class TestReadBackgroundJobToolWiring:
             with tempfile.TemporaryDirectory() as ws:
                 renderer = _BackgroundCapableRenderer()
 
-                exec_args = json.dumps({"command": "sleep 0.6 && echo from-background"})
+                exec_args = json.dumps({"command": "sleep 2 && echo from-background"})
                 rounds = [
                     [_chunk(_delta(tool_calls=[
                         _tool_call_delta(0, call_id="call_exec", name="execute_command", arguments=exec_args)
@@ -173,9 +173,26 @@ class TestReadBackgroundJobToolWiring:
                     # before dispatching each execute_command call (so a
                     # stale press from before this command started is never
                     # honored) -- this must fire AFTER that clear(), while
-                    # the "sleep 0.6" command above is still genuinely
+                    # the "sleep 2" command above is still genuinely
                     # in flight, to actually exercise the mid-command path.
-                    await asyncio.sleep(0.15)
+                    #
+                    # FIX (2026-08-21): this was 0.15s against a 0.6s
+                    # command -- a 0.45s margin that's real, not
+                    # implementation flakiness (the actual code races two
+                    # asyncio tasks via asyncio.wait(..., FIRST_COMPLETED),
+                    # which is correctly event-driven, no polling interval
+                    # involved). Live-confirmed the margin was too tight to
+                    # survive real interpreter/environment startup-overhead
+                    # variance: reproducibly failed 3/3 runs on a freshly
+                    # installed Python 3.11 (this suite's own CI version)
+                    # while passing reliably on this host's Python 3.13 --
+                    # not a version-specific logic difference, just not
+                    # enough margin against how long everything before the
+                    # subprocess dispatch (mock client round-trip, tool-call
+                    # parsing, etc.) can take on a slower/colder
+                    # interpreter. 0.5s trigger against a 2s command gives
+                    # roughly 3x the margin.
+                    await asyncio.sleep(0.5)
                     renderer.background_requested.set()
 
                 async def _drive():

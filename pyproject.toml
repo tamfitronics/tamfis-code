@@ -19,7 +19,15 @@ dependencies = [
     # Outbound MCP server (`tamfis-code mcp-server`, mcp_stdio_server.py) --
     # was already installed system-wide and imported ad hoc; same class of
     # undeclared-dependency gap as openai/pytest-asyncio above, now fixed.
-    "mcp>=1.2",
+    # <2.0 added 2026-08-21: mcp 2.0.0 is a real breaking change against
+    # this codebase's usage (Tool.inputSchema and Server.list_tools were
+    # both renamed/removed) -- live-confirmed via the first real CI run on
+    # a fresh Python 3.11 install, which pulled 2.0.0 and failed two
+    # mcp_stdio_server tests with AttributeError. This host's own working
+    # install is 1.28.1; pinning below the breaking major version until
+    # someone deliberately migrates the mcp.py/mcp_stdio_server.py call
+    # sites to the new API.
+    "mcp>=1.2,<2.0",
     "fastapi>=0.115",
     "uvicorn>=0.34",
     "websockets>=13",
