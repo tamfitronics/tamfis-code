@@ -21,5 +21,13 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
+      # sandbox.py's build_sandbox_command now defaults to fail-closed on
+      # Linux when bubblewrap is missing (see the 2026-08-21 sandbox
+      # fail-closed commit) -- ubuntu-latest doesn't ship it, so every real
+      # execute_command call in the suite would raise RuntimeError instead
+      # of running, without this. Live-confirmed as the actual cause of a
+      # cluster of "'failed' != 'completed'" test failures on the first CI
+      # run after that change landed.
+      - run: sudo apt-get update && sudo apt-get install -y bubblewrap
       - run: pip install -e ".[dev]"
       - run: pytest -q
