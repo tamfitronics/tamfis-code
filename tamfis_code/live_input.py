@@ -462,13 +462,22 @@ class LiveInputListener:
     def _bottom_toolbar(self):
         spinner = _STATUS_SPINNER_FRAMES[self._status_tick]
         status = self.renderer.live_input_status(spinner)
+        # FIX (2026-08-21): a multi-line function call inside an f-string
+        # expression (the {...} spanning several lines) is PEP 701 syntax,
+        # Python 3.12+ only -- pyproject.toml declares requires-python
+        # ">=3.10" and this was a real SyntaxError on 3.10/3.11, invisible
+        # locally on this host's 3.13 interpreter and never caught by CI
+        # because CI never actually ran pytest until today's fix wired that
+        # in (see the CI-gating commit history). Computing the value first
+        # is unambiguous across every supported Python version.
+        mode_and_agents_html = _mode_and_agents_html(
+            self.cli_config,
+            self.session_id,
+            active_agents=self._active_agents,
+        )
         left = (
             f" <ansigray>{status} · ↑ edit queued · esc to interrupt ·</ansigray> "
-            f"{_mode_and_agents_html(
-                self.cli_config,
-                self.session_id,
-                active_agents=self._active_agents,
-            )}"
+            f"{mode_and_agents_html}"
         )
         chip = _right_chip(self.session_id, self._active_agents)
         bottom_line = _right_align(left, chip + " ")
