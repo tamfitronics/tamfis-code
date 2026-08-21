@@ -29,5 +29,20 @@ jobs:
       # cluster of "'failed' != 'completed'" test failures on the first CI
       # run after that change landed.
       - run: sudo apt-get update && sudo apt-get install -y bubblewrap
+      # DIAGNOSTIC, temporary: bwrap installed successfully but the same
+      # tests still failed on the run right after adding it -- this proves
+      # (or disproves) whether it's a known class of issue: bubblewrap
+      # needs unprivileged user namespaces (CLONE_NEWUSER), which some
+      # container/CI environments restrict even with the binary present.
+      # Remove once the real cause is confirmed.
+      - name: Diagnose whether bwrap can actually sandbox anything here
+        run: |
+          echo "bwrap version:"; bwrap --version
+          echo "--- attempting a real sandboxed command ---"
+          bwrap --die-with-parent --unshare-all --ro-bind / / --proc /proc --dev /dev --tmpfs /tmp -- echo "bwrap sandbox works" || echo "bwrap FAILED with exit code $?"
+          echo "--- unprivileged userns sysctl ---"
+          cat /proc/sys/kernel/unprivileged_userns_clone 2>/dev/null || echo "(no such sysctl on this kernel)"
+          echo "--- apparmor bwrap-userns-restrict status ---"
+          sudo apparmor_status 2>&1 | grep -i bwrap || echo "(no bwrap apparmor profile found)"
       - run: pip install -e ".[dev]"
       - run: pytest -q
