@@ -9,8 +9,24 @@ from tamfis_code.config import Config as _RealConfig
 
 @dataclasses.dataclass
 class _TestConfig(_RealConfig):
-    # Only overrides the field default; every other Config() behavior
+    # Only overrides these field defaults; every other Config() behavior
     # (env-derived fields aside) is untouched.
+    #
+    # network_access=True is the actual fix (see the fixture below for why
+    # fail_if_unavailable=False alone doesn't cover GitHub Actions): it
+    # stops build_sandbox_command from appending bwrap's --unshare-net,
+    # which is what was actually failing there ("bwrap: loopback: Failed
+    # RTM_NEWADDR: Operation not permitted" -- setting up the loopback
+    # interface inside a *new* network namespace, not namespace creation
+    # itself). Without --unshare-net, bwrap just shares the host's network
+    # namespace and never touches loopback setup, so it runs successfully
+    # while still providing real filesystem isolation (ro-bind /,
+    # workspace-only writable root, etc.) -- these tests don't exercise
+    # network isolation, so this doesn't weaken what they're testing.
+    sandbox_network_access: bool = True
+    # Kept as a second line of defense for any environment where bwrap
+    # truly isn't installed at all (the "not found" branch this flag
+    # actually controls) -- distinct from the runtime failure above.
     sandbox_fail_if_unavailable: bool = False
 
 
@@ -29,19 +45,23 @@ def _isolate_tamfis_env(monkeypatch):
     for key in list(os.environ):
         if key.startswith(_TAMFIS_ENV_PREFIXES):
             monkeypatch.delenv(key, raising=False)
-    # sandbox_fail_if_unavailable defaults to True on Linux as of
-    # 2026-08-21 (see sandbox.py) -- correct for real usage, but several
-    # tests that aren't testing sandboxing itself (test_reasoning_plan.py,
-    # test_concurrent_dispatch_regressions.py, etc.) route real
-    # execute_command calls through _run_local_agent_turn_impl's default
-    # Config, which would now require bubblewrap to actually function, not
-    # just be installed. Live-confirmed this fails in GitHub Actions'
-    # runner environment specifically (bwrap's own loopback-interface setup
-    # gets "Operation not permitted" there even with the binary present and
-    # user namespaces nominally unrestricted -- an AppArmor/container layer
-    # neither this project nor these tests should need to fight).
+    # Several tests that aren't testing sandboxing itself
+    # (test_reasoning_plan.py, test_concurrent_dispatch_regressions.py,
+    # etc.) route real execute_command calls through
+    # _run_local_agent_turn_impl's default Config, which builds a real
+    # bwrap invocation. GitHub Actions' ubuntu-latest runner has bubblewrap
+    # installed and user namespaces nominally unrestricted, but bwrap's own
+    # loopback-interface setup inside a *new network namespace* (triggered
+    # by --unshare-net, which build_sandbox_command adds whenever
+    # network_access=False) fails there with "Operation not permitted" --
+    # an AppArmor/container layer neither this project nor these tests need
+    # to fight, since none of them are testing network isolation. See
+    # _TestConfig above for the actual fix (network_access=True avoids
+    # --unshare-net entirely); sandbox_fail_if_unavailable=False is a
+    # separate, secondary guard for the "bwrap not installed at all" case.
     #
-    # An env var can't fix this: runner_local.py builds the default config
+    # An env var can't do either override: runner_local.py builds the
+    # default config
     # as `cli_config or Config()` (line ~4182), a bare dataclass
     # constructor -- only load_config() reads TAMFIS_CODE_* env vars, and
     # this call site never goes through it. So the only reliable knob is
