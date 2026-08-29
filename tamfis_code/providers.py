@@ -513,6 +513,19 @@ class ProviderManager:
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
                 "moonshotai/kimi-k2.6",
+                # ADDED 2026-08-30: live-verified directly against
+                # integrate.api.nvidia.com/v1/chat/completions with a real
+                # account key -- three probes: (1) plain chat completion,
+                # 200 OK with real content; (2) a real function-calling
+                # probe (get_weather tool), returned a genuine tool_calls
+                # event, not narrated text; (3) NVIDIA's own catalog vision
+                # payload shape (text + image_url content parts), returned
+                # an accurate description of the real test image, not a
+                # refusal/generic non-answer. Same underlying model already
+                # available via Ollama Cloud (kimi-k3:cloud, see above) and
+                # HF (see model_registry.py); this is a third, independently
+                # verified route on the highest-priority provider here.
+                "moonshotai/kimi-k3",
                 "mistralai/mistral-large-2-123b",
                 "google/gemma-2-27b-it",
                 "microsoft/phi-3-medium-128k-instruct",
@@ -524,7 +537,11 @@ class ProviderManager:
             priority=0,
             weight=40,
             reasoning_supported=True,
-            vision_supported=False,
+            # FIX 2026-08-30: was False -- true before kimi-k3 above was
+            # added, since none of this bucket's other models had a
+            # confirmed vision route. Now live-verified true for at least
+            # one model in this provider's bucket (see the comment above).
+            vision_supported=True,
             context_window=128000,
             coding_quality=5,
             tool_calling=True,

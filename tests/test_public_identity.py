@@ -9,6 +9,7 @@ from tamfis_code.public_identity import (
     PUBLIC_MODEL_ULTIMA,
     parse_public_model_alias,
     public_model_name,
+    redact_routing_text,
     resolve_public_model_alias,
     sanitize_public_event,
 )
@@ -85,3 +86,28 @@ def test_top_level_legacy_event_shape_is_also_sanitized():
     event = sanitize_public_event({"type": "model_selected", "provider": "nvidia", "model": "kimi-k2"})
     assert event["provider"] == "TamfisGPT"
     assert event["model"] == PUBLIC_MODEL_ULTRA
+
+
+def test_redact_routing_text_leaves_urls_intact_even_with_a_provider_name_inside():
+    """Live-reproduced (2026-08-30): a real OpenRouter 402 error's remedy
+    text is "purchase more at https://openrouter.ai/settings/credits".
+    _PROVIDER_RE matches "openrouter" as a whole word wherever it appears,
+    so without protecting URLs first this rewrote the link into
+    "https://TamfisGPT.ai/settings/credits" -- a page that does not exist,
+    which is worse than the identity leak this function exists to prevent:
+    a real actionable remediation link silently became a dead one."""
+    message = (
+        "Insufficient credits. Make sure your key is on the correct account, "
+        "and if so, purchase more at https://openrouter.ai/settings/credits."
+    )
+    result = redact_routing_text(message)
+    assert "https://openrouter.ai/settings/credits" in result
+    assert "TamfisGPT.ai" not in result
+
+
+def test_redact_routing_text_still_redacts_bare_provider_mentions_outside_urls():
+    message = "Falling back from OpenRouter to Anthropic; see https://openrouter.ai/docs for nvidia/nemotron-3-super."
+    result = redact_routing_text(message)
+    assert "Falling back from TamfisGPT to TamfisGPT" in result
+    assert "https://openrouter.ai/docs" in result
+    assert "nvidia/nemotron" not in result

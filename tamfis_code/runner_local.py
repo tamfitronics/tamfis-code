@@ -1696,13 +1696,38 @@ def _close_interrupted_tool_calls(messages: list[dict[str, Any]]) -> list[dict[s
     return repaired
 
 
-def _workspace_roots_related(left: str, right: str) -> bool:
-    """True only for the same workspace or a direct ancestor/descendant."""
-    if not left or not right:
+def _workspace_roots_related(candidate_root: str, current_root: str) -> bool:
+    """True for the same workspace, or when `current_root` is a
+    subdirectory of `candidate_root` (restarting from deeper inside a
+    project the candidate session's interrupted turn was rooted at).
+
+    FIX (2026-08-30, live-reproduced): this used to also match the
+    opposite direction -- `current_root` an ancestor of `candidate_root` --
+    which meant a broad, multi-project current root (e.g. the server's own
+    /home, used because a task legitimately spans several sibling project
+    directories: confirmed live with an "audit/enhance all our WordPress
+    sites" task rooted at /home to reach /home/finima/www,
+    /home/tistalents/www, etc.) was an "ancestor" of every OTHER unrelated
+    project anywhere on the same box, no matter how deep. _select_resume_
+    state's search then picked up a completely different session's
+    checkpoint -- confirmed live: the WordPress task resumed a stale
+    checkpoint whose reasoning-plan steps were about fixing a "generic
+    fallback plan bug" in this very CLI's own orchestrator/planner.py, a
+    project the user never mentioned this turn, and the agent got stuck
+    re-reading files there instead of doing the requested WordPress work.
+    This function's own docstring (and its one caller's) only ever
+    describes the other direction as intentional -- "restarting from a
+    project subdirectory can legitimately select a different local
+    session than the interrupted PARENT-workspace turn" -- so only that
+    direction (candidate is the parent, current is the subdirectory) is
+    kept; a current root that happens to be an ancestor of some unrelated
+    candidate elsewhere on disk is no longer treated as related.
+    """
+    if not candidate_root or not current_root:
         return False
-    left_path = Path(left).expanduser().resolve()
-    right_path = Path(right).expanduser().resolve()
-    return left_path == right_path or left_path in right_path.parents or right_path in left_path.parents
+    candidate_path = Path(candidate_root).expanduser().resolve()
+    current_path = Path(current_root).expanduser().resolve()
+    return candidate_path == current_path or candidate_path in current_path.parents
 
 
 def _select_resume_state(session_id: int, workspace_root: str):
@@ -3896,6 +3921,8 @@ async def _attempt_reasoning_plan(
     evidence_summary: Optional[str] = None,
     reasoning_effort: Optional[str] = None,
     scope_roots: Optional[list[Path]] = None,
+    manager: Optional[ProviderManager] = None,
+    provider: Optional[ProviderType] = None,
 ) -> Optional[Any]:
     """Ask the resolved provider for a plan grounded in the real objective
     and real workspace facts (and, for a revision, real evidence gathered
@@ -3906,6 +3933,21 @@ async def _attempt_reasoning_plan(
     whatever plan it already had (the deterministic template from
     orchestrator.begin(), or the still-valid prior reasoning plan for a
     failed revision attempt).
+
+    FIX (2026-08-30): unlike the main answer-streaming path
+    (ProviderManager.chat_completion's allow_fallback), this call used to
+    hit one pre-resolved provider with no retry -- a retryable failure
+    (confirmed live: a 402 "insufficient credits" on an OpenRouter account
+    that never purchased any) silently gave up on a fresh plan even while
+    other configured providers were healthy, degrading to the existing
+    plan every single time rather than only when every provider was
+    actually down. When `manager`/`provider` are supplied, a retryable
+    error now retries once per remaining fallback candidate in the same
+    policy order the main path already uses (ProviderManager.
+    fallback_candidates) before giving up. Both are optional and default
+    to None -- omitting them reproduces the old single-attempt behavior
+    exactly, so existing callers that don't have a ProviderManager handy
+    are unaffected.
     """
     repository_context = local_state.get_session_state(session_id).repository_context or {}
     prompt_messages = build_reasoning_plan_prompt(
@@ -3913,17 +3955,49 @@ async def _attempt_reasoning_plan(
         reconnaissance_summary=reconnaissance_summary,
         evidence_summary=evidence_summary,
     )
-    try:
-        content, _tool_calls, finish_reason = await _stream_one_completion(
-            client, model=model, messages=prompt_messages, tools=[],
-            renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
-        )
-    except Exception as exc:
-        renderer.handle_event({
-            "event_type": "diagnostics",
-            "payload": {"content": f"Planning request failed ({exc}); using the existing plan."},
-        })
-        return None
+    attempt_client, attempt_model = client, model
+    tried_providers: set[ProviderType] = set()
+    last_exc: Optional[Exception] = None
+    while True:
+        try:
+            content, _tool_calls, finish_reason = await _stream_one_completion(
+                attempt_client, model=attempt_model, messages=prompt_messages, tools=[],
+                renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
+            )
+            break
+        except Exception as exc:
+            last_exc = exc
+            fallback_client = fallback_model = None
+            if (
+                manager is not None and provider is not None
+                and manager.is_retryable_provider_error(exc)
+            ):
+                for candidate in manager.fallback_candidates(
+                    provider, task_profile,
+                    allow_premium_primary=manager.is_quota_or_rate_limit_error(exc),
+                ):
+                    if candidate in tried_providers:
+                        continue
+                    candidate_client = manager.get_client(candidate)
+                    candidate_config = manager.PROVIDERS.get(candidate)
+                    if candidate_client is None or candidate_config is None:
+                        continue
+                    fallback_client = candidate_client
+                    fallback_model = manager.select_model(candidate_config, task_profile)
+                    provider = candidate
+                    break
+            if fallback_client is None:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": f"Planning request failed ({last_exc}); using the existing plan."},
+                })
+                return None
+            tried_providers.add(provider)
+            attempt_client, attempt_model = fallback_client, fallback_model
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": f"Planning request failed ({exc}); retrying with a different provider."},
+            })
     if finish_reason in {"degenerate_repetition", "conversation_echo", "repeated_content", "corrupted_output"}:
         renderer.handle_event({
             "event_type": "diagnostics",
@@ -4577,6 +4651,7 @@ async def _run_local_agent_turn_impl(
             evidence_summary=resumed_evidence_summary,
             reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
             scope_roots=scope_roots,
+            manager=manager, provider=resolved_provider,
         )
         selected_plan = reasoning_plan or grounded_fallback
         if selected_plan is not None and orchestrator.run is not None:
@@ -6665,7 +6740,11 @@ async def _run_local_agent_turn_impl(
                     hint = (
                         " Use read_file with offset/limit, search_code, or a recognized read-only "
                         "pipeline (for example grep/rg piped to head, sed -n, or bounded awk) "
-                        "instead of retrying Python or another general-purpose command."
+                        "instead of retrying Python or another general-purpose command. `php -l "
+                        "<one file>` and `bash -n <one file>` (or `sh -n <one file>`) are also "
+                        "read-only syntax checks -- run them per file (find the files first, "
+                        "already read-only, then lint each one individually); a find|xargs fan-out "
+                        "into an interpreter is not supported even in read-only mode."
                     )
                 result = {
                     "error": (
@@ -6897,6 +6976,7 @@ async def _run_local_agent_turn_impl(
                 evidence_summary=_summarise_progress_for_rollover(session_id),
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
                 scope_roots=scope_roots,
+                manager=manager, provider=resolved_provider,
             )
             if revised_plan is not None:
                 orchestrator.replace_plan(revised_plan)

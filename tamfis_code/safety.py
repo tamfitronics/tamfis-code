@@ -106,6 +106,15 @@ _READ_ONLY_COMMANDS = {
     "cat", "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
     "uniq", "wc", "stat", "file", "du", "tree", "realpath", "readlink",
     "awk", "sed",
+    # Live-reproduced (2026-08-30): a read-only audit turn had a real,
+    # non-mutating validation command to run -- `php -l file.php` (PHP's
+    # syntax-check-only flag, does not execute the script) and `bash -n
+    # script.sh` (same idea for shell scripts) -- and no way to run it: the
+    # only route this classifier offered was read_file/grep/sed/awk, none of
+    # which can invoke an interpreter's own syntax checker. Both are gated
+    # below to that single safe flag, exactly like sed's `-n '<N>p'`/awk's
+    # side-effect-free-program restriction already gate those two entries.
+    "php", "bash", "sh",
 }
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
 
@@ -182,6 +191,15 @@ def _is_read_only_command_segment(argv: list[str]) -> bool:
         for arg in argv[1:]
     ):
         return False
+    if executable == "php":
+        # -l lints without executing: exactly `php -l <one file>`, nothing
+        # else -- any other flag (or no -l at all) actually runs the script.
+        return len(argv) == 3 and argv[1] == "-l" and not argv[2].startswith("-")
+    if executable in {"bash", "sh"}:
+        # -n parses without executing. Reject if combined with -c (inline
+        # script text, arbitrary) or -i (interactive) even though -n is
+        # present, since either changes what actually happens.
+        return "-n" in argv[1:] and not any(arg in {"-c", "-i"} for arg in argv[1:])
     return True
 
 

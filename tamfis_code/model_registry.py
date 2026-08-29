@@ -49,6 +49,24 @@ MODELS: dict[str, ModelRecord] = {
         ModelCapabilities(parallel_tool_calls=True, long_context=True), 128000,
         ("multi_file_edit", "tool_heavy_execution", "planning"), "frontier", "medium",
     ),
+    # ADDED 2026-08-30: live-verified against integrate.api.nvidia.com with
+    # a real account key -- plain chat (200 OK), a real function-calling
+    # probe (returned a genuine tool_calls event, not narrated text), and
+    # NVIDIA's own catalog vision payload shape (text + image_url), which
+    # returned an accurate description of the real test image. vision=True
+    # is real, not a guess. Deliberately NOT claiming parallel_tool_calls
+    # or long_context here even though the sibling kimi-k2.6 entry above
+    # sets both -- only a single-tool-call probe and short-context chat
+    # were tested this pass, not simultaneous multi-tool calls or long-
+    # context behavior on this specific NIM host. context_window kept at
+    # 128000 (matching kimi-k2.6) rather than the 1M this model is
+    # documented at elsewhere (Ollama Cloud's kimi-k3:cloud comment in
+    # providers.py) for the same reason.
+    "moonshotai/kimi-k3": ModelRecord(
+        "moonshotai/kimi-k3", "nvidia",
+        ModelCapabilities(vision=True), 128000,
+        ("multi_file_edit", "planning", "vision_assisted_coding"), "frontier", "medium",
+    ),
     "moonshotai/Kimi-K2.6": ModelRecord(
         "moonshotai/Kimi-K2.6", "hf",
         ModelCapabilities(parallel_tool_calls=True, long_context=True), 128000,

@@ -188,14 +188,35 @@ def public_route_name(provider: Any = None, model: Any = None) -> str:
     return public_model_name(model)
 
 
+_URL_RE = re.compile(r"https?://\S+")
+
+
 def redact_routing_text(value: Any) -> str:
     """Redact backend names from internal status/error text before display.
 
     This is intentionally used only for runtime-owned metadata, never for
     assistant answers or tool/file output, where provider words may be the
     user's actual subject matter.
+
+    Live-reproduced (2026-08-30): a real OpenRouter 402 error's remedy text
+    includes "purchase more at https://openrouter.ai/settings/credits" --
+    _PROVIDER_RE matches "openrouter" as a whole word regardless of where it
+    sits, so the substitution pass below turned that into
+    "https://TamfisGPT.ai/settings/credits", a URL that does not exist. That
+    is worse than the identity leak this function exists to prevent: it is
+    an actionable remediation link the user needs, rewritten into a
+    plausible-looking dead link under our own domain. URLs are stashed
+    before substitution and restored verbatim afterward so their content is
+    never rewritten, even when a provider name happens to appear in one.
     """
     text = str(value or "")
+    urls: list[str] = []
+
+    def _stash_url(match: "re.Match[str]") -> str:
+        urls.append(match.group(0))
+        return f"\x00URL{len(urls) - 1}\x00"
+
+    text = _URL_RE.sub(_stash_url, text)
     # Model-hint pass runs FIRST, on whole tokens, before the provider-name
     # pass below. Raw catalog ids are frequently a single "namespace/model"
     # token (e.g. "nvidia/nemotron-3-super", "moonshotai/Kimi-K2.6"). Running
@@ -213,6 +234,8 @@ def redact_routing_text(value: Any) -> str:
             tokens[index] = token.replace(clean, public_model_name(clean))
     text = "".join(tokens)
     text = _PROVIDER_RE.sub(PUBLIC_PROVIDER_NAME, text)
+    for index, url in enumerate(urls):
+        text = text.replace(f"\x00URL{index}\x00", url)
     return text
 
 

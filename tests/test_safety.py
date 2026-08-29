@@ -38,6 +38,36 @@ class ClassifyCommandRiskTests(unittest.TestCase):
                 self.assertNotEqual(classify_command_risk(command), RISK_READ_ONLY)
         self.assertEqual(classify_command_risk("pytest -q"), RISK_MEDIUM)
 
+    def test_php_syntax_check_only_flag_is_read_only(self):
+        """Live-reproduced (2026-08-30): a read-only audit turn needed to
+        run `php -l file.php` (lint-only, does not execute the script) and
+        had no safe way to -- confirmed by the exact failure in production
+        ("'execute_command' is not available in read-only mode"). Any php
+        invocation without exactly this one flag actually runs the script,
+        so those must stay non-read-only."""
+        self.assertEqual(classify_command_risk("php -l /home/finima/www/wp-config.php"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("php file.php"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("php -l -r 'evil()'"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("php -l file.php extra.php"), RISK_READ_ONLY)
+
+    def test_bash_syntax_check_only_flag_is_read_only(self):
+        self.assertEqual(classify_command_risk("bash -n deploy.sh"), RISK_READ_ONLY)
+        self.assertEqual(classify_command_risk("sh -n deploy.sh"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("bash -n -c 'rm -rf /'"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("bash deploy.sh"), RISK_READ_ONLY)
+
+    def test_find_piped_to_xargs_php_lint_remains_unsupported(self):
+        # Deliberately NOT supported, same conservative stance this file
+        # already takes on `find -exec` -- xargs's sub-command is arbitrary
+        # and validating "the tail end is a safe command" is the same
+        # command-injection surface, not a narrower one. A real audit
+        # falls back to `find` (already read-only) to enumerate files, then
+        # `php -l` per file individually.
+        self.assertNotEqual(
+            classify_command_risk("find . -name '*.php' -print0 | xargs -0 -r -n1 php -l"),
+            RISK_READ_ONLY,
+        )
+
     def test_rm_rf_is_dangerous(self):
         self.assertEqual(classify_command_risk("rm -rf /tmp/scratch"), RISK_DANGEROUS)
         self.assertEqual(classify_command_risk("rm -fr build/"), RISK_DANGEROUS)

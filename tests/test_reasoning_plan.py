@@ -24,7 +24,7 @@ from tamfis_code.orchestrator.planner import (
 )
 from tamfis_code.providers import ProviderType
 from tamfis_code.routing import TaskProfile, TaskType
-from tamfis_code.runner_local import run_local_agent_turn
+from tamfis_code.runner_local import _attempt_reasoning_plan, run_local_agent_turn
 
 
 class ParseReasoningPlanTests(unittest.TestCase):
@@ -659,6 +659,147 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
                 if any("REVISION" in str(m.get("content")) for m in c["messages"] if m.get("role") == "user")
             ]
             self.assertEqual(len(revise_calls), 1)
+
+
+class _CreditErrorClient:
+    """A client whose every completion call raises the exact shape of a
+    real OpenRouter 402 "insufficient credits" error."""
+
+    def __init__(self):
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self.calls = 0
+
+    async def _create(self, **kwargs):
+        self.calls += 1
+        raise RuntimeError(
+            "Error code: 402 - {'error': {'message': 'Insufficient credits. This account never "
+            "purchased credits.', 'code': 402, 'metadata': {'limit_source': 'openrouter_credits'}}}"
+        )
+
+
+class _FallbackCapableManager:
+    """Minimal stand-in for ProviderManager exposing only what
+    _attempt_reasoning_plan's fallback path calls -- get_client,
+    is_retryable_provider_error, is_quota_or_rate_limit_error,
+    fallback_candidates, select_model, PROVIDERS."""
+
+    def __init__(self, clients: dict, fallback_order: list):
+        self._clients = clients
+        self._fallback_order = fallback_order
+        self.PROVIDERS = {provider: SimpleNamespace(default_model=f"{provider.value}-model") for provider in clients}
+
+    def get_client(self, provider):
+        return self._clients.get(provider)
+
+    def is_retryable_provider_error(self, exc):
+        return "402" in str(exc) or "429" in str(exc)
+
+    def is_quota_or_rate_limit_error(self, exc):
+        return "402" in str(exc)
+
+    def fallback_candidates(self, current, task_profile, *, allow_premium_primary=False):
+        return [p for p in self._fallback_order if p != current]
+
+    def select_model(self, config, task_profile):
+        return config.default_model
+
+
+class ReasoningPlanProviderFallbackTests(_StatePatchMixin, unittest.TestCase):
+    """Live-reproduced (2026-08-30): a real OpenRouter 402 "insufficient
+    credits" error on the planning call used to give up immediately and
+    fall back to the existing plan, even when other configured providers
+    were healthy -- because _attempt_reasoning_plan used one pre-resolved
+    client with no retry, unlike the main answer-streaming path (which
+    already retries across ProviderManager.fallback_candidates on exactly
+    this class of error). These test the new manager/provider-driven
+    retry directly against _attempt_reasoning_plan."""
+
+    def _renderer(self):
+        return _RecordingRenderer()
+
+    def _profile(self):
+        return TaskProfile(TaskType.DEBUG, "high", True, True, True, True, "frontier")
+
+    def test_retryable_error_falls_over_to_the_next_provider_and_succeeds(self):
+        plan_response = json.dumps({"steps": ["Read calc.py", "Fix it", "Verify"]})
+        failing_client = _CreditErrorClient()
+        working_client = _FakeClient([[_chunk(_delta(content=plan_response))]])
+        manager = _FallbackCapableManager(
+            {ProviderType.OPENROUTER: failing_client, ProviderType.NVIDIA: working_client},
+            fallback_order=[ProviderType.NVIDIA],
+        )
+        renderer = self._renderer()
+
+        plan = asyncio.run(_attempt_reasoning_plan(
+            failing_client, model="paid-model", objective="fix calc.py",
+            task_profile=self._profile(), session_id=1, renderer=renderer,
+            manager=manager, provider=ProviderType.OPENROUTER,
+        ))
+
+        self.assertIsNotNone(plan)
+        self.assertEqual(failing_client.calls, 1)
+        self.assertEqual(len(working_client.calls), 1)
+        diagnostics = [e["payload"]["content"] for e in renderer.events if e["event_type"] == "diagnostics"]
+        self.assertTrue(any("retrying with a different provider" in d for d in diagnostics))
+        self.assertFalse(any("using the existing plan" in d for d in diagnostics))
+
+    def test_no_healthy_fallback_still_degrades_gracefully_to_none(self):
+        failing_client = _CreditErrorClient()
+        manager = _FallbackCapableManager(
+            {ProviderType.OPENROUTER: failing_client}, fallback_order=[],
+        )
+        renderer = self._renderer()
+
+        plan = asyncio.run(_attempt_reasoning_plan(
+            failing_client, model="paid-model", objective="fix calc.py",
+            task_profile=self._profile(), session_id=1, renderer=renderer,
+            manager=manager, provider=ProviderType.OPENROUTER,
+        ))
+
+        self.assertIsNone(plan)
+        diagnostics = [e["payload"]["content"] for e in renderer.events if e["event_type"] == "diagnostics"]
+        self.assertTrue(any("using the existing plan" in d for d in diagnostics))
+
+    def test_non_retryable_error_never_attempts_fallback(self):
+        class _BadRequestClient:
+            def __init__(self):
+                self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+                self.calls = 0
+
+            async def _create(self, **kwargs):
+                self.calls += 1
+                raise RuntimeError("Error code: 400 - malformed request body")
+
+        failing_client = _BadRequestClient()
+        other_client = _FakeClient([[_chunk(_delta(content="unused"))]])
+        manager = _FallbackCapableManager(
+            {ProviderType.OPENROUTER: failing_client, ProviderType.NVIDIA: other_client},
+            fallback_order=[ProviderType.NVIDIA],
+        )
+        renderer = self._renderer()
+
+        plan = asyncio.run(_attempt_reasoning_plan(
+            failing_client, model="paid-model", objective="fix calc.py",
+            task_profile=self._profile(), session_id=1, renderer=renderer,
+            manager=manager, provider=ProviderType.OPENROUTER,
+        ))
+
+        self.assertIsNone(plan)
+        self.assertEqual(other_client.calls, [])
+
+    def test_omitting_manager_and_provider_reproduces_old_single_attempt_behavior(self):
+        failing_client = _CreditErrorClient()
+        renderer = self._renderer()
+
+        plan = asyncio.run(_attempt_reasoning_plan(
+            failing_client, model="paid-model", objective="fix calc.py",
+            task_profile=self._profile(), session_id=1, renderer=renderer,
+        ))
+
+        self.assertIsNone(plan)
+        self.assertEqual(failing_client.calls, 1)
+        diagnostics = [e["payload"]["content"] for e in renderer.events if e["event_type"] == "diagnostics"]
+        self.assertTrue(any("using the existing plan" in d for d in diagnostics))
 
 
 if __name__ == "__main__":
