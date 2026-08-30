@@ -30,6 +30,8 @@ from typing import Any, AsyncIterator, Dict, List, Optional, TYPE_CHECKING
 
 from openai import AsyncOpenAI
 
+from .provider_protocols import system_messages_first
+
 
 def _load_project_env() -> None:
     """Load Tamfis-Code's root .env without requiring python-dotenv.
@@ -1301,7 +1303,7 @@ class ProviderManager:
 
         request_kwargs: Dict[str, Any] = {
             "model": selected_model,
-            "messages": messages,
+            "messages": system_messages_first(messages),
             "stream": stream,
             "temperature": temperature,
             "max_tokens": max_tokens,

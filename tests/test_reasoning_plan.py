@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, patch
 from rich.console import Console
 
 from tamfis_code import state as state_module
+from tamfis_code.config import Config
 from tamfis_code.orchestrator.planner import (
     build_reasoning_plan_prompt,
     create_plan,
@@ -552,6 +553,112 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(outcome.status, "completed")
             self.assertEqual(len(client.calls), 3)
             self.assertFalse([e for e in renderer.events if e["event_type"] == "plan_created"])
+
+    def test_unsupported_edit_claim_gets_tool_evidence_repair_before_terminal_failure(self):
+        """A prose-only "I updated it" answer gets one chance to do the work.
+
+        This is the live failure shape that previously reached
+        orchestrator.complete immediately and stopped with both "requires
+        tool evidence" and "no successful file mutation" findings.
+        """
+        with tempfile.TemporaryDirectory() as ws:
+            calc_path = Path(ws) / "calc.py"
+            calc_path.write_text("def total(n):\n    return n + 2\n")
+            edit_args = json.dumps({
+                "path": str(calc_path),
+                "old_string": "return n + 2", "new_string": "return n + 1",
+            })
+            rounds = [
+                [_chunk(_delta(content="I updated calc.py and fixed the bug."))],
+                [_chunk(_delta(tool_calls=[_tool_call_delta(
+                    0, call_id="call_1", name="edit_file", arguments=edit_args,
+                )]))],
+                [_chunk(_delta(tool_calls=[_tool_call_delta(
+                    0, call_id="call_2", name="execute_command",
+                    arguments=json.dumps({"command": "true"}),
+                )]))],
+                [_chunk(_delta(content="Fixed with the edit and verification recorded."))],
+            ]
+            client = _FakeClient(rounds)
+            renderer = _RecordingRenderer()
+
+            with self._no_real_validation_commands():
+                outcome = asyncio.run(run_local_agent_turn(
+                    _FakeManager(client), ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": "fix the bug in calc.py"}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                    cli_config=Config(
+                        approval_policy="auto", sandbox_mode="danger-full-access",
+                    ),
+                ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertIn("return n + 1", calc_path.read_text())
+            self.assertEqual(len(client.calls), 4)
+            repair_messages = [
+                str(message.get("content") or "")
+                for message in client.calls[1]["messages"]
+                if message.get("role") == "system"
+            ]
+            self.assertTrue(any("failed completion-evidence validation" in item for item in repair_messages))
+            diagnostics = [
+                event["payload"].get("content", "")
+                for event in renderer.events if event["event_type"] == "diagnostics"
+            ]
+            self.assertTrue(any("finish without evidence" in item for item in diagnostics))
+
+    def test_duplicate_reads_after_real_edit_recover_instead_of_failing_task(self):
+        """A completed mutation must survive a no-new-evidence read loop."""
+        with tempfile.TemporaryDirectory() as ws:
+            target = Path(ws) / "BacklinksPage.tsx"
+            target.write_text("const limit = 10;\n")
+            edit_args = json.dumps({
+                "path": str(target),
+                "old_string": "limit = 10", "new_string": "limit = 20",
+            })
+            rounds = [
+                [_chunk(_delta(tool_calls=[_tool_call_delta(
+                    0, call_id="edit", name="edit_file", arguments=edit_args,
+                )]))],
+                *[
+                    [_chunk(_delta(tool_calls=[_tool_call_delta(
+                        0, call_id=f"read_{offset}", name="read_file",
+                        arguments=json.dumps({"path": str(target), "offset": offset, "limit": 20}),
+                    )]))]
+                    for offset in (1, 2, 3, 4)
+                ],
+                [_chunk(_delta(tool_calls=[_tool_call_delta(
+                    0, call_id="verify", name="execute_command",
+                    arguments=json.dumps({"command": "true"}),
+                )]))],
+                [_chunk(_delta(content="Updated the limit and verified the change."))],
+            ]
+            client = _FakeClient(rounds)
+            renderer = _RecordingRenderer()
+
+            with self._no_real_validation_commands():
+                outcome = asyncio.run(run_local_agent_turn(
+                    _FakeManager(client), ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": "fix the limit in BacklinksPage.tsx"}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                    cli_config=Config(
+                        approval_policy="auto", sandbox_mode="danger-full-access",
+                    ),
+                ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertIn("limit = 20", target.read_text())
+            diagnostics = [
+                event["payload"].get("content", "")
+                for event in renderer.events if event["event_type"] == "diagnostics"
+            ]
+            self.assertTrue(any("Agent stalled" in item for item in diagnostics))
+            self.assertFalse([
+                event for event in renderer.events if event["event_type"] == "ai_task_failed"
+                and "no new evidence" in event["payload"].get("error", "")
+            ])
 
     def test_natural_language_no_edit_constraint_blocks_mutating_shell_calls(self):
         with tempfile.TemporaryDirectory() as ws:

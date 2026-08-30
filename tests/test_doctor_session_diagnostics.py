@@ -8,13 +8,17 @@ event replay) actually held up.
 import asyncio
 import tempfile
 import unittest
+from io import StringIO
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
+from rich.console import Console
+
 from tamfis_code import state as state_module
+from tamfis_code.config import Config
 from tamfis_code.doctor import (
     CheckResult, _diagnose_local_providers, _diagnose_local_session,
-    _diagnose_session, check_event_sequence_integrity,
+    _diagnose_session, check_event_sequence_integrity, run_doctor,
 )
 
 
@@ -142,6 +146,17 @@ class DiagnoseLocalProvidersTests(unittest.TestCase):
             results = _diagnose_local_providers()
         by_name = {r.name: r for r in results}
         self.assertEqual(by_name["TamfisGPT model service"].status, "FAIL")
+
+    def test_doctor_without_remote_credentials_makes_no_remote_request(self):
+        console = Console(file=StringIO(), no_color=True, width=200)
+        with patch("tamfis_code.doctor.load_credentials", return_value=None), \
+             patch("tamfis_code.doctor.get_provider_status", return_value=self._status(configured=True)), \
+             patch("tamfis_code.doctor.RemoteAPIClient") as remote_client:
+            result = _run(run_doctor(Config(), console))
+
+        self.assertTrue(result)
+        remote_client.assert_not_called()
+        self.assertIn("not checked without --remote credentials", console.file.getvalue())
 
 
 class DiagnoseLocalSessionTests(unittest.TestCase):

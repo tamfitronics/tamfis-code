@@ -61,11 +61,11 @@ from .orchestrator import (
     parse_reasoning_plan,
     should_plan,
 )
-from .orchestrator.validator import verified_no_change_completion
+from .orchestrator.validator import validate_completion, verified_no_change_completion
 from .orchestrator.planner import create_plan
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
-from .provider_protocols import normalize_stream_chunk
+from .provider_protocols import normalize_stream_chunk, system_messages_first
 from .permissions import decide_permission
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import (
@@ -235,6 +235,25 @@ FAKE_TOOL_CALL_CORRECTION = (
     "writing the call as text does not run it. Use the real tool-calling mechanism this "
     "turn instead of describing or formatting one yourself, then continue based on its "
     "actual result."
+)
+
+# A final answer can evade all of the prose-shape guards above while still
+# failing the deterministic evidence gate -- most commonly a weak model says
+# "I updated/fixed ..." and stops without issuing any tool call. Previously
+# that candidate went straight to orchestrator.complete(), which correctly
+# rejected it but also ended the entire task. Give the model one bounded
+# chance to turn the unsupported claim into real tool work before terminal
+# validation. This is deliberately a single turn-wide retry: repeated
+# unsupported completion claims remain hard failures rather than loops.
+MAX_COMPLETION_EVIDENCE_RETRIES = 1
+COMPLETION_EVIDENCE_CORRECTION = (
+    "Your previous final answer failed completion-evidence validation: {findings} "
+    "Do not repeat or rephrase the completion claim. Continue the task now using the "
+    "registered tools: inspect the actual workspace, perform every requested file change "
+    "with a mutating tool, and run an appropriate verification command. Only provide a "
+    "new final answer after those successful tool results exist. If evidence proves that "
+    "no change is needed, say that explicitly and support it with successful inspection "
+    "and verification tool calls."
 )
 
 # Live-reported ("So why can't tamfis-code be efficient at least?"): a
@@ -2291,7 +2310,7 @@ async def _nonstream_one_completion(
     """Run a non-streaming completion and preserve structured tool calls."""
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": system_messages_first(messages),
         "stream": False,
         "temperature": 0.2,
         "max_tokens": MAX_TOKENS_PER_REQUEST,
@@ -3241,7 +3260,7 @@ async def _stream_one_completion(
 
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        "messages": system_messages_first(messages),
         "stream": True,
         "temperature": 0.2,
         "max_tokens": MAX_TOKENS_PER_REQUEST,
@@ -4689,6 +4708,7 @@ async def _run_local_agent_turn_impl(
     fabricated_result_failed_providers: set[ProviderType] = set()
     fake_tool_call_retries: dict[ProviderType, int] = {}
     fake_tool_call_failed_providers: set[ProviderType] = set()
+    completion_evidence_retries = 0
     consecutive_scope_errors = 0
     # Distinct from consecutive_identical_rounds/_is_cycling above: those
     # catch the model retrying the SAME (or a short repeating cycle of)
@@ -6096,6 +6116,56 @@ async def _run_local_agent_turn_impl(
                 _persist_turn_checkpoint()
                 continue
 
+            # Preflight the exact deterministic validator before committing
+            # this candidate as the terminal answer. The specialized guards
+            # above catch promises, fake call syntax, fabricated tool output,
+            # and missing post-edit verification; this closes the remaining
+            # gap where a model makes a plain unsupported completion/mutation
+            # claim and would otherwise hard-fail the whole task immediately.
+            # Use validate_completion directly rather than
+            # orchestrator.validate() so a repairable candidate does not
+            # persist a terminal validation result or transition the runtime
+            # into its validation phase prematurely.
+            tool_records = [
+                item.to_dict()
+                for item in (orchestrator.run.tool_records if orchestrator.run else [])
+            ]
+            preflight = validate_completion(
+                profile=task_profile,
+                tool_records=tool_records,
+                any_mutation=any_mutation,
+                final_text=content,
+                objective=objective,
+                workspace_root=workspace_root,
+            )
+            if (
+                tools
+                and preflight.severity == "error"
+                and completion_evidence_retries < MAX_COMPLETION_EVIDENCE_RETRIES
+            ):
+                completion_evidence_retries += 1
+                findings = "; ".join(preflight.unresolved) or "required tool evidence is missing."
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({
+                    "role": "system",
+                    "content": COMPLETION_EVIDENCE_CORRECTION.format(findings=findings),
+                })
+                orchestrator.mark_repair(
+                    "Rejecting an unsupported completion claim and requiring real tool evidence "
+                    f"(attempt {completion_evidence_retries}/{MAX_COMPLETION_EVIDENCE_RETRIES})"
+                )
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "The model attempted to finish without evidence required by the task; "
+                            "requesting the missing inspection/edit/verification tool calls now."
+                        )
+                    },
+                })
+                _persist_turn_checkpoint()
+                continue
+
             return await _finalize_completed_answer(content, finish_reason)
 
         signature = _tool_calls_signature(tool_calls)
@@ -6290,6 +6360,18 @@ async def _run_local_agent_turn_impl(
                 "tool_call_id": tc.call_id,
                 "content": json.dumps(result, default=str),
             })
+            if observation.stalled:
+                # The deterministic controller detected repeated/empty
+                # evidence. This used to be terminal, immediately failing a
+                # turn even after successful file mutations. Route it through
+                # the same bounded recovery used for identical/cycling tool
+                # calls: one change-approach nudge, then a tools-disabled
+                # evidence summary. Persist the just-completed real result
+                # first so interruption cannot cause it to be repeated.
+                _persist_turn_checkpoint()
+                recovery = await _handle_stuck_loop(observation.reason, [])
+                if recovery is not None:
+                    return recovery
             if result.get("success") is False:
                 failure = classify_failure(tool_name=tc.name, result=result)
                 repair_key = (tc.name, failure.value)

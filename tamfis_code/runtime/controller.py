@@ -35,6 +35,11 @@ class ObservationDecision:
     terminal: bool = False
     reason: str = ""
     evidence: tuple[str, ...] = field(default_factory=tuple)
+    # Signals a recoverable no-progress streak to the outer agent loop. The
+    # controller must stop repeated reconnaissance, but it must not mark the
+    # whole task FAILED: the runner can still nudge the model, synthesize an
+    # evidence-backed final answer, and preserve mutations already made.
+    stalled: bool = False
 
 
 class ExecutionController:
@@ -174,10 +179,10 @@ class ExecutionController:
             if count >= self.budgets.max_consecutive_empty_observations:
                 reason = (
                     f"Agent stalled after {count} consecutive tool results produced no new evidence. "
-                    "The runtime stopped the loop instead of repeating reconnaissance."
+                    "The runtime is stopping repeated reconnaissance and requesting recovery."
                 )
-                self._fail(reason)
-                return ObservationDecision(False, True, reason)
+                self.snapshot.transition(RuntimePhase.EXECUTE)
+                return ObservationDecision(False, False, reason, stalled=True)
             self.snapshot.transition(RuntimePhase.EXECUTE)
             detail = "Duplicate evidence" if duplicate else "No useful evidence"
             return ObservationDecision(

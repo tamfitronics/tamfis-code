@@ -1,6 +1,35 @@
 import pytest
 
-from tamfis_code.provider_protocols import ProviderStreamError, normalize_stream_chunk
+from tamfis_code.provider_protocols import (
+    ProviderStreamError,
+    normalize_stream_chunk,
+    system_messages_first,
+)
+
+
+def test_system_messages_are_stably_hoisted_without_breaking_tool_transcript():
+    messages = [
+        {"role": "system", "content": "base"},
+        {"role": "user", "content": "fix it"},
+        {
+            "role": "assistant", "content": "", "tool_calls": [{"id": "call_1"}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": "ok"},
+        {"role": "system", "content": "repair after evidence"},
+        {"role": "assistant", "content": "partial answer"},
+        {"role": "system", "content": "stream reconnect"},
+    ]
+
+    normalized = system_messages_first(messages)
+
+    assert [item["content"] for item in normalized[:3]] == [
+        "base", "repair after evidence", "stream reconnect",
+    ]
+    assert [item["role"] for item in normalized[3:]] == [
+        "user", "assistant", "tool", "assistant",
+    ]
+    assert normalized[4]["tool_calls"][0]["id"] == "call_1"
+    assert normalized[5]["tool_call_id"] == "call_1"
 
 
 def test_normalizes_ollama_native_text_and_done():

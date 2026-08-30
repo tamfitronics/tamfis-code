@@ -21,16 +21,18 @@ def test_useful_observation_resets_empty_streak():
     assert controller.snapshot.evidence_items >= 1
 
 
-def test_three_empty_observations_fail_terminally():
+def test_three_empty_observations_signal_recoverable_stall():
     controller = ExecutionController(RuntimeBudgets(max_consecutive_empty_observations=3, max_runtime_seconds=60))
     decision = None
     for index in range(3):
         args = {"root": "/tmp", "query": f"missing-{index}"}
         assert controller.guard_action("search_code", args).allowed
         decision = controller.observe("search_code", args, _result("(empty)"))
-    assert decision is not None and decision.terminal
-    assert controller.snapshot.phase == RuntimePhase.FAILED
-    assert "stalled" in controller.snapshot.failure_reason.casefold()
+    assert decision is not None and decision.stalled
+    assert not decision.terminal
+    assert controller.snapshot.phase == RuntimePhase.EXECUTE
+    assert not controller.snapshot.failure_reason
+    assert "stalled" in decision.reason.casefold()
 
 
 def test_tool_failures_are_actionable_evidence_not_empty_stalls():
@@ -72,7 +74,8 @@ def test_different_actions_returning_duplicate_evidence_trigger_stall():
         decision = controller.observe(
             "execute_command", args, _result("the same already-known line"),
         )
-    assert decision.terminal
+    assert decision.stalled
+    assert not decision.terminal
     assert "no new evidence" in decision.reason
     assert controller.snapshot.novel_observations == 1
 

@@ -4,29 +4,22 @@ import os
 import pytest
 
 from tamfis_code import runner_local as _runner_local_module
+from tamfis_code import config as _config_module
 from tamfis_code.config import Config as _RealConfig
 
 
 @dataclasses.dataclass
 class _TestConfig(_RealConfig):
-    # Only overrides these field defaults; every other Config() behavior
-    # (env-derived fields aside) is untouched.
-    #
-    # network_access=True is the actual fix (see the fixture below for why
-    # fail_if_unavailable=False alone doesn't cover GitHub Actions): it
-    # stops build_sandbox_command from appending bwrap's --unshare-net,
-    # which is what was actually failing there ("bwrap: loopback: Failed
-    # RTM_NEWADDR: Operation not permitted" -- setting up the loopback
-    # interface inside a *new* network namespace, not namespace creation
-    # itself). Without --unshare-net, bwrap just shares the host's network
-    # namespace and never touches loopback setup, so it runs successfully
-    # while still providing real filesystem isolation (ro-bind /,
-    # workspace-only writable root, etc.) -- these tests don't exercise
-    # network isolation, so this doesn't weaken what they're testing.
+    # Ordinary runner integration tests exercise tool dispatch, mutation
+    # accounting, validation, and recovery -- not the kernel sandbox itself.
+    # Some managed CI/container hosts forbid *all* user-namespace creation,
+    # so even bwrap without --unshare-net fails before the command starts.
+    # Keep those tests host-independent by disabling sandbox wrapping in the
+    # runner's test-only default. test_sandbox.py constructs SandboxPolicy
+    # directly with explicit modes and therefore still covers the real
+    # fail-closed production behavior.
+    sandbox_mode: str = "danger-full-access"
     sandbox_network_access: bool = True
-    # Kept as a second line of defense for any environment where bwrap
-    # truly isn't installed at all (the "not found" branch this flag
-    # actually controls) -- distinct from the runtime failure above.
     sandbox_fail_if_unavailable: bool = False
 
 
@@ -41,10 +34,23 @@ _TAMFIS_ENV_PREFIXES = ("TAMFIS_CODE_", "TAMFIS_PROVIDER_")
 
 
 @pytest.fixture(autouse=True)
-def _isolate_tamfis_env(monkeypatch):
+def _isolate_tamfis_env(monkeypatch, tmp_path):
     for key in list(os.environ):
         if key.startswith(_TAMFIS_ENV_PREFIXES):
             monkeypatch.delenv(key, raising=False)
+    # Unit tests must never depend on live localhost daemons. ProviderManager
+    # otherwise probes Ollama and Tier IV during construction (and `/doctor`
+    # legitimately constructs one), turning a pure rendering test into
+    # repeated multi-second network waits on hosts without those services.
+    # Tests covering these providers override the flags explicitly.
+    monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "false")
+    monkeypatch.setenv("TAMFIS_TIER_IV_ENABLED", "false")
+    # Never inherit the developer/machine's real login during tests. A
+    # `/doctor` rendering test previously found /root's credentials and made
+    # a live Remote API request, hanging for the production timeout.
+    monkeypatch.setattr(
+        _config_module, "CREDENTIALS_PATH", tmp_path / "credentials.json",
+    )
     # Several tests that aren't testing sandboxing itself
     # (test_reasoning_plan.py, test_concurrent_dispatch_regressions.py,
     # etc.) route real execute_command calls through

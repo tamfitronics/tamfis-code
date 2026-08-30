@@ -1680,12 +1680,33 @@ class MCPServer:
         
         info["is_git_repo"] = True
         
-        # Off the event loop for the same reason as _search_code above --
-        # git can be slow on a large repo (packed-refs, cold FS cache), and
-        # blocking here froze the live input loop while it ran.
-        async def _git(*args: str):
-            return await asyncio.to_thread(
-                subprocess.run, ['git', '-C', str(p), *args], capture_output=True, text=True
+        # Run Git natively through asyncio. asyncio.to_thread kept a default-
+        # executor worker alive after this coroutine returned under Python
+        # 3.13/strict event-loop teardown, which could leave `get_git_info`
+        # callers hanging indefinitely. A bounded async subprocess also
+        # prevents a hook/filesystem-stalled Git command from freezing the
+        # live input loop.
+        async def _git(*args: str) -> subprocess.CompletedProcess[str]:
+            command = ['git', '-C', str(p), *args]
+            proc = await asyncio.create_subprocess_exec(
+                *command,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10.0)
+            except asyncio.TimeoutError:
+                proc.kill()
+                stdout, stderr = await proc.communicate()
+                return subprocess.CompletedProcess(
+                    command, 124,
+                    stdout.decode("utf-8", errors="replace"),
+                    (stderr.decode("utf-8", errors="replace") + "\nGit command timed out").strip(),
+                )
+            return subprocess.CompletedProcess(
+                command, proc.returncode,
+                stdout.decode("utf-8", errors="replace"),
+                stderr.decode("utf-8", errors="replace"),
             )
 
         try:

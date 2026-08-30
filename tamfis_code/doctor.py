@@ -325,53 +325,55 @@ async def run_doctor(
         # artefacts either way.
         results.extend(_diagnose_self_health(workspace_root))
 
-    client = RemoteAPIClient(config, creds)
-    try:
+    # No credentials means there is no authenticated Remote Workspace check
+    # to perform. Do not construct RemoteAPIClient in that case: its normal
+    # convenience behavior reloads secure credentials when passed None,
+    # which can accidentally pick up a different installation/user context
+    # and turn a local `/doctor` into an unexpected production request with
+    # the full API timeout. Local diagnostics remain complete below.
+    client: Optional[RemoteAPIClient] = None
+    servers: Optional[list[dict]] = None
+    if creds is None:
+        results.append(CheckResult(
+            "Remote API (Tier III, port 9500)", "WARNING",
+            "not checked without --remote credentials; the default local mode does not require it",
+        ))
+    else:
+        client = RemoteAPIClient(config, creds)
         try:
             servers = await client.list_servers()
             results.append(CheckResult("Remote API (Tier III, port 9500)", "PASS", f"{len(servers)} registered server(s)"))
         except AuthRequiredError as e:
-            # Expected, not a failure, when this session never had --remote
-            # credentials to begin with (the default local mode doesn't need
-            # them) -- only a real FAIL if credentials exist but were
-            # rejected/expired.
             results.append(CheckResult(
                 "Remote API (Tier III, port 9500)",
-                "WARNING" if creds is None else "FAIL",
+                "FAIL",
                 str(e),
             ))
-            servers = None
         except (RemoteAPIError, httpx.HTTPError) as e:
             results.append(CheckResult("Remote API (Tier III, port 9500)", "FAIL", str(e)))
-            servers = None
+        finally:
+            if session_id is not None:
+                results.extend(await _diagnose_session(client, session_id, workspace_root))
+            await client.aclose()
 
-        if servers is not None:
-            local_server = next((s for s in servers if s.get("transport_type") == "local"), None)
-            if local_server is not None:
-                results.append(CheckResult("Local transport server", "PASS", f"server_id={local_server['id']}"))
-            else:
-                results.append(CheckResult("Local transport server", "WARNING", "none registered yet -- `tamfis-code init` will create one"))
+    if servers is not None:
+        local_server = next((s for s in servers if s.get("transport_type") == "local"), None)
+        if local_server is not None:
+            results.append(CheckResult("Local transport server", "PASS", f"server_id={local_server['id']}"))
+        else:
+            results.append(CheckResult("Local transport server", "WARNING", "none registered yet -- `tamfis-code init` will create one"))
 
-        if workspace_root is not None:
-            wr = str(workspace_root.resolve())
-            if workspace_root.is_dir():
-                results.append(CheckResult("Workspace directory", "PASS", wr))
-            else:
-                results.append(CheckResult("Workspace directory", "FAIL", f"{wr} is not a directory"))
+    if workspace_root is not None:
+        wr = str(workspace_root.resolve())
+        if workspace_root.is_dir():
+            results.append(CheckResult("Workspace directory", "PASS", wr))
+        else:
+            results.append(CheckResult("Workspace directory", "FAIL", f"{wr} is not a directory"))
 
-        # Tier IV reachability is inferred, not probed directly -- there is
-        # no public health endpoint on port 9555 to hit from here without
-        # a session already existing; a real ai-task submission is what
-        # actually proves the whole chain, which `doctor` deliberately does
-        # not do (it would create session/task rows as a side effect of a
-        # health check).
-        results.append(CheckResult("TamfisGPT agent runtime", "WARNING", "verified when a real `tamfis-code ask` is run"))
-
-        if session_id is not None:
-            results.extend(await _diagnose_session(client, session_id, workspace_root))
-
-    finally:
-        await client.aclose()
+    # Tier IV reachability is inferred, not probed directly -- there is no
+    # public health endpoint on port 9555 to hit from here without a session
+    # already existing; a real ai-task submission is what proves the chain.
+    results.append(CheckResult("TamfisGPT agent runtime", "WARNING", "verified when a real `tamfis-code ask` is run"))
 
     for result in results:
         style = _STATUS_STYLE[result.status]

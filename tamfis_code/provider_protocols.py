@@ -4,6 +4,23 @@ from __future__ import annotations
 from typing import Any
 
 
+def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return provider-safe chat ordering without disturbing the transcript.
+
+    Runtime repair, reconnect, and resume instructions are deliberately
+    represented as trusted system messages, but they are often created after
+    tool/assistant messages already exist. Some OpenAI-compatible providers
+    (including TamfisGPT subscription routes) reject any system message that
+    appears after the leading block. Stable-partition only by role: system
+    messages retain their order, and every user/assistant/tool message --
+    especially assistant tool_calls and their matching tool responses --
+    retains its exact relative order and identifiers.
+    """
+    leading = [message for message in messages if message.get("role") == "system"]
+    remainder = [message for message in messages if message.get("role") != "system"]
+    return [*leading, *remainder]
+
+
 class ProviderStreamError(RuntimeError):
     """Structured error reported after a provider stream has already opened."""
 
