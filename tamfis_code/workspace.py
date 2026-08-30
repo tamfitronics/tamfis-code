@@ -1041,6 +1041,39 @@ def _discover_project_type(workspace_root: Path) -> dict[str, Any]:
     return result("unknown", package_manager=None)
 
 
+def _detect_sibling_projects(root: Path, *, limit: int = 12) -> list[tuple[str, dict[str, Any]]]:
+    """One bounded level below `root`, list immediate subdirectories that
+    are themselves independently-recognizable projects.
+
+    Only called when `root` itself has no recognizable stack (see
+    build_system_prompt) -- this is specifically for the "workspace root is
+    a parent directory of several unrelated projects" shape (e.g. several
+    WordPress docroots and app codebases living as siblings under one home
+    directory), confirmed live: a session launched with that kind of root
+    has no way to know it's sitting above several distinct projects rather
+    than inside one, so a request naming one of them by description (e.g.
+    "the WordPress site") had nothing telling it to scope path arguments to
+    the matching child instead of operating -- and indexing -- from the
+    parent root across every sibling at once. Reuses _discover_project_type
+    per child (the same bounded, root-only signal check, never recursive)
+    rather than a new detection mechanism.
+    """
+    try:
+        children = sorted(p for p in root.iterdir() if p.is_dir())
+    except OSError:
+        return []
+    found: list[tuple[str, dict[str, Any]]] = []
+    for child in children:
+        if child.name in IGNORED_PARTS or child.name.startswith("."):
+            continue
+        detected = _discover_project_type(child)
+        if detected.get("language") and detected["language"] != "unknown":
+            found.append((child.name, detected))
+            if len(found) >= limit:
+                break
+    return found
+
+
 # Preference order for a real type/build verification script in package.json.
 # "build" is deliberately last and weakest: bundlers like esbuild/vite catch
 # syntax errors (a genuinely truncated file) but not type errors -- a project
@@ -1273,6 +1306,27 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
     rather than re-walking the repo on every call.
     """
     context = discover_local_repository(session_id, workspace_root, force=force_discovery)
+    root_for_siblings = Path(context.get("repository_root") or workspace_root).resolve()
+    # Gate on a REAL manifest/marker existing directly at root, not on
+    # _discover_project_type(root)'s own verdict -- that function's weakest
+    # fallback (any loose *.py or *.php file sitting at the root, with no
+    # actual manifest) is exactly the case that needs the sibling notice
+    # most: one stray script at a multi-project parent directory otherwise
+    # misclassifies the whole thing as "a Python project" and silently
+    # suppresses this check (confirmed live against /home: a single
+    # unrelated seo_enhance_all_sites.py made _discover_project_type return
+    # Python for a directory actually containing 7+ unrelated projects).
+    _root_has_real_marker = any(
+        (root_for_siblings / marker).exists()
+        for marker in (
+            "package.json", "pyproject.toml", "requirements.txt", "setup.py", "setup.cfg",
+            "Pipfile", "poetry.lock", "composer.json", "go.mod", "Cargo.toml", "manage.py",
+            "wp-config.php", "wp-content", "wp-admin", "wp-includes",
+        )
+    )
+    sibling_projects: list[tuple[str, dict[str, Any]]] = (
+        [] if _root_has_real_marker else _detect_sibling_projects(root_for_siblings)
+    )
     lines = [
         "You are a coding agent working directly in a real local repository via tool calls. "
         "Verify with tools before claiming something is done or correct. Prefer minimal, "
@@ -1346,6 +1400,18 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "own guess; run the command/inspection that actually matches what's really there.",
         f"Workspace root: {context['working_directory']}",
     ]
+    if len(sibling_projects) >= 2:
+        summary = ", ".join(f"{name} ({info.get('framework') or info['language']})" for name, info in sibling_projects)
+        lines.append(
+            f"IMPORTANT: {root_for_siblings} itself is not a single project -- it is a parent "
+            f"directory containing {len(sibling_projects)} independent projects as immediate "
+            f"subdirectories: {summary}. Identify which one the user's request actually refers to "
+            "(by name, domain, or technology mentioned) and scope every tool call's path argument "
+            "to that specific subdirectory -- do not list_directory, search_code, or read files "
+            "from the parent root itself, and never assume the request means all of them at once. "
+            "If it's genuinely unclear which project is meant, ask instead of guessing or exploring "
+            "every one of them."
+        )
     # discover_local_repository always sets repository_root (falling back to
     # workspace_root itself when `git rev-parse --show-toplevel` fails) --
     # `head` is the real "is this actually a Git repo" signal, since it's

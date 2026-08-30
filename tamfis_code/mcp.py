@@ -589,11 +589,27 @@ class MCPServer:
         
         self.register_tool(
             name="get_git_info",
-            description="Get git repository information",
+            description=(
+                "Get a quick snapshot of a git repository's current state: current branch, "
+                "remote.origin.url, the latest commit (hash/message/author/email/date), and "
+                "whether the working tree is dirty (has_changes plus a count of changed files "
+                "from `git status --porcelain`). Returns {\"is_git_repo\": false} if the path "
+                "has no .git directory, and only the fields a given git command actually "
+                "succeeded on -- a fresh repo with no commits yet, for example, still returns "
+                "branch/remote without a latest_commit. This is a fixed read-only snapshot, not "
+                "a general git command runner -- for anything else (diff, log history, blame, "
+                "specific file status), use execute_command with the real git subcommand."
+            ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Repository path"}
+                    "path": {
+                        "type": "string",
+                        "description": (
+                            "Repository path, relative to the workspace root (or absolute). "
+                            "Defaults to the workspace root."
+                        ),
+                    }
                 }
             },
             handler=self._get_git_info

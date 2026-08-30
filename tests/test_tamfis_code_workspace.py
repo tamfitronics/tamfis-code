@@ -6,9 +6,10 @@ from unittest.mock import patch
 
 from tamfis_code import state as state_module
 from tamfis_code.workspace import (
-    _indexable_files, _project_metadata, blocking_dirty_files, build_system_prompt, classify_root,
-    context_from_session, discover_local_repository, find_resumable_session,
-    recent_local_sessions_for_workspace, resolve_local_workspace, resolve_workspace, scratch_root,
+    _detect_sibling_projects, _indexable_files, _project_metadata, blocking_dirty_files,
+    build_system_prompt, classify_root, context_from_session, discover_local_repository,
+    find_resumable_session, recent_local_sessions_for_workspace, resolve_local_workspace,
+    resolve_workspace, scratch_root,
 )
 
 
@@ -739,6 +740,87 @@ class BuildSystemPromptTests(_StatePatchMixin, unittest.TestCase):
         self.assertIn("proxy_listener port 8080", prompt)
         self.assertIn("proxy_upstream port 9500", prompt)
         self.assertIn("proxy topology, not proof", prompt)
+
+
+class MultiProjectWorkspaceTests(_StatePatchMixin, unittest.TestCase):
+    """Regression coverage for a live-reported gap: a session launched at a
+    parent directory containing several unrelated projects (e.g. multiple
+    WordPress docroots and app codebases as siblings) had no signal telling
+    it that's the shape of the workspace, so a request naming one project
+    by description ("the WordPress site") had nothing steering it to scope
+    tool calls to the matching child instead of operating from -- and
+    indexing -- the parent root across every sibling at once."""
+
+    def _make_sibling(self, root: Path, name: str, marker: str, content: str = "") -> None:
+        child = root / name
+        child.mkdir()
+        (child / marker).write_text(content or "{}")
+
+    def test_two_or_more_recognizable_children_are_detected(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_sibling(root, "site-a", "package.json")
+            self._make_sibling(root, "site-b", "requirements.txt")
+            found = _detect_sibling_projects(root)
+        names = {name for name, _info in found}
+        self.assertEqual(names, {"site-a", "site-b"})
+
+    def test_wordpress_sibling_is_identified_by_framework(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            wp = root / "mysite"
+            wp.mkdir()
+            (wp / "wp-content").mkdir()
+            (wp / "wp-admin").mkdir()
+            self._make_sibling(root, "backend", "pyproject.toml")
+            found = dict(_detect_sibling_projects(root))
+        self.assertEqual(found["mysite"]["framework"], "WordPress")
+
+    def test_build_system_prompt_surfaces_the_notice_for_a_multi_project_root(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            self._make_sibling(root, "storefront", "package.json")
+            wp = root / "blog"
+            wp.mkdir()
+            (wp / "wp-content").mkdir()
+            (wp / "wp-admin").mkdir()
+            prompt = build_system_prompt(1, root)
+        self.assertIn("is not a single project", prompt)
+        self.assertIn("storefront", prompt)
+        self.assertIn("blog", prompt)
+        self.assertIn("scope every tool call's path argument", prompt)
+
+    def test_a_stray_loose_script_at_root_does_not_suppress_the_notice(self):
+        # The actual live defeat: _discover_project_type's weakest fallback
+        # (any loose *.py file with no real manifest) classified a
+        # multi-project parent as "a Python project" and silently
+        # suppressed this whole check -- confirmed live against /home,
+        # where a single unrelated seo_enhance_all_sites.py script did
+        # exactly this. Reproduced here with a synthetic stray script.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "unrelated_script.py").write_text("print('hi')\n")
+            self._make_sibling(root, "storefront", "package.json")
+            self._make_sibling(root, "api", "pyproject.toml")
+            prompt = build_system_prompt(1, root)
+        self.assertIn("is not a single project", prompt)
+
+    def test_a_real_single_project_root_is_never_flagged_as_multi_project(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "pyproject.toml").write_text("[project]\nname = 'x'\n")
+            (root / "src").mkdir()
+            (root / "tests").mkdir()
+            prompt = build_system_prompt(1, root)
+        self.assertNotIn("is not a single project", prompt)
+
+    def test_a_plain_directory_with_no_recognizable_children_is_not_flagged(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "notes").mkdir()
+            (root / "notes" / "readme.txt").write_text("just notes")
+            prompt = build_system_prompt(1, root)
+        self.assertNotIn("is not a single project", prompt)
 
 
 if __name__ == "__main__":
