@@ -1,10 +1,46 @@
 import dataclasses
 import os
+import shutil
+import subprocess
+import sys
 
 import pytest
 
 from tamfis_code import runner_local as _runner_local_module
 from tamfis_code.config import Config as _RealConfig
+
+
+def _bwrap_actually_works() -> bool:
+    """Detect whether bubblewrap can actually create a sandboxed subprocess
+    on this host, not merely whether the binary is on PATH.
+
+    Some CI/container hosts have bubblewrap installed but the kernel's
+    apparmor_restrict_unprivileged_userns=1 (Ubuntu 24.04+ default) blocks
+    the unprivileged user namespace bwrap needs to set up ANY sandbox,
+    failing every single invocation at startup with "bwrap: setting up uid
+    map: Permission denied" -- before the wrapped command ever runs, and
+    regardless of network_access (that only avoids the separate
+    --unshare-net loopback failure _TestConfig below already works around).
+    Tests that aren't testing sandboxing itself (test_reasoning_plan.py,
+    test_concurrent_dispatch_regressions.py, test_execute_command_background.py,
+    test_verify_command_gate.py) route real execute_command calls through a
+    real bwrap invocation and would otherwise spuriously fail every time
+    just because the sandbox itself can't start here.
+    """
+    bwrap = shutil.which("bwrap")
+    if not bwrap or not sys.platform.startswith("linux"):
+        return False
+    try:
+        probe = subprocess.run(
+            [bwrap, "--die-with-parent", "--ro-bind", "/", "/", "true"],
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=5,
+        )
+        return probe.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+_BWRAP_WORKS = _bwrap_actually_works()
 
 
 @dataclasses.dataclass
@@ -28,6 +64,14 @@ class _TestConfig(_RealConfig):
     # truly isn't installed at all (the "not found" branch this flag
     # actually controls) -- distinct from the runtime failure above.
     sandbox_fail_if_unavailable: bool = False
+    # When bwrap is installed but can't actually start a sandbox on this
+    # host (see _bwrap_actually_works above), fall back to running
+    # execute_command directly -- build_sandbox_command skips bwrap
+    # entirely for mode="danger-full-access". None of these tests exercise
+    # filesystem sandboxing itself (that's test_sandbox.py, which builds
+    # SandboxPolicy directly and never goes through Config), so losing
+    # that isolation here doesn't weaken what they're testing.
+    sandbox_mode: str = "workspace-write" if _BWRAP_WORKS else "danger-full-access"
 
 
 # providers.py unconditionally loads the real /home/tamfiscode/.env into
