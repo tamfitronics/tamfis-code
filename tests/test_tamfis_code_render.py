@@ -124,6 +124,32 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("-1", output)
         renderer.finish()
 
+    def test_file_changes_are_closed_with_diff_as_the_expander(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "file_mutation",
+            "payload": {
+                "path": "docs/README.md", "lines_added": 8,
+                "lines_removed": 2, "mutation_id": "mutation_1",
+            },
+        })
+        output = console.file.getvalue()
+        self.assertIn("Documentation updated", output)
+        self.assertIn("/diff mutation_1 to expand", output)
+
+    def test_prompt_change_uses_prompt_updated_label(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "file_mutation",
+            "payload": {
+                "path": "config/system_prompt.yaml", "lines_added": 1,
+                "lines_removed": 1, "mutation_id": "mutation_2",
+            },
+        })
+        self.assertIn("Prompt updated", console.file.getvalue())
+
     def test_assistant_delta_streams_and_sets_streamed_final_text(self):
         console = _console()
         renderer = StreamRenderer(console)

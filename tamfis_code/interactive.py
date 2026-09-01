@@ -11,7 +11,7 @@ from contextlib import suppress
 import inspect
 import re
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Any, Callable, Optional
 
 from prompt_toolkit import PromptSession
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
@@ -388,6 +388,7 @@ async def _wait_for_background_reinjection(session_id: int, prompt_session: Prom
 
 def next_message_suggestion(
     answer: Optional[str], previous_objective: Optional[str] = None,
+    *, state: Optional[Any] = None,
 ) -> Optional[str]:
     """Derive a grounded next action from the answer and prior objective.
 
@@ -396,9 +397,7 @@ def next_message_suggestion(
     no actionable continuation, return ``None`` instead of displaying the
     same generic sentence after every turn.
     """
-    if not answer:
-        return None
-    lines = [line.strip() for line in answer.splitlines() if line.strip()]
+    lines = [line.strip() for line in (answer or "").splitlines() if line.strip()]
     for index, line in enumerate(lines):
         match = re.match(
             r"(?i)^(?:[-*]\s*)?(?:recommended\s+)?next\s+step(?:s)?\s*[:—-]\s*(.+)$",
@@ -416,7 +415,7 @@ def next_message_suggestion(
         if candidate:
             return candidate[:240]
 
-    plain = re.sub(r"[`*_#]", "", answer).strip()
+    plain = re.sub(r"[`*_#]", "", answer or "").strip()
     lowered = plain.lower()
     objective = (previous_objective or "").strip()
     objective_lower = objective.lower()
@@ -445,14 +444,96 @@ def next_message_suggestion(
         if match and not cleaned.endswith(":"):
             return cleaned[:240]
 
+    if re.search(r"\btests?\b.{0,40}\bpassed\b", lowered) and not re.search(
+        r"\b(?:failed|failure|error)\b", lowered
+    ):
+        return "Review the verified diff, then commit only the intended changes"
+
+    # Durable progress is more precise than generic completion prose.  It
+    # also survives terse final answers and process/session resume, which is
+    # where answer-only suggestions used to disappear entirely.
+    if state is not None:
+        checkpoint = getattr(state, "turn_checkpoint", None) or {}
+        checkpoint_status = str(checkpoint.get("status") or "").lower()
+        if checkpoint_status in {"interrupted", "failed", "running", "partial"}:
+            error = str(checkpoint.get("last_error") or "").strip()
+            if error:
+                return f"Continue from the saved checkpoint and resolve: {error}"[:240]
+            return "Continue the interrupted task from the latest saved checkpoint"
+
+        plans = list(getattr(state, "saved_plans", None) or [])
+        active_plan_id = getattr(state, "active_plan_id", None)
+        active_plan = next(
+            (plan for plan in reversed(plans) if plan.get("id") == active_plan_id),
+            None,
+        )
+        if active_plan is not None and str(active_plan.get("status") or "").lower() not in {
+            "completed", "cancelled",
+        }:
+            steps = [item for item in active_plan.get("steps") or [] if isinstance(item, dict)]
+            next_step = next(
+                (item for status in ("failed", "in_progress", "pending") for item in steps
+                 if str(item.get("status") or "pending") == status),
+                None,
+            )
+            if next_step and next_step.get("step"):
+                step = re.sub(r"\s+", " ", str(next_step["step"])).strip()
+                if next_step.get("status") == "failed":
+                    return f"Repair the failed plan step, then revalidate it: {step}"[:240]
+                return f"Continue the active plan with: {step}"[:240]
+
+        issues = list(getattr(state, "unresolved_issues", None) or [])
+        if issues:
+            issue = issues[-1]
+            if isinstance(issue, dict):
+                detail = next(
+                    (str(issue.get(key) or "").strip() for key in ("issue", "detail", "purpose", "error")
+                     if issue.get(key)),
+                    "",
+                )
+            else:
+                detail = str(issue).strip()
+            if detail:
+                return f"Resolve the remaining issue, then continue: {detail}"[:240]
+
+        validations = list(getattr(state, "validation_results", None) or [])
+        latest_validation = validations[-1] if validations else None
+        validation_failed = False
+        if isinstance(latest_validation, dict):
+            status = str(latest_validation.get("status") or latest_validation.get("severity") or "").lower()
+            validation_failed = (
+                latest_validation.get("passed") is False
+                or status in {"failed", "failure", "error", "warning", "blocked"}
+                or bool(latest_validation.get("failed_tool_calls"))
+            )
+        if validation_failed:
+            label = str(
+                latest_validation.get("command")
+                or latest_validation.get("check")
+                or latest_validation.get("summary")
+                or latest_validation.get("status")
+                or "the latest validation"
+            ).strip()
+            return f"Fix {label}, then rerun the failing validation"[:240]
+
+        changes = [
+            item for item in (getattr(state, "modified_files", None) or [])
+            if isinstance(item, dict) and item.get("revert_status") != "reverted"
+        ]
+        if changes and isinstance(latest_validation, dict) and latest_validation.get("passed") is True:
+            return "Review the verified diff, then commit only the intended changes"
+        pending_changes = [item for item in changes if item.get("validation_status", "pending") == "pending"]
+        if pending_changes:
+            paths = [str(item.get("path")) for item in pending_changes[-3:] if item.get("path")]
+            scope = ", ".join(paths) if paths else "the changed files"
+            return f"Run focused validation for {scope}, then review the diff"[:240]
+
     if re.search(r"\b(?:implemented|fixed|resolved|completed)\b", lowered):
         if any(word in objective_lower for word in ("fix", "repair", "implement", "change", "update")):
             subject = re.sub(r"\s+", " ", objective).strip(" .")
             if subject:
                 return f"Verify this result end to end: {subject}"[:240]
         return "Verify the completed result end to end and report any remaining issue"
-    if re.search(r"\btests?\b.{0,40}\bpassed\b", lowered):
-        return "Run the remaining integration checks, then commit the verified changes"
     return None
 
 
@@ -461,14 +542,18 @@ class _NextMessageAutoSuggest(AutoSuggest):
         self,
         get_answer: Callable[[], Optional[str]],
         get_objective: Optional[Callable[[], Optional[str]]] = None,
+        get_state: Optional[Callable[[], Optional[Any]]] = None,
     ) -> None:
         self._get_answer = get_answer
         self._get_objective = get_objective or (lambda: None)
+        self._get_state = get_state or (lambda: None)
 
     def get_suggestion(self, buffer, document: Document) -> Optional[Suggestion]:
         if document.text:
             return None
-        value = next_message_suggestion(self._get_answer(), self._get_objective())
+        value = next_message_suggestion(
+            self._get_answer(), self._get_objective(), state=self._get_state(),
+        )
         return Suggestion(value) if value else None
 
 
@@ -476,6 +561,7 @@ def _seed_next_message_suggestion(
     session: PromptSession,
     answer: Optional[str],
     previous_objective: Optional[str] = None,
+    *, state: Optional[Any] = None,
 ) -> None:
     """Prime ghost text for an untouched, newly opened empty composer.
 
@@ -485,7 +571,7 @@ def _seed_next_message_suggestion(
     character. Seeding Buffer.suggestion in pre_run makes the ghost visible
     immediately.
     """
-    value = next_message_suggestion(answer, previous_objective)
+    value = next_message_suggestion(answer, previous_objective, state=state)
     session.default_buffer.suggestion = Suggestion(value) if value else None
 
 
@@ -653,6 +739,7 @@ async def run_interactive(
     provider_type = None
     last_turn: Optional[tuple[str, str]] = None  # (objective, mode) -- standalone /retry target
     last_response_text: Optional[str] = None  # most recent completed answer -- /copy target
+    suggestion_state = local_state.get_session_state(workspace.session_id)
     # Standalone-only: run_local_agent_turn's `messages` param used to be
     # rebuilt as a single fresh `[{"role": "user", "content": objective}]`
     # on every turn -- confirmed live, this made the interactive session
@@ -755,6 +842,7 @@ async def run_interactive(
         buffer = event.current_buffer
         suggestion = next_message_suggestion(
             last_response_text, last_turn[0] if last_turn else None,
+            state=suggestion_state,
         )
         if not buffer.text and suggestion:
             buffer.insert_text(suggestion)
@@ -819,12 +907,14 @@ async def run_interactive(
             model=model,
             has_suggestion=bool(next_message_suggestion(
                 last_response_text, last_turn[0] if last_turn else None,
+                state=suggestion_state,
             )),
             active_agents=idle_active_agents,
         ),
         auto_suggest=_NextMessageAutoSuggest(
             lambda: last_response_text,
             lambda: last_turn[0] if last_turn else None,
+            lambda: suggestion_state,
         ),
         style=composer_style(),
         reserve_space_for_menu=0,
@@ -903,6 +993,10 @@ async def run_interactive(
         return True
 
     while True:
+        # Snapshot once per prompt. Auto-suggest and toolbar callbacks run on
+        # every keypress, so reading the durable state ledger from either hot
+        # path would make typing progressively slower in long sessions.
+        suggestion_state = local_state.get_session_state(workspace.session_id)
         fresh_custom_commands = load_custom_commands(workspace.workspace_root)
         custom_commands.clear()
         custom_commands.update(fresh_custom_commands)
@@ -929,6 +1023,7 @@ async def run_interactive(
                         pre_run=lambda: _seed_next_message_suggestion(
                             session, last_response_text,
                             last_turn[0] if last_turn else None,
+                            state=suggestion_state,
                         ),
                     )
                 finally:

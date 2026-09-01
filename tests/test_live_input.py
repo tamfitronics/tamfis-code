@@ -7,11 +7,13 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
+from prompt_toolkit.document import Document
 
 from tamfis_code import state as state_module
 from tamfis_code.config import Config, next_mode_in_cycle
 from tamfis_code.live_input import (
     LiveInputListener,
+    _LiveProgressAutoSuggest,
     _CTRL_T,
     _CTRL_Y,
     _ROTATING_TIPS,
@@ -23,6 +25,7 @@ from tamfis_code.live_input import (
     composer_style,
     force_bottom_toolbar_visible,
     idle_bottom_toolbar,
+    live_next_message_suggestion,
 )
 from tamfis_code.render import StreamRenderer
 
@@ -48,6 +51,40 @@ def _config(approval_policy: str = "ask") -> Config:
     cfg = Config.__new__(Config)
     cfg.approval_policy = approval_policy
     return cfg
+
+
+class LiveProgressSuggestionTests(unittest.TestCase):
+    def test_in_progress_plan_step_drives_live_suggestion(self):
+        renderer = StreamRenderer(_console())
+        renderer._plan_steps = [
+            {"step": "Inspect auth flow", "status": "completed"},
+            {"step": "Add logout regression test", "status": "in_progress"},
+        ]
+        self.assertEqual(
+            live_next_message_suggestion(renderer),
+            "Finish and verify the active plan step: Add logout regression test",
+        )
+
+    def test_live_phase_supplies_a_grounded_fallback(self):
+        renderer = StreamRenderer(_console())
+        renderer._phase = "validate"
+        self.assertEqual(
+            live_next_message_suggestion(renderer),
+            "Fix any validation failure before declaring the task complete",
+        )
+
+    def test_pending_steering_suppresses_duplicate_suggestion(self):
+        renderer = StreamRenderer(_console())
+        renderer._phase = "validate"
+        renderer.request_steering()
+        self.assertIsNone(live_next_message_suggestion(renderer))
+
+    def test_live_ghost_only_appears_in_an_empty_composer(self):
+        renderer = StreamRenderer(_console())
+        renderer._phase = "repair"
+        suggest = _LiveProgressAutoSuggest(renderer)
+        self.assertIsNotNone(suggest.get_suggestion(None, Document("")))
+        self.assertIsNone(suggest.get_suggestion(None, Document("already typing")))
 
 
 class ShiftTabCyclesModeTests(unittest.TestCase):
@@ -323,7 +360,7 @@ class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(queued[0]["text"], "also check the login page")
         self.assertEqual(queued[0]["classification"], "follow_up")
         rendered = renderer.console.file.getvalue()
-        self.assertIn("Queued next instruction", rendered)
+        self.assertIn("Steering update sent", rendered)
         self.assertIn("also check the login page", rendered)
 
     @patch("prompt_toolkit.PromptSession.prompt_async", new_callable=AsyncMock, return_value="   ")

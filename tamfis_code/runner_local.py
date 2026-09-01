@@ -24,6 +24,8 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import contextlib
+import inspect
 import json
 import os
 import re
@@ -3295,6 +3297,11 @@ async def _stream_one_completion(
     stream_error: Optional[Exception] = None
     stream_iterator = stream.__aiter__()
     while True:
+        next_chunk_task = asyncio.create_task(stream_iterator.__anext__())
+        steering_task: Optional[asyncio.Task] = None
+        wait_for_steering = getattr(renderer, "wait_for_steering", None)
+        if emit and callable(wait_for_steering):
+            steering_task = asyncio.create_task(wait_for_steering())
         try:
             # FIX: bounds the gap between two consecutive chunks, not the
             # total response time -- see STREAM_IDLE_TIMEOUT_SECONDS above
@@ -3304,9 +3311,29 @@ async def _stream_one_completion(
             # the existing `except Exception` below and gets the same
             # stream-error/reconnect-or-fail treatment as any other
             # mid-stream provider failure -- no separate handling needed.
-            chunk = await asyncio.wait_for(
-                stream_iterator.__anext__(), timeout=STREAM_IDLE_TIMEOUT_SECONDS,
+            waiters = {next_chunk_task}
+            if steering_task is not None:
+                waiters.add(steering_task)
+            done, _pending = await asyncio.wait(
+                waiters,
+                timeout=STREAM_IDLE_TIMEOUT_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done:
+                raise asyncio.TimeoutError()
+            if steering_task is not None and steering_task in done:
+                next_chunk_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await next_chunk_task
+                close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+                if callable(close):
+                    with contextlib.suppress(Exception):
+                        result = close()
+                        if inspect.isawaitable(result):
+                            await result
+                finish_reason = "live_steering"
+                break
+            chunk = next_chunk_task.result()
         except StopAsyncIteration:
             break
         except Exception as exc:
@@ -3315,6 +3342,16 @@ async def _stream_one_completion(
             # lag vanished from both the terminal and the durable checkpoint.
             stream_error = exc
             break
+        finally:
+            if steering_task is not None and not steering_task.done():
+                steering_task.cancel()
+            if steering_task is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await steering_task
+            if not next_chunk_task.done():
+                next_chunk_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await next_chunk_task
         for event in normalize_stream_chunk(chunk, provider=model.split("/", 1)[0] if "/" in model else None, model=model):
             if event.event_type.value == "reasoning_delta":
                 reasoning = str(event.payload.get("content") or "")
@@ -5112,12 +5149,16 @@ async def _run_local_agent_turn_impl(
         # one process, so there's nothing 'live' to push into." Checking at
         # the top of every round (a natural checkpoint -- never mid-stream)
         # closes that gap for anything queued between rounds.
+        steering_revision = getattr(renderer, "steering_revision", lambda: None)()
         for live in _claim_live_queued_instructions(session_id):
             outcome = _apply_live_queued_instruction(
                 live, session_id=session_id, working_messages=working_messages, renderer=renderer,
             )
             if outcome is not None:
                 return outcome
+        acknowledge_steering = getattr(renderer, "acknowledge_steering", None)
+        if callable(acknowledge_steering):
+            acknowledge_steering(steering_revision)
 
         # Never fire a request already guaranteed to blow the provider's
         # context window -- confirmed live: HF 400'd with inputs(29548) +
@@ -5482,6 +5523,26 @@ async def _run_local_agent_turn_impl(
                 orchestrator.fail(message)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
                 return TaskOutcome(status="failed", error=message)
+
+        if finish_reason == "live_steering":
+            # Keep any clean prefix already shown, then go directly through
+            # the queue boundary. The newly submitted message becomes part of
+            # the next provider request for this same task.
+            if content.strip():
+                working_messages.append({"role": "assistant", "content": content})
+            working_messages.append({
+                "role": "system",
+                "content": (
+                    "Your response was interrupted because the user sent a live steering update. "
+                    "Read the next user message and revise the active approach immediately."
+                ),
+            })
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": "Applying your steering update now…"},
+            })
+            _persist_turn_checkpoint(partial_assistant=content, status="running")
+            continue
 
         # A provider can repeat across reconnects or agent rounds even when
         # each individual stream stays below the per-stream quality window.

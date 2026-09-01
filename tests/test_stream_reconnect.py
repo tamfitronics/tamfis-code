@@ -1,9 +1,18 @@
 import asyncio
 import unittest
+from io import StringIO
+from types import SimpleNamespace
 from unittest.mock import patch
 
+from rich.console import Console
+
 from tamfis_code.providers import ProviderType
-from tamfis_code.runner_local import _same_route_reconnectable, _stream_completion_with_reconnect
+from tamfis_code.render import StreamRenderer
+from tamfis_code.runner_local import (
+    _same_route_reconnectable,
+    _stream_completion_with_reconnect,
+    _stream_one_completion,
+)
 
 
 class _FakeManager:
@@ -86,6 +95,43 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
         ]
         self.assertEqual(len(reconnect_events), 1)
         self.assertIn("reconnecting", reconnect_events[0]["payload"]["content"])
+
+    def test_live_steering_interrupts_a_stalled_provider_stream(self):
+        class StalledStream:
+            def __init__(self):
+                self.closed = False
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+
+            async def close(self):
+                self.closed = True
+
+        stream = StalledStream()
+
+        class Completions:
+            async def create(self, **_kwargs):
+                return stream
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+        async def run():
+            renderer = StreamRenderer(Console(file=StringIO(), no_color=True))
+            task = asyncio.create_task(_stream_one_completion(
+                client, model="test-model", messages=[], tools=[], renderer=renderer,
+            ))
+            await asyncio.sleep(0)
+            renderer.request_steering()
+            return await asyncio.wait_for(task, timeout=1)
+
+        content, calls, finish_reason = asyncio.run(run())
+        self.assertEqual(content, "")
+        self.assertEqual(calls, [])
+        self.assertEqual(finish_reason, "live_steering")
+        self.assertTrue(stream.closed)
 
 
 if __name__ == "__main__":

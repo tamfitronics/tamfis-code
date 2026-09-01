@@ -15,6 +15,8 @@ import sys
 import time
 from typing import Any, Callable, Optional
 
+from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
+from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.styles import Style
@@ -208,6 +210,60 @@ def composer_style() -> Style:
         # background. Bright-black is the portable ANSI "ghost text" color.
         "auto-suggestion": "fg:ansibrightblack italic",
     })
+
+
+def live_next_message_suggestion(renderer: Any) -> Optional[str]:
+    """Suggest one useful steering message from live execution progress.
+
+    This stays deterministic and renderer-backed: the composer may reflect
+    the current plan step or phase, but it must not invent repository facts
+    while the model is still working.
+    """
+    has_pending = getattr(renderer, "has_pending_steering", None)
+    if callable(has_pending) and has_pending():
+        return None
+
+    steps = [
+        item for item in (getattr(renderer, "_plan_steps", None) or [])
+        if isinstance(item, dict) and item.get("step")
+    ]
+    for status, prefix in (
+        ("failed", "Repair and revalidate the failed plan step"),
+        ("in_progress", "Finish and verify the active plan step"),
+        ("pending", "Continue with the next plan step"),
+    ):
+        step = next(
+            (item for item in steps if str(item.get("status") or "pending") == status),
+            None,
+        )
+        if step is not None:
+            compact = " ".join(str(step["step"]).split())
+            return f"{prefix}: {compact}"[:240]
+
+    if getattr(renderer, "_running_command", None):
+        return "After the command finishes, inspect any failure and adapt the implementation"
+
+    phase = str(getattr(renderer, "_phase", "") or "").lower()
+    by_phase = {
+        "understand": "Inspect related tests and call sites before making the change",
+        "inspect": "Inspect related tests and call sites before making the change",
+        "execute": "Validate the current change before moving to the next step",
+        "observe": "Use the latest tool result to verify assumptions before continuing",
+        "repair": "Confirm the repair addresses the root cause, then rerun validation",
+        "validate": "Fix any validation failure before declaring the task complete",
+    }
+    return by_phase.get(phase)
+
+
+class _LiveProgressAutoSuggest(AutoSuggest):
+    def __init__(self, renderer: Any) -> None:
+        self._renderer = renderer
+
+    def get_suggestion(self, buffer, document: Document) -> Optional[Suggestion]:
+        if document.text:
+            return None
+        value = live_next_message_suggestion(self._renderer)
+        return Suggestion(value) if value else None
 
 
 def force_bottom_toolbar_visible(session: Any) -> None:
@@ -524,6 +580,13 @@ class LiveInputListener:
             if event.current_buffer.text.strip():
                 event.current_buffer.validate_and_handle()
 
+        @bindings.add("tab")
+        def _accept_progress_suggestion(event) -> None:
+            buffer = event.current_buffer
+            suggestion = live_next_message_suggestion(self.renderer)
+            if not buffer.text and suggestion:
+                buffer.insert_text(suggestion)
+
         @bindings.add("up")
         def _edit_latest_queued_instruction(event) -> None:
             # With an empty live composer, Up recalls the newest follow-up
@@ -567,6 +630,7 @@ class LiveInputListener:
             show_frame=True,
             reserve_space_for_menu=0,
             style=composer_style(),
+            auto_suggest=_LiveProgressAutoSuggest(self.renderer),
         )
         force_bottom_toolbar_visible(session)
         self._prompt_session = session
@@ -604,6 +668,13 @@ class LiveInputListener:
                             bottom_toolbar=self._bottom_toolbar,
                             show_frame=True,
                             set_exception_handler=False,
+                            pre_run=lambda: setattr(
+                                session.default_buffer,
+                                "suggestion",
+                                Suggestion(value)
+                                if (value := live_next_message_suggestion(self.renderer))
+                                else None,
+                            ),
                         )
                 except asyncio.CancelledError:
                     raise
@@ -786,6 +857,9 @@ class LiveInputListener:
         item = local_state.enqueue_instruction(
             self.session_id, text, classification="follow_up",
         )
+        request_steering = getattr(self.renderer, "request_steering", None)
+        if callable(request_steering):
+            request_steering()
         self.renderer.handle_event({
             "event_type": "user_message",
             "payload": {"content": text},
@@ -794,8 +868,8 @@ class LiveInputListener:
             "event_type": "diagnostics",
             "payload": {
                 "content": (
-                    f"◆ Queued next instruction {item.id}: {text} "
-                    "-- applied at the next safe round boundary."
+                    f"◆ Steering update sent {item.id}: {text} "
+                    "-- applying it to the active task now."
                 ),
             },
         })

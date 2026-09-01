@@ -18,6 +18,7 @@ from typing import Any, AsyncIterator, Dict, List, Optional
 from rich.console import Console
 
 from .local_tools import READ_ONLY_TOOL_SCHEMAS, LocalReadOnlyTools
+from .provider_protocols import system_messages_first
 from .providers import ProviderManager, ProviderType
 from .public_identity import resolve_public_model_alias
 
@@ -84,7 +85,7 @@ async def _run_local_turn_impl(
             kwargs["tool_choice"] = "auto"
 
         response = await client.chat.completions.create(
-            model=resolved_model, messages=working_messages, stream=False,
+            model=resolved_model, messages=system_messages_first(working_messages), stream=False,
             temperature=0.2, max_tokens=4096, **kwargs,
         )
         if not response.choices:

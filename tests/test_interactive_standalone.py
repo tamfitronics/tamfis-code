@@ -11,6 +11,7 @@ import io
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from rich.console import Console
@@ -137,6 +138,53 @@ class NextMessageSuggestionTests(unittest.TestCase):
 
     def test_no_grounded_next_action_means_no_suggestion(self):
         self.assertIsNone(next_message_suggestion("Python is a programming language."))
+
+    def test_interrupted_checkpoint_becomes_the_next_action(self):
+        state = SimpleNamespace(
+            turn_checkpoint={"status": "interrupted", "last_error": "provider disconnected"},
+            saved_plans=[], active_plan_id=None, unresolved_issues=[],
+            validation_results=[], modified_files=[],
+        )
+        self.assertEqual(
+            next_message_suggestion(None, state=state),
+            "Continue from the saved checkpoint and resolve: provider disconnected",
+        )
+
+    def test_active_plan_progress_names_the_actual_next_step(self):
+        state = SimpleNamespace(
+            turn_checkpoint=None, active_plan_id="plan_1",
+            saved_plans=[{"id": "plan_1", "steps": [
+                {"step": "Inspect the parser", "status": "completed"},
+                {"step": "Add boundary tests", "status": "in_progress"},
+            ]}],
+            unresolved_issues=[], validation_results=[], modified_files=[],
+        )
+        self.assertEqual(
+            next_message_suggestion("Work is underway.", state=state),
+            "Continue the active plan with: Add boundary tests",
+        )
+
+    def test_failed_validation_is_suggested_before_commit(self):
+        state = SimpleNamespace(
+            turn_checkpoint=None, active_plan_id=None, saved_plans=[], unresolved_issues=[],
+            validation_results=[{"passed": False, "command": "pytest tests/test_parser.py"}],
+            modified_files=[{"path": "parser.py", "validation_status": "pending"}],
+        )
+        self.assertEqual(
+            next_message_suggestion("Changes are ready for review.", state=state),
+            "Fix pytest tests/test_parser.py, then rerun the failing validation",
+        )
+
+    def test_pending_changes_suggest_focused_validation(self):
+        state = SimpleNamespace(
+            turn_checkpoint=None, active_plan_id=None, saved_plans=[], unresolved_issues=[],
+            validation_results=[],
+            modified_files=[{"path": "tamfis_code/render.py", "validation_status": "pending"}],
+        )
+        self.assertEqual(
+            next_message_suggestion(None, state=state),
+            "Run focused validation for tamfis_code/render.py, then review the diff",
+        )
 
     def test_ghost_suggestion_only_appears_for_empty_composer(self):
         suggest = _NextMessageAutoSuggest(lambda: "Next step: Verify production")

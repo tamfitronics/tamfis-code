@@ -274,6 +274,9 @@ _READ_ONLY_TOOLS = {
 }
 _MUTATION_TOOLS = {"write_file", "edit_file", "file_edit", "create_file", "update_file"}
 
+_DOCUMENTATION_SUFFIXES = {".md", ".mdx", ".rst", ".adoc", ".txt"}
+_PROMPT_NAME_MARKERS = {"prompt", "prompts", "instruction", "instructions", "system_message"}
+
 
 def _normalized_tool_name(name: str) -> str:
     return (name or "tool").strip().lower().replace("-", "_").rsplit("/", 1)[-1]
@@ -285,6 +288,20 @@ def _is_read_only_tool(name: str) -> bool:
 
 def _is_mutation_tool(name: str) -> bool:
     return _normalized_tool_name(name) in _MUTATION_TOOLS
+
+
+def _change_kind(path: Any) -> str:
+    """Human label for a default-collapsed file mutation card."""
+    value = str(path or "")
+    lowered = value.lower()
+    filename = lowered.rsplit("/", 1)[-1]
+    stem = filename.rsplit(".", 1)[0]
+    if any(marker in stem for marker in _PROMPT_NAME_MARKERS):
+        return "Prompt updated"
+    suffix = "." + filename.rsplit(".", 1)[-1] if "." in filename else ""
+    if suffix in _DOCUMENTATION_SUFFIXES or filename in {"readme", "license", "changelog"}:
+        return "Documentation updated"
+    return "Code updated"
 
 
 # Category label (gerund, singular noun, plural noun) for the round-summary
@@ -553,6 +570,13 @@ class StreamRenderer:
         # _execute_command actually awaits it (asyncio.wait alongside the
         # command's own completion), not just polls it.
         self.background_requested = asyncio.Event()
+        # The live composer increments this whenever the user submits a
+        # steering message. Provider streaming watches the signal so the
+        # update reaches the active turn without waiting for a long response
+        # to finish first.
+        self.steering_requested = asyncio.Event()
+        self._steering_revision = 0
+        self._steering_handled_revision = 0
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
         try:
@@ -607,6 +631,28 @@ class StreamRenderer:
         via a scrolling diagnostic line that later output pushes away."""
         self._mode_label = label
         self._refresh_live()
+
+    def request_steering(self) -> None:
+        """Wake the active provider stream for a new user direction."""
+        self._steering_revision += 1
+        self.steering_requested.set()
+
+    def steering_revision(self) -> int:
+        return self._steering_revision
+
+    def acknowledge_steering(self, revision: Optional[int] = None) -> None:
+        """Mark all messages claimed at the current safe boundary."""
+        handled = self._steering_revision if revision is None else revision
+        self._steering_handled_revision = max(self._steering_handled_revision, handled)
+        if not self.has_pending_steering():
+            self.steering_requested.clear()
+
+    def has_pending_steering(self) -> bool:
+        return self._steering_revision > self._steering_handled_revision
+
+    async def wait_for_steering(self) -> None:
+        while not self.has_pending_steering():
+            await self.steering_requested.wait()
 
     def live_input_activity_line(self) -> Optional[str]:
         """Plain-text "Searching for N patterns, reading M files…" summary,
@@ -781,7 +827,7 @@ class StreamRenderer:
             queued = 0
         parts = ["Type a message and press Enter", "Esc stops the task", "Ctrl+C/Ctrl+D exits"]
         if queued:
-            parts.insert(1, f"{queued} queued for after this turn")
+            parts.insert(1, f"{queued} steering update{'s' if queued != 1 else ''} pending")
         return Text(" · ".join(parts))
 
     def _build_status(self) -> Any:
@@ -1257,6 +1303,8 @@ class StreamRenderer:
                     self._tool_names_by_call_id[str(call_id)] = tool
                 args = payload.get("arguments") or {}
                 if _is_read_only_tool(tool):
+                    if self._is_tty and self.live_input_listener is not None:
+                        return
                     self.console.print(f"[dim]Reading {escape(_read_target(args))}[/dim]")
                     return
                 arg_text = ", ".join(f"{k}={v}" for k, v in args.items() if v not in (None, "")) if isinstance(args, dict) else ""
@@ -1280,6 +1328,12 @@ class StreamRenderer:
             name = str(payload.get("name") or payload.get("tool") or "tool")
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
             if _is_read_only_tool(name):
+                # The live footer already aggregates routine reads/searches.
+                # Avoid leaving one permanent scrollback line per file while
+                # preserving explicit lines in redirected/non-interactive
+                # logs and preserving durable read failures below.
+                if self._is_tty and self.live_input_listener is not None:
+                    return
                 self.console.print(f"[dim]Reading {escape(_read_target(args))}[/dim]")
                 return
             # On an interactive terminal the persistent live status line is
@@ -1304,6 +1358,14 @@ class StreamRenderer:
                         f"[red]Read failed[/red] {escape(_read_target(args))}: {escape(reason)}"
                     )
                 return
+            # A successful edit/write is represented by the compact
+            # file_mutation card. Rendering the tool envelope too can expose
+            # the entire inserted file and makes one change appear twice.
+            # Failures still render in full because they are actionable.
+            if _is_mutation_tool(tool) and self._is_tty:
+                _content, mutation_failed = _tool_result_message(payload)
+                if not mutation_failed:
+                    return
             # Command/file events already carry the useful result. Some
             # canonical tool-completion envelopes contain only a tool name
             # and success flag; rendering those produced the misleading,
@@ -1362,9 +1424,11 @@ class StreamRenderer:
             path = payload.get("path", "?")
             added, removed = payload.get("lines_added", 0), payload.get("lines_removed", 0)
             mutation_id = payload.get("mutation_id", "?")
+            label = _change_kind(path)
             self.console.print(
-                f"[bold blue]✎ {path}[/bold blue]  [dim]+{added}/-{removed}  "
-                f"(revert with: /revert {mutation_id})[/dim]"
+                f"[bold blue]▸ {escape(label)}[/bold blue] · {escape(str(path))}  "
+                f"[dim]+{added}/-{removed} · /diff {escape(str(mutation_id))} to expand · "
+                f"/revert {escape(str(mutation_id))}[/dim]"
             )
             return
 
