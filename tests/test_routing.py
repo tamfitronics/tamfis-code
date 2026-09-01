@@ -157,7 +157,7 @@ def test_auto_uses_operator_approved_100_percent_weight_pool(monkeypatch):
             ProviderType.NVIDIA, ProviderType.OLLAMA_CLOUD, ProviderType.HF,
             ProviderType.OPENROUTER, ProviderType.GROK,
         ],
-        "weights": [40, 15, 15, 15, 15],
+        "weights": [65, 20, 5, 5, 5],
         "k": 1,
     }
     assert sum(observed["weights"]) == 100
@@ -279,7 +279,7 @@ def test_auto_renormalizes_equal_weights_when_only_hf_and_openrouter_are_availab
         classify_task("fix and refactor the code"),
     ) == ProviderType.OPENROUTER
     assert observed["population"] == [ProviderType.HF, ProviderType.OPENROUTER]
-    assert observed["weights"] == [15, 15]
+    assert observed["weights"] == [5, 5]
 
 
 def test_openrouter_default_is_not_openai_family():
@@ -294,16 +294,27 @@ def test_openrouter_default_is_not_openai_family():
 
 def test_nvidia_default_model_is_tool_capable_and_not_unentitled_kimi():
     # The plain Llama route is fluent but has been observed fabricating local
-    # tool results. Use a verified NVIDIA nemotron tool-calling route instead;
-    # never use the account-unentitled Kimi route as the default.
+    # tool results. Use a verified NVIDIA route instead; never use the
+    # account-unentitled kimi-k2.6 route as the default -- that is a
+    # different model from kimi-k3 below (kimi-k2.6 404s as a per-account
+    # entitlement gap, see test_kimi_k2_6_is_still_selectable_on_openrouter_
+    # and_hf; kimi-k3 is independently live-verified on this account).
     # 2026-07-26: re-prioritized off nemotron-3-nano-omni-30b-a3b-reasoning
     # after it was caught live wrapping a fake tool call in CLI-flag/XML-ish
     # text (see runner_local.py's fake-tool-call detection fix) -- a failure
     # mode a single simple tool-calling smoke test doesn't surface, since
     # that model also returns clean real tool_calls on simple prompts.
+    #
+    # DEFAULT CHANGED 2026-09-01 (owner directive): moonshotai/kimi-k3 --
+    # live-verified 2026-08-30, real tool_calls + vision on this account --
+    # replaced nemotron-3-ultra-550b-a55b as NVIDIA's default, matching
+    # tamgpt6 (TamfisGPT) making the same model its own highest-priority
+    # NIM route for the identical reason. nemotron-3-ultra-550b-a55b is
+    # still the first fallback, see test_nvidia_exposes_deepseek_v4_pro_
+    # without_replacing_verified_default below.
     default_model = ProviderManager.PROVIDERS[ProviderType.NVIDIA].default_model
     assert default_model != "moonshotai/kimi-k2.6"
-    assert default_model == "nvidia/nemotron-3-ultra-550b-a55b"
+    assert default_model == "moonshotai/kimi-k3"
 
 
 def test_kimi_k2_6_is_still_selectable_on_openrouter_and_hf():
@@ -342,7 +353,8 @@ def test_hf_prefers_official_qwen36_coding_route_and_keeps_deepseek_fallbacks():
 
 def test_nvidia_exposes_deepseek_v4_pro_without_replacing_verified_default():
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
-    assert config.default_model == "nvidia/nemotron-3-ultra-550b-a55b"
+    assert config.default_model == "moonshotai/kimi-k3"
+    assert "nvidia/nemotron-3-ultra-550b-a55b" in config.models
     assert "deepseek-ai/deepseek-v4-pro" in config.models
     # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached NVIDIA NIM
     # end-of-life 2026-08-07 (HTTP 410 confirmed live in tamgpt6's intent

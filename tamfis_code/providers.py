@@ -244,16 +244,27 @@ class ProviderManager:
     )
 
     # AUTO is a weighted pool, not the fixed fallback order above. These
-    # operator-approved shares total exactly 100 when every route is healthy:
-    # NIM gets the larger 40% share; the four remaining cloud providers get
-    # equal 15% shares. TAMFIS/TIER_IV/LOCAL remain explicitly selectable but
-    # are not part of standalone automatic routing.
+    # operator-approved shares total exactly 100 when every route is healthy.
+    #
+    # REBALANCED 2026-09-01 (owner directive): the two plan-covered/free
+    # routes -- NVIDIA (default_model switched to moonshotai/kimi-k3
+    # below, live-verified 2026-08-30 -- real tool_calls + vision on this
+    # account) and Ollama Cloud (kimi-k2.7-code:cloud is included-plan,
+    # not extra-usage, see select_model() above) -- now get 85% combined,
+    # up from 55%. Separate xAI keys per app were considered and rejected:
+    # both TamfisGPT and Tamfis-Code bill the same xAI account regardless
+    # of which literal key value is used, so a second key would only
+    # split *visibility*, not spend. Cutting GROK's actual share (and
+    # HF/OpenRouter, also per-call billed) is what reduces spend. GROK
+    # specifically still gets a nonzero share, not 0: explicit --provider
+    # grok and Grok's own image/video capability edge stay reachable, just
+    # no longer AUTO's default coin-flip outcome for ordinary chat/coding.
     AUTO_PROVIDER_WEIGHTS: dict[ProviderType, int] = {
-        ProviderType.NVIDIA: 40,
-        ProviderType.OLLAMA_CLOUD: 15,
-        ProviderType.HF: 15,
-        ProviderType.OPENROUTER: 15,
-        ProviderType.GROK: 15,
+        ProviderType.NVIDIA: 65,
+        ProviderType.OLLAMA_CLOUD: 20,
+        ProviderType.HF: 5,
+        ProviderType.OPENROUTER: 5,
+        ProviderType.GROK: 5,
     }
 
     PROVIDERS: Dict[ProviderType, ProviderConfig] = {
@@ -472,17 +483,37 @@ class ProviderManager:
             # nemotron-3-ultra-550b-a55b (1.8s), nemotron-3-super-120b-a12b
             # (6.1s), nemotron-3-nano-30b-a3b, llama-3.3-nemotron-super-49b-
             # v1.5, llama-3.3-nemotron-super-49b-v1, minimaxai/minimax-m3
-            # all returned genuine tool_calls. ultra-550b-a55b is NVIDIA's
-            # largest/most capable hybrid Mamba-Transformer MoE for agentic
-            # reasoning, coding, planning, and tool calling and was fast in
-            # the live check, so it is now the default; super-120b-a12b
-            # (already separately confirmed to handle reasoning_effort
-            # without hanging) is the next fallback. The nano-omni-reasoning
-            # route stays selectable -- do not remove it entirely, since an
-            # account without ultra/super entitlement still needs a working
-            # route -- but it is no longer the automatic coding path.
-            default_model="nvidia/nemotron-3-ultra-550b-a55b",
+            # all returned genuine tool_calls. ultra-550b-a55b was NVIDIA's
+            # largest/most capable model verified at the time and became
+            # the default then; super-120b-a12b (already separately
+            # confirmed to handle reasoning_effort without hanging) is the
+            # next fallback. The nano-omni-reasoning route stays
+            # selectable -- do not remove it entirely, since an account
+            # without ultra/super entitlement still needs a working route.
+            #
+            # DEFAULT CHANGED 2026-09-01 (owner directive, same session as
+            # AUTO_PROVIDER_WEIGHTS's NVIDIA/Ollama Cloud rebalance above):
+            # moonshotai/kimi-k3 is now the default instead of
+            # nemotron-3-ultra-550b-a55b -- free/plan-covered like every
+            # other NVIDIA route here, and the same model tamgpt6
+            # (TamfisGPT) already made its own highest-weighted, highest-
+            # priority NIM model for the identical reason.
+            # nemotron-3-ultra-550b-a55b drops to first fallback, not
+            # removed. Live-verified 2026-08-30 directly against
+            # integrate.api.nvidia.com/v1/chat/completions with a real
+            # account key -- three probes: (1) plain chat completion, 200
+            # OK with real content; (2) a real function-calling probe
+            # (get_weather tool), returned a genuine tool_calls event, not
+            # narrated text; (3) NVIDIA's own catalog vision payload shape
+            # (text + image_url content parts), returned an accurate
+            # description of the real test image, not a refusal/generic
+            # non-answer. Same underlying model also available via Ollama
+            # Cloud (kimi-k3:cloud, see above) and HF (see
+            # model_registry.py); this is a third, independently verified
+            # route.
+            default_model="moonshotai/kimi-k3",
             models=[
+                "moonshotai/kimi-k3",
                 "nvidia/nemotron-3-ultra-550b-a55b",
                 "nvidia/nemotron-3-super-120b-a12b",
                 "nvidia/nemotron-3-nano-30b-a3b",
@@ -515,19 +546,9 @@ class ProviderManager:
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
                 "moonshotai/kimi-k2.6",
-                # ADDED 2026-08-30: live-verified directly against
-                # integrate.api.nvidia.com/v1/chat/completions with a real
-                # account key -- three probes: (1) plain chat completion,
-                # 200 OK with real content; (2) a real function-calling
-                # probe (get_weather tool), returned a genuine tool_calls
-                # event, not narrated text; (3) NVIDIA's own catalog vision
-                # payload shape (text + image_url content parts), returned
-                # an accurate description of the real test image, not a
-                # refusal/generic non-answer. Same underlying model already
-                # available via Ollama Cloud (kimi-k3:cloud, see above) and
-                # HF (see model_registry.py); this is a third, independently
-                # verified route on the highest-priority provider here.
-                "moonshotai/kimi-k3",
+                # moonshotai/kimi-k3 moved to the front of this list as
+                # default_model above (2026-09-01) -- see that comment for
+                # the verification details, not repeated here.
                 "mistralai/mistral-large-2-123b",
                 "google/gemma-2-27b-it",
                 "microsoft/phi-3-medium-128k-instruct",
