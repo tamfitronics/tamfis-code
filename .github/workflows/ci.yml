@@ -46,4 +46,6 @@ jobs:
       - name: Allow unprivileged user namespaces (Ubuntu's AppArmor confinement policy otherwise blocks bwrap's own loopback setup)
         run: sudo sysctl -w kernel.unprivileged_userns_apparmor_policy=0
       - run: pip install -e ".[dev]"
+      - name: Artifact benchmark corpus (provider-independent quality gate)
+        run: pytest -q tests/test_artifact_benchmark_corpus.py
       - run: pytest -q
