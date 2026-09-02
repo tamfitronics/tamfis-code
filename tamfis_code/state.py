@@ -228,6 +228,11 @@ class SessionState:
     selected_model: str = "auto"
     selected_provider: Optional[str] = None
     estimated_context_tokens: int = 0
+    # Compact, schema-stable ledger for long-horizon execution.  This is
+    # intentionally separate from the conversational turn checkpoint: the
+    # latter is protocol context, while this record is the resumable task
+    # state (plan progress, evidence and recovery history).
+    task_state: dict[str, Any] = field(default_factory=dict)
     updated_at: str = ""
     # Set only for a swarm sub-task's own child session (see
     # workspace.resolve_swarm_subtask_workspace) -- None for every ordinary
@@ -372,6 +377,7 @@ def _save_memory_snapshot(state: SessionState) -> None:
         "modified_files": state.modified_files[-50:],
         "validation_results": state.validation_results[-20:],
         "unresolved_issues": state.unresolved_issues[-20:],
+        "task_state": state.task_state,
     })
     target = memory_dir / f"session-{state.session_id}.json"
     fd, temp_name = tempfile.mkstemp(prefix=f".session-{state.session_id}-", suffix=".json", dir=memory_dir)
@@ -758,6 +764,40 @@ def checkpoint(session_id: int, *, reason: str, summary: str = "") -> None:
         "summary": summary,
     }])[-MAX_CHECKPOINTS:]
     put_session_state(state)
+
+
+def update_task_state(session_id: int, **updates: Any) -> dict[str, Any]:
+    """Merge a bounded, JSON-safe long-horizon task ledger into session state."""
+    state = get_session_state(session_id)
+    ledger = dict(state.task_state or {})
+    for key, value in updates.items():
+        if isinstance(value, list):
+            # Keep durable ledgers bounded; old detail remains available in
+            # completed_actions/validation_results and external event logs.
+            value = value[-300:]
+        ledger[key] = _sanitize(value)
+    ledger.setdefault("schema_version", 1)
+    ledger["updated_at"] = _now()
+    state.task_state = ledger
+    put_session_state(state)
+    return ledger
+
+
+def task_checkpoint(session_id: int, *, reason: str, next_action: str = "",
+                    **updates: Any) -> dict[str, Any]:
+    """Persist task ledger and an indexed checkpoint atomically at a milestone."""
+    ledger = update_task_state(session_id, **updates)
+    state = get_session_state(session_id)
+    entry = {
+        "checkpoint_id": f"cp_{uuid.uuid4().hex[:12]}",
+        "created_at": _now(), "reason": reason,
+        "phase": state.current_phase, "next_action": next_action,
+        "task_id": state.last_task_id,
+        "task_state": {k: v for k, v in ledger.items() if k != "context_summary"},
+    }
+    state.context_checkpoints = (state.context_checkpoints + [entry])[-MAX_CHECKPOINTS:]
+    put_session_state(state)
+    return entry
 
 
 def save_plan(

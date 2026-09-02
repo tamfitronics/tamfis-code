@@ -11,6 +11,26 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def classify_failure(error: str, *, tool_name: str = "") -> str:
+    """Provider-neutral failure taxonomy used by retries and observability."""
+    text = f"{tool_name} {error}".casefold()
+    patterns = (
+        ("timeout", ("timeout", "timed out", "deadline")),
+        ("permission_failure", ("permission denied", "not permitted", " EACCES")),
+        ("dependency_failure", ("module not found", "dependency", "importerror")),
+        ("typecheck_failure", ("typecheck", "mypy", "tsc", "type error")),
+        ("build_failure", ("build failed", "compile", "compilation")),
+        ("artifact_validation_failure", ("artifact", "workbook", "xlsx", "docx", "pptx", "pdf")),
+        ("provider_failure", ("provider", "429", "rate limit", "quota", "circuit")),
+        ("tool_failure", ("tool", "command not found")),
+        ("test_failure", ("pytest", "test failed", "assertionerror", "failed")),
+    )
+    for category, needles in patterns:
+        if any(needle in text for needle in needles):
+            return category
+    return "runtime_failure"
+
+
 class AgentPhase(str, Enum):
     UNDERSTAND = "understand"
     INSPECT = "inspect"

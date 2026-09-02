@@ -10,7 +10,7 @@ from .. import state as local_state
 from ..routing import TaskProfile, classify_task
 from .context import ContextBundle, build_context_bundle
 from .planner import ExecutionPlan, create_plan
-from .protocols import AgentPhase, ToolEnvelope
+from .protocols import AgentPhase, ToolEnvelope, classify_failure
 from .validator import ValidationReport, validate_completion
 from ..runtime import ExecutionController, GuardDecision, ObservationDecision
 from ..runtime.budgets import RuntimeBudgets
@@ -60,6 +60,10 @@ class AgentOrchestrator:
             running_action={"purpose": action or phase.value, "phase": phase.value},
         )
         self.emit({"event_type": f"orchestrator_{phase.value}", "payload": {"phase": phase.value, "action": action}})
+        local_state.task_checkpoint(
+            self.session_id, reason=f"phase_{phase.value}", next_action=action,
+            phase=phase.value, current_step=action,
+        )
 
     def begin(self, *, objective: str, messages: list[dict[str, Any]], read_only: bool) -> OrchestrationRun:
         profile = classify_task(objective, read_only=read_only)
@@ -68,6 +72,14 @@ class AgentOrchestrator:
             self.session_id,
             active_task={"objective": objective, "task_type": profile.task_type.value, "complexity": profile.complexity},
             current_phase=AgentPhase.UNDERSTAND.value, execution_status="running",
+        )
+        local_state.update_task_state(
+            self.session_id, task_id=str(self.session_id), objective=objective,
+            status="running", phase=AgentPhase.UNDERSTAND.value,
+            plan=[], completed_steps=[], pending_steps=[], blocked_steps=[],
+            assumptions=[], decisions=[], files_read=[], files_modified=[],
+            artifacts_created=[], commands_run=[], tests=[], failures=[],
+            retries=[], completion_evidence=[], next_action="Classify the request",
         )
         self.transition(AgentPhase.UNDERSTAND, action="Classify the request deterministically")
         if profile.requires_repository_context:
@@ -250,6 +262,24 @@ class AgentOrchestrator:
                 "runtime": self.run.runtime.snapshot.to_dict(),
             },
         )
+        ledger = local_state.get_session_state(self.session_id).task_state or {}
+        failures = list(ledger.get("failures") or [])
+        retries = list(ledger.get("retries") or [])
+        if not envelope.success:
+            failure = {
+                "category": classify_failure(envelope.stderr, tool_name=envelope.tool_name),
+                "action": envelope.tool_name,
+                "error": envelope.stderr[-1200:],
+                "at": envelope.completed_at,
+            }
+            failures.append(failure)
+            retries.append({"retry_number": len(retries) + 1, "failure": failure, "disposition": "pending_diagnosis"})
+        local_state.update_task_state(
+            self.session_id, phase=self.run.phase.value,
+            commands_run=list(ledger.get("commands_run") or []) + ([envelope.arguments.get("command")] if envelope.tool_name == "execute_command" and envelope.arguments.get("command") else []),
+            failures=failures, retries=retries,
+            files_modified=list(ledger.get("files_modified") or []) + list(envelope.files_changed),
+        )
         self._advance_plan_step(decision, envelope)
         if decision.terminal:
             self.fail(decision.reason)
@@ -408,6 +438,17 @@ class AgentOrchestrator:
             validation_results=(state.validation_results + [report.to_dict()])[-100:],
             unresolved_issues=[{"issue": item} for item in report.unresolved],
         )
+        ledger = local_state.get_session_state(self.session_id).task_state or {}
+        evidence = list(ledger.get("completion_evidence") or [])
+        if report.passed:
+            evidence.append("completion validation passed")
+        local_state.update_task_state(
+            self.session_id, phase=AgentPhase.VALIDATE.value,
+            status="running" if report.severity != "error" else "failed",
+            tests=list(ledger.get("tests") or []) + [report.to_dict()],
+            completion_evidence=evidence,
+            unresolved_issues=report.unresolved,
+        )
         return report
 
     def complete(self, *, final_text: str, any_mutation: bool) -> ValidationReport:
@@ -425,6 +466,11 @@ class AgentOrchestrator:
             self.run.runtime.complete()
         self.transition(AgentPhase.FAILED if report.severity == "error" else AgentPhase.COMPLETED)
         local_state.checkpoint(self.session_id, reason="orchestrator_complete", summary=final_text[-1000:])
+        local_state.task_checkpoint(
+            self.session_id, reason="delivery_ready", next_action="none",
+            phase=AgentPhase.COMPLETED.value, status="completed",
+            completion_evidence=list((local_state.get_session_state(self.session_id).task_state or {}).get("completion_evidence") or []) + ["final delivery emitted"],
+        )
         return report
 
     def fail(self, error: str) -> None:
@@ -437,3 +483,8 @@ class AgentOrchestrator:
                 self._sync_plan_progress()
             self.transition(AgentPhase.FAILED, action=error)
         local_state.checkpoint(self.session_id, reason="orchestrator_failed", summary=error[-1000:])
+        local_state.task_checkpoint(
+            self.session_id, reason="task_failed", next_action="diagnose and resume",
+            phase=AgentPhase.FAILED.value, status="failed",
+            failures=list((local_state.get_session_state(self.session_id).task_state or {}).get("failures") or []) + [{"category": classify_failure(error), "error": error[-1200:]}],
+        )
