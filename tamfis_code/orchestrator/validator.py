@@ -457,9 +457,14 @@ def _explicit_output_paths(objective: str) -> list[str]:
             continue
         if value.startswith(("a/", "b/")):
             value = value[2:]
-        context = (objective or "")[max(0, match.start() - 100):match.start()]
+        # Use the current sentence/line, not a broad character window: a
+        # nearby word such as ``implementation`` in an inspection sentence
+        # must not turn a referenced file into a deliverable.
+        prefix = (objective or "")[:match.start()]
+        boundary = max(prefix.rfind("."), prefix.rfind("!"), prefix.rfind("?"), prefix.rfind(":"), prefix.rfind("\n"))
+        context = prefix[boundary + 1:]
         production_intent = re.search(
-            r"\b(?:create|generate|build|write|produce|scaffold|deliver|add|implement|export|save|output)\w*\b",
+            r"\b(?:create|generate|build|write|produce|scaffold|deliver|export|save|output)\w*\b",
             objective or "",
             re.IGNORECASE,
         )
