@@ -244,6 +244,15 @@ def live_next_message_suggestion(renderer: Any) -> Optional[str]:
         return "After the command finishes, inspect any failure and adapt the implementation"
 
     phase = str(getattr(renderer, "_phase", "") or "").lower()
+    tool_counts = getattr(renderer, "_round_tool_counts", None) or {}
+    if tool_counts:
+        # Make the ghost action reflect the evidence currently on screen,
+        # rather than offering the same generic phase slogan after every
+        # tool call.  Counts are insertion-ordered by the renderer, so the
+        # last entry is the most recently observed operation.
+        latest_tool = str(next(reversed(tool_counts))).replace("_", " ")
+        if phase in {"observe", "validate", "repair", "execute"}:
+            return f"Review the latest {latest_tool} result, update the plan if needed, then verify the change"
     by_phase = {
         "understand": "Inspect related tests and call sites before making the change",
         "inspect": "Inspect related tests and call sites before making the change",
@@ -314,6 +323,12 @@ class LiveInputListener:
         self._ticker_task: Optional[asyncio.Task] = None
         self._outcome_status: Optional[str] = None
         self._editing_instruction_id: Optional[str] = None
+        # Distinguish a programmatic prompt shutdown (approval/tool UI,
+        # turn completion) from a user pressing Enter.  Without this marker,
+        # prompt_toolkit returns the current buffer through ``prompt_async``
+        # and a fast pause/resume race can enqueue half-typed text.
+        self._prompt_exit_requested = False
+        self._draft_text = ""
         # A footer callback runs for every redraw and keystroke. Snapshot the
         # count once per listener instead of touching the multi-megabyte
         # session-state file from prompt-toolkit's latency-sensitive path.
@@ -464,6 +479,11 @@ class LiveInputListener:
         session = self._prompt_session
         app = getattr(session, "app", None)
         if app is not None and not getattr(app, "is_done", False):
+            buffer = getattr(session, "default_buffer", None)
+            draft = str(getattr(buffer, "text", "") or "")
+            if draft.strip():
+                self._draft_text = draft
+            self._prompt_exit_requested = True
             with contextlib.suppress(Exception):
                 app.exit(result="")
 
@@ -659,6 +679,15 @@ class LiveInputListener:
         loop = asyncio.get_running_loop()
         self._previous_loop_exception_handler = loop.get_exception_handler()
         loop.set_exception_handler(self._handle_prompt_loop_exception)
+
+        def _prepare_prompt() -> None:
+            if self._draft_text and not session.default_buffer.text:
+                session.default_buffer.text = self._draft_text
+                session.default_buffer.cursor_position = len(self._draft_text)
+                self._draft_text = ""
+            value = live_next_message_suggestion(self.renderer)
+            session.default_buffer.suggestion = Suggestion(value) if value else None
+
         try:
             while self._active and not self._paused:
                 try:
@@ -668,13 +697,7 @@ class LiveInputListener:
                             bottom_toolbar=self._bottom_toolbar,
                             show_frame=True,
                             set_exception_handler=False,
-                            pre_run=lambda: setattr(
-                                session.default_buffer,
-                                "suggestion",
-                                Suggestion(value)
-                                if (value := live_next_message_suggestion(self.renderer))
-                                else None,
-                            ),
+                            pre_run=_prepare_prompt,
                         )
                 except asyncio.CancelledError:
                     raise
@@ -693,8 +716,15 @@ class LiveInputListener:
                         return
                     raise
 
-                if self._paused:
+                # app.exit(result="") is an internal teardown signal, not a
+                # submission.  Check the marker before _paused because a
+                # rapid resume may have flipped that flag by this point.
+                forced_exit = self._prompt_exit_requested
+                self._prompt_exit_requested = False
+                if forced_exit or self._paused:
                     break
+                if self._draft_text and not text.strip():
+                    text, self._draft_text = self._draft_text, ""
                 self._enqueue(text)
                 if not self._active:
                     break
