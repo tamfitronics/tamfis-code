@@ -18,6 +18,16 @@ See https://example.com/file.css
     ]
 
 
+def test_contextual_paths_and_diff_prefixes_are_not_output_contracts():
+    objective = (
+        "Inspect the existing implementation and apply the smallest fix. "
+        "Review `a/tier_iv_orchestration/office_artifacts.py`, "
+        "`b/tier_iv_orchestration/office_artifacts.py`, and "
+        "tests/test_append_xlsx_sheets_updates_existing.py before validating."
+    )
+    assert _explicit_output_paths(objective) == []
+
+
 def test_complete_project_cannot_finish_with_missing_tree_files(tmp_path: Path):
     present = tmp_path / "theme" / "style.css"
     present.parent.mkdir()

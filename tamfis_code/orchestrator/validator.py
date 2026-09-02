@@ -442,10 +442,32 @@ _OUTPUT_PATH_RE = re.compile(
 
 
 def _explicit_output_paths(objective: str) -> list[str]:
+    """Extract files the user actually asked the agent to produce.
+
+    Objectives often contain source files, tests, patch prefixes, and model
+    names as context.  Treating every filename as an output contract made a
+    successful edit fail after completion because unrelated files were never
+    supposed to be created.  Require a nearby production verb and discard
+    unified-diff ``a/``/``b/`` prefixes.
+    """
     paths: list[str] = []
     for match in _OUTPUT_PATH_RE.finditer(objective or ""):
         value = match.group(1).strip().replace("\\", "/")
         if value.startswith(("http://", "https://")) or ".." in Path(value).parts:
+            continue
+        if value.startswith(("a/", "b/")):
+            value = value[2:]
+        context = (objective or "")[max(0, match.start() - 100):match.start()]
+        production_intent = re.search(
+            r"\b(?:create|generate|build|write|produce|scaffold|deliver|add|implement|export|save|output)\w*\b",
+            objective or "",
+            re.IGNORECASE,
+        )
+        if not production_intent and not re.search(
+            r"\b(?:create|generate|build|write|produce|scaffold|deliver|add|implement|export|save|output)\w*\b",
+            context,
+            re.IGNORECASE,
+        ):
             continue
         if value not in paths:
             paths.append(value)

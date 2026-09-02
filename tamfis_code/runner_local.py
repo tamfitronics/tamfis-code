@@ -4911,10 +4911,22 @@ async def _run_local_agent_turn_impl(
             return TaskOutcome(status="failed", error=message, summary=content)
         validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
         if validation.severity == "error":
-            message = "Validation failed: " + "; ".join(validation.unresolved)
+            # Validator details are internal diagnostics, not a user-facing
+            # error contract.  Raw paths, provider/model names, and planner
+            # state previously leaked into the UI and made a recoverable
+            # retry look like a broken request. Keep the full report attached
+            # to the event for logs/telemetry, but show one stable message.
+            message = (
+                "An internal validation error prevented completion. "
+                "No completion was reported; please try again in a few minutes."
+            )
             renderer.handle_event({
                 "event_type": "ai_task_failed",
-                "payload": {"error": message, "validation": validation.to_dict()},
+                "payload": {
+                    "error": message,
+                    "internal_error": "; ".join(validation.unresolved),
+                    "validation": validation.to_dict(),
+                },
             })
             _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
             return TaskOutcome(status="failed", error=message, summary=content)
