@@ -94,7 +94,18 @@ def _atomic_write_json(path: Path, payload: object) -> None:
 
 
 class MemoryStore:
-    """File-based memory persistence rooted at ``CONFIG_DIR/memory``."""
+    """File-based memory persistence rooted at ``CONFIG_DIR/memory``.
+
+    Bounded on two axes so this can never grow unbounded across a long
+    project lifetime: each record's content is capped at save time
+    (``MAX_CONTENT_CHARS``), and the total record count is capped
+    (``MAX_RECORDS``) by evicting the oldest-updated records first --
+    "oldest" rather than "first written" because a record that was recently
+    re-saved (e.g. a corrected fact) is exactly the one worth keeping.
+    """
+
+    MAX_RECORDS = 200
+    MAX_CONTENT_CHARS = 4000
 
     def __init__(self, root: Path | None = None) -> None:
         self.root = root or MEMORY_DIR
@@ -121,11 +132,14 @@ class MemoryStore:
 
     def save(self, record: MemoryRecord) -> MemoryRecord:
         slug = slugify(record.name)
+        content = record.content
+        if len(content) > self.MAX_CONTENT_CHARS:
+            content = content[: self.MAX_CONTENT_CHARS - 20].rstrip() + "\n...[truncated]"
         record = MemoryRecord(
             name=slug,
             type=record.type,
             description=record.description,
-            content=record.content,
+            content=content,
             created_at=record.created_at,
             updated_at=time.time(),
         )
@@ -133,7 +147,22 @@ class MemoryStore:
         index = self._read_index()
         index[slug] = self._rebuild_index_entry(record)
         _atomic_write_json(self.index_path, index)
+        self._enforce_record_cap(index)
         return record
+
+    def _enforce_record_cap(self, index: dict[str, dict[str, object]]) -> None:
+        """Evict the oldest-updated records once the store exceeds
+        MAX_RECORDS, so a long-running project's memory never grows
+        unbounded. Called after every save() rather than periodically --
+        the cap check itself is O(n log n) over a store capped at a few
+        hundred small JSON files, cheap enough to run inline every time.
+        """
+        if len(index) <= self.MAX_RECORDS:
+            return
+        by_recency = sorted(index.items(), key=lambda item: item[1].get("updated_at", 0))
+        overflow = len(index) - self.MAX_RECORDS
+        for slug, _entry in by_recency[:overflow]:
+            self.delete(slug)
 
     def load(self, name: str) -> MemoryRecord | None:
         slug = slugify(name)

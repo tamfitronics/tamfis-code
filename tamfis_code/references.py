@@ -243,30 +243,79 @@ class ReferenceResolver:
 class InstructionManager:
     """Manages instruction files (TAMFIS.md, etc.)"""
     
-    INSTRUCTION_FILES = ['TAMFIS.md', 'CLAUDE.md', 'CODEX.md', '.tamfis', '.claude']
+    # AGENTS.md added for drop-in compatibility with repos that already
+    # standardized on it (the emerging cross-tool convention -- Codex CLI
+    # and others read it directly). Order matters only for get_instruction()'s
+    # single-file fallback; get_combined_instructions() concatenates every
+    # file found, so a repo with both TAMFIS.md and AGENTS.md gets both.
+    INSTRUCTION_FILES = ['TAMFIS.md', 'AGENTS.md', 'CLAUDE.md', 'CODEX.md', '.tamfis', '.claude']
     
+    # @import lines let a team split instructions across files (a root
+    # TAMFIS.md pulling in a subdirectory's own override, e.g.
+    # "@import backend/TAMFIS.md"), same idea as Claude Code's @-imports.
+    # Must start the line (optionally indented) so a mid-sentence "@import"
+    # in prose is never mistaken for a directive.
+    _IMPORT_LINE_RE = re.compile(r'^[ \t]*@import\s+(\S.*?)\s*$', re.MULTILINE)
+    _MAX_IMPORT_DEPTH = 5
+
     def __init__(self, workspace_root: Union[str, Path]):
         self.workspace_root = Path(workspace_root)
         self.instructions: Dict[str, str] = {}
         self._load_instructions()
-    
+
     def _load_instructions(self):
         """Load all instruction files from the workspace"""
         for filename in self.INSTRUCTION_FILES:
             # Check root
             root_file = self.workspace_root / filename
             if root_file.exists() and root_file.is_file():
-                self.instructions[filename] = root_file.read_text(encoding='utf-8', errors='ignore')
-            
+                raw = root_file.read_text(encoding='utf-8', errors='ignore')
+                self.instructions[filename] = self._resolve_imports(raw, root_file.parent, {root_file.resolve()})
+
             # Check .tamfis directory
             config_file = self.workspace_root / '.tamfis' / filename
             if config_file.exists() and config_file.is_file():
-                self.instructions[f".tamfis/{filename}"] = config_file.read_text(encoding='utf-8', errors='ignore')
-            
+                raw = config_file.read_text(encoding='utf-8', errors='ignore')
+                self.instructions[f".tamfis/{filename}"] = self._resolve_imports(raw, config_file.parent, {config_file.resolve()})
+
             # Check .claude directory
             config_file = self.workspace_root / '.claude' / filename
             if config_file.exists() and config_file.is_file():
-                self.instructions[f".claude/{filename}"] = config_file.read_text(encoding='utf-8', errors='ignore')
+                raw = config_file.read_text(encoding='utf-8', errors='ignore')
+                self.instructions[f".claude/{filename}"] = self._resolve_imports(raw, config_file.parent, {config_file.resolve()})
+
+    def _resolve_imports(
+        self, content: str, base_dir: Path, visited: set, depth: int = 0,
+    ) -> str:
+        """Inline every "@import <path>" line's target file content in place.
+
+        `path` resolves relative to the importing file's own directory
+        first (subdirectory overrides importing a sibling), then relative
+        to the workspace root (a shared/common snippet imported from
+        anywhere). A cycle or missing target degrades to a single HTML
+        comment noting why, rather than raising -- an instruction file is
+        loaded on every session start and must never crash one over a
+        typo'd import path.
+        """
+        if depth >= self._MAX_IMPORT_DEPTH:
+            return content
+
+        def _replace(match: 're.Match') -> str:
+            rel_path = match.group(1).strip()
+            candidate = (base_dir / rel_path)
+            if not candidate.is_file():
+                candidate = self.workspace_root / rel_path
+            if not candidate.is_file():
+                return f"<!-- @import {rel_path}: file not found -->"
+            resolved = candidate.resolve()
+            if resolved in visited:
+                return f"<!-- @import {rel_path}: skipped, circular import -->"
+            imported_text = candidate.read_text(encoding='utf-8', errors='ignore')
+            return self._resolve_imports(
+                imported_text, candidate.parent, visited | {resolved}, depth + 1,
+            )
+
+        return self._IMPORT_LINE_RE.sub(_replace, content)
     
     def get_instruction(self, name: str = None) -> Optional[str]:
         """Get a specific instruction file content"""

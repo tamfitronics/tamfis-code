@@ -384,6 +384,37 @@ class MCPServer:
         )
         
         self.register_tool(
+            name="save_memory",
+            description=(
+                "Save a durable, cross-session note the agent itself has learned during this "
+                "session -- a build/test command that worked, a gotcha hit, a correction the "
+                "user gave, a project fact worth remembering next time. Distinct from write_file: "
+                "this does not touch any workspace file. Saving with an existing `name` overwrites "
+                "that record (use this to correct or refresh a note, not to duplicate it). Only "
+                "save something genuinely reusable across a future session -- not routine task "
+                "narration."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string", "description": "Short, stable identifier for this note (e.g. \"deploy-command\")"},
+                    "type": {
+                        "type": "string", "enum": ["user", "feedback", "project", "reference"],
+                        "description": (
+                            "user: facts about the user/their role. feedback: guidance the user gave "
+                            "about how to work. project: facts about this project/task. reference: "
+                            "pointers to external systems/docs."
+                        ),
+                    },
+                    "description": {"type": "string", "description": "One-line summary of what this note is, for future search/listing"},
+                    "content": {"type": "string", "description": "The note itself"},
+                },
+                "required": ["name", "type", "description", "content"],
+            },
+            handler=self._save_memory,
+        )
+
+        self.register_tool(
             name="edit_file",
             description=(
                 "Replace an exact, unique occurrence of old_string with new_string in a file. "
@@ -1056,6 +1087,29 @@ class MCPServer:
                 transaction_id=self.transaction_id,
             )
         return f"✅ Successfully wrote {len(content)} bytes to '{path}'"
+
+    async def _save_memory(
+        self, name: str, type: str, description: str, content: str, **_aliases: Any
+    ) -> str:
+        """Append/update a durable, cross-session memory record (runtime/memory.py's
+        MemoryStore) -- distinct from write_file/edit_file, which only ever touch
+        workspace files. Saving overwrites any existing record of the same name
+        (same as `tamfis-code memory save`, which this mirrors); size and
+        record-count are capped automatically by the store, oldest evicted first."""
+        from .runtime.memory import MemoryError as _MemoryError, MemoryRecord, MemoryType, get_memory_store
+
+        try:
+            memory_type = MemoryType(type)
+        except ValueError:
+            valid = ", ".join(t.value for t in MemoryType)
+            return f"❌ Error: invalid memory type {type!r}. Must be one of: {valid}"
+        try:
+            record = get_memory_store().save(
+                MemoryRecord(name=name, type=memory_type, description=description, content=content)
+            )
+        except _MemoryError as exc:
+            return f"❌ Error: {exc}"
+        return f"✅ Saved memory '{record.name}' ({memory_type.value})"
 
     async def _edit_file(
         self, path: str, old_string: str | None = None, new_string: str | None = None, **aliases: Any

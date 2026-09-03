@@ -228,6 +228,21 @@ class ClassifyToolCallRiskTests(unittest.TestCase):
                 RISK_READ_ONLY,
             )
 
+    def test_save_memory_is_medium_risk_not_read_only_or_dangerous(self):
+        # Governed by the ordinary approval policy (a permissive policy can
+        # auto-approve it) rather than hardcoded to bypass risk
+        # classification -- writes outside the workspace root (CONFIG_DIR)
+        # still need the approval system to see and gate it.
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                classify_tool_call_risk(
+                    "save_memory",
+                    {"name": "deploy-notes", "type": "project", "description": "d", "content": "c"},
+                    workspace_root=root,
+                ),
+                RISK_MEDIUM,
+            )
+
     def test_common_inspection_pipelines_are_read_only(self):
         with tempfile.TemporaryDirectory() as root:
             commands = (
