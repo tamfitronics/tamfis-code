@@ -314,12 +314,23 @@ class ProviderManager:
                 "http://127.0.0.1:11434/v1",
             ).rstrip("/"),
             api_key_env="OLLAMA_API_KEY",
+            # FIX 2026-09-03 (operator request, "remove gemma4 entirely from
+            # ollama list, since it isn't helpful"): gemma4:cloud removed as
+            # both default_model and a selectable model. Same failure class
+            # TamfisGPT's gemma4-cloud route was live-disproven on the same
+            # day (tier_iv_orchestration/config/orchestration.yaml): under
+            # forced tool_choice, it answered with unparseable pseudo-tool-
+            # call text instead of a real structured call -- directly
+            # damaging for an agentic coding CLI that depends on real tool
+            # calls for every file edit/shell command. kimi-k2.7-code:cloud
+            # (the included-plan coding route select_model() already always
+            # returns for Ollama Cloud, per its own comment a few lines
+            # below) is the safe default here instead.
             default_model=os.environ.get(
                 "TAMFIS_CODE_OLLAMA_GENERAL_MODEL",
-                "gemma4:cloud",
+                "kimi-k2.7-code:cloud",
             ),
             models=[
-                "gemma4:cloud",
                 # Moonshot AI's newest Ollama Cloud model as of 2026-07-28:
                 # 2.81T-param native multimodal agentic MoE, 1M-token
                 # context, tools/thinking/vision confirmed on the model's
