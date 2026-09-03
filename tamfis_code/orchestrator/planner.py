@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from ..routing import TaskProfile, TaskType
+from ..routing import ComplexityLevel, TaskProfile, TaskType, complexity_at_least
 
 MAX_REASONING_PLAN_STEPS = 8
 MAX_ASSUMPTIONS = 6
@@ -288,7 +288,7 @@ def should_plan(profile: TaskProfile, objective: str | None = None) -> bool:
     genuinely have no request text. Runtime callers always provide it.
     """
     if objective is None:
-        return profile.complexity == "high" or profile.task_type in {
+        return complexity_at_least(profile.complexity, ComplexityLevel.COMPLEX) or profile.task_type in {
             TaskType.AUDIT, TaskType.EDIT, TaskType.DEBUG, TaskType.TEST, TaskType.MIXED,
         }
     if profile.task_type in {TaskType.PLAN, TaskType.AUDIT, TaskType.MIXED}:

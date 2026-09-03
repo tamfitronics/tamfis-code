@@ -52,7 +52,7 @@ from .render import (
     suspend_live_async_if_active,
     suspend_live_if_active,
 )
-from .routing import is_explicit_read_only_request
+from .routing import TaskType, is_explicit_read_only_request
 from .orchestrator import (
     AgentOrchestrator,
     ApprovalAction,
@@ -115,6 +115,52 @@ MAX_AGENT_ROUND_EXTENSIONS = 2
 # responsive default; set TAMFIS_CODE_REASONING_EFFORT=high when depth matters
 # more than first-token latency.
 DEFAULT_REASONING_EFFORT = os.environ.get("TAMFIS_CODE_REASONING_EFFORT", "medium").strip().lower()
+
+
+def _audit_evidence_targets(records: list[ToolEnvelope]) -> set[str]:
+    """Return distinct concrete evidence targets from successful read tools.
+
+    Directory listings are deliberately excluded: they help navigation but are
+    not evidence that the implementation itself was inspected. The boundary
+    is provider-neutral and based on completed tool envelopes, not model prose.
+    """
+    targets: set[str] = set()
+    evidence_tools = {
+        "read_file", "search_code", "find_references", "git_diff",
+        "git_status", "execute_command",
+    }
+    for record in records:
+        if record.success is not True or record.tool_name not in evidence_tools:
+            continue
+        arguments = record.arguments or {}
+        target = (
+            arguments.get("path")
+            or arguments.get("file_path")
+            or arguments.get("pattern")
+            or arguments.get("query")
+            or arguments.get("symbol")
+            or arguments.get("command")
+        )
+        if target:
+            targets.add(f"{record.tool_name}:{str(target).strip()}")
+    return targets
+
+
+def _read_only_audit_has_sufficient_evidence(
+    task_type: TaskType,
+    read_only: bool,
+    records: list[ToolEnvelope],
+) -> bool:
+    """Bound open-ended audits once enough concrete evidence was gathered.
+
+    Seven independent sources is intentionally a synthesis trigger, not a
+    success claim. The final model must still report gaps and uncertainty.
+    """
+    return (
+        read_only
+        and task_type == TaskType.AUDIT
+        and len(_audit_evidence_targets(records)) >= 7
+    )
 
 
 def _reasoning_effort(provider: ProviderType, model: str) -> Optional[str]:
@@ -4660,6 +4706,8 @@ async def _run_local_agent_turn_impl(
         provider=resolved_provider.value, model=resolved_model,
         reason=("explicit selection" if provider != ProviderType.AUTO else "capability-aware automatic routing"),
         fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+        requested_provider=provider.value,
+        requested_model=model or "auto",
     )
     orchestrator.start_execution()
 
@@ -4737,6 +4785,7 @@ async def _run_local_agent_turn_impl(
     compaction_count = 0
     replanned_after_evidence = False
     loop_nudge_count = 0
+    stalled_routes: set[tuple[ProviderType, str]] = set()
     narrated_retries: dict[ProviderType, int] = {}
     narrated_failed_providers: set[ProviderType] = set()
     capitulation_retries: dict[ProviderType, int] = {}
@@ -4766,6 +4815,7 @@ async def _run_local_agent_turn_impl(
     repair_attempts: dict[tuple[str, str], int] = {}
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
+    audit_synthesis_requested = False
     plan_completion_retries = 0
     validation_commands = [] if turn_read_only else detect_validation_commands(Path(workspace_root))
     validation_confirmed: set[str] = set()
@@ -5003,6 +5053,7 @@ async def _run_local_agent_turn_impl(
         (the caller should return that immediately).
         """
         nonlocal loop_nudge_count, consecutive_identical_rounds, recent_tool_signatures
+        nonlocal resolved_provider, resolved_model, config, client
 
         # Every tool_call_id from the assistant message the caller already
         # appended still needs a matching role=="tool" response, or the
@@ -5048,6 +5099,73 @@ async def _run_local_agent_turn_impl(
             consecutive_identical_rounds = 0
             recent_tool_signatures = []
             return None
+
+        # A model that cannot turn valid observations into a new action is a
+        # failed execution route, not proof that the task is impossible.
+        # Preserve the transcript, plan, completed tools and checkpoints, then
+        # try another model (another NIM deployment first) before disabling
+        # tools or reporting failure.
+        if _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
+            stalled_routes.add((resolved_provider, resolved_model))
+            if hasattr(manager, "record_route_failure"):
+                manager.record_route_failure(
+                    resolved_provider,
+                    resolved_model,
+                    RuntimeError(stuck_reason),
+                    tool_call=bool(tools),
+                )
+            for candidate in _fallback_candidates_for_turn(
+                manager, resolved_provider, task_profile,
+            ):
+                candidate_config = manager.PROVIDERS.get(candidate)
+                candidate_client = manager.get_client(candidate)
+                if candidate_config is None or candidate_client is None:
+                    continue
+                candidate_model = _select_model(manager, candidate_config, task_profile)
+                if (candidate, candidate_model) in stalled_routes:
+                    continue
+                previous_provider = resolved_provider
+                previous_model = resolved_model
+                resolved_provider = candidate
+                resolved_model = candidate_model
+                config = candidate_config
+                client = candidate_client
+                if hasattr(manager, "record_fallback"):
+                    manager.record_fallback(previous_provider)
+                orchestrator.mark_repair(
+                    f"Route {previous_provider.value}/{previous_model} stalled; continuing the active "
+                    f"plan on {candidate.value}/{candidate_model}",
+                    provider_switch=True,
+                )
+                orchestrator.record_route(
+                    provider=candidate.value,
+                    model=candidate_model,
+                    reason="automatic fallback after tool/evidence stall",
+                    fallback_reason=stuck_reason,
+                    fallback_chain=_standalone_fallback_chain_names(manager, candidate),
+                )
+                working_messages.append({
+                    "role": "system",
+                    "content": (
+                        "The previous model stalled by repeating reconnaissance. Continue the SAME active "
+                        "task and plan from the tool evidence already present. Do not repeat directory-level "
+                        "reads; inspect a concrete uninspected file or search for a concrete symbol/pattern."
+                    ),
+                })
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "The current model remained stalled after correction; preserving the task state "
+                            "and continuing on another compatible route."
+                        ),
+                    },
+                })
+                loop_nudge_count = 0
+                consecutive_identical_rounds = 0
+                recent_tool_signatures = []
+                _persist_turn_checkpoint()
+                return None
 
         renderer.handle_event({
             "event_type": "diagnostics",
@@ -5171,6 +5289,44 @@ async def _run_local_agent_turn_impl(
         acknowledge_steering = getattr(renderer, "acknowledge_steering", None)
         if callable(acknowledge_steering):
             acknowledge_steering(steering_revision)
+
+        # A read-only architecture audit can otherwise keep widening its
+        # reconnaissance indefinitely after collecting ample implementation
+        # evidence. Reserve the next turn for synthesis once the canonical
+        # tool ledger proves sufficient coverage; normal validation still
+        # owns the final completion decision.
+        tools_for_round = tools
+        if (
+            not audit_synthesis_requested
+            and orchestrator.run is not None
+            and _read_only_audit_has_sufficient_evidence(
+                task_profile.task_type,
+                turn_read_only,
+                orchestrator.run.tool_records,
+            )
+        ):
+            audit_synthesis_requested = True
+            evidence_count = len(_audit_evidence_targets(orchestrator.run.tool_records))
+            working_messages.append({
+                "role": "system",
+                "content": (
+                    f"EVIDENCE COVERAGE BOUNDARY: {evidence_count} distinct concrete successful "
+                    "read/search observations are now recorded for this read-only audit. Stop "
+                    "expanding reconnaissance and synthesize the final evidence-backed answer now. "
+                    "Trace the requested lifecycle from the evidence already present, distinguish "
+                    "verified facts from inference, and explicitly identify any remaining unknowns."
+                ),
+            })
+            tools_for_round = []
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"Collected {evidence_count} concrete audit evidence sources; "
+                        "moving to evidence synthesis."
+                    ),
+                },
+            })
 
         # Never fire a request already guaranteed to blow the provider's
         # context window -- confirmed live: HF 400'd with inputs(29548) +
@@ -5315,6 +5471,8 @@ async def _run_local_agent_turn_impl(
         checkpoint_partial_parts.clear()
         last_checkpoint_at = 0.0
         _persist_turn_checkpoint()
+        if hasattr(manager, "record_route_attempt"):
+            manager.record_route_attempt(resolved_provider, resolved_model)
         try:
             content, tool_calls, finish_reason = await _stream_completion_with_reconnect(
                 manager, client, provider=resolved_provider,
@@ -5323,7 +5481,7 @@ async def _run_local_agent_turn_impl(
                     _messages_with_vision_content(working_messages, vision_message_index, image_content_blocks)
                     if getattr(config, "vision_supported", False) else working_messages
                 ),
-                tools=tools, renderer=renderer,
+                tools=tools_for_round, renderer=renderer,
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
                 progress_callback=_remember_stream_delta,
             )
@@ -5334,6 +5492,8 @@ async def _run_local_agent_turn_impl(
                 partial_assistant=content,
                 status="running",
             )
+            if hasattr(manager, "record_route_success"):
+                manager.record_route_success(resolved_provider, resolved_model)
         except Exception as exc:
             # Automatic routing must treat provider/account failures as route
             # failures, not task failures. In particular, OpenRouter HTTP 402
@@ -5357,6 +5517,14 @@ async def _run_local_agent_turn_impl(
             # providers.py's routing logic in isolation, not this function),
             # which is how it went uncaught.
             failed_provider = resolved_provider
+            if hasattr(manager, "record_route_failure"):
+                manager.record_route_failure(
+                    failed_provider,
+                    resolved_model,
+                    root_exc,
+                    stream=True,
+                    tool_call=bool(tools),
+                )
             # Infra/account failures (rate limits, quota exhaustion, 5xx,
             # connection errors) must trigger cross-provider fallback even
             # when the user (or session default) explicitly pinned a
@@ -5470,6 +5638,10 @@ async def _run_local_agent_turn_impl(
                             "reason": "automatic provider fallback",
                         },
                     })
+                    if hasattr(manager, "record_fallback"):
+                        manager.record_fallback(failed_provider)
+                    if hasattr(manager, "record_route_attempt"):
+                        manager.record_route_attempt(candidate, candidate_model)
                     try:
                         checkpoint_partial_parts.clear()
                         if interrupted_partial:
@@ -5502,10 +5674,20 @@ async def _run_local_agent_turn_impl(
                         )
                         if isinstance(candidate_exc, _InterruptedCompletion):
                             interrupted_partial = candidate_exc.partial
+                        if hasattr(manager, "record_route_failure"):
+                            manager.record_route_failure(
+                                candidate,
+                                candidate_model,
+                                last_error,
+                                stream=True,
+                                tool_call=bool(tools),
+                            )
                         failed_provider = candidate
                         if not manager.is_retryable_provider_error(last_error):
                             break
                         continue
+                    if hasattr(manager, "record_route_success"):
+                        manager.record_route_success(candidate, candidate_model)
                     resolved_provider = candidate
                     config = candidate_config
                     client = candidate_client

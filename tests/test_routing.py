@@ -1,5 +1,11 @@
 from tamfis_code.providers import ProviderManager, ProviderType
-from tamfis_code.routing import TaskType, classify_task, is_explicit_read_only_request
+from tamfis_code.routing import (
+    ComplexityLevel,
+    TaskType,
+    classify_task,
+    estimate_complexity,
+    is_explicit_read_only_request,
+)
 from tamfis_code.orchestrator.planner import should_plan
 from tamfis_code.tool_policy import allowed_tools
 
@@ -9,6 +15,32 @@ def test_greeting_requires_no_tools_or_repo_context():
     assert profile.task_type == TaskType.CONVERSATION
     assert not profile.requires_tools
     assert not profile.requires_repository_context
+    assert profile.complexity == ComplexityLevel.TRIVIAL.value
+
+
+def test_complexity_uses_combined_task_shape_not_the_word_complex():
+    assert estimate_complexity(
+        "Explain this complex function.", TaskType.QUESTION,
+    ) in {ComplexityLevel.SIMPLE, ComplexityLevel.MODERATE}
+
+    request = (
+        "Trace the request from frontend through API and persistence; reproduce the race condition "
+        "from production logs, fix the root cause, add unit tests and integration tests, run the build, "
+        "then review backward compatibility across auth.py, api/router.py, db/models.py, and ui/App.tsx."
+    )
+    assert estimate_complexity(request, TaskType.DEBUG) == ComplexityLevel.VERY_COMPLEX
+
+
+def test_cross_file_multi_outcome_change_is_complex_without_complex_keyword():
+    profile = classify_task(
+        "Fix the request lifecycle across api.py and worker.py, add integration tests, "
+        "run the build, and verify the database persistence path."
+    )
+    assert profile.complexity in {
+        ComplexityLevel.COMPLEX.value,
+        ComplexityLevel.VERY_COMPLEX.value,
+    }
+    assert should_plan(profile, "Fix api.py and worker.py, add integration tests, and run the build")
 
 
 def test_closure_confirmation_is_conversation_not_debug():
@@ -137,41 +169,31 @@ def _manager_with(*providers):
     return manager
 
 
-def test_auto_uses_operator_approved_100_percent_weight_pool(monkeypatch):
+def test_auto_is_deterministically_nim_first_and_declares_85_percent_floor():
     manager = _manager_with(
         ProviderType.NVIDIA, ProviderType.OLLAMA_CLOUD, ProviderType.HF,
         ProviderType.OPENROUTER, ProviderType.GROK, ProviderType.TAMFIS,
     )
-    observed = {}
+    ProviderManager.reset_runtime_routing_state()
+    selected = [
+        manager._select_best_provider(classify_task("audit the whole repository"))
+        for _ in range(1000)
+    ]
 
-    def choose(population, *, weights, k):
-        observed.update(population=list(population), weights=list(weights), k=k)
-        return [ProviderType.NVIDIA]
-
-    monkeypatch.setattr("tamfis_code.providers.random.choices", choose)
-    selected = manager._select_best_provider(classify_task("audit the whole repository"))
-
-    assert selected == ProviderType.NVIDIA
-    assert observed == {
-        "population": [
-            ProviderType.NVIDIA, ProviderType.OLLAMA_CLOUD, ProviderType.HF,
-            ProviderType.OPENROUTER, ProviderType.GROK,
-        ],
-        "weights": [65, 20, 5, 5, 5],
-        "k": 1,
-    }
-    assert sum(observed["weights"]) == 100
+    assert set(selected) == {ProviderType.NVIDIA}
+    assert ProviderManager.AUTO_PROVIDER_WEIGHTS[ProviderType.NVIDIA] >= 85
+    assert sum(ProviderManager.AUTO_PROVIDER_WEIGHTS.values()) == 100
+    telemetry = manager.routing_telemetry()
+    assert telemetry.nim_eligible_requests == 1000
+    assert telemetry.nim_selected_requests == 1000
+    assert telemetry.nim_share_of_eligible == 1.0
 
 
-def test_legacy_ollama_auto_primary_flag_cannot_bypass_weighted_auto(monkeypatch):
+def test_legacy_ollama_auto_primary_flag_cannot_bypass_nim_first_auto(monkeypatch):
     monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
     manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
-    monkeypatch.setattr(
-        "tamfis_code.providers.random.choices",
-        lambda population, **_: [ProviderType.NVIDIA],
-    )
     resolved, _ = manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
     assert resolved == ProviderType.NVIDIA
 
@@ -210,13 +232,8 @@ def test_premium_ollama_remains_enabled_without_auto_primary(monkeypatch):
             manager.PROVIDERS[ProviderType.OLLAMA_CLOUD], profile
         ) == "kimi-k2.7-code:cloud"
 
-    # AUTO must use the weighted pool rather than force Ollama when this flag
-    # is off. Pin the random draw to NIM to verify resolve_route honours it.
+    # AUTO must use NIM-first rather than force Ollama when this flag is off.
     manager_with_nim = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
-    monkeypatch.setattr(
-        "tamfis_code.providers.random.choices",
-        lambda population, **_: [ProviderType.NVIDIA],
-    )
     resolved, _ = manager_with_nim.resolve_route(
         ProviderType.AUTO, classify_task("fix the API"),
     )
@@ -266,20 +283,11 @@ def test_unavailable_premium_ollama_is_removed_from_weighted_auto(monkeypatch):
     assert resolved == ProviderType.NVIDIA
 
 
-def test_auto_renormalizes_equal_weights_when_only_hf_and_openrouter_are_available(monkeypatch):
+def test_auto_uses_next_low_cost_provider_when_nim_is_unavailable():
     manager = _manager_with(ProviderType.OPENROUTER, ProviderType.HF)
-    observed = {}
-
-    def choose(population, *, weights, k):
-        observed.update(population=list(population), weights=list(weights), k=k)
-        return [ProviderType.OPENROUTER]
-
-    monkeypatch.setattr("tamfis_code.providers.random.choices", choose)
     assert manager._select_best_provider(
         classify_task("fix and refactor the code"),
-    ) == ProviderType.OPENROUTER
-    assert observed["population"] == [ProviderType.HF, ProviderType.OPENROUTER]
-    assert observed["weights"] == [5, 5]
+    ) == ProviderType.HF
 
 
 def test_openrouter_default_is_not_openai_family():
@@ -445,6 +453,21 @@ def test_plain_provider_404_without_response_detail_is_retryable():
         status_code = 404
 
     assert ProviderManager.is_retryable_provider_error(NotFoundError("Error code: 404"))
+
+
+def test_http_422_is_retryable_provider_failure():
+    # 422 was previously missing from the explicit retryable status set --
+    # it hit the same "Provider streaming failed ... type `continue` to
+    # resume" stop path as an unhandled 429 used to, with configured
+    # fallback routes sitting unused. Like the HTTP 400 degraded-function
+    # special-case, a 422 is a provider/model-specific rejection of this
+    # request's shape, not evidence the user's task itself is invalid --
+    # AUTO mode should route to the next provider, matching TamfisGPT's own
+    # multi-provider fallback behavior for the same status class.
+    class UnprocessableEntity(Exception):
+        status_code = 422
+
+    assert ProviderManager.is_retryable_provider_error(UnprocessableEntity("Unprocessable Entity"))
 
 
 def test_check_status_is_an_inspection_requiring_tools():

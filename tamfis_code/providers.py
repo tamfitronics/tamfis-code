@@ -4,11 +4,10 @@ Supports Ollama Cloud, xAI Grok, NVIDIA NIM, Hugging Face, OpenRouter, the
 TamfisGPT subscription API, and the internal Tier IV orchestration service
 through a canonical OpenAI-compatible client interface.
 
-Automatic standalone routing uses an operator-approved weighted pool after
-capability/availability filtering: NVIDIA NIM 40%; Ollama Cloud, Hugging Face,
-OpenRouter, and xAI Grok 15% each. Missing/ineligible routes are removed and
-the remaining weights are naturally renormalized. Tamfis/Tier IV/local routes
-remain explicitly selectable compatibility routes, not AUTO candidates.
+Automatic standalone routing is deterministic NVIDIA NIM-first after
+capability, configuration and live-health filtering. Other providers are an
+ordered resilience chain, not routine random traffic. Tamfis/Tier IV/local
+routes remain explicitly selectable compatibility routes, not AUTO candidates.
 
 Ollama Cloud is accessed through the signed-in local Ollama daemon at
 ``http://127.0.0.1:11434/v1``. The daemon forwards ``:cloud`` models to
@@ -22,7 +21,8 @@ packages use process/user configuration and never assume a builder's path.
 from __future__ import annotations
 
 import os
-import random
+import threading
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
@@ -189,7 +189,12 @@ def _task_needs_paid_tier(task_profile: Optional["TaskProfile"]) -> bool:
     task_type_value = getattr(task_type, "value", None) or str(task_type or "")
     if task_type_value in _PAID_TIER_TASK_TYPES:
         return True
-    return str(getattr(task_profile, "complexity", "")) == "high"
+    from .routing import ComplexityLevel, complexity_at_least
+
+    return complexity_at_least(
+        str(getattr(task_profile, "complexity", "")),
+        ComplexityLevel.COMPLEX,
+    )
 
 
 @dataclass(frozen=True)
@@ -225,6 +230,47 @@ class ProviderConfig:
     local_only: bool = False
 
 
+@dataclass
+class RouteHealth:
+    """Bounded runtime health for one provider/model route."""
+
+    failures: int = 0
+    successes: int = 0
+    circuit_open_until: float = 0.0
+    last_failure: float = 0.0
+    last_success: float = 0.0
+    last_error_class: str = ""
+
+
+@dataclass
+class RoutingTelemetry:
+    provider_requests: Dict[str, int] = field(default_factory=dict)
+    provider_successes: Dict[str, int] = field(default_factory=dict)
+    provider_failures: Dict[str, int] = field(default_factory=dict)
+    provider_fallbacks: Dict[str, int] = field(default_factory=dict)
+    provider_tool_failures: Dict[str, int] = field(default_factory=dict)
+    provider_stream_failures: Dict[str, int] = field(default_factory=dict)
+    nim_eligible_requests: int = 0
+    nim_selected_requests: int = 0
+    nim_successful_requests: int = 0
+    nim_fallback_requests: int = 0
+
+    @property
+    def nim_share_of_eligible(self) -> float:
+        if not self.nim_eligible_requests:
+            return 0.0
+        return self.nim_selected_requests / self.nim_eligible_requests
+
+
+_HEALTH_LOCK = threading.RLock()
+_ROUTE_HEALTH: Dict[tuple[str, str], RouteHealth] = {}
+_ROUTING_TELEMETRY = RoutingTelemetry()
+
+
+def _increment(mapping: Dict[str, int], key: str) -> None:
+    mapping[key] = mapping.get(key, 0) + 1
+
+
 class ProviderManager:
     """Initialise, inspect, rank, and access configured AI providers."""
 
@@ -243,28 +289,18 @@ class ProviderManager:
         ProviderType.TIER_IV,
     )
 
-    # AUTO is a weighted pool, not the fixed fallback order above. These
-    # operator-approved shares total exactly 100 when every route is healthy.
-    #
-    # REBALANCED 2026-09-01 (owner directive): the two plan-covered/free
-    # routes -- NVIDIA (default_model switched to moonshotai/kimi-k3
-    # below, live-verified 2026-08-30 -- real tool_calls + vision on this
-    # account) and Ollama Cloud (kimi-k2.7-code:cloud is included-plan,
-    # not extra-usage, see select_model() above) -- now get 85% combined,
-    # up from 55%. Separate xAI keys per app were considered and rejected:
-    # both TamfisGPT and Tamfis-Code bill the same xAI account regardless
-    # of which literal key value is used, so a second key would only
-    # split *visibility*, not spend. Cutting GROK's actual share (and
-    # HF/OpenRouter, also per-call billed) is what reduces spend. GROK
-    # specifically still gets a nonzero share, not 0: explicit --provider
-    # grok and Grok's own image/video capability edge stay reachable, just
-    # no longer AUTO's default coin-flip outcome for ordinary chat/coding.
+    # AUTO is deterministic NIM-first after capability and live-health
+    # filtering. These weights remain compatibility/diagnostic metadata;
+    # they are not used to randomly divert healthy NIM-eligible traffic.
+    # The >=85% economic target is therefore a floor: healthy eligible AUTO
+    # traffic is 100% NIM, while the ordered chain remains available for a
+    # genuine route failure or capability gap.
     AUTO_PROVIDER_WEIGHTS: dict[ProviderType, int] = {
-        ProviderType.NVIDIA: 65,
-        ProviderType.OLLAMA_CLOUD: 20,
+        ProviderType.NVIDIA: 85,
+        ProviderType.OLLAMA_CLOUD: 5,
         ProviderType.HF: 5,
-        ProviderType.OPENROUTER: 5,
-        ProviderType.GROK: 5,
+        ProviderType.OPENROUTER: 3,
+        ProviderType.GROK: 2,
     }
 
     PROVIDERS: Dict[ProviderType, ProviderConfig] = {
@@ -975,9 +1011,122 @@ class ProviderManager:
                 "kimi-k2.7-code:cloud",
             )
 
+        if config.name == "NVIDIA NIM":
+            # A failed NIM deployment is a model-route failure first, not a
+            # reason to abandon NIM. The bounded cooldown automatically
+            # makes it probe-eligible again later.
+            candidates = [config.default_model, *config.models]
+            for candidate in dict.fromkeys(item for item in candidates if item):
+                if self.route_is_healthy(ProviderType.NVIDIA, candidate):
+                    return candidate
+
         if config.free_model and not _task_needs_paid_tier(task_profile):
             return config.free_model
         return config.default_model
+
+    @staticmethod
+    def routing_telemetry() -> RoutingTelemetry:
+        return _ROUTING_TELEMETRY
+
+    @staticmethod
+    def reset_runtime_routing_state() -> None:
+        """Clear process-local health/metrics for deterministic diagnostics."""
+        with _HEALTH_LOCK:
+            _ROUTE_HEALTH.clear()
+            fresh = RoutingTelemetry()
+            _ROUTING_TELEMETRY.__dict__.update(fresh.__dict__)
+
+    @staticmethod
+    def route_is_healthy(provider: ProviderType, model: str = "") -> bool:
+        now = time.monotonic()
+        with _HEALTH_LOCK:
+            state = _ROUTE_HEALTH.get((provider.value, model or "*"))
+            return state is None or state.circuit_open_until <= now
+
+    def record_route_attempt(self, provider: ProviderType, model: str) -> None:
+        with _HEALTH_LOCK:
+            _increment(_ROUTING_TELEMETRY.provider_requests, provider.value)
+
+    def record_route_success(self, provider: ProviderType, model: str) -> None:
+        now = time.monotonic()
+        with _HEALTH_LOCK:
+            state = _ROUTE_HEALTH.setdefault((provider.value, model), RouteHealth())
+            state.successes += 1
+            state.failures = 0
+            state.circuit_open_until = 0.0
+            state.last_success = now
+            provider_state = _ROUTE_HEALTH.setdefault((provider.value, "*"), RouteHealth())
+            provider_state.failures = 0
+            provider_state.circuit_open_until = 0.0
+            provider_state.last_success = now
+            _increment(_ROUTING_TELEMETRY.provider_successes, provider.value)
+            if provider == ProviderType.NVIDIA:
+                _ROUTING_TELEMETRY.nim_successful_requests += 1
+
+    def record_route_failure(
+        self,
+        provider: ProviderType,
+        model: str,
+        exc: Exception,
+        *,
+        stream: bool = False,
+        tool_call: bool = False,
+    ) -> None:
+        status = self.provider_error_status(exc)
+        deterministic = status in {400, 401, 402, 403, 404}
+        cooldown = 300.0 if deterministic else 30.0
+        now = time.monotonic()
+        with _HEALTH_LOCK:
+            state = _ROUTE_HEALTH.setdefault((provider.value, model), RouteHealth())
+            state.failures += 1
+            state.last_failure = now
+            state.last_error_class = type(exc).__name__
+            state.circuit_open_until = max(state.circuit_open_until, now + cooldown)
+            # Non-NIM providers currently expose a single selected route per
+            # task, so cool the provider immediately. NIM is demoted only
+            # after every configured sibling model is unavailable.
+            provider_config = self.PROVIDERS.get(provider)
+            configured_models = list(dict.fromkeys(
+                [
+                    getattr(provider_config, "default_model", ""),
+                    *(getattr(provider_config, "models", ()) or ()),
+                ]
+            ))
+            all_models_unhealthy = bool(configured_models) and all(
+                not self.route_is_healthy(provider, candidate)
+                for candidate in configured_models if candidate
+            )
+            if provider != ProviderType.NVIDIA or all_models_unhealthy:
+                provider_state = _ROUTE_HEALTH.setdefault((provider.value, "*"), RouteHealth())
+                provider_state.failures += 1
+                provider_state.last_failure = now
+                provider_state.last_error_class = type(exc).__name__
+                provider_state.circuit_open_until = max(
+                    provider_state.circuit_open_until, now + cooldown,
+                )
+            _increment(_ROUTING_TELEMETRY.provider_failures, provider.value)
+            if stream:
+                _increment(_ROUTING_TELEMETRY.provider_stream_failures, provider.value)
+            if tool_call:
+                _increment(_ROUTING_TELEMETRY.provider_tool_failures, provider.value)
+
+    def record_fallback(self, provider: ProviderType) -> None:
+        with _HEALTH_LOCK:
+            _increment(_ROUTING_TELEMETRY.provider_fallbacks, provider.value)
+            if provider == ProviderType.NVIDIA:
+                _ROUTING_TELEMETRY.nim_fallback_requests += 1
+
+    def provider_health_status(self, provider: ProviderType) -> str:
+        if not self.route_is_healthy(provider, "*"):
+            return "circuit_open"
+        config = self.PROVIDERS.get(provider)
+        models = list(dict.fromkeys([
+            getattr(config, "default_model", ""),
+            *(getattr(config, "models", ()) or ()),
+        ]))
+        if any(model and not self.route_is_healthy(provider, model) for model in models):
+            return "degraded"
+        return "healthy"
 
     def resolve_route(
         self,
@@ -1026,7 +1175,7 @@ class ProviderManager:
         quality_mode: str = "quality",
         allowed_providers: Optional[tuple[ProviderType, ...]] = None,
     ) -> ProviderType:
-        """Select from the capability-eligible weighted AUTO pool."""
+        """Select the first healthy capability-compatible AUTO provider."""
 
         available = [
             provider
@@ -1034,6 +1183,7 @@ class ProviderManager:
             if provider in self.AUTO_PROVIDER_WEIGHTS
             if allowed_providers is None or provider in allowed_providers
             if provider in self.clients and self._has_valid_api_key(provider)
+            if self.route_is_healthy(provider, "*")
         ]
 
         if not available:
@@ -1062,8 +1212,14 @@ class ProviderManager:
             eligible = candidates
 
         del quality_mode  # retained in the public signature for compatibility
-        weights = [self.AUTO_PROVIDER_WEIGHTS[provider] for provider in eligible]
-        return random.choices(eligible, weights=weights, k=1)[0]
+        with _HEALTH_LOCK:
+            if ProviderType.NVIDIA in eligible:
+                _ROUTING_TELEMETRY.nim_eligible_requests += 1
+        selected = next(provider for provider in self.routing_order if provider in eligible)
+        with _HEALTH_LOCK:
+            if selected == ProviderType.NVIDIA:
+                _ROUTING_TELEMETRY.nim_selected_requests += 1
+        return selected
 
     @staticmethod
     def provider_error_status(exc: Exception) -> Optional[int]:
@@ -1108,6 +1264,20 @@ class ProviderManager:
                 404,
                 408,
                 409,
+                # 422 (Unprocessable Entity) was previously NOT in this set,
+                # so it hit the exact "Provider streaming failed ... type
+                # `continue` to resume" stop path documented below in
+                # runner_local.py -- with configured fallback routes sitting
+                # unused, same class of bug as the 429 case that comment
+                # describes. Like the HTTP 400 special-case above, a 422
+                # here is a provider/model-specific rejection of this
+                # request's shape (an unsupported tool-schema field, a
+                # parameter that provider doesn't accept), not evidence the
+                # user's actual task is malformed -- the next provider may
+                # well accept the same logical request. Route around it
+                # instead of stopping, matching TamfisGPT's own multi-
+                # provider fallback behavior for the same status class.
+                422,
                 425,
                 429,
             } or status >= 500
@@ -1210,12 +1380,34 @@ class ProviderManager:
         )
 
         candidates: List[ProviderType] = []
+        # A failed NIM model must not immediately eject the task from NIM.
+        # The caller records the failed route before asking for candidates;
+        # select_model() will therefore choose a healthy sibling deployment.
+        if current == ProviderType.NVIDIA:
+            config = self.PROVIDERS[current]
+            now = time.monotonic()
+            with _HEALTH_LOCK:
+                failed_nim_model_exists = any(
+                    provider_name == current.value
+                    and model_name != "*"
+                    and state.circuit_open_until > now
+                    for (provider_name, model_name), state in _ROUTE_HEALTH.items()
+                )
+            healthy_models = [
+                model
+                for model in dict.fromkeys([config.default_model, *config.models])
+                if model and self.route_is_healthy(current, model)
+            ]
+            if failed_nim_model_exists and healthy_models:
+                candidates.append(current)
         for provider in self.routing_order:
             if provider == current:
                 continue
             if provider not in self.clients:
                 continue
             if not self._has_valid_api_key(provider):
+                continue
+            if not self.route_is_healthy(provider, "*"):
                 continue
 
             config = self.PROVIDERS[provider]
@@ -1241,7 +1433,8 @@ class ProviderManager:
             enabled = self.config.get(provider_type.value, True)
             valid_key = self._has_valid_api_key(provider_type)
             client_initialised = provider_type in self.clients
-            available = enabled and valid_key and client_initialised
+            health_status = self.provider_health_status(provider_type)
+            available = enabled and valid_key and client_initialised and health_status != "circuit_open"
 
             key = self._get_api_key(provider_type)
             key_preview = "local"
@@ -1254,7 +1447,8 @@ class ProviderManager:
                     "type": provider_type.value,
                     "enabled": enabled,
                     "available": available,
-                    "healthy": available,
+                    "healthy": available and health_status == "healthy",
+                    "health_status": health_status if enabled and valid_key else "unconfigured",
                     "client_initialised": client_initialised,
                     "default_model": config.default_model,
                     "models": list(config.models),
@@ -1357,6 +1551,7 @@ class ProviderManager:
             extra_body.setdefault("mode", _tier_iv_mode_for_task(task_profile))
             request_kwargs["extra_body"] = extra_body
 
+        self.record_route_attempt(resolved, selected_model)
         try:
             response = await client.chat.completions.create(**request_kwargs)
 
@@ -1367,15 +1562,18 @@ class ProviderManager:
                     content = chunk.choices[0].delta.content
                     if content:
                         yield content
+                self.record_route_success(resolved, selected_model)
                 return
 
             if response.choices:
                 content = response.choices[0].message.content
                 if content:
                     yield content
+            self.record_route_success(resolved, selected_model)
             return
 
         except Exception as exc:
+            self.record_route_failure(resolved, selected_model, exc, stream=stream)
             # FIX 2026-08-07: `provider != ProviderType.AUTO` used to block
             # fallback entirely whenever a specific provider was resolved
             # (including the app's ordinary configured default, not just an
@@ -1411,6 +1609,7 @@ class ProviderManager:
                 allow_premium_primary=self.is_quota_or_rate_limit_error(exc),
             ):
                 try:
+                    self.record_fallback(resolved)
                     # Do not carry a model identifier across providers.
                     async for chunk in self.chat_completion(
                         fallback,
