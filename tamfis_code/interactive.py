@@ -1206,7 +1206,14 @@ async def run_interactive(
                     "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
                 )
             continue
-        if text == "/sidebar" or text.startswith("/sidebar "):
+        # Case-insensitive prefix match: mobile SSH clients (Termius in
+        # particular) commonly autocapitalize the first letter after "/"
+        # on their virtual keyboard, so a typed "/sidebar" can arrive here
+        # as "/Sidebar" -- every other slash-command below stays
+        # case-sensitive; this one's scoped narrowly to unblock exactly
+        # the symptom reported (typed /sidebar commands doing nothing on
+        # Termius) without changing matching behavior for anything else.
+        if text.lower() == "/sidebar" or text.lower().startswith("/sidebar "):
             action = text[len("/sidebar"):].strip().lower()
             if action in {"", "toggle"}:
                 sidebar.visible = not sidebar.visible
