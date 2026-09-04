@@ -233,9 +233,9 @@ $ <command>            explicit shell command
                       only the recent few turns in full, so a long REPL stays light in the
                       terminal and the next turn's context (Claude Code/Codex-style compaction)
 /summary             show a structured recap of the conversation so far without compressing it
-/sidebar [next|prev|close]
-                      toggle the session sidebar; Ctrl+B toggles it, < opens (then pages back),
-                      > closes it
+/sidebar [next|prev|close|clear <id> [--force]]
+                      toggle the session sidebar or clear a session you don't need from it;
+                      Ctrl+B toggles it, < opens (then pages back), > closes it
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
@@ -1222,8 +1222,43 @@ async def run_interactive(
                 sidebar.visible = False
                 console.print("[dim]Sidebar closed.[/dim]")
                 continue
+            elif action.startswith("clear"):
+                # /sidebar clear <id> [--force]: removes a session the user
+                # doesn't need from the sidebar's own listing (SESSION
+                # column) without leaving the REPL -- wraps the same
+                # local_state.clear_session_state() the `tamfis-code
+                # clear-session` CLI subcommand already uses, so the
+                # safety behavior (won't clear an actively-running session
+                # without --force) matches exactly.
+                clear_args = action[len("clear"):].split()
+                force = "--force" in clear_args
+                clear_args = [a for a in clear_args if a != "--force"]
+                if len(clear_args) != 1 or not clear_args[0].isdigit():
+                    print_error(console, "Usage: /sidebar clear <session_id> [--force]")
+                    continue
+                target_id = int(clear_args[0])
+                if target_id == workspace.session_id:
+                    print_error(console, "Can't clear the session you're currently in.")
+                    continue
+                if target_id not in local_state.all_known_session_ids():
+                    print_error(console, f"No known local session {target_id}.")
+                    continue
+                target_state = local_state.get_session_state(target_id)
+                if local_state.is_session_actively_running(target_state) and not force:
+                    print_error(
+                        console,
+                        f"Session {target_id} appears active. Stop its task first, "
+                        "or rerun as `/sidebar clear <id> --force`.",
+                    )
+                    continue
+                local_state.clear_session_state(target_id)
+                console.print(
+                    f"[green]Cleared local session {target_id}.[/green] "
+                    "[dim]Recovery checkpoints and evidence were retained.[/dim]"
+                )
+                sidebar.page = 0
             else:
-                print_error(console, "Usage: /sidebar [next|prev|close]")
+                print_error(console, "Usage: /sidebar [next|prev|close|clear <id>]")
                 continue
             if sidebar.visible:
                 render_sidebar(console, workspace.session_id, sidebar)
