@@ -1558,30 +1558,56 @@ class ProviderManager:
         # with no **kwargs passthrough, so it must travel via extra_body,
         # which the SDK merges into the literal outgoing JSON body.
         if resolved == ProviderType.TIER_IV:
+            from .runtime.telemetry import current_trace_id
             extra_body = dict(request_kwargs.get("extra_body") or {})
             extra_body.setdefault("mode", _tier_iv_mode_for_task(task_profile))
+            extra_body.setdefault("trace_id", current_trace_id())
+            metadata = dict(extra_body.get("metadata") or {})
+            metadata.setdefault("trace_id", current_trace_id())
+            metadata.setdefault("source_system", "tamfis-code")
+            metadata.setdefault("ai_component", "main_completion")
+            extra_body["metadata"] = metadata
             request_kwargs["extra_body"] = extra_body
 
         self.record_route_attempt(resolved, selected_model)
+        from .runtime.telemetry import record_usage, span
         try:
-            response = await client.chat.completions.create(**request_kwargs)
+            with span(
+                "provider.invoke",
+                provider=resolved.value,
+                model=selected_model,
+                operation="chat_completion",
+            ):
+                response = await client.chat.completions.create(**request_kwargs)
 
-            if stream:
-                async for chunk in response:
-                    if not chunk.choices:
-                        continue
-                    content = chunk.choices[0].delta.content
+                if stream:
+                    async for chunk in response:
+                        usage = getattr(chunk, "usage", None)
+                        if usage is not None:
+                            record_usage(input_tokens=getattr(usage, "prompt_tokens", None),
+                                         output_tokens=getattr(usage, "completion_tokens", None),
+                                         reasoning_tokens=getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None),
+                                         cached_input_tokens=getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None))
+                        if not chunk.choices:
+                            continue
+                        content = chunk.choices[0].delta.content
+                        if content:
+                            yield content
+                    self.record_route_success(resolved, selected_model)
+                    return
+
+                if response.choices:
+                    content = response.choices[0].message.content
                     if content:
                         yield content
+                usage = getattr(response, "usage", None)
+                if usage is not None:
+                    record_usage(input_tokens=getattr(usage, "prompt_tokens", None),
+                                 output_tokens=getattr(usage, "completion_tokens", None),
+                                 reasoning_tokens=getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None),
+                                 cached_input_tokens=getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None))
                 self.record_route_success(resolved, selected_model)
                 return
-
-            if response.choices:
-                content = response.choices[0].message.content
-                if content:
-                    yield content
-            self.record_route_success(resolved, selected_model)
-            return
 
         except Exception as exc:
             self.record_route_failure(resolved, selected_model, exc, stream=stream)

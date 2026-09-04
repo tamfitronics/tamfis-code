@@ -17,6 +17,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, Optional
 from .controller import ExecutionController
 from .journal import RuntimeEvent, append_event
 from .checkpoint import ExecutionCheckpoint, save_checkpoint
+from .telemetry import trace
 from .cognitive import EvidenceGraph, EvidenceNode, TaskContract
 from .memory import relevant_memories
 from .reviewer import IndependentReviewer
@@ -154,106 +155,107 @@ class UnifiedAgentRuntime:
                 # where execution happens.
                 request.workspace_root = str(handle.path)
             started = time.monotonic()
-            self._append_event(RuntimeEvent(
-                event="execution_started", execution_id=execution_id, mode=request.mode.value,
-                session_id=request.session_id, timestamp=_utc_now(), status="running",
-                objective=request.objective, workspace_root=request.workspace_root, metadata=request.metadata,
-            ))
-            self._save_checkpoint(ExecutionCheckpoint(
-                execution_id=execution_id, session_id=request.session_id, mode=request.mode.value,
-                objective=request.objective, workspace_root=request.workspace_root, status="running",
-                metadata={**request.metadata, "task_contract": self.task_contract.to_dict()},
-            ))
-            self._active_task = asyncio.create_task(operation(), name=f"tamfis:{request.mode.value}:{request.session_id}")
-            try:
-                result = await self._active_task
-            except asyncio.CancelledError:
-                self.controller.fail("Execution cancelled by user.")
-                if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
-                    local_state.mark_turn_checkpoint_interrupted(
-                        request.session_id, error="Execution cancelled by user.",
-                    )
-                duration_ms = int((time.monotonic() - started) * 1000)
-                self.history.append(ExecutionRecord(request.mode, "cancelled", request.session_id, error="cancelled", execution_id=execution_id, duration_ms=duration_ms))
-                self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="cancelled", objective=request.objective, workspace_root=request.workspace_root, error="cancelled", duration_ms=duration_ms))
-                self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="cancelled", unresolved=["Execution cancelled by user."], metadata=request.metadata))
-                raise
-            except Exception as exc:
-                message = f"{type(exc).__name__}: {exc}"
-                self.controller.fail(message)
-                if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
-                    # Preserve the last atomically written local turn instead
-                    # of allowing a provider disconnect or unexpected worker
-                    # failure to look like an unstarted turn on resume.
-                    local_state.mark_turn_checkpoint_interrupted(
-                        request.session_id, error=message,
-                    )
-                duration_ms = int((time.monotonic() - started) * 1000)
-                self.history.append(ExecutionRecord(request.mode, "failed", request.session_id, error=message, execution_id=execution_id, duration_ms=duration_ms))
-                self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="failed", objective=request.objective, workspace_root=request.workspace_root, error=message, duration_ms=duration_ms))
-                self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="failed", unresolved=[message], metadata=request.metadata))
-                raise
-            else:
-                status = str(getattr(result, "status", "completed"))
-                summary = str(getattr(result, "summary", "") or "")
-                error = getattr(result, "error", None)
-                changed_files = list(getattr(result, "changed_files", []) or [])
-                validations = list(getattr(result, "validations", []) or [])
-                # Adapters should provide these fields, but derive them from
-                # the canonical session ledger as a compatibility bridge for
-                # both the legacy remote stream and older local outcomes.
-                if request.session_id and (not changed_files or not validations):
-                    try:
-                        current_state = local_state.get_session_state(request.session_id)
-                        if not changed_files:
-                            changed_files = list(dict.fromkeys(
-                                str(item.get("path"))
-                                for item in current_state.modified_files
-                                if item.get("path") and str(item.get("mutation_id")) not in baseline_mutation_ids
-                            ))
-                        if not validations:
-                            validations = list(current_state.validation_results[baseline_validation_count:])
-                    except OSError:
-                        pass
-                if hasattr(result, "changed_files"):
-                    result.changed_files = changed_files
-                if hasattr(result, "validations"):
-                    result.validations = validations
-                self.evidence_graph.add(EvidenceNode(
-                    "completion", "completion_summary", summary or status, "execution_result", ["objective"]
+            with trace("cli.task", mode=request.mode.value):
+                self._append_event(RuntimeEvent(
+                    event="execution_started", execution_id=execution_id, mode=request.mode.value,
+                    session_id=request.session_id, timestamp=_utc_now(), status="running",
+                    objective=request.objective, workspace_root=request.workspace_root, metadata=request.metadata,
                 ))
-                self.evidence_graph.add(EvidenceNode(
-                    "observation", "tool_observation", "Execution produced a result", "unified_runtime", ["evidence"]
+                self._save_checkpoint(ExecutionCheckpoint(
+                    execution_id=execution_id, session_id=request.session_id, mode=request.mode.value,
+                    objective=request.objective, workspace_root=request.workspace_root, status="running",
+                    metadata={**request.metadata, "task_contract": self.task_contract.to_dict()},
                 ))
-                for index, path in enumerate(changed_files):
+                self._active_task = asyncio.create_task(operation(), name=f"tamfis:{request.mode.value}:{request.session_id}")
+                try:
+                    result = await self._active_task
+                except asyncio.CancelledError:
+                    self.controller.fail("Execution cancelled by user.")
+                    if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
+                        local_state.mark_turn_checkpoint_interrupted(
+                            request.session_id, error="Execution cancelled by user.",
+                        )
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    self.history.append(ExecutionRecord(request.mode, "cancelled", request.session_id, error="cancelled", execution_id=execution_id, duration_ms=duration_ms))
+                    self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="cancelled", objective=request.objective, workspace_root=request.workspace_root, error="cancelled", duration_ms=duration_ms))
+                    self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="cancelled", unresolved=["Execution cancelled by user."], metadata=request.metadata))
+                    raise
+                except Exception as exc:
+                    message = f"{type(exc).__name__}: {exc}"
+                    self.controller.fail(message)
+                    if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
+                        # Preserve the last atomically written local turn instead
+                        # of allowing a provider disconnect or unexpected worker
+                        # failure to look like an unstarted turn on resume.
+                        local_state.mark_turn_checkpoint_interrupted(
+                            request.session_id, error=message,
+                        )
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    self.history.append(ExecutionRecord(request.mode, "failed", request.session_id, error=message, execution_id=execution_id, duration_ms=duration_ms))
+                    self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="failed", objective=request.objective, workspace_root=request.workspace_root, error=message, duration_ms=duration_ms))
+                    self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="failed", unresolved=[message], metadata=request.metadata))
+                    raise
+                else:
+                    status = str(getattr(result, "status", "completed"))
+                    summary = str(getattr(result, "summary", "") or "")
+                    error = getattr(result, "error", None)
+                    changed_files = list(getattr(result, "changed_files", []) or [])
+                    validations = list(getattr(result, "validations", []) or [])
+                    # Adapters should provide these fields, but derive them from
+                    # the canonical session ledger as a compatibility bridge for
+                    # both the legacy remote stream and older local outcomes.
+                    if request.session_id and (not changed_files or not validations):
+                        try:
+                            current_state = local_state.get_session_state(request.session_id)
+                            if not changed_files:
+                                changed_files = list(dict.fromkeys(
+                                    str(item.get("path"))
+                                    for item in current_state.modified_files
+                                    if item.get("path") and str(item.get("mutation_id")) not in baseline_mutation_ids
+                                ))
+                            if not validations:
+                                validations = list(current_state.validation_results[baseline_validation_count:])
+                        except OSError:
+                            pass
+                    if hasattr(result, "changed_files"):
+                        result.changed_files = changed_files
+                    if hasattr(result, "validations"):
+                        result.validations = validations
                     self.evidence_graph.add(EvidenceNode(
-                        f"mutation-{index}", "file_mutation", str(path), "mutation_ledger", ["mutation"]
+                        "completion", "completion_summary", summary or status, "execution_result", ["objective"]
                     ))
-                for index, validation in enumerate(validations):
-                    passed = bool(validation.get("passed", validation.get("success", False))) if isinstance(validation, dict) else False
-                    if passed:
+                    self.evidence_graph.add(EvidenceNode(
+                        "observation", "tool_observation", "Execution produced a result", "unified_runtime", ["evidence"]
+                    ))
+                    for index, path in enumerate(changed_files):
                         self.evidence_graph.add(EvidenceNode(
-                            f"validation-{index}", "validation_result", str(validation), "validator", ["validation"]
+                            f"mutation-{index}", "file_mutation", str(path), "mutation_ledger", ["mutation"]
                         ))
-                if self.task_contract is not None:
-                    self.last_review = IndependentReviewer().review(self.task_contract, self.evidence_graph)
-                    if status == "completed" and not self.last_review.approved:
-                        status = "partial"
-                        missing = self.last_review.missing_requirements + self.last_review.warnings
-                        error = "Independent review blocked completion: " + "; ".join(missing)
-                if status == "completed":
-                    self.controller.complete()
-                elif status not in {"cancelled", "partial", "blocked", "no_changes_required"}:
-                    self.controller.fail(str(error or status))
-                duration_ms = int((time.monotonic() - started) * 1000)
-                self.history.append(ExecutionRecord(request.mode, status, request.session_id, summary, error, execution_id, duration_ms))
-                self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status=status, objective=request.objective, workspace_root=request.workspace_root, summary=summary, error=str(error or ""), duration_ms=duration_ms))
-                self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status=status, changed_files=changed_files, validations=validations, unresolved=[str(error)] if error else [], metadata={**request.metadata, "task_contract": self.task_contract.to_dict() if self.task_contract else None, "evidence_graph": self.evidence_graph.to_dict(), "independent_review": {"approved": self.last_review.approved, "missing_requirements": self.last_review.missing_requirements, "warnings": self.last_review.warnings} if self.last_review else None}))
-                return result
-            finally:
-                self._active_task = None
-                self._active_request = None
-                self._runner_task = None
+                    for index, validation in enumerate(validations):
+                        passed = bool(validation.get("passed", validation.get("success", False))) if isinstance(validation, dict) else False
+                        if passed:
+                            self.evidence_graph.add(EvidenceNode(
+                                f"validation-{index}", "validation_result", str(validation), "validator", ["validation"]
+                            ))
+                    if self.task_contract is not None:
+                        self.last_review = IndependentReviewer().review(self.task_contract, self.evidence_graph)
+                        if status == "completed" and not self.last_review.approved:
+                            status = "partial"
+                            missing = self.last_review.missing_requirements + self.last_review.warnings
+                            error = "Independent review blocked completion: " + "; ".join(missing)
+                    if status == "completed":
+                        self.controller.complete()
+                    elif status not in {"cancelled", "partial", "blocked", "no_changes_required"}:
+                        self.controller.fail(str(error or status))
+                    duration_ms = int((time.monotonic() - started) * 1000)
+                    self.history.append(ExecutionRecord(request.mode, status, request.session_id, summary, error, execution_id, duration_ms))
+                    self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status=status, objective=request.objective, workspace_root=request.workspace_root, summary=summary, error=str(error or ""), duration_ms=duration_ms))
+                    self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status=status, changed_files=changed_files, validations=validations, unresolved=[str(error)] if error else [], metadata={**request.metadata, "task_contract": self.task_contract.to_dict() if self.task_contract else None, "evidence_graph": self.evidence_graph.to_dict(), "independent_review": {"approved": self.last_review.approved, "missing_requirements": self.last_review.missing_requirements, "warnings": self.last_review.warnings} if self.last_review else None}))
+                    return result
+                finally:
+                    self._active_task = None
+                    self._active_request = None
+                    self._runner_task = None
 
     def cancel(self) -> bool:
         task = (

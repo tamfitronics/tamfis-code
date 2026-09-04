@@ -1423,16 +1423,18 @@ async def _stream_completion_with_reconnect(
                 progress_callback(delta)
 
         try:
-            content, calls, finish_reason = await _stream_one_completion(
-                client,
-                model=model,
-                messages=request_messages,
-                tools=tools,
-                renderer=renderer,
-                reasoning_effort=reasoning_effort,
-                emit=not retrying_partial,
-                progress_callback=remember_attempt,
-            )
+            from .runtime.telemetry import provider_context
+            with provider_context(provider.value):
+                content, calls, finish_reason = await _stream_one_completion(
+                    client,
+                    model=model,
+                    messages=request_messages,
+                    tools=tools,
+                    renderer=renderer,
+                    reasoning_effort=reasoning_effort,
+                    emit=not retrying_partial,
+                    progress_callback=remember_attempt,
+                )
             if retrying_partial:
                 novel = _novel_continuation(durable_partial, content)
                 if novel:
@@ -2352,7 +2354,7 @@ async def _recover_audit_plan_file(
     return True
 
 
-async def _nonstream_one_completion(
+async def _nonstream_one_completion_impl(
     client,
     *,
     model: str,
@@ -2388,6 +2390,27 @@ async def _nonstream_one_completion(
             )
         )
     return content, calls
+
+
+async def _nonstream_one_completion(
+    client,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    provider: Optional[ProviderType] = None,
+) -> tuple[str, list[_StreamedToolCall]]:
+    """Trace a compatible non-streaming provider request without its payload."""
+    from .runtime.telemetry import current_provider, span
+
+    provider_name = (
+        provider.value if isinstance(provider, ProviderType)
+        else str(provider or current_provider() or "unknown")
+    )
+    with span("provider.invoke", provider=provider_name, model=model, operation="completion"):
+        return await _nonstream_one_completion_impl(
+            client, model=model, messages=messages, tools=tools,
+        )
 
 
 async def _recover_empty_continuation(
@@ -3267,7 +3290,7 @@ def _insufficient_novel_evidence(rounds: int, novel_observations: int) -> bool:
     return rounds >= 20 and novel_observations < max(4, rounds // 5)
 
 
-async def _stream_one_completion(
+async def _stream_one_completion_impl(
     client, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     renderer: StreamRenderer, reasoning_effort: Optional[str] = None, emit: bool = True,
     progress_callback: Optional[Callable[[str], None]] = None,
@@ -3384,6 +3407,13 @@ async def _stream_one_completion(
                 finish_reason = "live_steering"
                 break
             chunk = next_chunk_task.result()
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                from .runtime.telemetry import record_usage
+                record_usage(input_tokens=getattr(usage, "prompt_tokens", None),
+                             output_tokens=getattr(usage, "completion_tokens", None),
+                             reasoning_tokens=getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None),
+                             cached_input_tokens=getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None))
         except StopAsyncIteration:
             break
         except Exception as exc:
@@ -3487,6 +3517,38 @@ async def _stream_one_completion(
     )
     final_content = "".join(content_parts)
     return final_content, ordered_calls, finish_reason
+
+
+async def _stream_one_completion(
+    client,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    renderer: StreamRenderer,
+    reasoning_effort: Optional[str] = None,
+    emit: bool = True,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    provider: Optional[ProviderType] = None,
+) -> tuple[str, list[_StreamedToolCall], Optional[str]]:
+    """Trace a compatible streaming provider request without its payload."""
+    from .runtime.telemetry import current_provider, span
+
+    provider_name = (
+        provider.value if isinstance(provider, ProviderType)
+        else str(provider or current_provider() or "unknown")
+    )
+    with span("provider.invoke", provider=provider_name, model=model, operation="stream"):
+        return await _stream_one_completion_impl(
+            client,
+            model=model,
+            messages=messages,
+            tools=tools,
+            renderer=renderer,
+            reasoning_effort=reasoning_effort,
+            emit=emit,
+            progress_callback=progress_callback,
+        )
 
 
 # Internal context rollover: a segment can be checkpointed out to durable
@@ -4066,10 +4128,12 @@ async def _attempt_reasoning_plan(
     last_exc: Optional[Exception] = None
     while True:
         try:
-            content, _tool_calls, finish_reason = await _stream_one_completion(
-                attempt_client, model=attempt_model, messages=prompt_messages, tools=[],
-                renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
-            )
+            from .runtime.telemetry import provider_context
+            with provider_context(provider.value if provider is not None else "unknown"):
+                content, _tool_calls, finish_reason = await _stream_one_completion(
+                    attempt_client, model=attempt_model, messages=prompt_messages, tools=[],
+                    renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
+                )
             break
         except Exception as exc:
             last_exc = exc

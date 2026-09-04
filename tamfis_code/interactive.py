@@ -234,7 +234,8 @@ $ <command>            explicit shell command
                       terminal and the next turn's context (Claude Code/Codex-style compaction)
 /summary             show a structured recap of the conversation so far without compressing it
 /sidebar [next|prev|close]
-                      toggle the session sidebar; Ctrl+B toggles it and </> scroll pages
+                      toggle the session sidebar; Ctrl+B toggles it, < opens (then pages back),
+                      > closes it
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
@@ -407,7 +408,7 @@ def render_sidebar(console: Console, session_id: int, sidebar: _SidebarState) ->
     console.print(Panel(
         table,
         title=f"Sessions · {sidebar.page + 1}/{page_count}",
-        subtitle="< previous · > next · Ctrl+B or /sidebar close closes",
+        subtitle="< previous page · > or Ctrl+B closes · /sidebar next for forward paging",
         border_style="cyan",
         expand=False,
     ))
@@ -906,20 +907,29 @@ async def run_interactive(
         event.app.exit(result=_SIDEBAR_ACTION)
 
     @bindings.add(">")
-    def _sidebar_next(event) -> None:
+    def _sidebar_close(event) -> None:
+        # > closes the sidebar when it's open. When it's already closed,
+        # > has nothing to close, so it falls back to normal typing --
+        # matching how < already behaved before this key took on an
+        # open/close role too.
         if sidebar.visible:
-            sidebar.page += 1
+            sidebar.visible = False
             event.app.exit(result=_SIDEBAR_ACTION)
             return
         event.current_buffer.insert_text(">")
 
     @bindings.add("<")
-    def _sidebar_previous(event) -> None:
-        if sidebar.visible:
-            sidebar.page = max(0, sidebar.page - 1)
+    def _sidebar_open(event) -> None:
+        # < opens the sidebar when it's closed. If it's already open, <
+        # still pages backward -- forward paging remains available via
+        # /sidebar next since > is now dedicated to closing.
+        if not sidebar.visible:
+            sidebar.visible = True
+            sidebar.page = 0
             event.app.exit(result=_SIDEBAR_ACTION)
             return
-        event.current_buffer.insert_text("<")
+        sidebar.page = max(0, sidebar.page - 1)
+        event.app.exit(result=_SIDEBAR_ACTION)
 
     @bindings.add("tab")
     def _accept_next_suggestion(event) -> None:

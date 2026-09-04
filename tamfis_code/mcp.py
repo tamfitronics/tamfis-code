@@ -850,6 +850,15 @@ class MCPServer:
     async def call_tool(
         self, name: str, parameters: Dict[str, Any], *, extra_kwargs: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
+        """Call a tool under the active task trace without recording arguments."""
+        from .runtime.telemetry import span
+
+        with span("tool.invoke", tool_name=name):
+            return await self._call_tool_impl(name, parameters, extra_kwargs=extra_kwargs)
+
+    async def _call_tool_impl(
+        self, name: str, parameters: Dict[str, Any], *, extra_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
         """Call a tool by name.
 
         `extra_kwargs` (e.g. execute_command's background_signal) is passed
