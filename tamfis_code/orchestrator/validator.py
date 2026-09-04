@@ -60,6 +60,12 @@ _MUTATION_CLAIM_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NEGATED_MUTATION_PREFIX_RE = re.compile(
+    r"\b(?:no|zero)\s+(?:files?|code|source|configuration|changes?)\b[^.!?\n]{0,120}$|"
+    r"\b(?:did\s+not|didn't|was\s+not|were\s+not|weren't)\b[^.!?\n]{0,80}$",
+    re.IGNORECASE,
+)
+
 _SERVICE_RESTART_CLAIM_RE = re.compile(
     r"\b(?:i\s+(?:have\s+)?(?:restarted|reloaded)|(?:system|service|server|worker|backend)\s+restart(?:ed)?|"
     r"(?:service|server|worker|backend)\s+(?:is|was)\s+(?:now\s+)?live)\b",
@@ -171,6 +177,27 @@ def _claims_completed_inspection(final_text: str) -> bool:
     return bool(_UNSUPPORTED_INSPECTION_CLAIM_RE.search(final_text or ""))
 
 
+def _claims_mutation(final_text: str) -> bool:
+    """Distinguish a real mutation claim from an explicit no-change report.
+
+    A read-only audit naturally says things such as "no file, environment
+    variable, service, or configuration was changed." The old bare regex
+    matched that sentence's trailing "configuration was changed" phrase and
+    rejected a correct audit as an unsupported edit.
+    """
+    text = final_text or ""
+    for match in _MUTATION_CLAIM_RE.finditer(text):
+        line_start = max(
+            text.rfind("\n", 0, match.start()),
+            text.rfind(".", 0, match.start()),
+            text.rfind("!", 0, match.start()),
+            text.rfind("?", 0, match.start()),
+        ) + 1
+        if not _NEGATED_MUTATION_PREFIX_RE.search(text[line_start:match.start()]):
+            return True
+    return False
+
+
 def _successful_changed_paths(tool_records: list[dict[str, Any]], workspace_root: str) -> set[Path]:
     root = Path(workspace_root or ".").resolve()
     changed: set[Path] = set()
@@ -217,7 +244,7 @@ def validate_completion(
     # be classified as QUESTION, but that must never permit a model to claim
     # files were updated, a service restarted, or production verified when
     # its own tool ledger proves otherwise.
-    mutation_claimed = bool(_MUTATION_CLAIM_RE.search(final_text or ""))
+    mutation_claimed = _claims_mutation(final_text)
     if mutation_claimed:
         changed_paths = _successful_changed_paths(tool_records, workspace_root)
         mutation_supported = bool(changed_paths) and any_mutation

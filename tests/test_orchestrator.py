@@ -378,6 +378,29 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertTrue(report.unresolved)
 
+    def test_read_only_audit_no_change_statement_is_not_a_mutation_claim(self):
+        """A correct audit must not fail because it says nothing was changed."""
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("audit provider routing and configuration"),
+            tool_records=[
+                {"tool_name": "read_file", "success": True, "arguments": {"path": "config.toml"}},
+                {"tool_name": "search_code", "success": True, "arguments": {"query": "provider"}},
+            ],
+            any_mutation=False,
+            final_text=(
+                "## Summary\n"
+                "No file, environment variable, service, or configuration was changed. "
+                "This was a read-only audit."
+            ),
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        self.assertFalse(any(item["name"] == "reported_mutation_supported" for item in report.checks))
+
     def test_latest_failed_verification_overrides_earlier_success(self):
         """A green build followed by a red check cannot be reported green."""
         from tamfis_code.orchestrator.validator import validate_completion
