@@ -30,6 +30,7 @@ from tamfis_code.interactive import (
     _wait_for_background_reinjection,
     next_message_suggestion,
     paste_placeholder,
+    sidebar_page,
 )
 from tamfis_code.runner import TaskOutcome
 from tamfis_code.workspace import WorkspaceContext
@@ -108,6 +109,45 @@ class SlashCommandCompleterTests(unittest.TestCase):
     def test_bare_slash_offers_every_command(self):
         results = self._complete("/")
         self.assertEqual(set(results), {name for name, _ in SLASH_COMMANDS})
+
+
+class SidebarPageTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self.originals
+        self.tmp.cleanup()
+
+    def test_sidebar_marks_current_session_and_excludes_swarm_children(self):
+        current = state_module.get_session_state(2)
+        current.workspace_root = "/work/current"
+        state_module.put_session_state(current)
+        child = state_module.get_session_state(3)
+        child.is_swarm_child = True
+        state_module.put_session_state(child)
+
+        rows, page, page_count = sidebar_page(2)
+
+        self.assertEqual(page, 0)
+        self.assertEqual(page_count, 1)
+        self.assertEqual(rows[0]["id"], "2")
+        self.assertEqual(rows[0]["active"], "*")
+        self.assertNotIn("3", [row["id"] for row in rows])
+
+    def test_sidebar_clamps_out_of_range_page(self):
+        for session_id in range(1, 12):
+            state_module.put_session_state(state_module.get_session_state(session_id))
+
+        rows, page, page_count = sidebar_page(1, page=999, page_size=4)
+
+        self.assertEqual(page_count, 3)
+        self.assertEqual(page, 2)
+        self.assertEqual(len(rows), 3)
 
 
 class NextMessageSuggestionTests(unittest.TestCase):

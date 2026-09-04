@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import dataclass
 import inspect
 import re
 from pathlib import Path
@@ -232,6 +233,8 @@ $ <command>            explicit shell command
                       only the recent few turns in full, so a long REPL stays light in the
                       terminal and the next turn's context (Claude Code/Codex-style compaction)
 /summary             show a structured recap of the conversation so far without compressing it
+/sidebar [next|prev|close]
+                      toggle the session sidebar; Ctrl+B toggles it and Ctrl+N/Ctrl+P scroll pages
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
@@ -285,6 +288,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the screen"),
     ("/compact", "compress the thread (fold older turns into the summary, keep recent turns)"),
     ("/summary", "show a structured recap of the conversation so far"),
+    ("/sidebar", "toggle or scroll the session sidebar"),
     ("/permissions", "show approval policy and immutable server safeguards"),
     ("/mode", "show or switch the active approval mode"),
     ("/model", "show or switch the active model route"),
@@ -351,6 +355,62 @@ class Intent:
         self.mode = mode
         self.background = background
         self.goal = goal
+
+
+_SIDEBAR_ACTION = "\x00tamfis-sidebar"
+_SIDEBAR_PAGE_SIZE = 8
+
+
+@dataclass
+class _SidebarState:
+    visible: bool = False
+    page: int = 0
+
+
+def sidebar_page(
+    session_id: int, *, page: int = 0, page_size: int = _SIDEBAR_PAGE_SIZE,
+) -> tuple[list[dict[str, str]], int, int]:
+    """Return one stable, bounded page for the interactive session drawer."""
+    sessions: list[dict[str, str]] = []
+    for known_id in reversed(local_state.all_known_session_ids()):
+        state = local_state.get_session_state(known_id)
+        if state.is_swarm_child:
+            continue
+        objective = str((state.active_task or {}).get("objective") or state.conversation_summary or "-")
+        sessions.append({
+            "id": str(known_id),
+            "active": "*" if known_id == session_id else "",
+            "status": str(state.execution_status or "idle"),
+            "workspace": Path(state.workspace_root or state.primary_workspace or "-").name or "-",
+            "objective": " ".join(objective.split())[:56],
+        })
+
+    page_count = max(1, (len(sessions) + page_size - 1) // page_size)
+    page = min(max(page, 0), page_count - 1)
+    start = page * page_size
+    return sessions[start:start + page_size], page, page_count
+
+
+def render_sidebar(console: Console, session_id: int, sidebar: _SidebarState) -> None:
+    """Render the terminal drawer without entering a fragile full-screen mode."""
+    rows, sidebar.page, page_count = sidebar_page(session_id, page=sidebar.page)
+    table = Table(show_header=True, header_style="bold cyan", expand=False)
+    table.add_column("", width=1)
+    table.add_column("SESSION", no_wrap=True)
+    table.add_column("STATUS", no_wrap=True)
+    table.add_column("WORKSPACE", no_wrap=True)
+    table.add_column("RECENT TASK", max_width=56)
+    for row in rows:
+        table.add_row(row["active"], row["id"], row["status"], row["workspace"], row["objective"])
+    if not rows:
+        table.add_row("", "-", "idle", "-", "No saved sessions")
+    console.print(Panel(
+        table,
+        title=f"Sessions · {sidebar.page + 1}/{page_count}",
+        subtitle="Ctrl+N/Ctrl+P scroll · Ctrl+B or /sidebar close closes",
+        border_style="cyan",
+        expand=False,
+    ))
 
 
 # Bounds standalone in-session conversation history (see run_interactive's
@@ -797,6 +857,7 @@ async def run_interactive(
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
     bindings = KeyBindings()
+    sidebar = _SidebarState()
     # Local only: which byte offset this REPL has already displayed per PTY
     # id, so /pty read shows only new output. The server (RemotePtySession/
     # pty_broker's or LocalPtyBroker's ring buffer is the source of truth;
@@ -836,6 +897,29 @@ async def run_interactive(
         # prompt_toolkit re-evaluates a callable `message=` on invalidate.
         config.approval_policy = next_mode_in_cycle(config.approval_policy)
         event.app.invalidate()
+
+    @bindings.add("c-b")
+    def _toggle_sidebar(event) -> None:
+        sidebar.visible = not sidebar.visible
+        if sidebar.visible:
+            sidebar.page = 0
+        event.app.exit(result=_SIDEBAR_ACTION)
+
+    @bindings.add("c-n")
+    def _sidebar_next(event) -> None:
+        if sidebar.visible:
+            sidebar.page += 1
+            event.app.exit(result=_SIDEBAR_ACTION)
+            return
+        event.current_buffer.cursor_down()
+
+    @bindings.add("c-p")
+    def _sidebar_previous(event) -> None:
+        if sidebar.visible:
+            sidebar.page = max(0, sidebar.page - 1)
+            event.app.exit(result=_SIDEBAR_ACTION)
+            return
+        event.current_buffer.cursor_up()
 
     @bindings.add("tab")
     def _accept_next_suggestion(event) -> None:
@@ -1079,6 +1163,10 @@ async def run_interactive(
                 )
 
         text = text.strip()
+        if text == _SIDEBAR_ACTION:
+            if sidebar.visible:
+                render_sidebar(console, workspace.session_id, sidebar)
+            continue
         if not text:
             continue
         if len(text) > 1_000_000:
@@ -1107,6 +1195,30 @@ async def run_interactive(
                     "[dim]Standalone mode: /model list needs the remote model catalog; /pty, diffs/revert, resume, "
                     "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
                 )
+            continue
+        if text == "/sidebar" or text.startswith("/sidebar "):
+            action = text[len("/sidebar"):].strip().lower()
+            if action in {"", "toggle"}:
+                sidebar.visible = not sidebar.visible
+                if sidebar.visible:
+                    sidebar.page = 0
+            elif action in {"next", "down"}:
+                sidebar.visible = True
+                sidebar.page += 1
+            elif action in {"prev", "previous", "up"}:
+                sidebar.visible = True
+                sidebar.page = max(0, sidebar.page - 1)
+            elif action in {"close", "hide"}:
+                sidebar.visible = False
+                console.print("[dim]Sidebar closed.[/dim]")
+                continue
+            else:
+                print_error(console, "Usage: /sidebar [next|prev|close]")
+                continue
+            if sidebar.visible:
+                render_sidebar(console, workspace.session_id, sidebar)
+            else:
+                console.print("[dim]Sidebar closed.[/dim]")
             continue
         if text == "/cwd":
             console.print(workspace.workspace_root)

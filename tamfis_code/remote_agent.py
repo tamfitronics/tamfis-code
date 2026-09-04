@@ -7,6 +7,7 @@ import json
 import os
 import platform
 import socket
+import tempfile
 import time
 import uuid
 from pathlib import Path
@@ -15,11 +16,14 @@ from urllib.parse import urlsplit, urlunsplit
 
 import websockets
 
+from .api_client import AuthRequiredError
 from .config import CONFIG_DIR
 from .mcp import MCPServer
 
 DEVICE_PATH = CONFIG_DIR / "device.json"
 OUTBOX_PATH = CONFIG_DIR / "agent-outbox.json"
+RECONNECT_DELAY_SECONDS = 1.0
+MAX_RECONNECT_DELAY_SECONDS = 30.0
 
 
 def load_or_create_device_identity() -> dict[str, str]:
@@ -68,6 +72,8 @@ class RemoteAgentBridge:
         self.server: Optional[dict[str, Any]] = None
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
+        self._started = asyncio.Event()
+        self._start_error: Optional[Exception] = None
         self._connected = asyncio.Event()
         self._outbox: dict[str, dict[str, Any]] = self._load_outbox()
         self._running: set[str] = set()
@@ -82,21 +88,42 @@ class RemoteAgentBridge:
 
     def _save_outbox(self) -> None:
         CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-        OUTBOX_PATH.write_text(json.dumps(self._outbox), encoding="utf-8")
+        # An RPC result must survive a process or power interruption between
+        # execution and its server acknowledgement. Replace atomically so a
+        # partial JSON write cannot discard every unacknowledged result.
+        with tempfile.NamedTemporaryFile(
+            "w", encoding="utf-8", dir=CONFIG_DIR, delete=False,
+            prefix=f".{OUTBOX_PATH.name}.", suffix=".tmp",
+        ) as handle:
+            temporary_path = Path(handle.name)
+            json.dump(self._outbox, handle, separators=(",", ":"))
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary_path, 0o600)
+        os.replace(temporary_path, OUTBOX_PATH)
         os.chmod(OUTBOX_PATH, 0o600)
 
     async def start(self) -> dict[str, Any]:
-        self.server = await self.client.register_agent_device(
-            name=self.device["name"],
-            device_id=self.device["device_id"],
-            os_family=platform.system().lower(),
-        )
         self._task = asyncio.create_task(self._run())
-        await asyncio.wait_for(self._connected.wait(), timeout=15.0)
+        # A bridge is explicitly a persistent connection. Waiting only 15
+        # seconds converted a recoverable server/network outage into a failed
+        # CLI command, which immediately closed the reconnecting task.
+        try:
+            await self._started.wait()
+        except asyncio.CancelledError:
+            # ensure_agent_bridge only stores the bridge after start() returns,
+            # so it cannot clean up a bridge interrupted during initial
+            # connection. Own that cancellation path here.
+            await self.stop()
+            raise
+        if self._start_error is not None:
+            raise self._start_error
+        assert self.server is not None
         return self.server
 
     async def stop(self) -> None:
         self._stop.set()
+        self._started.set()
         if self._task:
             self._task.cancel()
             try:
@@ -112,14 +139,25 @@ class RemoteAgentBridge:
         await self.stop()
 
     async def _run(self) -> None:
-        delay = 1.0
+        delay = RECONNECT_DELAY_SECONDS
         while not self._stop.is_set():
             try:
+                if self.server is None:
+                    self.server = await self.client.register_agent_device(
+                        name=self.device["name"],
+                        device_id=self.device["device_id"],
+                        os_family=platform.system().lower(),
+                    )
+                    self._started.set()
                 # Refresh an expired access token through the normal
                 # authenticated API path before opening a new socket.
                 await self.client.me()
                 credentials = self.client.credentials
                 if credentials is None:
+                    self._start_error = AuthRequiredError(
+                        401, "Not authenticated -- run `tamfis-code login`",
+                    )
+                    self._started.set()
                     return
                 url = _websocket_url(
                     self.client.config.api_base,
@@ -132,7 +170,7 @@ class RemoteAgentBridge:
                     },
                 ) as websocket:
                     self._connected.set()
-                    delay = 1.0
+                    delay = RECONNECT_DELAY_SECONDS
                     for message in list(self._outbox.values()):
                         await self._send(websocket, message)
                     await self._send_workspace_sync(websocket)
@@ -150,10 +188,19 @@ class RemoteAgentBridge:
                             self._save_outbox()
             except asyncio.CancelledError:
                 raise
+            except AuthRequiredError as exc:
+                self._connected.clear()
+                self._start_error = exc
+                self._started.set()
+                return
             except Exception:
                 self._connected.clear()
                 await asyncio.sleep(delay)
-                delay = min(delay * 2, 30.0)
+                delay = min(delay * 2, MAX_RECONNECT_DELAY_SECONDS)
+            finally:
+                # A clean server close is still a disconnection. Without this
+                # clear, callers can mistake a dead socket for a live bridge.
+                self._connected.clear()
 
     async def _handle_rpc(self, websocket, message: dict[str, Any]) -> None:
         request_id = str(message.get("id") or "")
