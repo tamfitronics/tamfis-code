@@ -24,6 +24,37 @@ from tamfis_code.config import Config, Credentials
 from rich.console import Console
 
 
+class UpdateCommandTests(unittest.TestCase):
+    def setUp(self):
+        self.runner = CliRunner()
+
+    @patch("tamfis_code.self_update.check_update_available", return_value=None)
+    def test_update_reports_installed_version_when_no_update_is_available(self, _available):
+        result = self.runner.invoke(cli, ["update"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("up to date", result.output)
+
+    @patch("tamfis_code.self_update.apply_update", return_value=(True, "Updated to 9.9.9."))
+    @patch("tamfis_code.self_update.check_update_available", return_value="9.9.9")
+    def test_update_installs_available_version(self, _available, apply_update):
+        result = self.runner.invoke(cli, ["update"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Update available", result.output)
+        self.assertIn("Updated to 9.9.9", result.output)
+        apply_update.assert_called_once_with()
+
+    @patch("tamfis_code.self_update.apply_update")
+    @patch("tamfis_code.self_update.check_update_available", return_value="9.9.9")
+    def test_update_check_only_never_installs(self, _available, apply_update):
+        result = self.runner.invoke(cli, ["update", "--check"])
+
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Update available", result.output)
+        apply_update.assert_not_called()
+
+
 class ExplicitAbsolutePathsTests(unittest.TestCase):
     def test_extracts_a_single_absolute_path(self):
         self.assertEqual(

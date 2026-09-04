@@ -405,6 +405,33 @@ def _apply_pending_update_after_login(console: Console) -> None:
             "Run /update to retry.[/yellow]"
         )
 
+
+@cli.command(name="update")
+@click.option("--check", "check_only", is_flag=True, default=False,
+              help="Check whether a newer configured Tamfis Code checkout is available without installing it.")
+@click.pass_context
+def update_command(ctx: click.Context, check_only: bool) -> None:
+    """Check for and install an available Tamfis Code update."""
+    from .self_update import apply_update, check_update_available
+
+    console = Console(no_color=not ctx.obj["config"].colour)
+    pending = check_update_available()
+    if pending is None:
+        console.print(f"[green]Tamfis Code {__version__} is up to date.[/green]")
+        return
+
+    console.print(f"[yellow]Update available:[/yellow] {__version__} -> {pending}")
+    if check_only:
+        return
+
+    console.print(f"[dim]Installing Tamfis Code {pending}...[/dim]")
+    ok, message = apply_update()
+    if not ok:
+        print_error(console, message)
+        raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
+    console.print(f"[green]{message}[/green] [dim]Run your next tamfis-code command to use it.[/dim]")
+
+
 @cli.command()
 @click.option("--email", default=None)
 @click.option("--token", "existing_token", default=None, envvar="TAMFIS_CODE_LOGIN_TOKEN",
