@@ -208,8 +208,12 @@ FINAL_RESPONSE_FORMAT_INSTRUCTION = (
     "sections when applicable: Summary, Changes, Verification, and Remaining issues. "
     "Use one short bullet per concrete fact under a section; do not emit nested or "
     "unrelated bullet lists, do not repeat the execution plan, and do not claim a "
-    "tool ran unless a real tool result appears in the conversation. If no files "
-    "changed, say so plainly under Summary."
+    "tool ran unless a real tool result appears in the conversation. For an audit or "
+    "review with more than three findings, put the findings in one compact Markdown "
+    "table with these columns: Priority, Finding, Evidence, Next action. Keep each "
+    "cell to one concise sentence; cite paths and the observed fact instead of "
+    "pasting long configuration inventories. Put unverified items only under "
+    "Remaining issues. If no files changed, say so plainly under Summary."
 )
 
 # Same one-chance-then-fallback shape as narrated tool intent, for the
