@@ -234,7 +234,7 @@ $ <command>            explicit shell command
                       terminal and the next turn's context (Claude Code/Codex-style compaction)
 /summary             show a structured recap of the conversation so far without compressing it
 /sidebar [next|prev|close]
-                      toggle the session sidebar; Ctrl+B toggles it and Ctrl+N/Ctrl+P scroll pages
+                      toggle the session sidebar; Ctrl+B toggles it and </> scroll pages
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
@@ -407,7 +407,7 @@ def render_sidebar(console: Console, session_id: int, sidebar: _SidebarState) ->
     console.print(Panel(
         table,
         title=f"Sessions · {sidebar.page + 1}/{page_count}",
-        subtitle="Ctrl+N/Ctrl+P scroll · Ctrl+B or /sidebar close closes",
+        subtitle="< previous · > next · Ctrl+B or /sidebar close closes",
         border_style="cyan",
         expand=False,
     ))
@@ -905,21 +905,21 @@ async def run_interactive(
             sidebar.page = 0
         event.app.exit(result=_SIDEBAR_ACTION)
 
-    @bindings.add("c-n")
+    @bindings.add(">")
     def _sidebar_next(event) -> None:
         if sidebar.visible:
             sidebar.page += 1
             event.app.exit(result=_SIDEBAR_ACTION)
             return
-        event.current_buffer.cursor_down()
+        event.current_buffer.insert_text(">")
 
-    @bindings.add("c-p")
+    @bindings.add("<")
     def _sidebar_previous(event) -> None:
         if sidebar.visible:
             sidebar.page = max(0, sidebar.page - 1)
             event.app.exit(result=_SIDEBAR_ACTION)
             return
-        event.current_buffer.cursor_up()
+        event.current_buffer.insert_text("<")
 
     @bindings.add("tab")
     def _accept_next_suggestion(event) -> None:
@@ -1202,10 +1202,10 @@ async def run_interactive(
                 sidebar.visible = not sidebar.visible
                 if sidebar.visible:
                     sidebar.page = 0
-            elif action in {"next", "down"}:
+            elif action in {"next", "down", ">"}:
                 sidebar.visible = True
                 sidebar.page += 1
-            elif action in {"prev", "previous", "up"}:
+            elif action in {"prev", "previous", "up", "<"}:
                 sidebar.visible = True
                 sidebar.page = max(0, sidebar.page - 1)
             elif action in {"close", "hide"}:
