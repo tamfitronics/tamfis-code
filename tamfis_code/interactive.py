@@ -730,33 +730,54 @@ def contextualize_short_reply(raw: str, *, has_context: bool) -> str:
     return text
 
 
+def _ci_equals(text: str, value: str) -> bool:
+    """Case-insensitive equality for a built-in slash command's exact
+    (no-argument) form. Several mobile SSH clients (Termius among them)
+    autocapitalize the first letter after "/" on their virtual keyboard,
+    so a typed "/status" can arrive here as "/Status" -- every built-in
+    command below is matched this way so no user, on any client, has a
+    command silently fail to dispatch over capitalization. User-defined
+    custom commands (custom_commands.py) are deliberately NOT included in
+    this treatment -- they're keyed by filename, a case-sensitive
+    filesystem convention, not typed-text autocorrect."""
+    return text.lower() == value.lower()
+
+
+def _ci_startswith(text: str, prefix: str) -> bool:
+    """Case-insensitive startswith for a built-in slash command that takes
+    a trailing argument (e.g. prefix="/cd ") -- see _ci_equals above for
+    why. The argument text itself keeps its original case; only the
+    command word is compared case-insensitively."""
+    return text.lower().startswith(prefix.lower())
+
+
 def parse_intent(raw: str, custom_commands: Optional[dict[str, CustomCommand]] = None) -> Intent:
     text = raw.strip()
     if text.startswith("$ "):
         return Intent("shell", command=text[2:].strip())
-    if text.startswith("/run "):
+    if _ci_startswith(text, "/run "):
         return Intent("shell", command=text[5:].strip())
-    if text.startswith("/shell "):
+    if _ci_startswith(text, "/shell "):
         return Intent("shell", command=text[7:].strip())
-    if text.startswith("/audit "):
+    if _ci_startswith(text, "/audit "):
         return Intent("ai", objective=text[7:].strip(), mode="audit")
-    if text.startswith("/chat "):
+    if _ci_startswith(text, "/chat "):
         return Intent("ai", objective=text[6:].strip(), mode="chat")
-    if text.startswith("/plan "):
+    if _ci_startswith(text, "/plan "):
         return Intent("ai", objective=text[6:].strip(), mode="plan")
-    if text == "/execute-plan" or text.startswith("/execute-plan "):
+    if _ci_equals(text, "/execute-plan") or _ci_startswith(text, "/execute-plan "):
         return Intent("saved_plan", command=text[len("/execute-plan"):].strip())
-    if text.startswith("/agent "):
+    if _ci_startswith(text, "/agent "):
         return Intent("ai", objective=text[7:].strip(), mode="execute")
-    if text.startswith("/execute "):
+    if _ci_startswith(text, "/execute "):
         return Intent("ai", objective=text[9:].strip(), mode="execute")
-    if text.startswith("/ask "):
+    if _ci_startswith(text, "/ask "):
         return Intent("ai", objective=text[5:].strip(), mode="coding")
-    if text.startswith("/background "):
+    if _ci_startswith(text, "/background "):
         return Intent("ai", objective=text[len("/background "):].strip(), mode="coding", background=True)
-    if text == "/goal" or text in {"/goal status", "/goal pause", "/goal cancel", "/goal resume"}:
+    if _ci_equals(text, "/goal") or text.lower() in {"/goal status", "/goal pause", "/goal cancel", "/goal resume"}:
         return Intent("goal_control", command=text[len("/goal"):].strip() or "status")
-    if text.startswith("/goal "):
+    if _ci_startswith(text, "/goal "):
         return Intent(
             "ai", objective=text[len("/goal "):].strip(), mode="coding",
             background=True, goal=True,
@@ -1182,7 +1203,7 @@ async def run_interactive(
         if len(text) > 1_000_000:
             print_error(console, "Objective exceeds the 1,000,000 character safety limit.")
             continue
-        if text in ("/exit", "/quit", "/detach"):
+        if text.lower() in ("/exit", "/quit", "/detach"):
             # No task submitted through this REPL outlives this process's
             # lifetime any differently based on which of these three the
             # user types -- background durability comes from `--bg` /
@@ -1198,7 +1219,7 @@ async def run_interactive(
         # requires an exact match or a trailing space with content) -- it
         # was submitted to the AI as a one-character objective instead of
         # showing the command list the way typing "/" alone is expected to.
-        if text in ("/help", "/"):
+        if text.lower() in ("/help", "/"):
             console.print(HELP_TEXT)
             if standalone:
                 console.print(
@@ -1206,14 +1227,7 @@ async def run_interactive(
                     "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
                 )
             continue
-        # Case-insensitive prefix match: mobile SSH clients (Termius in
-        # particular) commonly autocapitalize the first letter after "/"
-        # on their virtual keyboard, so a typed "/sidebar" can arrive here
-        # as "/Sidebar" -- every other slash-command below stays
-        # case-sensitive; this one's scoped narrowly to unblock exactly
-        # the symptom reported (typed /sidebar commands doing nothing on
-        # Termius) without changing matching behavior for anything else.
-        if text.lower() == "/sidebar" or text.lower().startswith("/sidebar "):
+        if _ci_equals(text, "/sidebar") or _ci_startswith(text, "/sidebar "):
             action = text[len("/sidebar"):].strip().lower()
             if action in {"", "toggle"}:
                 sidebar.visible = not sidebar.visible
@@ -1272,10 +1286,10 @@ async def run_interactive(
             else:
                 console.print("[dim]Sidebar closed.[/dim]")
             continue
-        if text == "/cwd":
+        if _ci_equals(text, "/cwd"):
             console.print(workspace.workspace_root)
             continue
-        if text == "/cd" or text.startswith("/cd "):
+        if _ci_equals(text, "/cd") or _ci_startswith(text, "/cd "):
             # Claude Code/Codex both let you just tell the agent to look
             # somewhere else and it re-orients immediately -- this REPL had
             # no equivalent at all: `tamfis-code cwd <path>` only existed as
@@ -1334,7 +1348,7 @@ async def run_interactive(
             discover_local_repository(workspace.session_id, resolved, force=True)
             console.print(f"[green]Working directory:[/green] {target}")
             continue
-        if text == "/copy":
+        if _ci_equals(text, "/copy"):
             if not last_response_text:
                 console.print("[dim]Nothing to copy yet.[/dim]")
             elif copy_to_clipboard(console, last_response_text):
@@ -1342,7 +1356,7 @@ async def run_interactive(
             else:
                 console.print("[dim]Can't copy: output isn't attached to a terminal.[/dim]")
             continue
-        if text == "/status":
+        if _ci_equals(text, "/status"):
             state = local_state.get_session_state(workspace.session_id)
             identity_line = (
                 f"session_id={workspace.session_id}  (standalone, local session)"
@@ -1366,7 +1380,7 @@ async def run_interactive(
                 f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
             )
             continue
-        if text == "/usage":
+        if _ci_equals(text, "/usage"):
             # Real per-feature credit balance from the SAME ledger the
             # TamfisGPT web app's Settings > Billing page reads -- day/week/
             # month, not just a monthly total, matching the enforcement
@@ -1424,7 +1438,7 @@ async def run_interactive(
                 warn = " ⚠" if b.get("low_credit_warning") else ""
                 console.print(f"{feature:<12}{day_cell:>18}{week_cell:>18}{month_cell:>18}{warn}")
             continue
-        if text == "/context":
+        if _ci_equals(text, "/context"):
             context = discover_local_repository(workspace.session_id, Path(workspace.workspace_root))
             state = local_state.get_session_state(workspace.session_id)
             console.print(f"repository={context.get('repository_root')}  branch={context.get('branch') or '-'}  dirty={context.get('dirty')}")
@@ -1433,7 +1447,7 @@ async def run_interactive(
             for path in context.get("instruction_files", []):
                 console.print(f"  instruction: {path}")
             continue
-        if text == "/reports":
+        if _ci_equals(text, "/reports"):
             discover_local_repository(workspace.session_id, Path(workspace.workspace_root))
             reports = local_state.get_session_state(workspace.session_id).discovered_reports
             if not reports:
@@ -1441,7 +1455,7 @@ async def run_interactive(
             for report in reports:
                 console.print(f"  {str(report.get('modified_at', ''))[:10]}  {report.get('verification')}  {report.get('path')}")
             continue
-        if text == "/plans":
+        if _ci_equals(text, "/plans"):
             state = local_state.get_session_state(workspace.session_id)
             if not state.saved_plans:
                 console.print("[dim]No saved plans yet. Create one with /plan <objective>.[/dim]")
@@ -1457,8 +1471,8 @@ async def run_interactive(
                 )
             console.print(table)
             continue
-        if text == "/plan" or text == "/plan show" or text.startswith("/plan show "):
-            plan_id = text[len("/plan show"):].strip() if text.startswith("/plan show") else ""
+        if _ci_equals(text, "/plan") or _ci_equals(text, "/plan show") or _ci_startswith(text, "/plan show "):
+            plan_id = text[len("/plan show"):].strip() if _ci_startswith(text, "/plan show") else ""
             plan = local_state.get_plan(workspace.session_id, plan_id or None)
             if plan is None:
                 print_error(console, "Plan not found. Use /plans to list saved plans.")
@@ -1469,7 +1483,7 @@ async def run_interactive(
             )
             console.print(Markdown(str(plan.get("content") or "")))
             continue
-        if text == "/update":
+        if _ci_equals(text, "/update"):
             from .self_update import apply_update, check_update_available, reexec
 
             pending = check_update_available()
@@ -1484,7 +1498,7 @@ async def run_interactive(
             console.print(f"[green]{message}[/green] [dim]Restarting into this session...[/dim]")
             reexec()
             continue
-        if text == "/queue" or text.startswith("/queue "):
+        if _ci_equals(text, "/queue") or _ci_startswith(text, "/queue "):
             arg = text[len("/queue"):].strip()
             if arg:
                 item = local_state.enqueue_instruction(workspace.session_id, arg)
@@ -1492,7 +1506,7 @@ async def run_interactive(
             for item in local_state.get_session_state(workspace.session_id).queued_user_instructions:
                 console.print(f"  {item.get('id')}  {item.get('status')}  {item.get('classification')}  {item.get('text')}")
             continue
-        if text == "/model" or text.startswith("/model "):
+        if _ci_equals(text, "/model") or _ci_startswith(text, "/model "):
             arg = text[len("/model"):].strip()
             state = local_state.get_session_state(workspace.session_id)
             if not arg:
@@ -1607,7 +1621,7 @@ async def run_interactive(
             from .public_identity import public_model_name
             console.print(f"[green]Model set to[/green] {public_model_name(model_id)}")
             continue
-        if text == "/tools":
+        if _ci_equals(text, "/tools"):
             # One real tool set regardless of standalone vs --remote: every
             # task -- remote-mode ones included -- now executes through the
             # local engine (mcp.py), never a server-side agent loop (see
@@ -1638,7 +1652,7 @@ async def run_interactive(
                 "risk is classified and see /diffs for the mutation ledger.[/dim]"
             )
             continue
-        if text == "/commands":
+        if _ci_equals(text, "/commands"):
             if not custom_commands:
                 console.print(
                     "[dim]No custom commands found. Add one at "
@@ -1655,7 +1669,7 @@ async def run_interactive(
                 table.add_row(f"/{name}", command.description, command.source)
             console.print(table)
             continue
-        if text == "/agent-types":
+        if _ci_equals(text, "/agent-types"):
             from .agent_definitions import load_agent_definitions
             definitions = load_agent_definitions(workspace.workspace_root)
             if not definitions:
@@ -1681,7 +1695,7 @@ async def run_interactive(
             console.print(table)
             console.print("[dim]Use with: /delegate --agent <name> ... or /swarm --agent <name> ....[/dim]")
             continue
-        if text == "/pty" or text.startswith("/pty "):
+        if _ci_equals(text, "/pty") or _ci_startswith(text, "/pty "):
             arg = text[len("/pty"):].strip()
             parts = arg.split(maxsplit=1)
             sub = parts[0].lower() if parts else "list"
@@ -1808,7 +1822,7 @@ async def run_interactive(
 
             print_error(console, "Usage: /pty <start|list|send|read|kill> ...")
             continue
-        if text == "/permissions":
+        if _ci_equals(text, "/permissions"):
             console.print(f"approval_policy={config.approval_policy}")
             for action in ("deny", "ask", "allow"):
                 rules = getattr(config, f"permission_{action}")
@@ -1819,7 +1833,7 @@ async def run_interactive(
                 "protected repository/configuration paths always require explicit approval.[/dim]"
             )
             continue
-        if text == "/mode" or text.startswith("/mode "):
+        if _ci_equals(text, "/mode") or _ci_startswith(text, "/mode "):
             arg = text[len("/mode"):].strip().lower()
             if not arg:
                 console.print(f"Current mode: [bold]{mode_label_for_policy(config.approval_policy)}[/bold] ({config.approval_policy})")
@@ -1846,7 +1860,7 @@ async def run_interactive(
             config.approval_policy = resolved
             console.print(f"[green]Mode set to[/green] {arg} [dim]({resolved})[/dim]")
             continue
-        if text == "/compact":
+        if _ci_equals(text, "/compact"):
             # Real thread compression (Claude Code/Codex parity): fold older
             # turns into conversation_summary and keep only the recent few
             # turns in conversation_history, so a long REPL thread stops
@@ -1864,11 +1878,11 @@ async def run_interactive(
             console.print("[green]Thread compressed.[/green] Older turns were folded into the session summary; recent turns are retained in full.")
             console.print(f"[dim]~{len(recap)} char recap saved. Next turn starts from the compressed context.[/dim]")
             continue
-        if text == "/summary":
+        if _ci_equals(text, "/summary"):
             recap = local_state.summarize_thread(workspace.session_id)
             console.print(Panel(recap, title="Thread summary", border_style="cyan", expand=False))
             continue
-        if text == "/doctor":
+        if _ci_equals(text, "/doctor"):
             # Full self-health-check in both modes (Claude Code/Codex parity):
             # standalone mode used to only print a one-line provider status,
             # never running the real session/workspace/context/recent-failure
@@ -1880,7 +1894,7 @@ async def run_interactive(
                 session_id=workspace.session_id,
             )
             continue
-        if text == "/agents" or text == "/agents --all":
+        if _ci_equals(text, "/agents") or _ci_equals(text, "/agents --all"):
             show_all = text.endswith("--all")
             if standalone:
                 for sid in local_state.all_known_session_ids():
@@ -1900,7 +1914,7 @@ async def run_interactive(
                 marker = " *" if sess.get("id") == workspace.session_id else ""
                 console.print(f"  {sess.get('id')}  {sess.get('status')}  {sess.get('working_directory') or ''}{marker}")
             continue
-        if text == "/delegate" or text.startswith("/delegate "):
+        if _ci_equals(text, "/delegate") or _ci_startswith(text, "/delegate "):
             if not config.enable_subagent_delegation:
                 print_error(
                     console,
@@ -1945,7 +1959,7 @@ async def run_interactive(
                 if summary:
                     console.print(f"   {summary}")
             continue
-        if text == "/swarm" or text.startswith("/swarm "):
+        if _ci_equals(text, "/swarm") or _ci_startswith(text, "/swarm "):
             if not config.enable_subagent_delegation:
                 print_error(
                     console,
@@ -1996,7 +2010,7 @@ async def run_interactive(
                 if summary:
                     console.print(f"   {summary}")
             continue
-        if text == "/diffs" or text.startswith("/diffs "):
+        if _ci_equals(text, "/diffs") or _ci_startswith(text, "/diffs "):
             arg = text[len("/diffs"):].strip()
             try:
                 limit = int(arg) if arg else 10
@@ -2025,7 +2039,7 @@ async def run_interactive(
                     f"+{m.get('lines_added')}/-{m.get('lines_removed')}{marker}{turn_suffix}"
                 )
             continue
-        if text == "/diff" or text.startswith("/diff "):
+        if _ci_equals(text, "/diff") or _ci_startswith(text, "/diff "):
             mutation_id = text[len("/diff"):].strip()
             if standalone:
                 mutations = local_state.get_session_state(workspace.session_id).modified_files
@@ -2047,7 +2061,7 @@ async def run_interactive(
             else:
                 print_unified_diff(console, str(selected.get("unified_diff") or ""), title=str(selected.get("path") or "Changes"))
             continue
-        if text == "/revert" or text.startswith("/revert "):
+        if _ci_equals(text, "/revert") or _ci_startswith(text, "/revert "):
             arg = text[len("/revert"):].strip()
             if not arg:
                 print_error(console, "Usage: /revert <mutation_id | turn_id> -- see /diffs for recent mutation ids; a turn_... id reverts every mutation from that turn together.")
@@ -2077,10 +2091,10 @@ async def run_interactive(
                 continue
             console.print(f"[green]Reverted[/green] {result.get('path')}")
             continue
-        if text == "/clear":
+        if _ci_equals(text, "/clear"):
             console.clear()
             continue
-        if text == "/resume" or text.startswith("/resume "):
+        if _ci_equals(text, "/resume") or _ci_startswith(text, "/resume "):
             arg = text[len("/resume"):].strip()
             if standalone:
                 known = local_state.all_known_session_ids()
@@ -2139,7 +2153,7 @@ async def run_interactive(
             except (AuthRequiredError, RemoteAPIError):
                 pass
             continue
-        if text == "/fork":
+        if _ci_equals(text, "/fork"):
             if not standalone:
                 print_error(console, "/fork is currently available for standalone local sessions only.")
                 continue
@@ -2161,7 +2175,7 @@ async def run_interactive(
                 "The original remains unchanged; this prompt now uses the new branch."
             )
             continue
-        if text == "/retry" or text.startswith("/retry "):
+        if _ci_equals(text, "/retry") or _ci_startswith(text, "/retry "):
             if standalone:
                 if last_turn is None:
                     console.print("[dim]No previous turn in this session to retry.[/dim]")
