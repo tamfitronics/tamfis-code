@@ -222,6 +222,9 @@ class ProviderConfig:
     weight: int = 1
     reasoning_supported: bool = False
     vision_supported: bool = False
+    # Exact models in this provider bucket that accept image input. An empty
+    # list preserves the legacy provider-wide flag for compatibility.
+    vision_models: List[str] = field(default_factory=list)
     context_window: int = 32768
     coding_quality: int = 1
     tool_calling: bool = True
@@ -372,6 +375,10 @@ class ProviderManager:
             weight=15,
             reasoning_supported=True,
             vision_supported=True,
+            vision_models=[
+                "kimi-k2.7-code:cloud",
+                "kimi-k3:cloud",
+            ],
             # NOTE: this budget is shared by the whole provider bucket
             # (gemma4:cloud, minimax-m3:cloud too, not just kimi-k3), and
             # gates real request-size/truncation logic in runner_local.py --
@@ -612,6 +619,10 @@ class ProviderManager:
             # confirmed vision route. Now live-verified true for at least
             # one model in this provider's bucket (see the comment above).
             vision_supported=True,
+            vision_models=[
+                "moonshotai/kimi-k3",
+                "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+            ],
             context_window=128000,
             coding_quality=5,
             tool_calling=True,
@@ -651,6 +662,14 @@ class ProviderManager:
             weight=15,
             reasoning_supported=False,
             vision_supported=True,
+            vision_models=[
+                "Qwen/Qwen3.6-35B-A3B",
+                "Qwen/Qwen3.6-27B",
+                "microsoft/Phi-3.5-vision-instruct",
+                "meta-llama/Llama-3.2-11B-Vision-Instruct",
+                "Qwen/Qwen2-VL-7B-Instruct",
+                "moonshotai/Kimi-K2.6",
+            ],
             context_window=262144,
             coding_quality=5,
             tool_calling=True,
@@ -1034,6 +1053,36 @@ class ProviderManager:
         if config.free_model and not _task_needs_paid_tier(task_profile):
             return config.free_model
         return config.default_model
+
+    def model_supports_vision(self, config: ProviderConfig, model: str) -> bool:
+        """Return image-input support for the selected model, not merely
+        for some model hosted by the same provider."""
+        if not config.vision_supported:
+            return False
+        if not config.vision_models:
+            return True
+        return model in config.vision_models
+
+    def select_vision_model(
+        self,
+        config: ProviderConfig,
+        task_profile: Optional["TaskProfile"] = None,
+    ) -> str:
+        """Select a documented image-capable route within a provider."""
+        selected = self.select_model(config, task_profile)
+        if self.model_supports_vision(config, selected):
+            return selected
+
+        provider = next(
+            (kind for kind, known in self.PROVIDERS.items() if known is config),
+            None,
+        )
+        for candidate in config.vision_models:
+            if candidate not in config.models and candidate != config.default_model:
+                continue
+            if provider is None or self.route_is_healthy(provider, candidate):
+                return candidate
+        return selected
 
     @staticmethod
     def routing_telemetry() -> RoutingTelemetry:

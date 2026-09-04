@@ -211,6 +211,49 @@ def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
         ) == "kimi-k2.7-code:cloud"
 
 
+def test_researched_provider_routes_expose_exact_vision_models():
+    expected = {
+        ProviderType.OLLAMA_CLOUD: {
+            "kimi-k2.7-code:cloud",
+            "kimi-k3:cloud",
+        },
+        ProviderType.NVIDIA: {
+            "moonshotai/kimi-k3",
+            "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+        },
+        ProviderType.HF: {
+            "Qwen/Qwen3.6-35B-A3B",
+            "Qwen/Qwen3.6-27B",
+            "microsoft/Phi-3.5-vision-instruct",
+            "meta-llama/Llama-3.2-11B-Vision-Instruct",
+            "Qwen/Qwen2-VL-7B-Instruct",
+            "moonshotai/Kimi-K2.6",
+        },
+    }
+
+    manager = _manager_with(*expected)
+    for provider, models in expected.items():
+        config = manager.PROVIDERS[provider]
+        assert config.vision_supported is True
+        assert set(config.vision_models) == models
+        assert manager.model_supports_vision(config, config.vision_models[0])
+
+
+def test_vision_selection_stays_on_image_capable_defaults(monkeypatch):
+    monkeypatch.delenv("TAMFIS_CODE_OLLAMA_CODING_MODEL", raising=False)
+    manager = _manager_with(
+        ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA, ProviderType.HF,
+    )
+    profile = classify_task("inspect the attached letterhead image")
+
+    for provider in (
+        ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA, ProviderType.HF,
+    ):
+        config = manager.PROVIDERS[provider]
+        selected = manager.select_vision_model(config, profile)
+        assert manager.model_supports_vision(config, selected)
+
+
 def test_premium_ollama_remains_enabled_without_auto_primary(monkeypatch):
     # Subscription entitlement must remain enabled without forcing AUTO to
     # Ollama Cloud. Historically one flag controlled both concerns and

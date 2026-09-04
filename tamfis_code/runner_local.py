@@ -3235,25 +3235,51 @@ class _TextToolStreamFilter:
         return trailing, parsed
 
 
-def _select_model(manager: Any, config: Any, task_profile: Any) -> str:
+def _select_model(
+    manager: Any,
+    config: Any,
+    task_profile: Any,
+    *,
+    requires_vision: bool = False,
+) -> str:
     """manager.select_model(config, task_profile) when the manager supports
     it, falling back to config.default_model otherwise -- same tolerance-
     for-minimal-test-doubles convention as this module's existing
     `hasattr(manager, "fallback_candidates")` checks, since the many
     lightweight fake managers across the test suite only implement the
     handful of ProviderManager methods each specific test actually needs."""
+    if requires_vision:
+        select_vision = getattr(manager, "select_vision_model", None)
+        if select_vision is not None:
+            return select_vision(config, task_profile)
     select = getattr(manager, "select_model", None)
     if select is None:
         return config.default_model
     return select(config, task_profile)
 
 
-def _select_fallback_model(manager: Any, config: Any, task_profile: Any) -> str:
+def _select_fallback_model(
+    manager: Any,
+    config: Any,
+    task_profile: Any,
+    *,
+    requires_vision: bool = False,
+) -> str:
     """Choose a free fallback model unless paid fallback was opted in."""
     paid = getattr(manager, "paid_fallback_enabled", None)
     if callable(paid) and not paid() and getattr(config, "free_model", None):
         return str(config.free_model)
-    return _select_model(manager, config, task_profile)
+    return _select_model(
+        manager, config, task_profile, requires_vision=requires_vision,
+    )
+
+
+def _model_supports_vision(manager: Any, config: Any, model: str) -> bool:
+    """Prefer exact model capability metadata when the manager exposes it."""
+    check = getattr(manager, "model_supports_vision", None)
+    if check is not None:
+        return bool(check(config, model))
+    return bool(getattr(config, "vision_supported", False))
 
 
 def _tool_calls_signature(tool_calls: list[_StreamedToolCall]) -> tuple[tuple[str, str], ...]:
@@ -4718,7 +4744,10 @@ async def _run_local_agent_turn_impl(
                 allow_premium_primary=True,
             )
             choices = [
-                (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                (candidate, _select_model(
+                    manager, manager.PROVIDERS[candidate], task_profile,
+                    requires_vision=bool(image_content_blocks),
+                ))
                 for candidate in candidates
                 if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
             ]
@@ -4746,9 +4775,15 @@ async def _run_local_agent_turn_impl(
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
             return TaskOutcome(status="failed", error=error)
     selected_default_model = (
-        _select_fallback_model(manager, config, task_profile)
+        _select_fallback_model(
+            manager, config, task_profile,
+            requires_vision=bool(image_content_blocks),
+        )
         if provider == ProviderType.AUTO and not _paid_provider_fallback_enabled(manager)
-        else _select_model(manager, config, task_profile)
+        else _select_model(
+            manager, config, task_profile,
+            requires_vision=bool(image_content_blocks),
+        )
     )
     from .public_identity import resolve_public_model_alias
 
@@ -5190,7 +5225,10 @@ async def _run_local_agent_turn_impl(
                 candidate_client = manager.get_client(candidate)
                 if candidate_config is None or candidate_client is None:
                     continue
-                candidate_model = _select_model(manager, candidate_config, task_profile)
+                candidate_model = _select_model(
+                    manager, candidate_config, task_profile,
+                    requires_vision=bool(image_content_blocks),
+                )
                 if (candidate, candidate_model) in stalled_routes:
                     continue
                 previous_provider = resolved_provider
@@ -5548,7 +5586,7 @@ async def _run_local_agent_turn_impl(
                 model=resolved_model,
                 messages=(
                     _messages_with_vision_content(working_messages, vision_message_index, image_content_blocks)
-                    if getattr(config, "vision_supported", False) else working_messages
+                    if _model_supports_vision(manager, config, resolved_model) else working_messages
                 ),
                 tools=tools_for_round, renderer=renderer,
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
@@ -5635,7 +5673,10 @@ async def _run_local_agent_turn_impl(
                     allow_premium_primary=True,
                 )
                 premium_choices = [
-                    (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                    (candidate, _select_model(
+                        manager, manager.PROVIDERS[candidate], task_profile,
+                        requires_vision=bool(image_content_blocks),
+                    ))
                     for candidate in premium_candidates
                     if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
                 ]
@@ -5675,7 +5716,10 @@ async def _run_local_agent_turn_impl(
                     candidate_config = manager.PROVIDERS.get(candidate)
                     if candidate_client is None or candidate_config is None:
                         continue
-                    candidate_model = _select_model(manager, candidate_config, task_profile)
+                    candidate_model = _select_model(
+                        manager, candidate_config, task_profile,
+                        requires_vision=bool(image_content_blocks),
+                    )
                     if (
                         failed_provider == ProviderType.OLLAMA_CLOUD
                         and premium_choices
@@ -5723,7 +5767,9 @@ async def _run_local_agent_turn_impl(
                             model=candidate_model,
                             messages=(
                                 _messages_with_vision_content(working_messages, vision_message_index, image_content_blocks)
-                                if getattr(candidate_config, "vision_supported", False) else working_messages
+                                if _model_supports_vision(
+                                    manager, candidate_config, candidate_model,
+                                ) else working_messages
                             ),
                             tools=tools if getattr(candidate_config, "tool_calling", True) else [],
                             renderer=renderer,
