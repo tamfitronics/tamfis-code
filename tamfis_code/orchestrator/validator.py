@@ -130,6 +130,26 @@ _MUTATING_TOOLS = {
     "create_artifact",
 }
 
+# Confirmed live: a turn that finds an objective already fully committed
+# (by a prior turn, or already sitting on disk before this one started) and
+# verifies it with `git diff --stat`/`git show --stat` never calls
+# write_file/edit_file itself, so any_mutation and the edit-tool-only
+# _successful_changed_paths scan below both stay empty -- the mutation and
+# authorship checks then fail a turn that did real, verified, pushed work,
+# forcing pointless re-edit retries that can never succeed (the code is
+# already correct) before the turn fails anyway. A successful git diffstat
+# command is trustworthy evidence of real file changes precisely because its
+# stdout comes from an actual subprocess run recorded in tool_records, not
+# from the model's own claims -- so it closes this gap without weakening the
+# claim-vs-evidence bar the other checks enforce.
+_GIT_DIFFSTAT_COMMAND_RE = re.compile(
+    r"\bgit\s+(?:diff|show|log)\b[^|;&\n]*--stat\b|\bgit\s+diff\b[^|;&\n]*--name-only\b",
+    re.IGNORECASE,
+)
+_GIT_DIFFSTAT_LINE_RE = re.compile(
+    r"^\s*([^\s|][^|]*?)\s*\|\s*\d+\s*[+\-]*\s*$", re.MULTILINE,
+)
+
 _VALIDATION_EVIDENCE_TOOLS = {
     "execute_command", "get_git_info", "read_file", "search_code", "list_directory",
 }
@@ -202,7 +222,21 @@ def _successful_changed_paths(tool_records: list[dict[str, Any]], workspace_root
     root = Path(workspace_root or ".").resolve()
     changed: set[Path] = set()
     for item in tool_records:
-        if item.get("success") is not True or item.get("tool_name") not in _MUTATING_TOOLS:
+        if item.get("success") is not True:
+            continue
+        if item.get("tool_name") == "execute_command":
+            command = str((item.get("arguments") or {}).get("command") or "")
+            if not _GIT_DIFFSTAT_COMMAND_RE.search(command):
+                continue
+            stdout = str(item.get("stdout") or "")
+            for match in _GIT_DIFFSTAT_LINE_RE.finditer(stdout):
+                raw_path = match.group(1).strip()
+                if not raw_path or not _looks_like_file_path(Path(raw_path)):
+                    continue
+                candidate = Path(raw_path).expanduser()
+                changed.add((candidate if candidate.is_absolute() else root / candidate).resolve())
+            continue
+        if item.get("tool_name") not in _MUTATING_TOOLS:
             continue
         candidates = list(item.get("files_changed") or [])
         argument_path = (item.get("arguments") or {}).get("path")
@@ -344,11 +378,13 @@ def validate_completion(
                 )
 
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}:
-        mutation_requirement_met = any_mutation or verified_no_change
+        git_diffstat_evidence = bool(_successful_changed_paths(tool_records, workspace_root))
+        mutation_requirement_met = any_mutation or verified_no_change or git_diffstat_evidence
         checks.append({
             "name": "mutation_recorded",
             "passed": mutation_requirement_met,
             "accepted_verified_no_change": verified_no_change,
+            "accepted_git_diffstat_evidence": git_diffstat_evidence,
         })
         if not mutation_requirement_met:
             unresolved.append("The request required a code change, but no successful file mutation was recorded.")

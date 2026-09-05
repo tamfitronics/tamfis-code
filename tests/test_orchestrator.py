@@ -478,6 +478,82 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(report.severity, "error")
         self.assertTrue(any("no successful file mutation" in item for item in report.unresolved))
 
+    def test_git_commit_with_diffstat_satisfies_mutation_recorded(self):
+        """A turn that finds an objective already committed and verifies it
+        with `git diff --stat` must not be told no mutation was recorded.
+
+        Live-reproduced: a turn ran only git status/log/diff-stat, tsc, and
+        compileall (no write_file/edit_file calls -- the edits and commit
+        predated this turn's tool_records), reported the real, verified,
+        pushed commit's diffstat, and validate_completion still failed with
+        "no successful file mutation was recorded" even though the diffstat
+        output proved real files changed. Twice-repeated evidence-correction
+        retries followed, each re-running the same read-only commands with
+        nothing new to add, before the turn failed anyway.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken router"),
+            tool_records=[
+                {"tool_name": "read_file", "success": True},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git commit -m 'fix'"},
+                },
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git diff --stat HEAD~1..HEAD"},
+                    "stdout": (
+                        " api/seo-router.ts           | 24 ++++++++++++++++++++++++\n"
+                        " src/pages/CampaignsPage.tsx |  5 +++++\n"
+                        " 2 files changed, 29 insertions(+)\n"
+                    ),
+                },
+            ],
+            any_mutation=False,
+            final_text=(
+                "Changes committed and pushed: abc1234 -- 2 files, 29 insertions.\n"
+                "api/seo-router.ts and src/pages/CampaignsPage.tsx were updated."
+            ),
+            workspace_root="/srv/app",
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        mutation_check = next(item for item in report.checks if item["name"] == "mutation_recorded")
+        self.assertTrue(mutation_check["accepted_git_diffstat_evidence"])
+
+    def test_git_diffstat_evidence_ignores_non_diffstat_command_output(self):
+        """Arbitrary command stdout must not be mistaken for a real diffstat.
+
+        Only the stdout of a command that actually ran `git diff/show/log
+        --stat` (or `git diff --name-only`) is trusted -- text that merely
+        looks like a diffstat line, printed by an unrelated command, must not
+        satisfy mutation_recorded.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken router"),
+            tool_records=[
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "cat notes.txt"},
+                    "stdout": " api/seo-router.ts | 24 ++++++++++++++++++++++++\n",
+                },
+            ],
+            any_mutation=False,
+            final_text="I fixed api/seo-router.ts.",
+            workspace_root="/srv/app",
+        )
+
+        self.assertFalse(report.passed)
+        self.assertEqual(report.severity, "error")
+        self.assertTrue(any("no successful file mutation" in item for item in report.unresolved))
+
     def test_guard_tool_call_auto_extends_the_tool_call_budget(self):
         # Regression: a "round" can contain several tool calls, so the raw
         # tool-call ceiling was reachable before the round budget's own
