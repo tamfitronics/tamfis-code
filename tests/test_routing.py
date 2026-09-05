@@ -500,6 +500,23 @@ def test_plain_provider_404_without_response_detail_is_retryable():
     assert ProviderManager.is_retryable_provider_error(NotFoundError("Error code: 404"))
 
 
+def test_system_message_ordering_400_is_retryable():
+    # Live-reported (2026-09-05): TamfisGPT Ultra's backend rejected a
+    # request outright because tamfis-code appends a role="system"
+    # correction/nudge message mid-conversation (NARRATED_TOOL_CORRECTION,
+    # CAPITULATION_CORRECTION, etc. in runner_local.py -- a deliberate,
+    # working pattern most providers accept anywhere in the array). This is
+    # a route-shape incompatibility, not evidence the user's task is
+    # malformed -- AUTO mode should fall back to the next provider instead
+    # of hard-stopping the turn.
+    exc = RuntimeError(
+        "Error code: 400 - {'error': {'message': 'System message must be "
+        "at the beginning.', 'type': 'BadRequestError', 'param': None, "
+        "'code': 400}}"
+    )
+    assert ProviderManager.is_retryable_provider_error(exc)
+
+
 def test_http_422_is_retryable_provider_failure():
     # 422 was previously missing from the explicit retryable status set --
     # it hit the same "Provider streaming failed ... type `continue` to

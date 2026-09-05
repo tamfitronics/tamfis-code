@@ -1311,6 +1311,24 @@ class ProviderManager:
                 if (
                     "degraded function cannot be invoked" in message
                     or "function cannot be invoked" in message
+                    # FIX (2026-09-05, operator report): tamfis-code appends
+                    # a role="system" correction/nudge message mid-
+                    # conversation in ~15 places (NARRATED_TOOL_CORRECTION,
+                    # FAKE_TOOL_CALL_CORRECTION, PORT_CONFLICT_CORRECTION,
+                    # CAPITULATION_CORRECTION, etc. in runner_local.py) --
+                    # a deliberate, working pattern most providers accept
+                    # anywhere in the array. TamfisGPT Ultra's backend at
+                    # the time rejected it outright with this exact message,
+                    # which is a route-shape incompatibility, not evidence
+                    # the user's actual task is malformed: the next provider
+                    # accepts the identical logical request (confirmed live
+                    # -- switching routes on this exact error resolved it).
+                    # Rewriting every mid-conversation system-nudge call
+                    # site to a different role would be a much larger, far
+                    # riskier change for the same outcome; route around the
+                    # incompatible provider instead, same as the 422/
+                    # "degraded function" cases just above.
+                    or "system message must be at the beginning" in message
                 ):
                     return True
             return status in {
@@ -1386,6 +1404,12 @@ class ProviderManager:
             "not found for account",
             "degraded function cannot be invoked",
             "function cannot be invoked",
+            # See the identical marker's comment in the status==400 branch
+            # above -- a mid-conversation role="system" correction/nudge
+            # message (a deliberate, working tamfis-code pattern) rejected
+            # by one specific backend's stricter message-ordering rule, not
+            # evidence the user's task is malformed.
+            "system message must be at the beginning",
         )
         return any(marker in message for marker in retryable_markers)
 
