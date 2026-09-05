@@ -508,6 +508,39 @@ class OrchestratorTests(unittest.TestCase):
                 )
                 self.assertTrue(live_check["passed"])
 
+    def test_pm2_and_supervisorctl_restarts_satisfy_restart_claim(self):
+        """pm2/supervisorctl are recognized restart mechanisms elsewhere here.
+
+        runner_local.py's own _SERVICE_RESTART_RE (used to warn before
+        approving a disruptive restart) recognizes systemctl/service/
+        /etc/init.d/apachectl/nginx/pm2/supervisorctl restart-or-reload, but
+        this check's allowlist only recognized systemctl/service/docker
+        compose -- a pm2- or supervisord-managed project's real, successful
+        restart never satisfied a "the service is now live" claim.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        for restart_command in ("pm2 restart api", "supervisorctl restart worker", "nginx -s reload"):
+            with self.subTest(restart_command=restart_command):
+                report = validate_completion(
+                    profile=classify_task("fix the config and restart the service"),
+                    tool_records=[
+                        {"tool_name": "write_file", "success": True},
+                        {
+                            "tool_name": "execute_command", "success": True, "exit_code": 0,
+                            "arguments": {"command": restart_command},
+                        },
+                    ],
+                    any_mutation=True,
+                    final_text="The service is now live with the fix.",
+                )
+                restart_check = next(
+                    item for item in report.checks
+                    if item["name"] == "reported_restart_supported"
+                )
+                self.assertTrue(restart_check["passed"])
+
     def test_verified_already_resolved_debug_task_does_not_require_meaningless_edit(self):
         from tamfis_code.orchestrator.validator import validate_completion
         from tamfis_code.routing import classify_task

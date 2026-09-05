@@ -336,7 +336,22 @@ def validate_completion(
 
     successful_commands = _successful_commands(tool_records)
     if _SERVICE_RESTART_CLAIM_RE.search(final_text or ""):
-        restart_supported = any(re.search(r"\b(?:systemctl|service|docker(?:\s+compose)?)\b.*\brestart\b", command, re.I) for command in successful_commands)
+        # runner_local.py's own _SERVICE_RESTART_RE (used to warn before
+        # approving a disruptive restart) recognizes systemctl/service/
+        # /etc/init.d/apachectl/nginx/pm2/supervisorctl restart-or-reload --
+        # a strictly broader, already-established definition of "a restart
+        # command" than this check used. A project managed by pm2 or
+        # supervisord (both first-class enough elsewhere in this codebase
+        # to get their own pre-approval warning) had its real, successful
+        # restart wrongly rejected as unsupported here.
+        restart_supported = any(
+            re.search(
+                r"\b(?:systemctl|service|/etc/init\.d/\S+|apachectl|nginx|pm2|supervisorctl|docker(?:\s+compose)?)\b"
+                r".*\b(?:restart|reload)\b",
+                command, re.I,
+            )
+            for command in successful_commands
+        )
         checks.append({"name": "reported_restart_supported", "passed": restart_supported})
         if not restart_supported:
             unresolved.append("The response claims a service restart, but no successful restart command supports that claim.")
