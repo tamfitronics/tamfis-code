@@ -150,6 +150,26 @@ _GIT_DIFFSTAT_LINE_RE = re.compile(
     r"^\s*([^\s|][^|]*?)\s*\|\s*\d+\s*[+\-]*\s*$", re.MULTILINE,
 )
 
+# Confirmed live: a turn that fixes the requested bug, verifies it cleanly
+# (build/typecheck/test all pass), then tries `git push origin main` as its
+# last action inside a sandbox with no outbound network route to the git
+# remote fails that push every time -- "Could not connect to github.com port
+# 443" -- and no amount of repair-and-retry ever changes that, because the
+# code is not what's broken. Treating that as "the latest verification
+# command failed" (below) blocks a turn that actually succeeded from ever
+# being reported complete. A delivery command (push/fetch/pull/clone/publish
+# to a remote) reflects network reachability, not code correctness, so it
+# must never stand in for the last *verification* command this gate exists
+# to check -- unlike a local command (build/test/lint/git commit), whose
+# failure is something a repair can actually fix.
+_DELIVERY_ONLY_COMMAND_RE = re.compile(
+    r"^\s*(?:git\s+(?:push|fetch|pull|clone|remote\b)|"
+    r"npm\s+publish\b|yarn\s+publish\b|pnpm\s+publish\b|"
+    r"docker\s+(?:push|pull)\b|"
+    r"gh\s+(?:pr|release)\s+create\b)",
+    re.IGNORECASE,
+)
+
 _VALIDATION_EVIDENCE_TOOLS = {
     "execute_command", "get_git_info", "read_file", "search_code", "list_directory",
 }
@@ -436,7 +456,11 @@ def validate_completion(
         # passed".  The runner may ask the model to repair and retry, but it
         # must never call the turn complete while the latest verification is
         # red.
-        commands = [item for item in tool_records if item.get("tool_name") == "execute_command"]
+        commands = [
+            item for item in tool_records
+            if item.get("tool_name") == "execute_command"
+            and not _DELIVERY_ONLY_COMMAND_RE.search(str((item.get("arguments") or {}).get("command") or ""))
+        ]
         latest_command = commands[-1] if commands else None
         latest_command_failed = bool(
             latest_command

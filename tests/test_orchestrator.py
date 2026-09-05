@@ -431,6 +431,51 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(report.severity, "error")
         self.assertTrue(any("latest verification command failed" in item for item in report.unresolved))
 
+    def test_failed_git_push_does_not_block_completion_after_clean_verification(self):
+        """A network-blocked git push must not fail a turn that verified clean.
+
+        Live-reproduced: a turn fixed the requested bug, ran a clean build/
+        typecheck, committed, then tried `git push origin main` as its last
+        action inside a sandbox with no outbound route to the git remote --
+        "Could not connect to github.com port 443". That failure reflects
+        network reachability, not code correctness, and no repair-and-retry
+        loop can ever fix it from inside the same sandbox. Treating the push
+        as "the latest verification command" wrongly failed a turn that had
+        actually already succeeded.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken TypeScript router"),
+            tool_records=[
+                {"tool_name": "write_file", "success": True},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "npx tsc --noEmit"},
+                },
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git commit -m 'fix'"},
+                },
+                {
+                    "tool_name": "execute_command", "success": False, "exit_code": 1,
+                    "arguments": {"command": "git push origin main"},
+                },
+            ],
+            any_mutation=True,
+            final_text=(
+                "Fixed the router and verified with a clean typecheck. The commit "
+                "is ready locally; push to origin/main is blocked by the sandbox's "
+                "network boundary (could not connect to github.com port 443)."
+            ),
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        latest_check = next(item for item in report.checks if item["name"] == "latest_command_clean")
+        self.assertTrue(latest_check["passed"])
+
     def test_verified_already_resolved_debug_task_does_not_require_meaningless_edit(self):
         from tamfis_code.orchestrator.validator import validate_completion
         from tamfis_code.routing import classify_task
