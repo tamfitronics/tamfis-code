@@ -476,6 +476,38 @@ class OrchestratorTests(unittest.TestCase):
         latest_check = next(item for item in report.checks if item["name"] == "latest_command_clean")
         self.assertTrue(latest_check["passed"])
 
+    def test_yarn_and_bun_test_runs_satisfy_live_verification_claim(self):
+        """yarn/bun are first-class package managers here, not npm-only.
+
+        workspace.py detects yarn.lock and sets package_manager="yarn";
+        planner.py's command regex covers npm/pnpm/yarn/bun/deno. But the
+        live-verification allowlist only recognized npm/pnpm test, so a
+        yarn- or bun-based project's real, successful `yarn test`/`bun test`
+        run never satisfied a "the endpoint is now working" claim.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        for test_command in ("yarn test", "bun test"):
+            with self.subTest(test_command=test_command):
+                report = validate_completion(
+                    profile=classify_task("fix the broken API endpoint"),
+                    tool_records=[
+                        {"tool_name": "write_file", "success": True},
+                        {
+                            "tool_name": "execute_command", "success": True, "exit_code": 0,
+                            "arguments": {"command": test_command},
+                        },
+                    ],
+                    any_mutation=True,
+                    final_text="The endpoint is now working and verified.",
+                )
+                live_check = next(
+                    item for item in report.checks
+                    if item["name"] == "reported_live_verification_supported"
+                )
+                self.assertTrue(live_check["passed"])
+
     def test_verified_already_resolved_debug_task_does_not_require_meaningless_edit(self):
         from tamfis_code.orchestrator.validator import validate_completion
         from tamfis_code.routing import classify_task

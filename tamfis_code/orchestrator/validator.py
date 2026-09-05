@@ -342,8 +342,19 @@ def validate_completion(
             unresolved.append("The response claims a service restart, but no successful restart command supports that claim.")
 
     if _LIVE_VERIFICATION_CLAIM_RE.search(final_text or ""):
+        # yarn and bun are first-class package managers elsewhere in this
+        # codebase (workspace.py detects yarn.lock and sets
+        # package_manager="yarn"; planner.py's command regex covers
+        # npm/pnpm/yarn/bun/deno) -- but this allowlist only recognized
+        # npm/pnpm test, silently failing every yarn- or bun-based project's
+        # live/API verification claim even after a real successful
+        # `yarn test`/`bun test` run.
         live_check_supported = any(
-            re.search(r"\b(?:curl|wget|httpie|pytest|vitest|playwright|npm\s+(?:run\s+)?test|pnpm\s+(?:run\s+)?test)\b", command, re.I)
+            re.search(
+                r"\b(?:curl|wget|httpie|pytest|vitest|playwright|"
+                r"(?:npm|pnpm|yarn|bun|deno)\s+(?:run\s+)?test)\b",
+                command, re.I,
+            )
             for command in successful_commands
         )
         checks.append({"name": "reported_live_verification_supported", "passed": live_check_supported})
