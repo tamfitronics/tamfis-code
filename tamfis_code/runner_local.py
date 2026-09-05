@@ -4148,6 +4148,7 @@ async def _attempt_reasoning_plan(
         objective, task_profile, repository_context,
         reconnaissance_summary=reconnaissance_summary,
         evidence_summary=evidence_summary,
+        scope_roots=scope_roots,
     )
     attempt_client, attempt_model = client, model
     tried_providers: set[ProviderType] = set()
@@ -4853,6 +4854,7 @@ async def _run_local_agent_turn_impl(
             objective, task_profile,
             reconnaissance_summary=planning_reconnaissance,
             workspace_summary=repository_context,
+            scope_roots=scope_roots,
         )
         reasoning_plan = await _attempt_reasoning_plan(
             client, model=resolved_model, objective=objective, task_profile=task_profile,

@@ -255,6 +255,40 @@ class GroundedFallbackPlanTests(unittest.TestCase):
         self.assertIn(str(target), rendered)
         self.assertNotIn("Trace objective-relevant code paths from reconnaissance", rendered)
 
+    def test_scope_roots_narrow_the_plan_when_repository_root_is_a_broad_wrapper(self):
+        """A session whose cached repository_root is a broad wrapper repo
+        (e.g. /home, itself a real git repo spanning many unrelated sibling
+        projects) must not inventory every sibling project when the actual
+        objective is scoped to one subproject. Live-reproduced: a plan for an
+        SEO campaign feature in one subdirectory inventoried /tmp, unrelated
+        sibling projects' manifests, and another session's scratchpad files,
+        because create_plan only ever consulted the broad repository_root
+        and never the narrower scope_roots already used elsewhere (tool
+        authorization) to bound a turn to its actual project."""
+        with tempfile.TemporaryDirectory() as tmp:
+            broad_root = Path(tmp)
+            (broad_root / "unrelated_project").mkdir()
+            (broad_root / "unrelated_project" / "package.json").write_text("{}\n")
+            project = broad_root / "my_project"
+            project.mkdir()
+            (project / "pyproject.toml").write_text("[project]\nname='demo'\n")
+            profile = TaskProfile(
+                task_type=TaskType.DEBUG, complexity="high", requires_tools=True,
+                requires_validation=True, requires_repository_context=True,
+                requires_long_context=True, preferred_quality_tier="frontier",
+            )
+            plan = create_plan(
+                "fix the multi-file campaign auto-start bug",
+                profile,
+                workspace_summary={"repository_root": str(broad_root)},
+                scope_roots=[project],
+            )
+
+        self.assertIsNotNone(plan)
+        rendered = "\n".join(step.name for step in plan.steps)
+        self.assertIn(str(project), rendered)
+        self.assertNotIn(str(broad_root / "unrelated_project"), rendered)
+
     def test_deeply_fabricated_nonexistent_path_is_rejected_with_no_graph_evidence(self):
         # Parent directory doesn't exist either -- not a plausible creation
         # target, distinct from "new file in an existing directory".
