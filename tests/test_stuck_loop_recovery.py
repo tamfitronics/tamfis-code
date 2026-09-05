@@ -17,6 +17,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from tamfis_code.providers import ProviderType
 from tamfis_code.runner_local import run_local_agent_turn
@@ -24,12 +25,36 @@ from tamfis_code.runner_local import run_local_agent_turn
 from test_reasoning_plan import (
     _FakeClient,
     _FakeManager,
+    _FakeStream,
+    _FallbackCapableManager,
     _RecordingRenderer,
     _StatePatchMixin,
     _chunk,
     _delta,
     _tool_call_delta,
 )
+
+
+class _RoundsThenRateLimitedClient:
+    """Serves the given rounds normally, then raises a retryable rate-limit
+    error on every call after -- simulating the stuck-loop recovery's own
+    completion call landing on the same exhausted free-tier route that
+    already served every earlier round in the turn."""
+
+    def __init__(self, rounds):
+        self._rounds = list(rounds)
+        self.calls = 0
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+
+    async def _create(self, **kwargs):
+        self.calls += 1
+        if self._rounds:
+            return _FakeStream(self._rounds.pop(0))
+        raise RuntimeError(
+            "Error code: 429 - {'error': {'message': 'Rate limit exceeded: "
+            "free-models-per-day. Add 10 credits to unlock 1000 free model "
+            "requests per day', 'code': 429}}"
+        )
 
 
 class StuckLoopRecoveryTests(_StatePatchMixin, unittest.TestCase):
@@ -77,6 +102,54 @@ class StuckLoopRecoveryTests(_StatePatchMixin, unittest.TestCase):
                 if e["event_type"] == "diagnostics"
             ]
             self.assertTrue(any("reconstructing a summary" in d for d in diagnostics))
+
+    def test_recovery_answer_falls_over_to_another_provider_on_rate_limit(self):
+        """Live-reported: the tools-disabled recovery completion hit a 429
+        on an exhausted free-tier OpenRouter route and hard-failed the whole
+        turn ("nothing further to try this turn"), even though a different,
+        healthy provider was configured. This call must retry across
+        fallback_candidates the same way the main answer path and
+        _attempt_reasoning_plan already do, instead of giving up on the
+        first failure."""
+        with tempfile.TemporaryDirectory() as ws:
+            path = Path(ws) / "file_0.py"
+            path.write_text("# real content\n")
+
+            rounds = [self._read_round(i, path) for i in range(5)]
+            failing_client = _RoundsThenRateLimitedClient(rounds)
+            working_client = _FakeClient([[_chunk(_delta(content="Recovered answer after fallback."))]])
+            manager = _FallbackCapableManager(
+                {ProviderType.NVIDIA: failing_client, ProviderType.OPENROUTER: working_client},
+                fallback_order=[ProviderType.OPENROUTER],
+            )
+            for config in manager.PROVIDERS.values():
+                config.context_window = 32768
+            # Isolate the fix under test (the tools-disabled recovery call's
+            # own retry-with-fallback) from the separate, earlier
+            # switch-provider-and-continue-the-round-loop mechanism, which
+            # would otherwise also trigger on this same stuck detection and
+            # reach the fallback provider before the code path this test
+            # targets ever runs.
+            manager.auto_fallback_enabled = lambda: False
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "read file_0.py repeatedly"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertIn("Recovered answer after fallback.", outcome.summary)
+            self.assertEqual(len(working_client.calls), 1)
+            diagnostics = [
+                str(e["payload"].get("content"))
+                for e in renderer.events
+                if e["event_type"] == "diagnostics"
+            ]
+            self.assertTrue(any("retrying with a different provider" in d for d in diagnostics))
+            self.assertFalse(any("nothing further to try this turn" in d for d in diagnostics))
 
 
 if __name__ == "__main__":

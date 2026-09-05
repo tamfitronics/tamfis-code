@@ -5296,16 +5296,56 @@ async def _run_local_agent_turn_impl(
                 "finish this way, say so plainly and tell the user what to narrow it to."
             ),
         })
-        try:
-            recovery_content, _recovery_calls, recovery_finish_reason = await _stream_one_completion(
-                client, model=resolved_model, messages=working_messages, tools=[], renderer=renderer,
-                reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
-            )
-        except Exception as exc:
-            message = f"Stuck-loop recovery answer failed too ({exc}); nothing further to try this turn."
-            orchestrator.fail(message)
-            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
-            return TaskOutcome(status="failed", error=message)
+        # Confirmed live: this recovery call used to hit one pre-resolved
+        # provider with no retry, unlike the main answer-streaming path
+        # (ProviderManager.chat_completion's allow_fallback) and
+        # _attempt_reasoning_plan's own fallback loop. A retryable failure
+        # here (a 429/rate-limit on a free-tier route) repeated identically
+        # against the SAME route and then hard-failed the whole turn, even
+        # though other configured providers were healthy -- the one place a
+        # stuck turn most needs a working fallback path is exactly where it
+        # had none. Mirrors _attempt_reasoning_plan's retry-with-fallback
+        # pattern: try each remaining fallback candidate in the same policy
+        # order the main path uses before giving up.
+        recovery_client, recovery_model = client, resolved_model
+        recovery_provider = resolved_provider
+        tried_recovery_providers: set[ProviderType] = set()
+        recovery_content = _recovery_calls = recovery_finish_reason = None
+        while True:
+            try:
+                recovery_content, _recovery_calls, recovery_finish_reason = await _stream_one_completion(
+                    recovery_client, model=recovery_model, messages=working_messages, tools=[], renderer=renderer,
+                    reasoning_effort=_reasoning_effort(recovery_provider, recovery_model),
+                )
+                break
+            except Exception as exc:
+                fallback_client = fallback_model = None
+                if manager.is_retryable_provider_error(exc):
+                    for candidate in manager.fallback_candidates(
+                        recovery_provider, task_profile,
+                        allow_premium_primary=manager.is_quota_or_rate_limit_error(exc),
+                    ):
+                        if candidate in tried_recovery_providers:
+                            continue
+                        candidate_client = manager.get_client(candidate)
+                        candidate_config = manager.PROVIDERS.get(candidate)
+                        if candidate_client is None or candidate_config is None:
+                            continue
+                        fallback_client = candidate_client
+                        fallback_model = manager.select_model(candidate_config, task_profile)
+                        recovery_provider = candidate
+                        break
+                if fallback_client is None:
+                    message = f"Stuck-loop recovery answer failed too ({exc}); nothing further to try this turn."
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    return TaskOutcome(status="failed", error=message)
+                tried_recovery_providers.add(recovery_provider)
+                recovery_client, recovery_model = fallback_client, fallback_model
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": f"Stuck-loop recovery answer failed ({exc}); retrying with a different provider."},
+                })
         if not recovery_content.strip():
             fallback_summary = _synthesize_stuck_recovery_summary(working_messages)
             if fallback_summary:
