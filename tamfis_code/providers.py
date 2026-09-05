@@ -347,7 +347,9 @@ class ProviderManager:
                 # included-plan Kimi coding default. This makes it available
                 # as an explicit Ollama Cloud priority without unexpectedly
                 # changing the automatic model for every task.
-                "glm-5.2:cloud",
+                "glm-5.3:cloud",
+                "glm-5.3-flash:cloud",
+                "deepseek-v4-pro:cloud",
                 # Replaces the prior minimax-m2.7:cloud route outright
                 # (2026-08-03): same MiniMax family already routed via
                 # Ollama Cloud, now the latest generation with a 1M-token
@@ -378,6 +380,7 @@ class ProviderManager:
             vision_models=[
                 "kimi-k2.7-code:cloud",
                 "kimi-k3:cloud",
+                "glm-5.3-flash:cloud",
             ],
             # NOTE: this budget is shared by the whole provider bucket
             # (gemma4:cloud, minimax-m3:cloud too, not just kimi-k3), and
@@ -1575,6 +1578,10 @@ class ProviderManager:
                 else self.select_model(config, task_profile)
             )
         )
+
+        if resolved == ProviderType.OLLAMA_CLOUD and selected_model in {"glm-5.2", "glm-5.2:cloud", "glm-5.2-cloud"}:
+            # Migrate saved sessions and inherited shell overrides too.
+            selected_model = "glm-5.3:cloud"
 
         request_kwargs: Dict[str, Any] = {
             "model": selected_model,

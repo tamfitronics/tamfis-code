@@ -216,6 +216,7 @@ def test_researched_provider_routes_expose_exact_vision_models():
         ProviderType.OLLAMA_CLOUD: {
             "kimi-k2.7-code:cloud",
             "kimi-k3:cloud",
+            "glm-5.3-flash:cloud",
         },
         ProviderType.NVIDIA: {
             "moonshotai/kimi-k3",
@@ -285,8 +286,9 @@ def test_premium_ollama_remains_enabled_without_auto_primary(monkeypatch):
 
 def test_ollama_exposes_glm_52_as_a_priority():
     config = ProviderManager.PROVIDERS[ProviderType.OLLAMA_CLOUD]
-    assert "glm-5.2:cloud" in config.models
-    assert config.models.index("glm-5.2:cloud") == (
+    assert "glm-5.2:cloud" not in config.models
+    assert "glm-5.3:cloud" in config.models
+    assert config.models.index("glm-5.3:cloud") == (
         config.models.index("kimi-k2.7-code:cloud") + 1
     )
 

@@ -15,7 +15,7 @@ from typing import Any
 # with a terminal that implements CPR can explicitly opt back in.
 os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 
-__version__ = "1.6.14"
+__version__ = "1.6.18"
 MIN_COMPATIBLE_API_VERSION = "remote-ai-v2"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {

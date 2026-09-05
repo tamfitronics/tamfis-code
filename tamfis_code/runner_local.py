@@ -4787,6 +4787,9 @@ async def _run_local_agent_turn_impl(
     )
     from .public_identity import resolve_public_model_alias
 
+    if resolved_provider == ProviderType.OLLAMA_CLOUD and model in {"glm-5.2", "glm-5.2:cloud", "glm-5.2-cloud"}:
+        model = "glm-5.3:cloud"
+
     resolved_model = resolve_public_model_alias(
         model,
         models=getattr(config, "models", ()),

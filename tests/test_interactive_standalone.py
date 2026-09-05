@@ -110,6 +110,14 @@ class SlashCommandCompleterTests(unittest.TestCase):
         results = self._complete("/")
         self.assertEqual(set(results), {name for name, _ in SLASH_COMMANDS})
 
+    def test_model_space_offers_distinct_options(self):
+        self.assertEqual(set(self._complete("/model ")), {"auto", "smart", "pro", "ultra", "ultima"})
+        self.assertEqual(set(self._complete("/model ul")), {"ultra", "ultima"})
+
+    def test_model_provider_options_complete_the_whole_selection(self):
+        self.completer = _SlashCommandCompleter(model_options={"ollama_cloud glm-5.3:cloud": "Ollama Cloud"})
+        self.assertEqual(self._complete("/model ollama_cloud g"), ["ollama_cloud glm-5.3:cloud"])
+
 
 class SidebarPageTests(unittest.TestCase):
     def setUp(self):

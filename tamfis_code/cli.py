@@ -421,6 +421,8 @@ def update_command(ctx: click.Context, check_only: bool) -> None:
         return
 
     console.print(f"[yellow]Update available:[/yellow] {__version__} -> {pending}")
+    from .self_update import update_instructions
+    console.print(update_instructions(), markup=False)
     if check_only:
         return
 

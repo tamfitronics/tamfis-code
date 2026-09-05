@@ -242,10 +242,10 @@ $ <command>            explicit shell command
 Shift+Tab            cycle mode without typing a command (shown in the prompt as [mode]);
                      also works while a task is already running, not just at this prompt
 message>             while a task is running: type a message and press Enter
-/model               show the active model route
-/model list          list TamfisGPT model aliases
+/model               show current route and available choices
+/model list          list model groups and available provider models
 /model auto          restore TamfisGPT automatic model selection
-/model <alias>       select Auto, Fast, Code, Pro, or Vision
+/model <alias>       select Auto, Smart, Pro, Ultra, or Ultima
 /tools               show the tools exposed to tamfis-code tasks
 /pty start [command]  start a persistent background terminal (default: bash)
 /pty list             list this session's background terminals
@@ -327,11 +327,24 @@ class _SlashCommandCompleter(Completer):
     needing to be reconstructed when a command file changes mid-session.
     """
 
-    def __init__(self, custom_commands: Optional[dict[str, CustomCommand]] = None) -> None:
+    def __init__(self, custom_commands: Optional[dict[str, CustomCommand]] = None, model_options: Optional[dict[str, str]] = None) -> None:
         self._custom_commands = custom_commands if custom_commands is not None else {}
+        self._model_options = model_options if model_options is not None else {
+            name: description for name, description in (
+                ("auto", "Automatic selection"), ("smart", "Quick tasks"),
+                ("pro", "Everyday coding"), ("ultra", "Complex work"),
+                ("ultima", "Frontier reasoning"),
+            )
+        }
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
+        if text.lower().startswith("/model "):
+            prefix = text[len("/model "):]
+            for option, description in self._model_options.items():
+                if option.lower().startswith(prefix.lower()) and option.lower() != prefix.lower():
+                    yield Completion(option, start_position=-len(prefix), display_meta=description)
+            return
         if not text.startswith("/") or " " in text:
             return
         for name, description in SLASH_COMMANDS:
@@ -868,13 +881,14 @@ async def run_interactive(
         "Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
 
-    from .self_update import check_update_available
+    from .self_update import check_update_available, update_instructions
     _available_update = check_update_available()
     if _available_update:
         console.print(
             f"[yellow]◆ Update available: {__version__} -> {_available_update}.[/yellow] "
             "[dim]Type /update to apply and restart into this same session.[/dim]\n"
         )
+        console.print(Panel(update_instructions(), title="Tamfis Code update"))
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
@@ -962,7 +976,17 @@ async def run_interactive(
         if not buffer.text and suggestion:
             buffer.insert_text(suggestion)
             return
-        buffer.start_completion(select_first=False)
+        if buffer.complete_state:
+            buffer.complete_next()
+        else:
+            buffer.start_completion(select_first=False)
+
+    @bindings.add("/")
+    def _open_slash_menu(event) -> None:
+        buffer = event.current_buffer
+        buffer.insert_text("/")
+        if buffer.text == "/":
+            buffer.start_completion(select_first=False)
 
     # Reported live: pasting a long block (clipboard paste, terminal
     # bracketed-paste mode) inserted the entire raw text into the input
@@ -1012,9 +1036,17 @@ async def run_interactive(
     idle_active_agents = local_state.active_swarm_child_count(
         exclude_session_id=workspace.session_id,
     )
+    model_options = dict(_SlashCommandCompleter()._model_options)
+    if standalone and provider_manager is not None:
+        for available_provider, provider_config in provider_manager.PROVIDERS.items():
+            if available_provider not in provider_manager.clients:
+                continue
+            for candidate in dict.fromkeys([provider_config.default_model, *provider_config.models]):
+                if candidate:
+                    model_options[f"{available_provider.value} {candidate}"] = provider_config.name
     session: PromptSession = PromptSession(
         history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
-        completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
+        completer=_SlashCommandCompleter(custom_commands, model_options), complete_while_typing=True,
         bottom_toolbar=lambda: idle_bottom_toolbar(
             config,
             workspace.session_id,
@@ -1032,7 +1064,7 @@ async def run_interactive(
             lambda: suggestion_state,
         ),
         style=composer_style(),
-        reserve_space_for_menu=0,
+        reserve_space_for_menu=8,
         # prompt-toolkit supplies a real dynamic Frame around the entire
         # multiline editor. This is the composer box the previous prompt-only
         # change failed to provide; the status/mode toolbar remains directly
@@ -1223,7 +1255,7 @@ async def run_interactive(
             console.print(HELP_TEXT)
             if standalone:
                 console.print(
-                    "[dim]Standalone mode: /model list needs the remote model catalog; /pty, diffs/revert, resume, "
+                    "[dim]Standalone mode: /model list shows available local provider choices; /pty, diffs/revert, resume, "
                     "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
                 )
             continue
@@ -1512,7 +1544,7 @@ async def run_interactive(
             if not arg:
                 from .public_identity import public_model_name
                 console.print(f"model={public_model_name(state.selected_model)}")
-                continue
+                arg = "list"
             parts = arg.split()
 
             from .public_identity import (
@@ -1555,6 +1587,13 @@ async def run_interactive(
                         status = "🟢 Available" if tier in entitled_tiers else "🔒 Not on your plan"
                         table.add_row(tier, uses[tier], status)
                 console.print(table)
+                if standalone:
+                    choices = Table("SELECT WITH", "PROVIDER")
+                    for option, description in model_options.items():
+                        if " " in option:
+                            choices.add_row(f"/model {option}", description)
+                    console.print(choices)
+                console.print("[dim]Type /model followed by a space for selectable options. Use arrows or Tab, then Enter.[/dim]")
                 continue
             public_alias = parse_public_model_alias(parts[0])
             if public_alias:
