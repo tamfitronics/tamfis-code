@@ -7,7 +7,13 @@ from tamfis_code.provider_protocols import (
 )
 
 
-def test_system_messages_are_stably_hoisted_without_breaking_tool_transcript():
+def test_system_messages_are_merged_to_one_without_breaking_tool_transcript():
+    # FIX (2026-09-05, live-confirmed): hoisting-only (keeping N separate
+    # system messages, just reordered to the front) was not enough --
+    # a backend still rejected the request with the same "System message
+    # must be at the beginning" error, meaning its real constraint is
+    # "exactly one system message, and it's first". Collapsing to one
+    # combined message satisfies both readings.
     messages = [
         {"role": "system", "content": "base"},
         {"role": "user", "content": "fix it"},
@@ -22,14 +28,33 @@ def test_system_messages_are_stably_hoisted_without_breaking_tool_transcript():
 
     normalized = system_messages_first(messages)
 
-    assert [item["content"] for item in normalized[:3]] == [
-        "base", "repair after evidence", "stream reconnect",
-    ]
-    assert [item["role"] for item in normalized[3:]] == [
+    assert normalized[0] == {
+        "role": "system", "content": "base\n\nrepair after evidence\n\nstream reconnect",
+    }
+    assert [item["role"] for item in normalized[1:]] == [
         "user", "assistant", "tool", "assistant",
     ]
-    assert normalized[4]["tool_calls"][0]["id"] == "call_1"
-    assert normalized[5]["tool_call_id"] == "call_1"
+    assert normalized[2]["tool_calls"][0]["id"] == "call_1"
+    assert normalized[3]["tool_call_id"] == "call_1"
+
+
+def test_system_message_with_list_content_is_flattened_to_text():
+    messages = [
+        {"role": "system", "content": [{"text": "part one"}, {"text": "part two"}]},
+        {"role": "user", "content": "hi"},
+    ]
+    normalized = system_messages_first(messages)
+    assert normalized[0] == {"role": "system", "content": "part one\npart two"}
+
+
+def test_no_system_messages_returns_transcript_unchanged():
+    messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
+    assert system_messages_first(messages) == messages
+
+
+def test_blank_system_messages_do_not_produce_an_empty_leading_message():
+    messages = [{"role": "system", "content": "   "}, {"role": "user", "content": "hi"}]
+    assert system_messages_first(messages) == [{"role": "user", "content": "hi"}]
 
 
 def test_normalizes_ollama_native_text_and_done():

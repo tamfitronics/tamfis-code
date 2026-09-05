@@ -9,16 +9,48 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
 
     Runtime repair, reconnect, and resume instructions are deliberately
     represented as trusted system messages, but they are often created after
-    tool/assistant messages already exist. Some OpenAI-compatible providers
-    (including TamfisGPT subscription routes) reject any system message that
-    appears after the leading block. Stable-partition only by role: system
-    messages retain their order, and every user/assistant/tool message --
-    especially assistant tool_calls and their matching tool responses --
-    retains its exact relative order and identifiers.
+    tool/assistant messages already exist -- a long session can easily
+    accumulate several (the leading identity/format prompt, a scope rule, a
+    resume instruction, and any number of NARRATED_TOOL_CORRECTION/
+    CAPITULATION_CORRECTION/PORT_CONFLICT_CORRECTION-style mid-conversation
+    nudges appended over the turn).
+
+    FIX (2026-09-05, live-confirmed): a simple stable-partition-by-role
+    (move every system message to the front, keep their relative order) was
+    not enough -- a user still hit "System message must be at the
+    beginning" on the very next provider in the fallback chain, meaning
+    that backend's real constraint is stricter than "ordered first": having
+    several distinct system messages, even correctly clustered at the very
+    front, was rejected too. Collapsing them into exactly one combined
+    system message satisfies both readings of the constraint. Content is
+    joined with blank lines in original order, each coerced to plain text
+    (a system message with list/multi-part content -- a different shape
+    some backends also reject under an identically-worded error -- is
+    flattened rather than merged as-is).
     """
-    leading = [message for message in messages if message.get("role") == "system"]
+    def _as_text(content: Any) -> str:
+        if isinstance(content, str):
+            return content
+        if isinstance(content, list):
+            parts = []
+            for block in content:
+                if isinstance(block, dict):
+                    parts.append(str(block.get("text", block.get("content", ""))))
+                else:
+                    parts.append(str(block))
+            return "\n".join(part for part in parts if part)
+        return str(content) if content is not None else ""
+
+    system_texts = [
+        _as_text(message.get("content"))
+        for message in messages
+        if message.get("role") == "system"
+    ]
     remainder = [message for message in messages if message.get("role") != "system"]
-    return [*leading, *remainder]
+    combined_text = "\n\n".join(text for text in system_texts if text.strip())
+    if not combined_text:
+        return remainder
+    return [{"role": "system", "content": combined_text}, *remainder]
 
 
 class ProviderStreamError(RuntimeError):
