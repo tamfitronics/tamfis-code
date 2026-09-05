@@ -1036,14 +1036,16 @@ async def run_interactive(
     idle_active_agents = local_state.active_swarm_child_count(
         exclude_session_id=workspace.session_id,
     )
+    # FIX (2026-09-05, operator request): this used to also list every
+    # concrete provider/model pair (Ollama Cloud/HF/OpenRouter model ids,
+    # even a redundant literal "tamfis tamfis-gpt-*" row) whenever a
+    # provider client was configured, in both /model's tab-completion and
+    # its printed table below. The product decision is that a user should
+    # only ever see the five branded TamfisGPT tiers, matching Claude Code/
+    # Codex's own clean model-naming UX -- never the underlying subscription
+    # provider plumbing, standalone or not. _SlashCommandCompleter's default
+    # (five tiers) is used unconditionally now.
     model_options = dict(_SlashCommandCompleter()._model_options)
-    if standalone and provider_manager is not None:
-        for available_provider, provider_config in provider_manager.PROVIDERS.items():
-            if available_provider not in provider_manager.clients:
-                continue
-            for candidate in dict.fromkeys([provider_config.default_model, *provider_config.models]):
-                if candidate:
-                    model_options[f"{available_provider.value} {candidate}"] = provider_config.name
     session: PromptSession = PromptSession(
         history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
         completer=_SlashCommandCompleter(custom_commands, model_options), complete_while_typing=True,
@@ -1587,13 +1589,7 @@ async def run_interactive(
                         status = "🟢 Available" if tier in entitled_tiers else "🔒 Not on your plan"
                         table.add_row(tier, uses[tier], status)
                 console.print(table)
-                if standalone:
-                    choices = Table("SELECT WITH", "PROVIDER")
-                    for option, description in model_options.items():
-                        if " " in option:
-                            choices.add_row(f"/model {option}", description)
-                    console.print(choices)
-                console.print("[dim]Type /model followed by a space for selectable options. Use arrows or Tab, then Enter.[/dim]")
+                console.print("[dim]Type /model followed by a space for selectable options (Auto, Smart, Pro, Ultra, Ultima). Use arrows or Tab, then Enter.[/dim]")
                 continue
             public_alias = parse_public_model_alias(parts[0])
             if public_alias:
