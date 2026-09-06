@@ -7327,11 +7327,22 @@ async def _run_local_agent_turn_impl(
                     display_command = f"{tc.name}(path={arguments.get('path')!r})"
                 else:
                     display_command = f"{tc.name}({json.dumps(display_arguments, default=str)})"
+                # Confirmed live: this always showed the SESSION's launch
+                # root here, even for a command whose own `cwd` argument
+                # targeted a different directory (e.g. a sibling project
+                # under a shared parent launch root) -- reading, in the same
+                # panel, "Working directory: /home" next to a reason of "The
+                # agent needs access outside the resolved workspace scope:
+                # /home/tamfisseo" as if that path were simultaneously the
+                # working directory and outside it. Show the command's own
+                # requested cwd when it names one; only bare commands with
+                # no cwd concept fall back to the session's launch root.
+                approval_cwd = arguments.get("cwd") if isinstance(arguments, dict) else None
                 renderer.handle_event({
                     "event_type": "approval_required",
                     "payload": {
                         "command": display_command, "risk_level": risk,
-                        "working_directory": workspace_root, "reason": reason,
+                        "working_directory": approval_cwd or workspace_root, "reason": reason,
                         "diff": diff_preview,
                     },
                 })

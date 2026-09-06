@@ -350,5 +350,59 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             self.assertEqual(scoped["_tamfis_external_scope_paths"], [str(root.resolve())])
 
 
+class ApprovalPanelWorkingDirectoryTests(unittest.TestCase):
+    """Live-observed: an execute_command call whose own `cwd` argument named
+    a directory outside the session's launch root always showed the
+    session's launch root as "Working directory" in the approval panel --
+    reading, in the same panel, "Working directory: /home" next to a reason
+    of "The agent needs access outside the resolved workspace scope:
+    /home/tamfisseo", as if that path were simultaneously the working
+    directory and outside it. The panel must show the command's own
+    requested cwd instead, since that -- not the launch root -- is what the
+    reason line is actually talking about."""
+
+    def test_approval_panel_shows_the_commands_own_cwd_not_the_launch_root(self):
+        import asyncio
+        import json
+        import tempfile
+        from io import StringIO
+        from pathlib import Path
+
+        from rich.console import Console
+
+        from tamfis_code.providers import ProviderType
+        from tamfis_code.runner_local import run_local_agent_turn
+
+        from test_reasoning_plan import (
+            _FakeClient, _FakeManager, _RecordingRenderer, _chunk, _delta, _tool_call_delta,
+        )
+
+        with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory(dir="/var/tmp") as outside:
+            command_args = json.dumps({"command": "ls", "cwd": outside})
+            rounds = [
+                [_chunk(_delta(tool_calls=[
+                    _tool_call_delta(0, call_id="call_1", name="execute_command", arguments=command_args)
+                ]))],
+                [_chunk(_delta(content="Done."))],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+            console = Console(file=StringIO(), no_color=True, width=200)
+
+            asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "list files somewhere else"}],
+                console, renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            approval_events = [e for e in renderer.events if e["event_type"] == "approval_required"]
+            self.assertTrue(approval_events, "expected an approval_required event for the out-of-scope cwd")
+            payload = approval_events[0]["payload"]
+            self.assertIn(str(Path(outside).resolve()), payload["reason"])
+            self.assertEqual(payload["working_directory"], str(Path(outside).resolve()))
+
+
 if __name__ == "__main__":
     unittest.main()
