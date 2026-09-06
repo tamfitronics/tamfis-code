@@ -4929,6 +4929,13 @@ async def _run_local_agent_turn_impl(
     validation_confirmed: set[str] = set()
     validation_retries: dict[str, int] = {}
     validation_errors: dict[str, str] = {}
+    # Cosmetic-only validation commands (currently just "git diff --check",
+    # which flags whitespace-in-diff, not functional breakage) must never be
+    # able to discard an otherwise-complete task the way a failing test/lint/
+    # build command legitimately can. When retries are exhausted for one of
+    # these, the check is downgraded to a note here instead of a hard fail;
+    # _finalize_completed_answer surfaces it in the final report.
+    soft_validation_notes: list[str] = []
     unresolved_edit_paths: set[str] = set()
     # FIX: when a project has no detectable test/lint/build fingerprint,
     # validation_commands is empty, so next_validation below is always None
@@ -5093,6 +5100,10 @@ async def _run_local_agent_turn_impl(
             caveat = "\n\n⚠ Validation incomplete: " + "; ".join(validation.unresolved)
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
+        if soft_validation_notes:
+            note = "\n\nℹ " + " ".join(dict.fromkeys(soft_validation_notes))
+            renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": note}})
+            content += note
         renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed", "validation": validation.to_dict()}})
         local_state.remember_conversation_turn(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
@@ -6495,6 +6506,35 @@ async def _run_local_agent_turn_impl(
                 validation_label, validation_command = next_validation
                 retries = validation_retries.get(validation_command, 0)
                 if retries >= MAX_VERIFY_COMMAND_RETRIES:
+                    if validation_command == "git diff --check":
+                        # This only flags whitespace-in-the-diff (trailing
+                        # whitespace, missing final newline) -- a style nit,
+                        # never evidence the actual change is broken. Real
+                        # functional checks (npm test/build, compileall,
+                        # project lint) still hard-fail below; this one must
+                        # not be able to discard a working, already-verified
+                        # fix just because the model couldn't get a whitespace
+                        # nit clean within the retry budget.
+                        validation_confirmed.add(validation_command)
+                        soft_validation_notes.append(
+                            f"`{validation_command}` still reported whitespace issues in the "
+                            "diff after the allowed automatic fix attempts. This does not "
+                            "indicate the change is broken -- run `git diff --check` yourself "
+                            "if you want to clean up the formatting."
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    f"`{validation_command}` did not come back clean after "
+                                    f"{MAX_VERIFY_COMMAND_RETRIES} attempts; treating it as a "
+                                    "non-blocking note instead of failing the task, since it "
+                                    "only checks diff whitespace, not correctness."
+                                )
+                            },
+                        })
+                        _persist_turn_checkpoint()
+                        continue
                     message = (
                         f"Validation incomplete: `{validation_command}` did not produce a "
                         "confirmed successful result after the allowed attempts."
