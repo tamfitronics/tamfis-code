@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import suppress
+from dataclasses import dataclass
 import inspect
 import re
 from pathlib import Path
@@ -232,16 +233,19 @@ $ <command>            explicit shell command
                       only the recent few turns in full, so a long REPL stays light in the
                       terminal and the next turn's context (Claude Code/Codex-style compaction)
 /summary             show a structured recap of the conversation so far without compressing it
+/sidebar [next|prev|close|clear <id> [--force]]
+                      toggle the session sidebar or clear a session you don't need from it;
+                      Ctrl+B toggles it, < opens (then pages back), > closes it
 /permissions         show approval policy and immutable server safeguards
 /mode                show the active approval mode and available modes
 /mode <name>         switch mode: manual | accept-edits | auto | plan
 Shift+Tab            cycle mode without typing a command (shown in the prompt as [mode]);
                      also works while a task is already running, not just at this prompt
 message>             while a task is running: type a message and press Enter
-/model               show the active model route
-/model list          list TamfisGPT model aliases
+/model               show current route and available choices
+/model list          list model groups and available provider models
 /model auto          restore TamfisGPT automatic model selection
-/model <alias>       select Auto, Fast, Code, Pro, or Vision
+/model <alias>       select Auto, Smart, Pro, Ultra, or Ultima
 /tools               show the tools exposed to tamfis-code tasks
 /pty start [command]  start a persistent background terminal (default: bash)
 /pty list             list this session's background terminals
@@ -285,6 +289,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the screen"),
     ("/compact", "compress the thread (fold older turns into the summary, keep recent turns)"),
     ("/summary", "show a structured recap of the conversation so far"),
+    ("/sidebar", "toggle or scroll the session sidebar"),
     ("/permissions", "show approval policy and immutable server safeguards"),
     ("/mode", "show or switch the active approval mode"),
     ("/model", "show or switch the active model route"),
@@ -322,11 +327,24 @@ class _SlashCommandCompleter(Completer):
     needing to be reconstructed when a command file changes mid-session.
     """
 
-    def __init__(self, custom_commands: Optional[dict[str, CustomCommand]] = None) -> None:
+    def __init__(self, custom_commands: Optional[dict[str, CustomCommand]] = None, model_options: Optional[dict[str, str]] = None) -> None:
         self._custom_commands = custom_commands if custom_commands is not None else {}
+        self._model_options = model_options if model_options is not None else {
+            name: description for name, description in (
+                ("auto", "Automatic selection"), ("smart", "Quick tasks"),
+                ("pro", "Everyday coding"), ("ultra", "Complex work"),
+                ("ultima", "Frontier reasoning"),
+            )
+        }
 
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
+        if text.lower().startswith("/model "):
+            prefix = text[len("/model "):]
+            for option, description in self._model_options.items():
+                if option.lower().startswith(prefix.lower()) and option.lower() != prefix.lower():
+                    yield Completion(option, start_position=-len(prefix), display_meta=description)
+            return
         if not text.startswith("/") or " " in text:
             return
         for name, description in SLASH_COMMANDS:
@@ -351,6 +369,62 @@ class Intent:
         self.mode = mode
         self.background = background
         self.goal = goal
+
+
+_SIDEBAR_ACTION = "\x00tamfis-sidebar"
+_SIDEBAR_PAGE_SIZE = 8
+
+
+@dataclass
+class _SidebarState:
+    visible: bool = False
+    page: int = 0
+
+
+def sidebar_page(
+    session_id: int, *, page: int = 0, page_size: int = _SIDEBAR_PAGE_SIZE,
+) -> tuple[list[dict[str, str]], int, int]:
+    """Return one stable, bounded page for the interactive session drawer."""
+    sessions: list[dict[str, str]] = []
+    for known_id in reversed(local_state.all_known_session_ids()):
+        state = local_state.get_session_state(known_id)
+        if state.is_swarm_child:
+            continue
+        objective = str((state.active_task or {}).get("objective") or state.conversation_summary or "-")
+        sessions.append({
+            "id": str(known_id),
+            "active": "*" if known_id == session_id else "",
+            "status": str(state.execution_status or "idle"),
+            "workspace": Path(state.workspace_root or state.primary_workspace or "-").name or "-",
+            "objective": " ".join(objective.split())[:56],
+        })
+
+    page_count = max(1, (len(sessions) + page_size - 1) // page_size)
+    page = min(max(page, 0), page_count - 1)
+    start = page * page_size
+    return sessions[start:start + page_size], page, page_count
+
+
+def render_sidebar(console: Console, session_id: int, sidebar: _SidebarState) -> None:
+    """Render the terminal drawer without entering a fragile full-screen mode."""
+    rows, sidebar.page, page_count = sidebar_page(session_id, page=sidebar.page)
+    table = Table(show_header=True, header_style="bold cyan", expand=False)
+    table.add_column("", width=1)
+    table.add_column("SESSION", no_wrap=True)
+    table.add_column("STATUS", no_wrap=True)
+    table.add_column("WORKSPACE", no_wrap=True)
+    table.add_column("RECENT TASK", max_width=56)
+    for row in rows:
+        table.add_row(row["active"], row["id"], row["status"], row["workspace"], row["objective"])
+    if not rows:
+        table.add_row("", "-", "idle", "-", "No saved sessions")
+    console.print(Panel(
+        table,
+        title=f"Sessions · {sidebar.page + 1}/{page_count}",
+        subtitle="< previous page · > or Ctrl+B closes · /sidebar next for forward paging",
+        border_style="cyan",
+        expand=False,
+    ))
 
 
 # Bounds standalone in-session conversation history (see run_interactive's
@@ -669,33 +743,54 @@ def contextualize_short_reply(raw: str, *, has_context: bool) -> str:
     return text
 
 
+def _ci_equals(text: str, value: str) -> bool:
+    """Case-insensitive equality for a built-in slash command's exact
+    (no-argument) form. Several mobile SSH clients (Termius among them)
+    autocapitalize the first letter after "/" on their virtual keyboard,
+    so a typed "/status" can arrive here as "/Status" -- every built-in
+    command below is matched this way so no user, on any client, has a
+    command silently fail to dispatch over capitalization. User-defined
+    custom commands (custom_commands.py) are deliberately NOT included in
+    this treatment -- they're keyed by filename, a case-sensitive
+    filesystem convention, not typed-text autocorrect."""
+    return text.lower() == value.lower()
+
+
+def _ci_startswith(text: str, prefix: str) -> bool:
+    """Case-insensitive startswith for a built-in slash command that takes
+    a trailing argument (e.g. prefix="/cd ") -- see _ci_equals above for
+    why. The argument text itself keeps its original case; only the
+    command word is compared case-insensitively."""
+    return text.lower().startswith(prefix.lower())
+
+
 def parse_intent(raw: str, custom_commands: Optional[dict[str, CustomCommand]] = None) -> Intent:
     text = raw.strip()
     if text.startswith("$ "):
         return Intent("shell", command=text[2:].strip())
-    if text.startswith("/run "):
+    if _ci_startswith(text, "/run "):
         return Intent("shell", command=text[5:].strip())
-    if text.startswith("/shell "):
+    if _ci_startswith(text, "/shell "):
         return Intent("shell", command=text[7:].strip())
-    if text.startswith("/audit "):
+    if _ci_startswith(text, "/audit "):
         return Intent("ai", objective=text[7:].strip(), mode="audit")
-    if text.startswith("/chat "):
+    if _ci_startswith(text, "/chat "):
         return Intent("ai", objective=text[6:].strip(), mode="chat")
-    if text.startswith("/plan "):
+    if _ci_startswith(text, "/plan "):
         return Intent("ai", objective=text[6:].strip(), mode="plan")
-    if text == "/execute-plan" or text.startswith("/execute-plan "):
+    if _ci_equals(text, "/execute-plan") or _ci_startswith(text, "/execute-plan "):
         return Intent("saved_plan", command=text[len("/execute-plan"):].strip())
-    if text.startswith("/agent "):
+    if _ci_startswith(text, "/agent "):
         return Intent("ai", objective=text[7:].strip(), mode="execute")
-    if text.startswith("/execute "):
+    if _ci_startswith(text, "/execute "):
         return Intent("ai", objective=text[9:].strip(), mode="execute")
-    if text.startswith("/ask "):
+    if _ci_startswith(text, "/ask "):
         return Intent("ai", objective=text[5:].strip(), mode="coding")
-    if text.startswith("/background "):
+    if _ci_startswith(text, "/background "):
         return Intent("ai", objective=text[len("/background "):].strip(), mode="coding", background=True)
-    if text == "/goal" or text in {"/goal status", "/goal pause", "/goal cancel", "/goal resume"}:
+    if _ci_equals(text, "/goal") or text.lower() in {"/goal status", "/goal pause", "/goal cancel", "/goal resume"}:
         return Intent("goal_control", command=text[len("/goal"):].strip() or "status")
-    if text.startswith("/goal "):
+    if _ci_startswith(text, "/goal "):
         return Intent(
             "ai", objective=text[len("/goal "):].strip(), mode="coding",
             background=True, goal=True,
@@ -786,17 +881,19 @@ async def run_interactive(
         "Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
 
-    from .self_update import check_update_available
+    from .self_update import check_update_available, update_instructions
     _available_update = check_update_available()
     if _available_update:
         console.print(
             f"[yellow]◆ Update available: {__version__} -> {_available_update}.[/yellow] "
             "[dim]Type /update to apply and restart into this same session.[/dim]\n"
         )
+        console.print(Panel(update_instructions(), title="Tamfis Code update"))
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
     bindings = KeyBindings()
+    sidebar = _SidebarState()
     # Local only: which byte offset this REPL has already displayed per PTY
     # id, so /pty read shows only new output. The server (RemotePtySession/
     # pty_broker's or LocalPtyBroker's ring buffer is the source of truth;
@@ -837,6 +934,38 @@ async def run_interactive(
         config.approval_policy = next_mode_in_cycle(config.approval_policy)
         event.app.invalidate()
 
+    @bindings.add("c-b")
+    def _toggle_sidebar(event) -> None:
+        sidebar.visible = not sidebar.visible
+        if sidebar.visible:
+            sidebar.page = 0
+        event.app.exit(result=_SIDEBAR_ACTION)
+
+    @bindings.add(">")
+    def _sidebar_close(event) -> None:
+        # > closes the sidebar when it's open. When it's already closed,
+        # > has nothing to close, so it falls back to normal typing --
+        # matching how < already behaved before this key took on an
+        # open/close role too.
+        if sidebar.visible:
+            sidebar.visible = False
+            event.app.exit(result=_SIDEBAR_ACTION)
+            return
+        event.current_buffer.insert_text(">")
+
+    @bindings.add("<")
+    def _sidebar_open(event) -> None:
+        # < opens the sidebar when it's closed. If it's already open, <
+        # still pages backward -- forward paging remains available via
+        # /sidebar next since > is now dedicated to closing.
+        if not sidebar.visible:
+            sidebar.visible = True
+            sidebar.page = 0
+            event.app.exit(result=_SIDEBAR_ACTION)
+            return
+        sidebar.page = max(0, sidebar.page - 1)
+        event.app.exit(result=_SIDEBAR_ACTION)
+
     @bindings.add("tab")
     def _accept_next_suggestion(event) -> None:
         buffer = event.current_buffer
@@ -847,7 +976,17 @@ async def run_interactive(
         if not buffer.text and suggestion:
             buffer.insert_text(suggestion)
             return
-        buffer.start_completion(select_first=False)
+        if buffer.complete_state:
+            buffer.complete_next()
+        else:
+            buffer.start_completion(select_first=False)
+
+    @bindings.add("/")
+    def _open_slash_menu(event) -> None:
+        buffer = event.current_buffer
+        buffer.insert_text("/")
+        if buffer.text == "/":
+            buffer.start_completion(select_first=False)
 
     # Reported live: pasting a long block (clipboard paste, terminal
     # bracketed-paste mode) inserted the entire raw text into the input
@@ -897,9 +1036,19 @@ async def run_interactive(
     idle_active_agents = local_state.active_swarm_child_count(
         exclude_session_id=workspace.session_id,
     )
+    # FIX (2026-09-05, operator request): this used to also list every
+    # concrete provider/model pair (Ollama Cloud/HF/OpenRouter model ids,
+    # even a redundant literal "tamfis tamfis-gpt-*" row) whenever a
+    # provider client was configured, in both /model's tab-completion and
+    # its printed table below. The product decision is that a user should
+    # only ever see the five branded TamfisGPT tiers, matching Claude Code/
+    # Codex's own clean model-naming UX -- never the underlying subscription
+    # provider plumbing, standalone or not. _SlashCommandCompleter's default
+    # (five tiers) is used unconditionally now.
+    model_options = dict(_SlashCommandCompleter()._model_options)
     session: PromptSession = PromptSession(
         history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
-        completer=_SlashCommandCompleter(custom_commands), complete_while_typing=True,
+        completer=_SlashCommandCompleter(custom_commands, model_options), complete_while_typing=True,
         bottom_toolbar=lambda: idle_bottom_toolbar(
             config,
             workspace.session_id,
@@ -917,7 +1066,7 @@ async def run_interactive(
             lambda: suggestion_state,
         ),
         style=composer_style(),
-        reserve_space_for_menu=0,
+        reserve_space_for_menu=8,
         # prompt-toolkit supplies a real dynamic Frame around the entire
         # multiline editor. This is the composer box the previous prompt-only
         # change failed to provide; the status/mode toolbar remains directly
@@ -1079,12 +1228,16 @@ async def run_interactive(
                 )
 
         text = text.strip()
+        if text == _SIDEBAR_ACTION:
+            if sidebar.visible:
+                render_sidebar(console, workspace.session_id, sidebar)
+            continue
         if not text:
             continue
         if len(text) > 1_000_000:
             print_error(console, "Objective exceeds the 1,000,000 character safety limit.")
             continue
-        if text in ("/exit", "/quit", "/detach"):
+        if text.lower() in ("/exit", "/quit", "/detach"):
             # No task submitted through this REPL outlives this process's
             # lifetime any differently based on which of these three the
             # user types -- background durability comes from `--bg` /
@@ -1100,18 +1253,77 @@ async def run_interactive(
         # requires an exact match or a trailing space with content) -- it
         # was submitted to the AI as a one-character objective instead of
         # showing the command list the way typing "/" alone is expected to.
-        if text in ("/help", "/"):
+        if text.lower() in ("/help", "/"):
             console.print(HELP_TEXT)
             if standalone:
                 console.print(
-                    "[dim]Standalone mode: /model list needs the remote model catalog; /pty, diffs/revert, resume, "
+                    "[dim]Standalone mode: /model list shows available local provider choices; /pty, diffs/revert, resume, "
                     "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
                 )
             continue
-        if text == "/cwd":
+        if _ci_equals(text, "/sidebar") or _ci_startswith(text, "/sidebar "):
+            action = text[len("/sidebar"):].strip().lower()
+            if action in {"", "toggle"}:
+                sidebar.visible = not sidebar.visible
+                if sidebar.visible:
+                    sidebar.page = 0
+            elif action in {"next", "down", ">"}:
+                sidebar.visible = True
+                sidebar.page += 1
+            elif action in {"prev", "previous", "up", "<"}:
+                sidebar.visible = True
+                sidebar.page = max(0, sidebar.page - 1)
+            elif action in {"close", "hide"}:
+                sidebar.visible = False
+                console.print("[dim]Sidebar closed.[/dim]")
+                continue
+            elif action.startswith("clear"):
+                # /sidebar clear <id> [--force]: removes a session the user
+                # doesn't need from the sidebar's own listing (SESSION
+                # column) without leaving the REPL -- wraps the same
+                # local_state.clear_session_state() the `tamfis-code
+                # clear-session` CLI subcommand already uses, so the
+                # safety behavior (won't clear an actively-running session
+                # without --force) matches exactly.
+                clear_args = action[len("clear"):].split()
+                force = "--force" in clear_args
+                clear_args = [a for a in clear_args if a != "--force"]
+                if len(clear_args) != 1 or not clear_args[0].isdigit():
+                    print_error(console, "Usage: /sidebar clear <session_id> [--force]")
+                    continue
+                target_id = int(clear_args[0])
+                if target_id == workspace.session_id:
+                    print_error(console, "Can't clear the session you're currently in.")
+                    continue
+                if target_id not in local_state.all_known_session_ids():
+                    print_error(console, f"No known local session {target_id}.")
+                    continue
+                target_state = local_state.get_session_state(target_id)
+                if local_state.is_session_actively_running(target_state) and not force:
+                    print_error(
+                        console,
+                        f"Session {target_id} appears active. Stop its task first, "
+                        "or rerun as `/sidebar clear <id> --force`.",
+                    )
+                    continue
+                local_state.clear_session_state(target_id)
+                console.print(
+                    f"[green]Cleared local session {target_id}.[/green] "
+                    "[dim]Recovery checkpoints and evidence were retained.[/dim]"
+                )
+                sidebar.page = 0
+            else:
+                print_error(console, "Usage: /sidebar [next|prev|close|clear <id>]")
+                continue
+            if sidebar.visible:
+                render_sidebar(console, workspace.session_id, sidebar)
+            else:
+                console.print("[dim]Sidebar closed.[/dim]")
+            continue
+        if _ci_equals(text, "/cwd"):
             console.print(workspace.workspace_root)
             continue
-        if text == "/cd" or text.startswith("/cd "):
+        if _ci_equals(text, "/cd") or _ci_startswith(text, "/cd "):
             # Claude Code/Codex both let you just tell the agent to look
             # somewhere else and it re-orients immediately -- this REPL had
             # no equivalent at all: `tamfis-code cwd <path>` only existed as
@@ -1170,7 +1382,7 @@ async def run_interactive(
             discover_local_repository(workspace.session_id, resolved, force=True)
             console.print(f"[green]Working directory:[/green] {target}")
             continue
-        if text == "/copy":
+        if _ci_equals(text, "/copy"):
             if not last_response_text:
                 console.print("[dim]Nothing to copy yet.[/dim]")
             elif copy_to_clipboard(console, last_response_text):
@@ -1178,7 +1390,7 @@ async def run_interactive(
             else:
                 console.print("[dim]Can't copy: output isn't attached to a terminal.[/dim]")
             continue
-        if text == "/status":
+        if _ci_equals(text, "/status"):
             state = local_state.get_session_state(workspace.session_id)
             identity_line = (
                 f"session_id={workspace.session_id}  (standalone, local session)"
@@ -1202,7 +1414,7 @@ async def run_interactive(
                 f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
             )
             continue
-        if text == "/usage":
+        if _ci_equals(text, "/usage"):
             # Real per-feature credit balance from the SAME ledger the
             # TamfisGPT web app's Settings > Billing page reads -- day/week/
             # month, not just a monthly total, matching the enforcement
@@ -1260,7 +1472,7 @@ async def run_interactive(
                 warn = " ⚠" if b.get("low_credit_warning") else ""
                 console.print(f"{feature:<12}{day_cell:>18}{week_cell:>18}{month_cell:>18}{warn}")
             continue
-        if text == "/context":
+        if _ci_equals(text, "/context"):
             context = discover_local_repository(workspace.session_id, Path(workspace.workspace_root))
             state = local_state.get_session_state(workspace.session_id)
             console.print(f"repository={context.get('repository_root')}  branch={context.get('branch') or '-'}  dirty={context.get('dirty')}")
@@ -1269,7 +1481,7 @@ async def run_interactive(
             for path in context.get("instruction_files", []):
                 console.print(f"  instruction: {path}")
             continue
-        if text == "/reports":
+        if _ci_equals(text, "/reports"):
             discover_local_repository(workspace.session_id, Path(workspace.workspace_root))
             reports = local_state.get_session_state(workspace.session_id).discovered_reports
             if not reports:
@@ -1277,7 +1489,7 @@ async def run_interactive(
             for report in reports:
                 console.print(f"  {str(report.get('modified_at', ''))[:10]}  {report.get('verification')}  {report.get('path')}")
             continue
-        if text == "/plans":
+        if _ci_equals(text, "/plans"):
             state = local_state.get_session_state(workspace.session_id)
             if not state.saved_plans:
                 console.print("[dim]No saved plans yet. Create one with /plan <objective>.[/dim]")
@@ -1293,8 +1505,8 @@ async def run_interactive(
                 )
             console.print(table)
             continue
-        if text == "/plan" or text == "/plan show" or text.startswith("/plan show "):
-            plan_id = text[len("/plan show"):].strip() if text.startswith("/plan show") else ""
+        if _ci_equals(text, "/plan") or _ci_equals(text, "/plan show") or _ci_startswith(text, "/plan show "):
+            plan_id = text[len("/plan show"):].strip() if _ci_startswith(text, "/plan show") else ""
             plan = local_state.get_plan(workspace.session_id, plan_id or None)
             if plan is None:
                 print_error(console, "Plan not found. Use /plans to list saved plans.")
@@ -1305,7 +1517,7 @@ async def run_interactive(
             )
             console.print(Markdown(str(plan.get("content") or "")))
             continue
-        if text == "/update":
+        if _ci_equals(text, "/update"):
             from .self_update import apply_update, check_update_available, reexec
 
             pending = check_update_available()
@@ -1320,7 +1532,7 @@ async def run_interactive(
             console.print(f"[green]{message}[/green] [dim]Restarting into this session...[/dim]")
             reexec()
             continue
-        if text == "/queue" or text.startswith("/queue "):
+        if _ci_equals(text, "/queue") or _ci_startswith(text, "/queue "):
             arg = text[len("/queue"):].strip()
             if arg:
                 item = local_state.enqueue_instruction(workspace.session_id, arg)
@@ -1328,13 +1540,13 @@ async def run_interactive(
             for item in local_state.get_session_state(workspace.session_id).queued_user_instructions:
                 console.print(f"  {item.get('id')}  {item.get('status')}  {item.get('classification')}  {item.get('text')}")
             continue
-        if text == "/model" or text.startswith("/model "):
+        if _ci_equals(text, "/model") or _ci_startswith(text, "/model "):
             arg = text[len("/model"):].strip()
             state = local_state.get_session_state(workspace.session_id)
             if not arg:
                 from .public_identity import public_model_name
                 console.print(f"model={public_model_name(state.selected_model)}")
-                continue
+                arg = "list"
             parts = arg.split()
 
             from .public_identity import (
@@ -1377,6 +1589,7 @@ async def run_interactive(
                         status = "🟢 Available" if tier in entitled_tiers else "🔒 Not on your plan"
                         table.add_row(tier, uses[tier], status)
                 console.print(table)
+                console.print("[dim]Type /model followed by a space for selectable options (Auto, Smart, Pro, Ultra, Ultima). Use arrows or Tab, then Enter.[/dim]")
                 continue
             public_alias = parse_public_model_alias(parts[0])
             if public_alias:
@@ -1443,7 +1656,7 @@ async def run_interactive(
             from .public_identity import public_model_name
             console.print(f"[green]Model set to[/green] {public_model_name(model_id)}")
             continue
-        if text == "/tools":
+        if _ci_equals(text, "/tools"):
             # One real tool set regardless of standalone vs --remote: every
             # task -- remote-mode ones included -- now executes through the
             # local engine (mcp.py), never a server-side agent loop (see
@@ -1474,7 +1687,7 @@ async def run_interactive(
                 "risk is classified and see /diffs for the mutation ledger.[/dim]"
             )
             continue
-        if text == "/commands":
+        if _ci_equals(text, "/commands"):
             if not custom_commands:
                 console.print(
                     "[dim]No custom commands found. Add one at "
@@ -1491,7 +1704,7 @@ async def run_interactive(
                 table.add_row(f"/{name}", command.description, command.source)
             console.print(table)
             continue
-        if text == "/agent-types":
+        if _ci_equals(text, "/agent-types"):
             from .agent_definitions import load_agent_definitions
             definitions = load_agent_definitions(workspace.workspace_root)
             if not definitions:
@@ -1517,7 +1730,7 @@ async def run_interactive(
             console.print(table)
             console.print("[dim]Use with: /delegate --agent <name> ... or /swarm --agent <name> ....[/dim]")
             continue
-        if text == "/pty" or text.startswith("/pty "):
+        if _ci_equals(text, "/pty") or _ci_startswith(text, "/pty "):
             arg = text[len("/pty"):].strip()
             parts = arg.split(maxsplit=1)
             sub = parts[0].lower() if parts else "list"
@@ -1644,7 +1857,7 @@ async def run_interactive(
 
             print_error(console, "Usage: /pty <start|list|send|read|kill> ...")
             continue
-        if text == "/permissions":
+        if _ci_equals(text, "/permissions"):
             console.print(f"approval_policy={config.approval_policy}")
             for action in ("deny", "ask", "allow"):
                 rules = getattr(config, f"permission_{action}")
@@ -1655,7 +1868,7 @@ async def run_interactive(
                 "protected repository/configuration paths always require explicit approval.[/dim]"
             )
             continue
-        if text == "/mode" or text.startswith("/mode "):
+        if _ci_equals(text, "/mode") or _ci_startswith(text, "/mode "):
             arg = text[len("/mode"):].strip().lower()
             if not arg:
                 console.print(f"Current mode: [bold]{mode_label_for_policy(config.approval_policy)}[/bold] ({config.approval_policy})")
@@ -1682,7 +1895,7 @@ async def run_interactive(
             config.approval_policy = resolved
             console.print(f"[green]Mode set to[/green] {arg} [dim]({resolved})[/dim]")
             continue
-        if text == "/compact":
+        if _ci_equals(text, "/compact"):
             # Real thread compression (Claude Code/Codex parity): fold older
             # turns into conversation_summary and keep only the recent few
             # turns in conversation_history, so a long REPL thread stops
@@ -1700,11 +1913,11 @@ async def run_interactive(
             console.print("[green]Thread compressed.[/green] Older turns were folded into the session summary; recent turns are retained in full.")
             console.print(f"[dim]~{len(recap)} char recap saved. Next turn starts from the compressed context.[/dim]")
             continue
-        if text == "/summary":
+        if _ci_equals(text, "/summary"):
             recap = local_state.summarize_thread(workspace.session_id)
             console.print(Panel(recap, title="Thread summary", border_style="cyan", expand=False))
             continue
-        if text == "/doctor":
+        if _ci_equals(text, "/doctor"):
             # Full self-health-check in both modes (Claude Code/Codex parity):
             # standalone mode used to only print a one-line provider status,
             # never running the real session/workspace/context/recent-failure
@@ -1716,7 +1929,7 @@ async def run_interactive(
                 session_id=workspace.session_id,
             )
             continue
-        if text == "/agents" or text == "/agents --all":
+        if _ci_equals(text, "/agents") or _ci_equals(text, "/agents --all"):
             show_all = text.endswith("--all")
             if standalone:
                 for sid in local_state.all_known_session_ids():
@@ -1736,7 +1949,7 @@ async def run_interactive(
                 marker = " *" if sess.get("id") == workspace.session_id else ""
                 console.print(f"  {sess.get('id')}  {sess.get('status')}  {sess.get('working_directory') or ''}{marker}")
             continue
-        if text == "/delegate" or text.startswith("/delegate "):
+        if _ci_equals(text, "/delegate") or _ci_startswith(text, "/delegate "):
             if not config.enable_subagent_delegation:
                 print_error(
                     console,
@@ -1781,7 +1994,7 @@ async def run_interactive(
                 if summary:
                     console.print(f"   {summary}")
             continue
-        if text == "/swarm" or text.startswith("/swarm "):
+        if _ci_equals(text, "/swarm") or _ci_startswith(text, "/swarm "):
             if not config.enable_subagent_delegation:
                 print_error(
                     console,
@@ -1832,7 +2045,7 @@ async def run_interactive(
                 if summary:
                     console.print(f"   {summary}")
             continue
-        if text == "/diffs" or text.startswith("/diffs "):
+        if _ci_equals(text, "/diffs") or _ci_startswith(text, "/diffs "):
             arg = text[len("/diffs"):].strip()
             try:
                 limit = int(arg) if arg else 10
@@ -1861,7 +2074,7 @@ async def run_interactive(
                     f"+{m.get('lines_added')}/-{m.get('lines_removed')}{marker}{turn_suffix}"
                 )
             continue
-        if text == "/diff" or text.startswith("/diff "):
+        if _ci_equals(text, "/diff") or _ci_startswith(text, "/diff "):
             mutation_id = text[len("/diff"):].strip()
             if standalone:
                 mutations = local_state.get_session_state(workspace.session_id).modified_files
@@ -1883,7 +2096,7 @@ async def run_interactive(
             else:
                 print_unified_diff(console, str(selected.get("unified_diff") or ""), title=str(selected.get("path") or "Changes"))
             continue
-        if text == "/revert" or text.startswith("/revert "):
+        if _ci_equals(text, "/revert") or _ci_startswith(text, "/revert "):
             arg = text[len("/revert"):].strip()
             if not arg:
                 print_error(console, "Usage: /revert <mutation_id | turn_id> -- see /diffs for recent mutation ids; a turn_... id reverts every mutation from that turn together.")
@@ -1913,10 +2126,10 @@ async def run_interactive(
                 continue
             console.print(f"[green]Reverted[/green] {result.get('path')}")
             continue
-        if text == "/clear":
+        if _ci_equals(text, "/clear"):
             console.clear()
             continue
-        if text == "/resume" or text.startswith("/resume "):
+        if _ci_equals(text, "/resume") or _ci_startswith(text, "/resume "):
             arg = text[len("/resume"):].strip()
             if standalone:
                 known = local_state.all_known_session_ids()
@@ -1975,7 +2188,7 @@ async def run_interactive(
             except (AuthRequiredError, RemoteAPIError):
                 pass
             continue
-        if text == "/fork":
+        if _ci_equals(text, "/fork"):
             if not standalone:
                 print_error(console, "/fork is currently available for standalone local sessions only.")
                 continue
@@ -1997,7 +2210,7 @@ async def run_interactive(
                 "The original remains unchanged; this prompt now uses the new branch."
             )
             continue
-        if text == "/retry" or text.startswith("/retry "):
+        if _ci_equals(text, "/retry") or _ci_startswith(text, "/retry "):
             if standalone:
                 if last_turn is None:
                     console.print("[dim]No previous turn in this session to retry.[/dim]")

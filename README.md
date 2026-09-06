@@ -38,6 +38,7 @@ from source, using a TamfisGPT tenancy, and the release process.
 ```
 tamfis-code login                                   # activate TamfisGPT models
 tamfis-code doctor                                  # check model-service connectivity
+tamfis-code update                                  # install a newer configured checkout, if available
 tamfis-code ask "explain what this repo does"
 tamfis-code agent "add a health-check endpoint"     # full read/write/execute loop
 tamfis-code                                         # interactive REPL

@@ -63,3 +63,40 @@ def test_slugify_rejects_empty_name(tmp_path: Path):
 
 def test_memory_type_matches_assistant_taxonomy():
     assert {t.value for t in MemoryType} == {"user", "feedback", "project", "reference"}
+
+
+def test_oversized_content_is_truncated_at_save_time(tmp_path: Path):
+    store = _store(tmp_path)
+    huge = "x" * (store.MAX_CONTENT_CHARS * 2)
+    saved = store.save(MemoryRecord(name="huge", type=MemoryType.PROJECT, description="d", content=huge))
+    assert len(saved.content) <= store.MAX_CONTENT_CHARS
+    assert saved.content.endswith("[truncated]")
+    loaded = store.load("huge")
+    assert loaded is not None
+    assert len(loaded.content) <= store.MAX_CONTENT_CHARS
+
+
+def test_record_count_is_capped_evicting_oldest_first(tmp_path: Path):
+    store = _store(tmp_path)
+    store.MAX_RECORDS = 3
+    for i in range(5):
+        store.save(MemoryRecord(name=f"record-{i}", type=MemoryType.PROJECT, description="d", content="c"))
+    remaining = {r.name for r in store.list()}
+    assert len(remaining) == 3
+    # The two oldest (record-0, record-1) should have been evicted; the
+    # most recently saved three survive.
+    assert remaining == {"record-2", "record-3", "record-4"}
+
+
+def test_re_saving_an_existing_record_refreshes_its_recency_for_the_cap(tmp_path: Path):
+    store = _store(tmp_path)
+    store.MAX_RECORDS = 3
+    for i in range(3):
+        store.save(MemoryRecord(name=f"record-{i}", type=MemoryType.PROJECT, description="d", content="c"))
+    # Touch record-0 again so it's no longer the oldest by updated_at.
+    store.save(MemoryRecord(name="record-0", type=MemoryType.PROJECT, description="d", content="updated"))
+    store.save(MemoryRecord(name="record-3", type=MemoryType.PROJECT, description="d", content="c"))
+    remaining = {r.name for r in store.list()}
+    assert len(remaining) == 3
+    assert "record-0" in remaining  # survived because it was refreshed
+    assert "record-1" not in remaining  # evicted as the true oldest

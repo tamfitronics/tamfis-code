@@ -307,6 +307,15 @@ def classify_tool_call_risk(name: str, arguments: dict[str, Any], *, workspace_r
         return classify_command_risk(str(arguments.get("command") or ""))
     if name == "browser":
         return RISK_MEDIUM
+    if name == "save_memory":
+        # Auto memory writes to CONFIG_DIR/memory, outside the declared
+        # workspace root by design (it's cross-session, cross-project
+        # notes) -- per this module's own rule that no feature may act
+        # outside the workspace without explicit approval, this stays
+        # governed by the ordinary approval policy (medium, not read-only)
+        # rather than being hardcoded to bypass it. A permissive policy can
+        # still auto-approve it same as any other medium-risk tool.
+        return RISK_MEDIUM
     return RISK_DANGEROUS  # unknown tool name -- fail safe, never default to permissive
 
 

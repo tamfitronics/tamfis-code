@@ -21,7 +21,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from ..routing import TaskProfile, TaskType
+from ..routing import ComplexityLevel, TaskProfile, TaskType, complexity_at_least
 
 MAX_REASONING_PLAN_STEPS = 8
 MAX_ASSUMPTIONS = 6
@@ -288,7 +288,7 @@ def should_plan(profile: TaskProfile, objective: str | None = None) -> bool:
     genuinely have no request text. Runtime callers always provide it.
     """
     if objective is None:
-        return profile.complexity == "high" or profile.task_type in {
+        return complexity_at_least(profile.complexity, ComplexityLevel.COMPLEX) or profile.task_type in {
             TaskType.AUDIT, TaskType.EDIT, TaskType.DEBUG, TaskType.TEST, TaskType.MIXED,
         }
     if profile.task_type in {TaskType.PLAN, TaskType.AUDIT, TaskType.MIXED}:
@@ -307,6 +307,7 @@ def create_plan(
     *,
     reconnaissance_summary: Optional[str] = None,
     workspace_summary: Optional[dict[str, Any]] = None,
+    scope_roots: Optional[Sequence[str | Path]] = None,
 ) -> ExecutionPlan | None:
     """Create a safe deterministic fallback plan without guessed technology."""
     if not should_plan(profile, objective):
@@ -315,6 +316,7 @@ def create_plan(
     evidence = build_planner_evidence(
         reconnaissance_summary=reconnaissance_summary,
         workspace_summary=workspace_summary or {},
+        scope_roots=scope_roots,
     )
 
     # Step text is deliberately terse -- Claude Code/Codex-style single-line
@@ -482,11 +484,13 @@ def build_reasoning_plan_prompt(
     *,
     reconnaissance_summary: Optional[str] = None,
     evidence_summary: Optional[str] = None,
+    scope_roots: Optional[Sequence[str | Path]] = None,
 ) -> list[dict[str, str]]:
     """Build a tool-free planning request from verified repository facts."""
     evidence = build_planner_evidence(
         reconnaissance_summary=reconnaissance_summary,
         workspace_summary=workspace_summary,
+        scope_roots=scope_roots,
     )
 
     payload: dict[str, Any] = {
@@ -760,11 +764,23 @@ def build_planner_evidence(
         if resolved is not None and resolved.is_dir():
             evidence.roots.append(resolved)
 
-    repository_root = workspace_summary.get("repository_root")
-    if repository_root:
-        resolved = _safe_resolve(Path(str(repository_root)).expanduser())
-        if resolved is not None and resolved.is_dir():
-            evidence.roots.append(resolved)
+    # Confirmed live: a session whose actual objective is scoped to one
+    # subproject (e.g. /home/tamfisseo) but whose cached repository_context
+    # resolved to a much broader wrapping git root (e.g. /home, itself a
+    # real repo spanning many unrelated sibling projects) produced a plan
+    # inventorying /tmp, sibling projects' manifests, and another session's
+    # scratchpad files -- none relevant to the objective. scope_roots is the
+    # narrower, per-turn security boundary already threaded through tool
+    # authorization elsewhere in runner_local.py; when it's available it is
+    # a strictly better answer to "what should this plan be scoped to" than
+    # the broad, HEAD/dirty-fingerprint-cached repository_root, so only fall
+    # back to repository_root when no scope_roots were given at all.
+    if not evidence.roots:
+        repository_root = workspace_summary.get("repository_root")
+        if repository_root:
+            resolved = _safe_resolve(Path(str(repository_root)).expanduser())
+            if resolved is not None and resolved.is_dir():
+                evidence.roots.append(resolved)
 
     for key in ("project_manifests", "manifests"):
         for item in _iter_values(workspace_summary.get(key)):

@@ -52,7 +52,7 @@ from .render import (
     suspend_live_async_if_active,
     suspend_live_if_active,
 )
-from .routing import is_explicit_read_only_request
+from .routing import TaskType, is_explicit_read_only_request
 from .orchestrator import (
     AgentOrchestrator,
     ApprovalAction,
@@ -117,6 +117,52 @@ MAX_AGENT_ROUND_EXTENSIONS = 2
 DEFAULT_REASONING_EFFORT = os.environ.get("TAMFIS_CODE_REASONING_EFFORT", "medium").strip().lower()
 
 
+def _audit_evidence_targets(records: list[ToolEnvelope]) -> set[str]:
+    """Return distinct concrete evidence targets from successful read tools.
+
+    Directory listings are deliberately excluded: they help navigation but are
+    not evidence that the implementation itself was inspected. The boundary
+    is provider-neutral and based on completed tool envelopes, not model prose.
+    """
+    targets: set[str] = set()
+    evidence_tools = {
+        "read_file", "search_code", "find_references", "git_diff",
+        "git_status", "execute_command",
+    }
+    for record in records:
+        if record.success is not True or record.tool_name not in evidence_tools:
+            continue
+        arguments = record.arguments or {}
+        target = (
+            arguments.get("path")
+            or arguments.get("file_path")
+            or arguments.get("pattern")
+            or arguments.get("query")
+            or arguments.get("symbol")
+            or arguments.get("command")
+        )
+        if target:
+            targets.add(f"{record.tool_name}:{str(target).strip()}")
+    return targets
+
+
+def _read_only_audit_has_sufficient_evidence(
+    task_type: TaskType,
+    read_only: bool,
+    records: list[ToolEnvelope],
+) -> bool:
+    """Bound open-ended audits once enough concrete evidence was gathered.
+
+    Seven independent sources is intentionally a synthesis trigger, not a
+    success claim. The final model must still report gaps and uncertainty.
+    """
+    return (
+        read_only
+        and task_type == TaskType.AUDIT
+        and len(_audit_evidence_targets(records)) >= 7
+    )
+
+
 def _reasoning_effort(provider: ProviderType, model: str) -> Optional[str]:
     if not reasoning_effort_capable(provider, model):
         return None
@@ -162,8 +208,12 @@ FINAL_RESPONSE_FORMAT_INSTRUCTION = (
     "sections when applicable: Summary, Changes, Verification, and Remaining issues. "
     "Use one short bullet per concrete fact under a section; do not emit nested or "
     "unrelated bullet lists, do not repeat the execution plan, and do not claim a "
-    "tool ran unless a real tool result appears in the conversation. If no files "
-    "changed, say so plainly under Summary."
+    "tool ran unless a real tool result appears in the conversation. For an audit or "
+    "review with more than three findings, put the findings in one compact Markdown "
+    "table with these columns: Priority, Finding, Evidence, Next action. Keep each "
+    "cell to one concise sentence; cite paths and the observed fact instead of "
+    "pasting long configuration inventories. Put unverified items only under "
+    "Remaining issues. If no files changed, say so plainly under Summary."
 )
 
 # Same one-chance-then-fallback shape as narrated tool intent, for the
@@ -1373,16 +1423,18 @@ async def _stream_completion_with_reconnect(
                 progress_callback(delta)
 
         try:
-            content, calls, finish_reason = await _stream_one_completion(
-                client,
-                model=model,
-                messages=request_messages,
-                tools=tools,
-                renderer=renderer,
-                reasoning_effort=reasoning_effort,
-                emit=not retrying_partial,
-                progress_callback=remember_attempt,
-            )
+            from .runtime.telemetry import provider_context
+            with provider_context(provider.value):
+                content, calls, finish_reason = await _stream_one_completion(
+                    client,
+                    model=model,
+                    messages=request_messages,
+                    tools=tools,
+                    renderer=renderer,
+                    reasoning_effort=reasoning_effort,
+                    emit=not retrying_partial,
+                    progress_callback=remember_attempt,
+                )
             if retrying_partial:
                 novel = _novel_continuation(durable_partial, content)
                 if novel:
@@ -2302,7 +2354,7 @@ async def _recover_audit_plan_file(
     return True
 
 
-async def _nonstream_one_completion(
+async def _nonstream_one_completion_impl(
     client,
     *,
     model: str,
@@ -2338,6 +2390,27 @@ async def _nonstream_one_completion(
             )
         )
     return content, calls
+
+
+async def _nonstream_one_completion(
+    client,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    provider: Optional[ProviderType] = None,
+) -> tuple[str, list[_StreamedToolCall]]:
+    """Trace a compatible non-streaming provider request without its payload."""
+    from .runtime.telemetry import current_provider, span
+
+    provider_name = (
+        provider.value if isinstance(provider, ProviderType)
+        else str(provider or current_provider() or "unknown")
+    )
+    with span("provider.invoke", provider=provider_name, model=model, operation="completion"):
+        return await _nonstream_one_completion_impl(
+            client, model=model, messages=messages, tools=tools,
+        )
 
 
 async def _recover_empty_continuation(
@@ -3162,25 +3235,51 @@ class _TextToolStreamFilter:
         return trailing, parsed
 
 
-def _select_model(manager: Any, config: Any, task_profile: Any) -> str:
+def _select_model(
+    manager: Any,
+    config: Any,
+    task_profile: Any,
+    *,
+    requires_vision: bool = False,
+) -> str:
     """manager.select_model(config, task_profile) when the manager supports
     it, falling back to config.default_model otherwise -- same tolerance-
     for-minimal-test-doubles convention as this module's existing
     `hasattr(manager, "fallback_candidates")` checks, since the many
     lightweight fake managers across the test suite only implement the
     handful of ProviderManager methods each specific test actually needs."""
+    if requires_vision:
+        select_vision = getattr(manager, "select_vision_model", None)
+        if select_vision is not None:
+            return select_vision(config, task_profile)
     select = getattr(manager, "select_model", None)
     if select is None:
         return config.default_model
     return select(config, task_profile)
 
 
-def _select_fallback_model(manager: Any, config: Any, task_profile: Any) -> str:
+def _select_fallback_model(
+    manager: Any,
+    config: Any,
+    task_profile: Any,
+    *,
+    requires_vision: bool = False,
+) -> str:
     """Choose a free fallback model unless paid fallback was opted in."""
     paid = getattr(manager, "paid_fallback_enabled", None)
     if callable(paid) and not paid() and getattr(config, "free_model", None):
         return str(config.free_model)
-    return _select_model(manager, config, task_profile)
+    return _select_model(
+        manager, config, task_profile, requires_vision=requires_vision,
+    )
+
+
+def _model_supports_vision(manager: Any, config: Any, model: str) -> bool:
+    """Prefer exact model capability metadata when the manager exposes it."""
+    check = getattr(manager, "model_supports_vision", None)
+    if check is not None:
+        return bool(check(config, model))
+    return bool(getattr(config, "vision_supported", False))
 
 
 def _tool_calls_signature(tool_calls: list[_StreamedToolCall]) -> tuple[tuple[str, str], ...]:
@@ -3217,7 +3316,7 @@ def _insufficient_novel_evidence(rounds: int, novel_observations: int) -> bool:
     return rounds >= 20 and novel_observations < max(4, rounds // 5)
 
 
-async def _stream_one_completion(
+async def _stream_one_completion_impl(
     client, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     renderer: StreamRenderer, reasoning_effort: Optional[str] = None, emit: bool = True,
     progress_callback: Optional[Callable[[str], None]] = None,
@@ -3334,6 +3433,13 @@ async def _stream_one_completion(
                 finish_reason = "live_steering"
                 break
             chunk = next_chunk_task.result()
+            usage = getattr(chunk, "usage", None)
+            if usage is not None:
+                from .runtime.telemetry import record_usage
+                record_usage(input_tokens=getattr(usage, "prompt_tokens", None),
+                             output_tokens=getattr(usage, "completion_tokens", None),
+                             reasoning_tokens=getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None),
+                             cached_input_tokens=getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None))
         except StopAsyncIteration:
             break
         except Exception as exc:
@@ -3437,6 +3543,38 @@ async def _stream_one_completion(
     )
     final_content = "".join(content_parts)
     return final_content, ordered_calls, finish_reason
+
+
+async def _stream_one_completion(
+    client,
+    *,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]],
+    renderer: StreamRenderer,
+    reasoning_effort: Optional[str] = None,
+    emit: bool = True,
+    progress_callback: Optional[Callable[[str], None]] = None,
+    provider: Optional[ProviderType] = None,
+) -> tuple[str, list[_StreamedToolCall], Optional[str]]:
+    """Trace a compatible streaming provider request without its payload."""
+    from .runtime.telemetry import current_provider, span
+
+    provider_name = (
+        provider.value if isinstance(provider, ProviderType)
+        else str(provider or current_provider() or "unknown")
+    )
+    with span("provider.invoke", provider=provider_name, model=model, operation="stream"):
+        return await _stream_one_completion_impl(
+            client,
+            model=model,
+            messages=messages,
+            tools=tools,
+            renderer=renderer,
+            reasoning_effort=reasoning_effort,
+            emit=emit,
+            progress_callback=progress_callback,
+        )
 
 
 # Internal context rollover: a segment can be checkpointed out to durable
@@ -4010,16 +4148,19 @@ async def _attempt_reasoning_plan(
         objective, task_profile, repository_context,
         reconnaissance_summary=reconnaissance_summary,
         evidence_summary=evidence_summary,
+        scope_roots=scope_roots,
     )
     attempt_client, attempt_model = client, model
     tried_providers: set[ProviderType] = set()
     last_exc: Optional[Exception] = None
     while True:
         try:
-            content, _tool_calls, finish_reason = await _stream_one_completion(
-                attempt_client, model=attempt_model, messages=prompt_messages, tools=[],
-                renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
-            )
+            from .runtime.telemetry import provider_context
+            with provider_context(provider.value if provider is not None else "unknown"):
+                content, _tool_calls, finish_reason = await _stream_one_completion(
+                    attempt_client, model=attempt_model, messages=prompt_messages, tools=[],
+                    renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
+                )
             break
         except Exception as exc:
             last_exc = exc
@@ -4604,7 +4745,10 @@ async def _run_local_agent_turn_impl(
                 allow_premium_primary=True,
             )
             choices = [
-                (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                (candidate, _select_model(
+                    manager, manager.PROVIDERS[candidate], task_profile,
+                    requires_vision=bool(image_content_blocks),
+                ))
                 for candidate in candidates
                 if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
             ]
@@ -4632,11 +4776,20 @@ async def _run_local_agent_turn_impl(
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
             return TaskOutcome(status="failed", error=error)
     selected_default_model = (
-        _select_fallback_model(manager, config, task_profile)
+        _select_fallback_model(
+            manager, config, task_profile,
+            requires_vision=bool(image_content_blocks),
+        )
         if provider == ProviderType.AUTO and not _paid_provider_fallback_enabled(manager)
-        else _select_model(manager, config, task_profile)
+        else _select_model(
+            manager, config, task_profile,
+            requires_vision=bool(image_content_blocks),
+        )
     )
     from .public_identity import resolve_public_model_alias
+
+    if resolved_provider == ProviderType.OLLAMA_CLOUD and model in {"glm-5.2", "glm-5.2:cloud", "glm-5.2-cloud"}:
+        model = "glm-5.3:cloud"
 
     resolved_model = resolve_public_model_alias(
         model,
@@ -4660,6 +4813,8 @@ async def _run_local_agent_turn_impl(
         provider=resolved_provider.value, model=resolved_model,
         reason=("explicit selection" if provider != ProviderType.AUTO else "capability-aware automatic routing"),
         fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+        requested_provider=provider.value,
+        requested_model=model or "auto",
     )
     orchestrator.start_execution()
 
@@ -4699,6 +4854,7 @@ async def _run_local_agent_turn_impl(
             objective, task_profile,
             reconnaissance_summary=planning_reconnaissance,
             workspace_summary=repository_context,
+            scope_roots=scope_roots,
         )
         reasoning_plan = await _attempt_reasoning_plan(
             client, model=resolved_model, objective=objective, task_profile=task_profile,
@@ -4737,6 +4893,7 @@ async def _run_local_agent_turn_impl(
     compaction_count = 0
     replanned_after_evidence = False
     loop_nudge_count = 0
+    stalled_routes: set[tuple[ProviderType, str]] = set()
     narrated_retries: dict[ProviderType, int] = {}
     narrated_failed_providers: set[ProviderType] = set()
     capitulation_retries: dict[ProviderType, int] = {}
@@ -4766,11 +4923,19 @@ async def _run_local_agent_turn_impl(
     repair_attempts: dict[tuple[str, str], int] = {}
     quality_failed_providers: set[ProviderType] = set()
     audit_recovery_reads = 0
+    audit_synthesis_requested = False
     plan_completion_retries = 0
     validation_commands = [] if turn_read_only else detect_validation_commands(Path(workspace_root))
     validation_confirmed: set[str] = set()
     validation_retries: dict[str, int] = {}
     validation_errors: dict[str, str] = {}
+    # Cosmetic-only validation commands (currently just "git diff --check",
+    # which flags whitespace-in-diff, not functional breakage) must never be
+    # able to discard an otherwise-complete task the way a failing test/lint/
+    # build command legitimately can. When retries are exhausted for one of
+    # these, the check is downgraded to a note here instead of a hard fail;
+    # _finalize_completed_answer surfaces it in the final report.
+    soft_validation_notes: list[str] = []
     unresolved_edit_paths: set[str] = set()
     # FIX: when a project has no detectable test/lint/build fingerprint,
     # validation_commands is empty, so next_validation below is always None
@@ -4911,14 +5076,15 @@ async def _run_local_agent_turn_impl(
             return TaskOutcome(status="failed", error=message, summary=content)
         validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
         if validation.severity == "error":
-            # Validator details are internal diagnostics, not a user-facing
-            # error contract.  Raw paths, provider/model names, and planner
-            # state previously leaked into the UI and made a recoverable
-            # retry look like a broken request. Keep the full report attached
-            # to the event for logs/telemetry, but show one stable message.
+            # Do not throw away a completed response behind an opaque
+            # "internal validation" message. A real evidence mismatch is
+            # recoverable, and the user needs the first concrete blocker to
+            # continue the same checkpoint rather than wait blindly.
+            blockers = "; ".join(str(item) for item in validation.unresolved[:2]).strip()
             message = (
-                "An internal validation error prevented completion. "
-                "No completion was reported; please try again in a few minutes."
+                "Completion needs more verified work before it can be reported"
+                + (f": {blockers}" if blockers else "")
+                + ". The response is retained; use `/retry` to continue from this checkpoint."
             )
             renderer.handle_event({
                 "event_type": "ai_task_failed",
@@ -4934,6 +5100,10 @@ async def _run_local_agent_turn_impl(
             caveat = "\n\n⚠ Validation incomplete: " + "; ".join(validation.unresolved)
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
+        if soft_validation_notes:
+            note = "\n\nℹ " + " ".join(dict.fromkeys(soft_validation_notes))
+            renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": note}})
+            content += note
         renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed", "validation": validation.to_dict()}})
         local_state.remember_conversation_turn(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
@@ -5003,6 +5173,7 @@ async def _run_local_agent_turn_impl(
         (the caller should return that immediately).
         """
         nonlocal loop_nudge_count, consecutive_identical_rounds, recent_tool_signatures
+        nonlocal resolved_provider, resolved_model, config, client
 
         # Every tool_call_id from the assistant message the caller already
         # appended still needs a matching role=="tool" response, or the
@@ -5049,6 +5220,76 @@ async def _run_local_agent_turn_impl(
             recent_tool_signatures = []
             return None
 
+        # A model that cannot turn valid observations into a new action is a
+        # failed execution route, not proof that the task is impossible.
+        # Preserve the transcript, plan, completed tools and checkpoints, then
+        # try another model (another NIM deployment first) before disabling
+        # tools or reporting failure.
+        if _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
+            stalled_routes.add((resolved_provider, resolved_model))
+            if hasattr(manager, "record_route_failure"):
+                manager.record_route_failure(
+                    resolved_provider,
+                    resolved_model,
+                    RuntimeError(stuck_reason),
+                    tool_call=bool(tools),
+                )
+            for candidate in _fallback_candidates_for_turn(
+                manager, resolved_provider, task_profile,
+            ):
+                candidate_config = manager.PROVIDERS.get(candidate)
+                candidate_client = manager.get_client(candidate)
+                if candidate_config is None or candidate_client is None:
+                    continue
+                candidate_model = _select_model(
+                    manager, candidate_config, task_profile,
+                    requires_vision=bool(image_content_blocks),
+                )
+                if (candidate, candidate_model) in stalled_routes:
+                    continue
+                previous_provider = resolved_provider
+                previous_model = resolved_model
+                resolved_provider = candidate
+                resolved_model = candidate_model
+                config = candidate_config
+                client = candidate_client
+                if hasattr(manager, "record_fallback"):
+                    manager.record_fallback(previous_provider)
+                orchestrator.mark_repair(
+                    f"Route {previous_provider.value}/{previous_model} stalled; continuing the active "
+                    f"plan on {candidate.value}/{candidate_model}",
+                    provider_switch=True,
+                )
+                orchestrator.record_route(
+                    provider=candidate.value,
+                    model=candidate_model,
+                    reason="automatic fallback after tool/evidence stall",
+                    fallback_reason=stuck_reason,
+                    fallback_chain=_standalone_fallback_chain_names(manager, candidate),
+                )
+                working_messages.append({
+                    "role": "system",
+                    "content": (
+                        "The previous model stalled by repeating reconnaissance. Continue the SAME active "
+                        "task and plan from the tool evidence already present. Do not repeat directory-level "
+                        "reads; inspect a concrete uninspected file or search for a concrete symbol/pattern."
+                    ),
+                })
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            "The current model remained stalled after correction; preserving the task state "
+                            "and continuing on another compatible route."
+                        ),
+                    },
+                })
+                loop_nudge_count = 0
+                consecutive_identical_rounds = 0
+                recent_tool_signatures = []
+                _persist_turn_checkpoint()
+                return None
+
         renderer.handle_event({
             "event_type": "diagnostics",
             "payload": {
@@ -5066,16 +5307,56 @@ async def _run_local_agent_turn_impl(
                 "finish this way, say so plainly and tell the user what to narrow it to."
             ),
         })
-        try:
-            recovery_content, _recovery_calls, recovery_finish_reason = await _stream_one_completion(
-                client, model=resolved_model, messages=working_messages, tools=[], renderer=renderer,
-                reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
-            )
-        except Exception as exc:
-            message = f"Stuck-loop recovery answer failed too ({exc}); nothing further to try this turn."
-            orchestrator.fail(message)
-            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
-            return TaskOutcome(status="failed", error=message)
+        # Confirmed live: this recovery call used to hit one pre-resolved
+        # provider with no retry, unlike the main answer-streaming path
+        # (ProviderManager.chat_completion's allow_fallback) and
+        # _attempt_reasoning_plan's own fallback loop. A retryable failure
+        # here (a 429/rate-limit on a free-tier route) repeated identically
+        # against the SAME route and then hard-failed the whole turn, even
+        # though other configured providers were healthy -- the one place a
+        # stuck turn most needs a working fallback path is exactly where it
+        # had none. Mirrors _attempt_reasoning_plan's retry-with-fallback
+        # pattern: try each remaining fallback candidate in the same policy
+        # order the main path uses before giving up.
+        recovery_client, recovery_model = client, resolved_model
+        recovery_provider = resolved_provider
+        tried_recovery_providers: set[ProviderType] = set()
+        recovery_content = _recovery_calls = recovery_finish_reason = None
+        while True:
+            try:
+                recovery_content, _recovery_calls, recovery_finish_reason = await _stream_one_completion(
+                    recovery_client, model=recovery_model, messages=working_messages, tools=[], renderer=renderer,
+                    reasoning_effort=_reasoning_effort(recovery_provider, recovery_model),
+                )
+                break
+            except Exception as exc:
+                fallback_client = fallback_model = None
+                if manager.is_retryable_provider_error(exc):
+                    for candidate in manager.fallback_candidates(
+                        recovery_provider, task_profile,
+                        allow_premium_primary=manager.is_quota_or_rate_limit_error(exc),
+                    ):
+                        if candidate in tried_recovery_providers:
+                            continue
+                        candidate_client = manager.get_client(candidate)
+                        candidate_config = manager.PROVIDERS.get(candidate)
+                        if candidate_client is None or candidate_config is None:
+                            continue
+                        fallback_client = candidate_client
+                        fallback_model = manager.select_model(candidate_config, task_profile)
+                        recovery_provider = candidate
+                        break
+                if fallback_client is None:
+                    message = f"Stuck-loop recovery answer failed too ({exc}); nothing further to try this turn."
+                    orchestrator.fail(message)
+                    renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                    return TaskOutcome(status="failed", error=message)
+                tried_recovery_providers.add(recovery_provider)
+                recovery_client, recovery_model = fallback_client, fallback_model
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": f"Stuck-loop recovery answer failed ({exc}); retrying with a different provider."},
+                })
         if not recovery_content.strip():
             fallback_summary = _synthesize_stuck_recovery_summary(working_messages)
             if fallback_summary:
@@ -5171,6 +5452,44 @@ async def _run_local_agent_turn_impl(
         acknowledge_steering = getattr(renderer, "acknowledge_steering", None)
         if callable(acknowledge_steering):
             acknowledge_steering(steering_revision)
+
+        # A read-only architecture audit can otherwise keep widening its
+        # reconnaissance indefinitely after collecting ample implementation
+        # evidence. Reserve the next turn for synthesis once the canonical
+        # tool ledger proves sufficient coverage; normal validation still
+        # owns the final completion decision.
+        tools_for_round = tools
+        if (
+            not audit_synthesis_requested
+            and orchestrator.run is not None
+            and _read_only_audit_has_sufficient_evidence(
+                task_profile.task_type,
+                turn_read_only,
+                orchestrator.run.tool_records,
+            )
+        ):
+            audit_synthesis_requested = True
+            evidence_count = len(_audit_evidence_targets(orchestrator.run.tool_records))
+            working_messages.append({
+                "role": "system",
+                "content": (
+                    f"EVIDENCE COVERAGE BOUNDARY: {evidence_count} distinct concrete successful "
+                    "read/search observations are now recorded for this read-only audit. Stop "
+                    "expanding reconnaissance and synthesize the final evidence-backed answer now. "
+                    "Trace the requested lifecycle from the evidence already present, distinguish "
+                    "verified facts from inference, and explicitly identify any remaining unknowns."
+                ),
+            })
+            tools_for_round = []
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"Collected {evidence_count} concrete audit evidence sources; "
+                        "moving to evidence synthesis."
+                    ),
+                },
+            })
 
         # Never fire a request already guaranteed to blow the provider's
         # context window -- confirmed live: HF 400'd with inputs(29548) +
@@ -5315,15 +5634,17 @@ async def _run_local_agent_turn_impl(
         checkpoint_partial_parts.clear()
         last_checkpoint_at = 0.0
         _persist_turn_checkpoint()
+        if hasattr(manager, "record_route_attempt"):
+            manager.record_route_attempt(resolved_provider, resolved_model)
         try:
             content, tool_calls, finish_reason = await _stream_completion_with_reconnect(
                 manager, client, provider=resolved_provider,
                 model=resolved_model,
                 messages=(
                     _messages_with_vision_content(working_messages, vision_message_index, image_content_blocks)
-                    if getattr(config, "vision_supported", False) else working_messages
+                    if _model_supports_vision(manager, config, resolved_model) else working_messages
                 ),
-                tools=tools, renderer=renderer,
+                tools=tools_for_round, renderer=renderer,
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
                 progress_callback=_remember_stream_delta,
             )
@@ -5334,6 +5655,8 @@ async def _run_local_agent_turn_impl(
                 partial_assistant=content,
                 status="running",
             )
+            if hasattr(manager, "record_route_success"):
+                manager.record_route_success(resolved_provider, resolved_model)
         except Exception as exc:
             # Automatic routing must treat provider/account failures as route
             # failures, not task failures. In particular, OpenRouter HTTP 402
@@ -5357,6 +5680,14 @@ async def _run_local_agent_turn_impl(
             # providers.py's routing logic in isolation, not this function),
             # which is how it went uncaught.
             failed_provider = resolved_provider
+            if hasattr(manager, "record_route_failure"):
+                manager.record_route_failure(
+                    failed_provider,
+                    resolved_model,
+                    root_exc,
+                    stream=True,
+                    tool_call=bool(tools),
+                )
             # Infra/account failures (rate limits, quota exhaustion, 5xx,
             # connection errors) must trigger cross-provider fallback even
             # when the user (or session default) explicitly pinned a
@@ -5398,7 +5729,10 @@ async def _run_local_agent_turn_impl(
                     allow_premium_primary=True,
                 )
                 premium_choices = [
-                    (candidate, _select_model(manager, manager.PROVIDERS[candidate], task_profile))
+                    (candidate, _select_model(
+                        manager, manager.PROVIDERS[candidate], task_profile,
+                        requires_vision=bool(image_content_blocks),
+                    ))
                     for candidate in premium_candidates
                     if candidate in manager.PROVIDERS and manager.get_client(candidate) is not None
                 ]
@@ -5438,7 +5772,10 @@ async def _run_local_agent_turn_impl(
                     candidate_config = manager.PROVIDERS.get(candidate)
                     if candidate_client is None or candidate_config is None:
                         continue
-                    candidate_model = _select_model(manager, candidate_config, task_profile)
+                    candidate_model = _select_model(
+                        manager, candidate_config, task_profile,
+                        requires_vision=bool(image_content_blocks),
+                    )
                     if (
                         failed_provider == ProviderType.OLLAMA_CLOUD
                         and premium_choices
@@ -5470,6 +5807,10 @@ async def _run_local_agent_turn_impl(
                             "reason": "automatic provider fallback",
                         },
                     })
+                    if hasattr(manager, "record_fallback"):
+                        manager.record_fallback(failed_provider)
+                    if hasattr(manager, "record_route_attempt"):
+                        manager.record_route_attempt(candidate, candidate_model)
                     try:
                         checkpoint_partial_parts.clear()
                         if interrupted_partial:
@@ -5482,7 +5823,9 @@ async def _run_local_agent_turn_impl(
                             model=candidate_model,
                             messages=(
                                 _messages_with_vision_content(working_messages, vision_message_index, image_content_blocks)
-                                if getattr(candidate_config, "vision_supported", False) else working_messages
+                                if _model_supports_vision(
+                                    manager, candidate_config, candidate_model,
+                                ) else working_messages
                             ),
                             tools=tools if getattr(candidate_config, "tool_calling", True) else [],
                             renderer=renderer,
@@ -5502,10 +5845,20 @@ async def _run_local_agent_turn_impl(
                         )
                         if isinstance(candidate_exc, _InterruptedCompletion):
                             interrupted_partial = candidate_exc.partial
+                        if hasattr(manager, "record_route_failure"):
+                            manager.record_route_failure(
+                                candidate,
+                                candidate_model,
+                                last_error,
+                                stream=True,
+                                tool_call=bool(tools),
+                            )
                         failed_provider = candidate
                         if not manager.is_retryable_provider_error(last_error):
                             break
                         continue
+                    if hasattr(manager, "record_route_success"):
+                        manager.record_route_success(candidate, candidate_model)
                     resolved_provider = candidate
                     config = candidate_config
                     client = candidate_client
@@ -6153,6 +6506,35 @@ async def _run_local_agent_turn_impl(
                 validation_label, validation_command = next_validation
                 retries = validation_retries.get(validation_command, 0)
                 if retries >= MAX_VERIFY_COMMAND_RETRIES:
+                    if validation_command == "git diff --check":
+                        # This only flags whitespace-in-the-diff (trailing
+                        # whitespace, missing final newline) -- a style nit,
+                        # never evidence the actual change is broken. Real
+                        # functional checks (npm test/build, compileall,
+                        # project lint) still hard-fail below; this one must
+                        # not be able to discard a working, already-verified
+                        # fix just because the model couldn't get a whitespace
+                        # nit clean within the retry budget.
+                        validation_confirmed.add(validation_command)
+                        soft_validation_notes.append(
+                            f"`{validation_command}` still reported whitespace issues in the "
+                            "diff after the allowed automatic fix attempts. This does not "
+                            "indicate the change is broken -- run `git diff --check` yourself "
+                            "if you want to clean up the formatting."
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    f"`{validation_command}` did not come back clean after "
+                                    f"{MAX_VERIFY_COMMAND_RETRIES} attempts; treating it as a "
+                                    "non-blocking note instead of failing the task, since it "
+                                    "only checks diff whitespace, not correctness."
+                                )
+                            },
+                        })
+                        _persist_turn_checkpoint()
+                        continue
                     message = (
                         f"Validation incomplete: `{validation_command}` did not produce a "
                         "confirmed successful result after the allowed attempts."
@@ -6985,11 +7367,22 @@ async def _run_local_agent_turn_impl(
                     display_command = f"{tc.name}(path={arguments.get('path')!r})"
                 else:
                     display_command = f"{tc.name}({json.dumps(display_arguments, default=str)})"
+                # Confirmed live: this always showed the SESSION's launch
+                # root here, even for a command whose own `cwd` argument
+                # targeted a different directory (e.g. a sibling project
+                # under a shared parent launch root) -- reading, in the same
+                # panel, "Working directory: /home" next to a reason of "The
+                # agent needs access outside the resolved workspace scope:
+                # /home/tamfisseo" as if that path were simultaneously the
+                # working directory and outside it. Show the command's own
+                # requested cwd when it names one; only bare commands with
+                # no cwd concept fall back to the session's launch root.
+                approval_cwd = arguments.get("cwd") if isinstance(arguments, dict) else None
                 renderer.handle_event({
                     "event_type": "approval_required",
                     "payload": {
                         "command": display_command, "risk_level": risk,
-                        "working_directory": workspace_root, "reason": reason,
+                        "working_directory": approval_cwd or workspace_root, "reason": reason,
                         "diff": diff_preview,
                     },
                 })

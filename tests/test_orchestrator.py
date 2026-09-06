@@ -378,6 +378,29 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertTrue(report.unresolved)
 
+    def test_read_only_audit_no_change_statement_is_not_a_mutation_claim(self):
+        """A correct audit must not fail because it says nothing was changed."""
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("audit provider routing and configuration"),
+            tool_records=[
+                {"tool_name": "read_file", "success": True, "arguments": {"path": "config.toml"}},
+                {"tool_name": "search_code", "success": True, "arguments": {"query": "provider"}},
+            ],
+            any_mutation=False,
+            final_text=(
+                "## Summary\n"
+                "No file, environment variable, service, or configuration was changed. "
+                "This was a read-only audit."
+            ),
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        self.assertFalse(any(item["name"] == "reported_mutation_supported" for item in report.checks))
+
     def test_latest_failed_verification_overrides_earlier_success(self):
         """A green build followed by a red check cannot be reported green."""
         from tamfis_code.orchestrator.validator import validate_completion
@@ -407,6 +430,116 @@ class OrchestratorTests(unittest.TestCase):
         self.assertFalse(report.passed)
         self.assertEqual(report.severity, "error")
         self.assertTrue(any("latest verification command failed" in item for item in report.unresolved))
+
+    def test_failed_git_push_does_not_block_completion_after_clean_verification(self):
+        """A network-blocked git push must not fail a turn that verified clean.
+
+        Live-reproduced: a turn fixed the requested bug, ran a clean build/
+        typecheck, committed, then tried `git push origin main` as its last
+        action inside a sandbox with no outbound route to the git remote --
+        "Could not connect to github.com port 443". That failure reflects
+        network reachability, not code correctness, and no repair-and-retry
+        loop can ever fix it from inside the same sandbox. Treating the push
+        as "the latest verification command" wrongly failed a turn that had
+        actually already succeeded.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken TypeScript router"),
+            tool_records=[
+                {"tool_name": "write_file", "success": True},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "npx tsc --noEmit"},
+                },
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git commit -m 'fix'"},
+                },
+                {
+                    "tool_name": "execute_command", "success": False, "exit_code": 1,
+                    "arguments": {"command": "git push origin main"},
+                },
+            ],
+            any_mutation=True,
+            final_text=(
+                "Fixed the router and verified with a clean typecheck. The commit "
+                "is ready locally; push to origin/main is blocked by the sandbox's "
+                "network boundary (could not connect to github.com port 443)."
+            ),
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        latest_check = next(item for item in report.checks if item["name"] == "latest_command_clean")
+        self.assertTrue(latest_check["passed"])
+
+    def test_yarn_and_bun_test_runs_satisfy_live_verification_claim(self):
+        """yarn/bun are first-class package managers here, not npm-only.
+
+        workspace.py detects yarn.lock and sets package_manager="yarn";
+        planner.py's command regex covers npm/pnpm/yarn/bun/deno. But the
+        live-verification allowlist only recognized npm/pnpm test, so a
+        yarn- or bun-based project's real, successful `yarn test`/`bun test`
+        run never satisfied a "the endpoint is now working" claim.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        for test_command in ("yarn test", "bun test"):
+            with self.subTest(test_command=test_command):
+                report = validate_completion(
+                    profile=classify_task("fix the broken API endpoint"),
+                    tool_records=[
+                        {"tool_name": "write_file", "success": True},
+                        {
+                            "tool_name": "execute_command", "success": True, "exit_code": 0,
+                            "arguments": {"command": test_command},
+                        },
+                    ],
+                    any_mutation=True,
+                    final_text="The endpoint is now working and verified.",
+                )
+                live_check = next(
+                    item for item in report.checks
+                    if item["name"] == "reported_live_verification_supported"
+                )
+                self.assertTrue(live_check["passed"])
+
+    def test_pm2_and_supervisorctl_restarts_satisfy_restart_claim(self):
+        """pm2/supervisorctl are recognized restart mechanisms elsewhere here.
+
+        runner_local.py's own _SERVICE_RESTART_RE (used to warn before
+        approving a disruptive restart) recognizes systemctl/service/
+        /etc/init.d/apachectl/nginx/pm2/supervisorctl restart-or-reload, but
+        this check's allowlist only recognized systemctl/service/docker
+        compose -- a pm2- or supervisord-managed project's real, successful
+        restart never satisfied a "the service is now live" claim.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        for restart_command in ("pm2 restart api", "supervisorctl restart worker", "nginx -s reload"):
+            with self.subTest(restart_command=restart_command):
+                report = validate_completion(
+                    profile=classify_task("fix the config and restart the service"),
+                    tool_records=[
+                        {"tool_name": "write_file", "success": True},
+                        {
+                            "tool_name": "execute_command", "success": True, "exit_code": 0,
+                            "arguments": {"command": restart_command},
+                        },
+                    ],
+                    any_mutation=True,
+                    final_text="The service is now live with the fix.",
+                )
+                restart_check = next(
+                    item for item in report.checks
+                    if item["name"] == "reported_restart_supported"
+                )
+                self.assertTrue(restart_check["passed"])
 
     def test_verified_already_resolved_debug_task_does_not_require_meaningless_edit(self):
         from tamfis_code.orchestrator.validator import validate_completion
@@ -449,6 +582,82 @@ class OrchestratorTests(unittest.TestCase):
             ],
             any_mutation=False,
             final_text="The issue is now resolved; no code changes were needed.",
+        )
+
+        self.assertFalse(report.passed)
+        self.assertEqual(report.severity, "error")
+        self.assertTrue(any("no successful file mutation" in item for item in report.unresolved))
+
+    def test_git_commit_with_diffstat_satisfies_mutation_recorded(self):
+        """A turn that finds an objective already committed and verifies it
+        with `git diff --stat` must not be told no mutation was recorded.
+
+        Live-reproduced: a turn ran only git status/log/diff-stat, tsc, and
+        compileall (no write_file/edit_file calls -- the edits and commit
+        predated this turn's tool_records), reported the real, verified,
+        pushed commit's diffstat, and validate_completion still failed with
+        "no successful file mutation was recorded" even though the diffstat
+        output proved real files changed. Twice-repeated evidence-correction
+        retries followed, each re-running the same read-only commands with
+        nothing new to add, before the turn failed anyway.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken router"),
+            tool_records=[
+                {"tool_name": "read_file", "success": True},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git commit -m 'fix'"},
+                },
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git diff --stat HEAD~1..HEAD"},
+                    "stdout": (
+                        " api/seo-router.ts           | 24 ++++++++++++++++++++++++\n"
+                        " src/pages/CampaignsPage.tsx |  5 +++++\n"
+                        " 2 files changed, 29 insertions(+)\n"
+                    ),
+                },
+            ],
+            any_mutation=False,
+            final_text=(
+                "Changes committed and pushed: abc1234 -- 2 files, 29 insertions.\n"
+                "api/seo-router.ts and src/pages/CampaignsPage.tsx were updated."
+            ),
+            workspace_root="/srv/app",
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        mutation_check = next(item for item in report.checks if item["name"] == "mutation_recorded")
+        self.assertTrue(mutation_check["accepted_git_diffstat_evidence"])
+
+    def test_git_diffstat_evidence_ignores_non_diffstat_command_output(self):
+        """Arbitrary command stdout must not be mistaken for a real diffstat.
+
+        Only the stdout of a command that actually ran `git diff/show/log
+        --stat` (or `git diff --name-only`) is trusted -- text that merely
+        looks like a diffstat line, printed by an unrelated command, must not
+        satisfy mutation_recorded.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken router"),
+            tool_records=[
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "cat notes.txt"},
+                    "stdout": " api/seo-router.ts | 24 ++++++++++++++++++++++++\n",
+                },
+            ],
+            any_mutation=False,
+            final_text="I fixed api/seo-router.ts.",
+            workspace_root="/srv/app",
         )
 
         self.assertFalse(report.passed)

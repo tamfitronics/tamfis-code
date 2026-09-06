@@ -158,6 +158,34 @@ class StreamRendererTests(unittest.TestCase):
         self.assertTrue(renderer.streamed_final_text)
         self.assertIn("hello", console.file.getvalue())
 
+    def test_interactive_markdown_report_renders_as_a_structured_card(self):
+        console = Console(file=StringIO(), no_color=True, width=120, force_terminal=True)
+        renderer = StreamRenderer(console)
+        # The live listener normally owns the prompt-toolkit composer. Its
+        # presence selects the buffered Markdown-card path without needing
+        # an actual terminal input loop in this renderer test.
+        renderer.live_input_listener = object()
+        renderer.handle_event({
+            "event_type": "assistant_delta",
+            "payload": {
+                "content": (
+                    "## Summary\nNo files changed.\n\n"
+                    "## Verification\n"
+                    "| Priority | Finding | Evidence | Next action |\n"
+                    "| --- | --- | --- | --- |\n"
+                    "| High | Missing adapter | `providers/__init__.py` | Add adapter |"
+                ),
+            },
+        })
+        renderer.finish()
+
+        output = console.file.getvalue()
+        self.assertIn("Assistant", output)
+        self.assertIn("Summary", output)
+        self.assertIn("Priority", output)
+        self.assertIn("Missing adapter", output)
+        self.assertNotIn("| Priority | Finding |", output)
+
     def test_reasoning_delta_tracks_real_thinking_time_then_freezes(self):
         # reasoning_content is a real, separate pre-answer stream some
         # OpenAI-compatible reasoning models emit (confirmed live against

@@ -177,10 +177,39 @@ class AgentOrchestrator:
         self.run.plan.remove_step(index)
         self._sync_plan_progress()
 
-    def record_route(self, *, provider: str, model: str, reason: str, fallback_chain: list[str] | None = None) -> None:
+    def record_route(
+        self,
+        *,
+        provider: str,
+        model: str,
+        reason: str,
+        fallback_chain: list[str] | None = None,
+        requested_provider: str | None = None,
+        requested_model: str | None = None,
+        fallback_reason: str | None = None,
+    ) -> None:
         assert self.run is not None
         self.transition(AgentPhase.ROUTE, action="Select a capability-matched provider and model")
-        self.run.route = {"provider": provider, "model": model, "reason": reason, "fallback_chain": fallback_chain or []}
+        prior = self.run.route
+        immutable_requested_provider = prior.get("requested_provider") or requested_provider or provider
+        immutable_requested_model = prior.get("requested_model") or requested_model or model
+        self.run.route = {
+            # Compatibility names retained for renderers and older state.
+            "provider": provider,
+            "model": model,
+            "requested_provider": immutable_requested_provider,
+            "requested_model": immutable_requested_model,
+            "effective_provider": provider,
+            "effective_model": model,
+            "fallback_reason": fallback_reason or (
+                reason if prior and (
+                    provider != immutable_requested_provider
+                    or model != immutable_requested_model
+                ) else ""
+            ),
+            "reason": reason,
+            "fallback_chain": fallback_chain or [],
+        }
         local_state.save_session_state(self.session_id, selected_provider=provider, selected_model=model)
 
     def start_execution(self) -> None:

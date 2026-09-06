@@ -15,9 +15,13 @@ from .routing import TaskProfile, TaskType
 # (confirmed user request: the agent should be able to pause and ask instead
 # of silently guessing when it's genuinely uncertain, e.g. a stated project
 # type it can't otherwise verify).
+# save_memory belongs here for the same reason as ask_user_question: it has
+# no side effects on the workspace (it writes to CONFIG_DIR/memory, not any
+# project file), so a read-only audit/inspect/plan turn should still be able
+# to record something worth remembering next session.
 READ_TOOLS = [
     "list_directory", "search_code", "find_references", "read_file",
-    "get_git_info", "ask_user_question", "inspect_artifact",
+    "get_git_info", "ask_user_question", "inspect_artifact", "save_memory",
 ]
 EDIT_TOOLS = [
     *READ_TOOLS,

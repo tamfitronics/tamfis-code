@@ -22,6 +22,7 @@ from typing import Any, Optional
 from rich.console import Console, Group
 from rich.live import Live
 from rich.markup import escape
+from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
 from rich.spinner import Spinner
@@ -1115,21 +1116,13 @@ class StreamRenderer:
             # and checkpoint remain unchanged.
             self._assistant_live.update(Text(unscrolled), refresh=True)
         elif self._is_tty:
-            # A real terminal with live_input_listener active (the ordinary
-            # interactive path -- see the class docstring on
-            # live_input_listener): Rich Live can't be used here (it would
-            # fight the listener's prompt-toolkit bottom toolbar for the
-            # same rows), so the enclosing box is drawn as plain completed
-            # lines instead of one live-redrawn region. A trailing partial
-            # line is held back so a boxed line's right border is never
-            # printed before the line is actually finished.
-            delta = self._assistant_buffer[self._assistant_rendered_length:]
-            if delta:
-                self._assistant_rendered_length = len(self._assistant_buffer)
-                self._assistant_line_buffer += delta
-                *complete_lines, self._assistant_line_buffer = self._assistant_line_buffer.split("\n")
-                for line in complete_lines:
-                    self._print_box_line(line)
+            # prompt-toolkit owns the live input rows, so a Rich Live
+            # Markdown renderer would corrupt the composer. Keep this block
+            # buffered and render one proper Markdown card at its natural
+            # boundary instead. Previously we printed each source line in a
+            # box; headings, lists, and Markdown tables then appeared as raw
+            # `##`, `-`, and `|` characters and wrapped unreadably.
+            self._assistant_rendered_length = len(self._assistant_buffer)
         else:
             # Redirected/non-terminal output: keep the original unboxed
             # plain-text stream -- box-drawing characters are noise in a
@@ -1142,12 +1135,21 @@ class StreamRenderer:
     def _close_assistant(self) -> None:
         if self._assistant_open:
             self._flush_assistant(force=True)
+            rendered_markdown = self._assistant_buffer.strip()
             if self._box_open:
                 if self._assistant_line_buffer:
                     self._print_box_line(self._assistant_line_buffer)
                     self._assistant_line_buffer = ""
                 self._print_box_bottom()
                 self._box_open = False
+            if self._is_tty and self.live_input_listener is not None and rendered_markdown:
+                self.console.print(Panel(
+                    Markdown(rendered_markdown),
+                    title="Assistant",
+                    border_style="cyan",
+                    expand=False,
+                    padding=(0, 1),
+                ))
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None

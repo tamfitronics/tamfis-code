@@ -22,6 +22,33 @@ class TaskType(str, Enum):
     MIXED = "mixed"
 
 
+class ComplexityLevel(str, Enum):
+    TRIVIAL = "trivial"
+    SIMPLE = "simple"
+    MODERATE = "moderate"
+    COMPLEX = "complex"
+    VERY_COMPLEX = "very_complex"
+
+
+_COMPLEXITY_RANK = {
+    # Legacy values remain accepted for callers/tests constructing profiles
+    # directly while runtime classification emits the five-level vocabulary.
+    "low": 1,
+    "medium": 2,
+    "high": 3,
+    ComplexityLevel.TRIVIAL.value: 0,
+    ComplexityLevel.SIMPLE.value: 1,
+    ComplexityLevel.MODERATE.value: 2,
+    ComplexityLevel.COMPLEX.value: 3,
+    ComplexityLevel.VERY_COMPLEX.value: 4,
+}
+
+
+def complexity_at_least(value: str, minimum: ComplexityLevel | str) -> bool:
+    floor = minimum.value if isinstance(minimum, ComplexityLevel) else str(minimum)
+    return _COMPLEXITY_RANK.get(str(value), 0) >= _COMPLEXITY_RANK.get(floor, 0)
+
+
 @dataclass(frozen=True)
 class TaskProfile:
     task_type: TaskType
@@ -87,6 +114,89 @@ _EXPLICIT_MUTATION_RE = re.compile(
     re.IGNORECASE,
 )
 
+_FILE_REFERENCE_RE = re.compile(
+    r"(?<![\w.-])[\w@+-]+(?:/[\w@+.-]+)*\.[A-Za-z0-9]{1,10}\b"
+)
+
+
+def estimate_complexity(text: str, task_type: TaskType) -> ComplexityLevel:
+    """Estimate orchestration depth from task shape, not one magic word.
+
+    The score combines independent observable signals. A user saying
+    "complex" does not itself escalate a task, while a multi-outcome change
+    spanning API, persistence, frontend and tests does even without that word.
+    """
+
+    raw = (text or "").strip()
+    lowered = raw.casefold()
+    if not raw or task_type == TaskType.CONVERSATION:
+        return ComplexityLevel.TRIVIAL
+
+    base = {
+        TaskType.QUESTION: 1,
+        TaskType.INSPECT: 1,
+        TaskType.RESEARCH: 2,
+        TaskType.TEST: 2,
+        TaskType.EXECUTE: 2,
+        TaskType.GIT: 2,
+        TaskType.PLAN: 2,
+        TaskType.EDIT: 2,
+        TaskType.DEBUG: 2,
+        TaskType.AUDIT: 3,
+        TaskType.MIXED: 3,
+    }.get(task_type, 1)
+    score = base
+
+    file_refs = set(_FILE_REFERENCE_RE.findall(raw))
+    if len(file_refs) >= 2:
+        score += 1
+    if len(file_refs) >= 5:
+        score += 1
+
+    outcome_signals = len(re.findall(
+        r"(?:^|[\n;.]|\bthen\b|\band\b)\s*(?:find|trace|inspect|fix|add|remove|"
+        r"implement|update|test|verify|build|deploy|restart|review|document)\b",
+        lowered,
+    ))
+    if outcome_signals >= 3:
+        score += 1
+    if outcome_signals >= 6:
+        score += 1
+
+    component_hits = sum(
+        bool(re.search(rf"\b{component}\b", lowered))
+        for component in (
+            "frontend", "backend", "api", "database", "persistence",
+            "worker", "cli", "gateway", "orchestrator", "provider",
+        )
+    )
+    if component_hits >= 2:
+        score += 1
+    if component_hits >= 4:
+        score += 1
+
+    independent_signals = (
+        bool(re.search(r"\b(?:whole|entire|repository-wide|end-to-end|cross-file|cross-component)\b", lowered)),
+        bool(re.search(r"\b(?:migration|schema|backward compatibility|public api|architecture)\b", lowered)),
+        bool(re.search(r"\b(?:intermittent|race condition|unknown root cause|production logs|reproduce)\b", lowered)),
+        bool(re.search(r"\b(?:external api|third-party|webhook|oauth|deployment|systemd)\b", lowered)),
+        bool(re.search(r"\b(?:unit tests?|integration tests?|typecheck|lint|build)\b", lowered)),
+        bool(re.search(r"\b(?:retry|replan|repair loop|independent review|subagents?)\b", lowered)),
+    )
+    score += sum(independent_signals)
+    if len(raw) >= 600:
+        score += 1
+    if len(raw) >= 1800:
+        score += 1
+
+    if score <= 1:
+        return ComplexityLevel.SIMPLE
+    if score <= 3:
+        return ComplexityLevel.MODERATE
+    if score <= 6:
+        return ComplexityLevel.COMPLEX
+    return ComplexityLevel.VERY_COMPLEX
+
 
 def is_explicit_read_only_request(text: str) -> bool:
     """Return whether the user explicitly prohibited repository mutation.
@@ -110,36 +220,53 @@ def is_explicit_read_only_request(text: str) -> bool:
 
 def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
     raw = (text or "").strip().lower()
+    def profile(
+        task_type: TaskType,
+        requires_tools: bool,
+        requires_repository_context: bool,
+        requires_long_context: bool,
+        requires_validation: bool,
+        preferred_quality_tier: str,
+    ) -> TaskProfile:
+        return TaskProfile(
+            task_type,
+            estimate_complexity(text, task_type).value,
+            requires_tools,
+            requires_repository_context,
+            requires_long_context,
+            requires_validation,
+            preferred_quality_tier,
+        )
     if not raw or raw in _GREETINGS or raw.startswith(("who are you", "what can you do", "tell me about yourself")):
-        return TaskProfile(TaskType.CONVERSATION, "low", False, False, False, False, "economy")
+        return profile(TaskType.CONVERSATION, False, False, False, False, "economy")
 
     def has(words: Iterable[str]) -> bool:
         return any(word in raw for word in words)
 
     if has(_CLOSURE_SIGNALS):
-        return TaskProfile(TaskType.CONVERSATION, "low", False, False, False, False, "economy")
+        return profile(TaskType.CONVERSATION, False, False, False, False, "economy")
     # A report/status request often names an artefact such as
     # ATTACHMENT_PIPELINE_FIX_PROGRESS.md. The old substring-first DEBUG
     # check treated the incidental "fix" in that filename as an instruction
     # to mutate the repository despite an explicit "no file edit" constraint.
     if is_explicit_read_only_request(raw):
         if has(("audit", "entire stack", "whole repository", "whole repo", "end-to-end", "end to end")):
-            return TaskProfile(TaskType.AUDIT, "high", True, True, True, False, "frontier")
-        return TaskProfile(TaskType.INSPECT, "medium", True, True, False, False, "high")
+            return profile(TaskType.AUDIT, True, True, True, False, "frontier")
+        return profile(TaskType.INSPECT, True, True, False, False, "high")
     if has(("audit", "entire stack", "whole repository", "whole repo", "end-to-end", "end to end")):
-        return TaskProfile(TaskType.AUDIT, "high", True, True, True, True, "frontier")
+        return profile(TaskType.AUDIT, True, True, True, True, "frontier")
     if has(("debug", "fix", "repair", "bug", "traceback", "exception", "failing")):
-        return TaskProfile(TaskType.DEBUG, "high", True, True, True, True, "frontier")
+        return profile(TaskType.DEBUG, True, True, True, True, "frontier")
     if has(("implement", "edit", "modify", "refactor", "rewrite", "add ", "create ", "remove ", "delete ", "patch")) and not read_only:
-        return TaskProfile(TaskType.EDIT, "high", True, True, True, True, "frontier")
+        return profile(TaskType.EDIT, True, True, True, True, "frontier")
     if has(("pytest", "test suite", "run tests", "fix tests", "lint", "typecheck", "type check")):
-        return TaskProfile(TaskType.TEST, "medium", True, True, False, True, "high")
+        return profile(TaskType.TEST, True, True, False, True, "high")
     if has(("git ", "commit", "push", "pull request", "branch", "merge")):
-        return TaskProfile(TaskType.GIT, "medium", True, True, False, True, "high")
+        return profile(TaskType.GIT, True, True, False, True, "high")
     if has(("run ", "execute ", "install ", "build ", "restart ", "systemctl")):
-        return TaskProfile(TaskType.EXECUTE, "medium", True, True, False, True, "high")
+        return profile(TaskType.EXECUTE, True, True, False, True, "high")
     if has(("plan", "proposal", "roadmap", "architecture")):
-        return TaskProfile(TaskType.PLAN, "medium", True, True, True, False, "high")
+        return profile(TaskType.PLAN, True, True, True, False, "high")
     # Checked before INSPECT's broad "search"/"find" catch below, which would
     # otherwise swallow explicitly web-directed phrasing first -- this branch
     # only fires on cues naming the web/internet/a browser, not on ordinary
@@ -155,9 +282,9 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
         "what's the latest", "whats the latest", "up to date information",
         "up-to-date information", "current events", "today's news",
     )):
-        return TaskProfile(TaskType.RESEARCH, "medium", True, False, False, False, "high")
+        return profile(TaskType.RESEARCH, True, False, False, False, "high")
     if has(("inspect", "analyse", "analyze", "review", "search", "find", "check ", "read file", "repository", "codebase")):
-        return TaskProfile(TaskType.INSPECT, "medium", True, True, False, False, "high")
+        return profile(TaskType.INSPECT, True, True, False, False, "high")
     # requires_tools/requires_validation must stay False here: a generic
     # question is answerable without tool evidence. `read_only` only governs
     # which tools are *offered* (see tool_policy.py) -- it used to also be
@@ -165,7 +292,7 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
     # plain chat-mode question (confirmed live: "reply with exactly PONG"
     # got flagged "Validation incomplete" with no explanation) purely
     # because no tool call was made, even though none was ever needed.
-    return TaskProfile(TaskType.QUESTION, "low", False, read_only, False, False, "balanced")
+    return profile(TaskType.QUESTION, False, read_only, False, False, "balanced")
 
 class Router:
     """Compatibility facade for deterministic classification and provider selection."""
