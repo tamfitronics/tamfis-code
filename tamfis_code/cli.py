@@ -1452,7 +1452,9 @@ async def _run_local_ai_command(
     from .local_chat import resolve_provider_type
     from .providers import ProviderManager
     from .runner_local import (
+        MAX_DIRECT_OBJECTIVE_CHARS,
         _is_resume_request,
+        archive_oversized_objective,
         build_vision_content_blocks,
         is_vision_image_path,
         run_local_agent_turn,
@@ -1479,6 +1481,16 @@ async def _run_local_ai_command(
         raise click.UsageError(str(exc))
 
     workspace = resolve_local_workspace(workspace_root, discover=mode != "chat")
+    if len(objective) > MAX_DIRECT_OBJECTIVE_CHARS:
+        prepared, evidence_id = archive_oversized_objective(
+            [{"role": "user", "content": objective}],
+            session_id=workspace.session_id,
+        )
+        objective = str(prepared[0]["content"])
+        console.print(
+            "[dim]Preserved oversized objective as "
+            f"{evidence_id}; the agent can search or page through all content.[/dim]"
+        )
     state = local_state.get_session_state(workspace.session_id)
 
     from .interactive import contextualize_short_reply
@@ -1668,8 +1680,16 @@ def _ai_command(mode: str, help_text: str):
             objective_text = sys.stdin.read()
         else:
             objective_text = objective or ""
-        if len(objective_text) > 1_000_000:
-            raise click.UsageError("Objective exceeds the 1,000,000 character safety limit.")
+        from .runner_local import MAX_DIRECT_OBJECTIVE_CHARS, MAX_LOCAL_OBJECTIVE_CHARS
+        objective_limit = (
+            MAX_DIRECT_OBJECTIVE_CHARS
+            if _use_remote(config, remote)
+            else MAX_LOCAL_OBJECTIVE_CHARS
+        )
+        if len(objective_text) > objective_limit:
+            raise click.UsageError(
+                f"Objective exceeds the {objective_limit:,} character safety limit."
+            )
         if background and not _use_remote(config, remote):
             from .background import spawn_background_task
             from .workspace import resolve_local_workspace

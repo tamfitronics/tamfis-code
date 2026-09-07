@@ -2799,6 +2799,61 @@ def _trim_tool_outputs(messages: list[dict[str, Any]], target_tokens: int, keep_
 
     return trimmed_any
 
+
+def archive_oversized_objective(
+    messages: list[dict[str, Any]], *, session_id: int,
+) -> tuple[list[dict[str, Any]], Optional[str]]:
+    """Archive and compact the latest user objective when it exceeds 1M.
+
+    The returned messages never contain the full oversized value, which keeps
+    provider payloads, task classification, checkpoints, and session memory
+    bounded.  The evidence record retains every character and the prompt tells
+    the model how to retrieve bounded windows (or search for known text).
+    """
+    latest_index = next(
+        (
+            index for index in range(len(messages) - 1, -1, -1)
+            if messages[index].get("role") == "user"
+        ),
+        None,
+    )
+    if latest_index is None:
+        return messages, None
+    content = messages[latest_index].get("content")
+    if not isinstance(content, str):
+        return messages, None
+    if len(content) <= MAX_DIRECT_OBJECTIVE_CHARS:
+        existing_reference = re.search(r"Evidence ID: (evidence_[a-f0-9]+)", content)
+        return messages, (existing_reference.group(1) if existing_reference else None)
+    if len(content) > MAX_LOCAL_OBJECTIVE_CHARS:
+        raise ValueError(
+            f"Objective exceeds the {MAX_LOCAL_OBJECTIVE_CHARS:,} character safety limit."
+        )
+
+    evidence_id = evidence_store.store_segment(
+        session_id,
+        objective=content,
+        messages=[],
+        summary=(
+            f"Oversized user objective archived before provider dispatch "
+            f"({len(content):,} characters)."
+        ),
+    )
+    preview = _bounded_text(
+        content, head=6_000, tail=2_000, label="oversized objective archived",
+    )
+    replacement = (
+        f"{preview}\n\n"
+        "[Tamfis Code preserved the exact full objective outside the provider context. "
+        f"Evidence ID: {evidence_id}; total characters: {len(content):,}. "
+        "Use retrieve_evidence with evidence_id plus offset/max_chars to page through it, "
+        "or query to locate known text. Do not assume the omitted middle is unavailable.]"
+    )
+    prepared = [dict(message) for message in messages]
+    prepared[latest_index]["content"] = replacement
+    return prepared, evidence_id
+
+
 def _latest_user_text(messages: list[dict[str, Any]]) -> str:
     for message in reversed(messages):
         if message.get("role") == "user":
@@ -3584,12 +3639,19 @@ async def _stream_one_completion(
 # fails cleanly instead of looping forever.
 MAX_CONTEXT_ROLLOVERS_PER_TURN = 3
 
+# Direct provider context stays at the established safety boundary.  Larger
+# local objectives are accepted up to five million characters, archived once
+# as durable evidence, and replaced in the prompt/state with a compact,
+# retrievable reference.
+MAX_DIRECT_OBJECTIVE_CHARS = 1_000_000
+MAX_LOCAL_OBJECTIVE_CHARS = 5_000_000
+
 RETRIEVE_EVIDENCE_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
         "name": "retrieve_evidence",
         "description": (
-            "Retrieve full detail from a prior context-rollover evidence segment "
+            "Retrieve a bounded, pageable objective chunk and compact detail from an evidence segment "
             "(referenced by an evidence_id mentioned in a CONTEXT ROLLOVER system "
             "message). Use this when you need exact prior tool output or file "
             "content that was checkpointed out of the working context during a "
@@ -3599,6 +3661,19 @@ RETRIEVE_EVIDENCE_TOOL_SCHEMA: dict[str, Any] = {
             "type": "object",
             "properties": {
                 "evidence_id": {"type": "string", "description": "The evidence_id to retrieve"},
+                "offset": {
+                    "type": "integer", "minimum": 0,
+                    "description": "Character offset for a bounded objective chunk (default 0)",
+                },
+                "max_chars": {
+                    "type": "integer", "minimum": 1,
+                    "maximum": evidence_store.MAX_OBJECTIVE_CHUNK_CHARS,
+                    "description": "Maximum objective characters to return (default 12000)",
+                },
+                "query": {
+                    "type": "string",
+                    "description": "Optional case-insensitive text to locate within the objective",
+                },
             },
             "required": ["evidence_id"],
         },
@@ -4393,6 +4468,9 @@ async def _run_local_agent_turn_impl(
     remain visible only via the plain-text attachment note already added to
     `messages` (path only, no pixel content) for those routes.
     """
+    messages, oversized_evidence_id = archive_oversized_objective(
+        messages, session_id=session_id,
+    )
     incoming_objective = _latest_user_text(messages)
     resume_requested = _is_resume_request(incoming_objective)
     prior_state = (
@@ -4532,7 +4610,7 @@ async def _run_local_agent_turn_impl(
     # command has actually happened; offering them whenever any other tool
     # is offered costs one small schema entry each and means the model
     # never has to be told about them mid-turn.
-    if tools:
+    if tools or oversized_evidence_id:
         tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA, READ_BACKGROUND_JOB_TOOL_SCHEMA]
         if allow_swarm_tool and not turn_read_only and cli_config is not None and cli_config.enable_subagent_delegation:
             tools = [*tools, SWARM_TOOL_SCHEMA]
@@ -7108,11 +7186,17 @@ async def _run_local_agent_turn_impl(
                         "error": f"No evidence segment found for evidence_id={arguments.get('evidence_id')!r}.",
                     }
                 else:
+                    chunk = evidence_store.objective_chunk(
+                        segment,
+                        offset=arguments.get("offset") or 0,
+                        max_chars=arguments.get("max_chars") or evidence_store.DEFAULT_OBJECTIVE_CHUNK_CHARS,
+                        query=str(arguments.get("query") or ""),
+                    )
                     result = {
                         "success": True,
                         "result": {
                             "evidence_id": segment.get("evidence_id"),
-                            "objective": segment.get("objective"),
+                            **chunk,
                             "summary": segment.get("summary"),
                             "message_count": segment.get("message_count"),
                             # Bounded immediately (rather than relying on next

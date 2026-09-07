@@ -102,6 +102,12 @@ operation is available non-interactively with `tamfis-code fork [session_id]`;
 resume the new ID printed by the command. Conversation and repository context
 are copied, while in-flight tasks and queued instructions are deliberately not.
 
+Standalone Tamfis Code accepts pasted objectives up to 5,000,000 characters.
+Objectives over 1,000,000 characters are stored as private, durable evidence;
+the model receives a compact preview and can search or page through the exact
+archived content without overflowing its context window. Legacy `--remote`
+mode retains its 1,000,000-character request limit.
+
 Use `tamfis-code clear-session <session_id>` to remove a stopped or stale local
 session from active listings and prevent it from being reused for that
 workspace. A session that still appears live is protected unless `--force` is

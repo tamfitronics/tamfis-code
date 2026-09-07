@@ -65,7 +65,13 @@ from .runner import (
     run_shell_command,
     submit_ai_task_background,
 )
-from .runner_local import run_local_agent_turn, run_local_shell_command
+from .runner_local import (
+    MAX_DIRECT_OBJECTIVE_CHARS,
+    MAX_LOCAL_OBJECTIVE_CHARS,
+    archive_oversized_objective,
+    run_local_agent_turn,
+    run_local_shell_command,
+)
 from .pty import LocalPtyBroker
 from .safety import revert_mutation as local_revert_mutation
 from .safety import revert_transaction as local_revert_transaction
@@ -874,8 +880,13 @@ async def run_interactive(
         console, host=(f"local:{provider}" if standalone else config.api_base),
         workspace_root=workspace.workspace_root, mode="interactive", approval_policy=config.approval_policy,
     )
+    paste_limit = MAX_LOCAL_OBJECTIVE_CHARS if standalone else MAX_DIRECT_OBJECTIVE_CHARS
+    paste_note = (
+        f"Paste up to {paste_limit:,} characters"
+        + ("; pastes over 1,000,000 are archived and searchable" if standalone else "")
+    )
     console.print(
-        "[dim]Type /help for commands. Paste up to 1,000,000 characters; Alt+Enter adds a newline. "
+        f"[dim]Type /help for commands. {paste_note}; Alt+Enter adds a newline. "
         "While a task runs, a normal message prompt remains available: type and press Enter; "
         "your text is queued without a special shortcut, and Up edits the latest queued message. "
         "Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
@@ -1234,9 +1245,20 @@ async def run_interactive(
             continue
         if not text:
             continue
-        if len(text) > 1_000_000:
-            print_error(console, "Objective exceeds the 1,000,000 character safety limit.")
+        objective_limit = MAX_LOCAL_OBJECTIVE_CHARS if standalone else MAX_DIRECT_OBJECTIVE_CHARS
+        if len(text) > objective_limit:
+            print_error(console, f"Objective exceeds the {objective_limit:,} character safety limit.")
             continue
+        if standalone and len(text) > MAX_DIRECT_OBJECTIVE_CHARS:
+            prepared, evidence_id = archive_oversized_objective(
+                [{"role": "user", "content": text}],
+                session_id=workspace.session_id,
+            )
+            text = str(prepared[0]["content"])
+            console.print(
+                "[dim]diagnostics: Preserved oversized paste as "
+                f"{evidence_id}; the agent can search or page through all content.[/dim]"
+            )
         if text.lower() in ("/exit", "/quit", "/detach"):
             # No task submitted through this REPL outlives this process's
             # lifetime any differently based on which of these three the
