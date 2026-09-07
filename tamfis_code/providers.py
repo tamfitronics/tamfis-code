@@ -20,13 +20,14 @@ packages use process/user configuration and never assume a builder's path.
 
 from __future__ import annotations
 
+import itertools
 import os
 import threading
 import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, AsyncIterator, Dict, List, Optional, TYPE_CHECKING
+from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
@@ -303,6 +304,45 @@ _ROUTING_TELEMETRY = RoutingTelemetry()
 
 def _increment(mapping: Dict[str, int], key: str) -> None:
     mapping[key] = mapping.get(key, 0) + 1
+
+
+# NIM multi-key rotation: the owner runs multiple NVIDIA NIM accounts (each
+# presumed to have its own separate rate limit/quota, not just a spare
+# credential for the same account) specifically so a single account's limit
+# doesn't stall AUTO's NIM-first routing. Checks both `_1` (this repo's own
+# .env convention) and `_2.._5` (tamgpt6's convention, in case a shared key
+# is ever set under that name here too) so either naming works.
+_NIM_KEY_ENV_NAMES = (
+    "NVIDIA_API_KEY", "NVIDIA_API_KEY_1", "NVIDIA_API_KEY_2",
+    "NVIDIA_API_KEY_3", "NVIDIA_API_KEY_4", "NVIDIA_API_KEY_5",
+)
+# Module-wide, not per-instance: this distributes the starting key across
+# managers created by a long-running process (for example tamfis-code-server).
+# A short-lived CLI process starts with the primary key and rotates only when
+# that account reports quota/rate limiting.
+_nim_rr_counter = itertools.count()
+
+
+def _nim_configured_keys() -> List[str]:
+    keys: List[str] = []
+    seen: set = set()
+    for env_name in _NIM_KEY_ENV_NAMES:
+        val = os.environ.get(env_name, "").strip()
+        if _valid_api_key_value(val) and val not in seen:
+            keys.append(val)
+            seen.add(val)
+    return keys
+
+
+def _valid_api_key_value(key: Optional[str]) -> bool:
+    value = str(key or "").strip()
+    if len(value) < 8:
+        return False
+    upper_key = value.upper()
+    placeholder_markers = (
+        "YOUR_", "CHANGE_ME", "REPLACE_ME", "_API_KEY", "EXAMPLE", "DUMMY",
+    )
+    return not any(marker in upper_key for marker in placeholder_markers)
 
 
 class ProviderManager:
@@ -783,6 +823,12 @@ class ProviderManager:
             raise ValueError(f"Unsupported provider runtime mode: {runtime_mode!r}")
         self.clients: Dict[ProviderType, AsyncOpenAI] = {}
         self.config = self._load_config()
+        # One client per configured NVIDIA NIM key -- see _NIM_KEY_ENV_NAMES.
+        # Populated in _init_clients(); self.clients[NVIDIA] is kept pointed
+        # at pool[_nim_key_index] so every existing call site that reads
+        # self.clients.get(NVIDIA) keeps working unchanged.
+        self._nim_client_pool: List[AsyncOpenAI] = []
+        self._nim_key_index: int = next(_nim_rr_counter)
         self._init_clients()
 
     @property
@@ -872,6 +918,10 @@ class ProviderManager:
             # in the environment for direct native API use elsewhere.
             return os.environ.get(config.api_key_env, "").strip() or "ollama"
 
+        if provider_type == ProviderType.NVIDIA:
+            keys = _nim_configured_keys()
+            return keys[0] if keys else None
+
         if provider_type == ProviderType.TAMFIS:
             # An explicitly supplied developer key wins.  Otherwise reuse
             # the renewable credential created by `tamfis-code login`; the
@@ -907,20 +957,7 @@ class ProviderManager:
         if config is None:
             return False
 
-        key = self._get_api_key(provider_type)
-        if not key or len(key) < 8:
-            return False
-
-        upper_key = key.upper()
-        placeholder_markers = (
-            "YOUR_",
-            "CHANGE_ME",
-            "REPLACE_ME",
-            "_API_KEY",
-            "EXAMPLE",
-            "DUMMY",
-        )
-        return not any(marker in upper_key for marker in placeholder_markers)
+        return _valid_api_key_value(self._get_api_key(provider_type))
 
     def _check_ollama_available(self) -> bool:
         """Return True when the local Ollama daemon is reachable.
@@ -990,6 +1027,23 @@ class ProviderManager:
                 continue
 
             try:
+                if provider_type == ProviderType.NVIDIA:
+                    # One AsyncOpenAI client per configured NIM key -- the
+                    # api_key is baked into the client at construction (the
+                    # SDK doesn't support swapping it per-call), so rotating
+                    # keys means rotating which pre-built client is active,
+                    # not mutating one client's key in place.
+                    nim_keys = _nim_configured_keys()
+                    self._nim_client_pool = [
+                        AsyncOpenAI(base_url=config.base_url, api_key=key, timeout=120.0, max_retries=0)
+                        for key in nim_keys
+                    ]
+                    if self._nim_client_pool:
+                        self.clients[provider_type] = self._nim_client_pool[
+                            self._nim_key_index % len(self._nim_client_pool)
+                        ]
+                    continue
+
                 self.clients[provider_type] = AsyncOpenAI(
                     base_url=config.base_url,
                     api_key=self._get_api_key(provider_type),
@@ -1598,9 +1652,18 @@ class ProviderManager:
         reasoning_effort: Optional[str] = "high",
         task_profile: Optional["TaskProfile"] = None,
         allow_fallback: bool = True,
+        _nim_tried_key_indices: Optional[set[int]] = None,
+        _nim_key_index_override: Optional[int] = None,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
-        """Yield text from one provider, with safe automatic fallback."""
+        """Yield text from one provider, with safe automatic fallback.
+
+        _nim_tried_key_indices is internal-only (set by this method's own
+        NIM-key-rotation retry below, never by external callers): tracks
+        which NVIDIA_API_KEY* indices this call chain has already tried, so
+        rotation is bounded by the number of configured keys instead of
+        looping forever if every key is simultaneously rate-limited.
+        """
 
         resolved, config = self.resolve_route(
             provider,
@@ -1613,7 +1676,16 @@ class ProviderManager:
                 )
             ),
         )
-        client = self.clients.get(resolved)
+        active_nim_key_index: Optional[int] = None
+        if resolved == ProviderType.NVIDIA and self._nim_client_pool:
+            active_nim_key_index = (
+                self._nim_key_index
+                if _nim_key_index_override is None
+                else _nim_key_index_override
+            ) % len(self._nim_client_pool)
+            client = self._nim_client_pool[active_nim_key_index]
+        else:
+            client = self.clients.get(resolved)
         if client is None:
             raise ValueError(f"Provider {resolved.value} is not available")
 
@@ -1721,7 +1793,58 @@ class ProviderManager:
                 return
 
         except Exception as exc:
+            # Rotate to the next configured NVIDIA NIM key before ever
+            # falling back to a different provider entirely -- one account
+            # hitting its rate/weekly-usage limit shouldn't give up NIM's
+            # free tier, 1M context, and verified tool-calling for a paid or
+            # more limited fallback provider while a second (or third...)
+            # configured key is still fresh. Bounded by
+            # _nim_tried_key_indices so simultaneous exhaustion of every
+            # configured key still falls through to the normal
+            # cross-provider fallback path below exactly once, never an
+            # infinite loop.
+            if (
+                resolved == ProviderType.NVIDIA
+                and len(self._nim_client_pool) > 1
+                and self.is_quota_or_rate_limit_error(exc)
+            ):
+                tried = set(_nim_tried_key_indices or set())
+                tried.add(
+                    active_nim_key_index
+                    if active_nim_key_index is not None
+                    else self._nim_key_index % len(self._nim_client_pool)
+                )
+                if len(tried) < len(self._nim_client_pool):
+                    next_index = (
+                        (active_nim_key_index if active_nim_key_index is not None else self._nim_key_index)
+                        + 1
+                    ) % len(self._nim_client_pool)
+                    self._nim_key_index = next_index
+                    self.clients[ProviderType.NVIDIA] = self._nim_client_pool[next_index]
+                    async for chunk in self.chat_completion(
+                        ProviderType.NVIDIA,
+                        messages,
+                        model=model,
+                        stream=stream,
+                        temperature=temperature,
+                        max_tokens=max_tokens,
+                        reasoning_effort=reasoning_effort,
+                        task_profile=task_profile,
+                        allow_fallback=allow_fallback,
+                        _nim_tried_key_indices=tried,
+                        _nim_key_index_override=next_index,
+                        **kwargs,
+                    ):
+                        yield chunk
+                    return
+
+            # Account-specific quota failures do not poison this model's
+            # circuit while another configured NIM account can still serve
+            # it. Record the route failure only after key rotation is
+            # exhausted (or for failures that are not account quota/rate
+            # limits).
             self.record_route_failure(resolved, selected_model, exc, stream=stream)
+
             # FIX 2026-08-07: `provider != ProviderType.AUTO` used to block
             # fallback entirely whenever a specific provider was resolved
             # (including the app's ordinary configured default, not just an

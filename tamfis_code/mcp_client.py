@@ -19,6 +19,7 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,30 @@ class MCPServerConfig:
         return "http" if self.url else "stdio"
 
 
+def _expand_env(value: str) -> str:
+    """Expand ``${VAR_NAME}`` references against the current process
+    environment, same convention as tamgpt6's own mcp_config.yaml loader.
+
+    Added so a header value like ``"Bearer ${HF_TOKEN}"`` in .mcp.json
+    resolves the real secret from the environment at load time instead
+    of requiring the raw token to be written directly into a config
+    file on disk -- config files are more widely readable/shared/
+    committed by habit than a project's own .env, which this repo
+    already treats as the one place secrets belong (see
+    providers.py's _load_project_env).  A reference to an unset
+    variable is left as the literal ``${VAR_NAME}`` text rather than
+    silently becoming an empty string, so a misconfigured server fails
+    loudly (a bad Bearer token) instead of connecting with no auth at
+    all.
+    """
+
+    def _sub(match: "re.Match[str]") -> str:
+        name = match.group(1)
+        return os.environ.get(name, match.group(0))
+
+    return re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}", _sub, value)
+
+
 def _read_servers(path: Path) -> dict[str, MCPServerConfig]:
     if not path.is_file():
         return {}
@@ -75,10 +100,10 @@ def _read_servers(path: Path) -> dict[str, MCPServerConfig]:
             name=str(name),
             command=str(command) if command else None,
             args=tuple(str(arg) for arg in (spec.get("args") or [])),
-            env={str(k): str(v) for k, v in env.items()} if isinstance(env, dict) else None,
+            env={str(k): _expand_env(str(v)) for k, v in env.items()} if isinstance(env, dict) else None,
             cwd=str(spec.get("cwd")) if spec.get("cwd") else None,
             url=str(url) if url else None,
-            headers={str(k): str(v) for k, v in headers.items()} if isinstance(headers, dict) else None,
+            headers={str(k): _expand_env(str(v)) for k, v in headers.items()} if isinstance(headers, dict) else None,
         )
     return result
 

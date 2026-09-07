@@ -1,14 +1,21 @@
+import asyncio
 import json
 import sys
-import asyncio
 from pathlib import Path
 from unittest.mock import patch
 
 import httpx
 import pytest
 
+from tamfis_code import mcp_client
 from tamfis_code.mcp import MCPServer
 from tamfis_code.mcp_client import StandaloneMCPBridge, load_mcp_servers
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_mcp_config(tmp_path: Path, monkeypatch):
+    """Project-config tests must not inherit this machine's personal MCPs."""
+    monkeypatch.setattr(mcp_client, "CONFIG_DIR", tmp_path / "user-config")
 
 
 def _configure(root: Path):
@@ -57,6 +64,33 @@ def test_loads_remote_http_server_configuration(tmp_path: Path):
     assert server.url == "https://mcp.example.com/mcp"
     assert server.headers == {"Authorization": "Bearer secret"}
     assert server.command is None
+
+
+def test_expands_environment_references_in_mcp_env_and_headers(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("MCP_TEST_TOKEN", "secret-from-environment")
+    config = tmp_path / ".tamfis" / "mcp.json"
+    config.parent.mkdir(parents=True)
+    config.write_text(json.dumps({
+        "mcpServers": {
+            "remote": {
+                "url": "https://mcp.example.com/mcp",
+                "env": {"TOKEN": "${MCP_TEST_TOKEN}"},
+                "headers": {"Authorization": "Bearer ${MCP_TEST_TOKEN}"},
+            },
+        },
+    }))
+
+    server = load_mcp_servers(tmp_path)["remote"]
+    assert server.env == {"TOKEN": "secret-from-environment"}
+    assert server.headers == {"Authorization": "Bearer secret-from-environment"}
+
+
+def test_unset_environment_reference_remains_visible(tmp_path: Path, monkeypatch):
+    monkeypatch.delenv("MCP_MISSING_TOKEN", raising=False)
+    _configure_http(tmp_path, headers={"Authorization": "Bearer ${MCP_MISSING_TOKEN}"})
+
+    server = load_mcp_servers(tmp_path)["remote-server"]
+    assert server.headers == {"Authorization": "Bearer ${MCP_MISSING_TOKEN}"}
 
 
 class _FakeRemoteMCPServer:

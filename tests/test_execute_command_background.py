@@ -147,6 +147,22 @@ class TestReadBackgroundJobToolWiring:
                 super().__init__()
                 self.background_requested = asyncio.Event()
 
+            def handle_event(self, event):
+                super().handle_event(event)
+                payload = event.get("payload") or {}
+                if (
+                    event.get("event_type") == "tool_call_requested"
+                    and payload.get("name") == "execute_command"
+                ):
+                    # Synchronize with the real command-dispatch event rather
+                    # than sleeping from the beginning of agent setup. The
+                    # runner clears stale signals immediately before dispatch;
+                    # this delayed signal therefore lands while `sleep 2` is
+                    # actually running, regardless of host startup speed.
+                    asyncio.get_running_loop().call_later(
+                        0.1, self.background_requested.set,
+                    )
+
         class _Harness(_StatePatchMixin):
             def runTest(self):
                 pass
@@ -168,38 +184,10 @@ class TestReadBackgroundJobToolWiring:
 
                 from tamfis_code.mcp import read_background_job_status
 
-                async def _press_ctrl_b_shortly_after_the_command_starts():
-                    # runner_local.py clears background_requested right
-                    # before dispatching each execute_command call (so a
-                    # stale press from before this command started is never
-                    # honored) -- this must fire AFTER that clear(), while
-                    # the "sleep 2" command above is still genuinely
-                    # in flight, to actually exercise the mid-command path.
-                    #
-                    # FIX (2026-08-21): this was 0.15s against a 0.6s
-                    # command -- a 0.45s margin that's real, not
-                    # implementation flakiness (the actual code races two
-                    # asyncio tasks via asyncio.wait(..., FIRST_COMPLETED),
-                    # which is correctly event-driven, no polling interval
-                    # involved). Live-confirmed the margin was too tight to
-                    # survive real interpreter/environment startup-overhead
-                    # variance: reproducibly failed 3/3 runs on a freshly
-                    # installed Python 3.11 (this suite's own CI version)
-                    # while passing reliably on this host's Python 3.13 --
-                    # not a version-specific logic difference, just not
-                    # enough margin against how long everything before the
-                    # subprocess dispatch (mock client round-trip, tool-call
-                    # parsing, etc.) can take on a slower/colder
-                    # interpreter. 0.5s trigger against a 2s command gives
-                    # roughly 3x the margin.
-                    await asyncio.sleep(0.5)
-                    renderer.background_requested.set()
-
                 async def _drive():
                     from io import StringIO
                     from rich.console import Console
                     console = Console(file=StringIO(), no_color=True, width=200)
-                    asyncio.ensure_future(_press_ctrl_b_shortly_after_the_command_starts())
                     # max_rounds=1 with no final-answer round: the turn ends
                     # via the round-budget path, which is fine -- what's
                     # under test is the tool_output for the execute_command

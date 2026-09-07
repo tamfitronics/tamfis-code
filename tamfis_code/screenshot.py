@@ -3,16 +3,18 @@ Screenshot capability for TAMFIS-CODE
 Supports multiple backends: Codex-style (Playwright/Puppeteer) and Claude-style (PIL/OpenCV)
 """
 
-import os
-import sys
-import json
 import base64
+import json
+import os
 import subprocess
-from pathlib import Path
-from typing import Optional, Dict, Any, List, Union
-from dataclasses import dataclass, field
+import sys
 import tempfile
 import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
+
+import click
 
 try:
     from PIL import Image, ImageDraw, ImageFont
@@ -89,8 +91,23 @@ class ScreenshotTaker:
         Returns:
             Path to the screenshot file
         """
-        backend = backend or self.backend
         options = options or ScreenshotOptions()
+
+        # A normal installation includes the Playwright package, but may not
+        # have downloaded a browser binary yet.  Local image conversion does
+        # not need a browser, so prefer Pillow for files it can actually open
+        # when the caller did not explicitly request a backend.
+        if backend is None and HAS_PIL:
+            source_path = Path(url_or_path)
+            if source_path.is_file():
+                try:
+                    with Image.open(source_path) as image:
+                        image.verify()
+                except (OSError, ValueError):
+                    pass
+                else:
+                    backend = "pil"
+        backend = backend or self.backend
         
         if filename is None:
             import uuid
@@ -114,8 +131,9 @@ class ScreenshotTaker:
         options: ScreenshotOptions
     ) -> Path:
         """Take screenshot using Playwright (Codex-style)"""
-        from playwright.async_api import async_playwright
         import asyncio
+
+        from playwright.async_api import async_playwright
         
         async def _screenshot():
             async with async_playwright() as p:
@@ -335,9 +353,16 @@ class ScreenshotTaker:
 # CLI Command for screenshot
 async def screenshot_cli(url_or_path: str, **kwargs):
     """CLI wrapper for screenshot functionality"""
+    import asyncio
+
     taker = ScreenshotTaker()
     options = ScreenshotOptions(**kwargs)
-    result = taker.take_screenshot(url_or_path, options=options)
+    # ScreenshotTaker is synchronous and its Playwright backend owns an
+    # asyncio.run() call.  Run it in a worker so this async wrapper remains
+    # usable from an already-running event loop.
+    result = await asyncio.to_thread(
+        taker.take_screenshot, url_or_path, options=options,
+    )
     print(f"📸 Screenshot saved: {result}")
     return result
 
@@ -377,6 +402,6 @@ def add_screenshot_command(cli):
             )
             click.echo(f"✅ Screenshot saved: {result}")
         except Exception as e:
-            click.echo(f"❌ Screenshot failed: {e}")
+            raise click.ClickException(f"Screenshot failed: {e}") from e
     
     return cli

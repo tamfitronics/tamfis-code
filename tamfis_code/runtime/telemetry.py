@@ -98,6 +98,14 @@ def _safe_attributes(attributes: Mapping[str, Any]) -> dict[str, str]:
     }
 
 
+def _is_retry(value: Any) -> bool:
+    """Interpret retry metadata without letting telemetry break a call."""
+    try:
+        return int(value or 1) > 1
+    except (TypeError, ValueError):
+        return False
+
+
 def _rotate_if_needed() -> None:
     if not TELEMETRY_PATH.exists() or TELEMETRY_PATH.stat().st_size <= MAX_TELEMETRY_BYTES:
         return
@@ -124,7 +132,11 @@ def _append(record: Mapping[str, Any]) -> None:
     """Persist one completion record. Any storage failure is intentionally ignored."""
     try:
         with _WRITE_LOCK:
-            CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+            # TELEMETRY_PATH is intentionally replaceable by embedders and
+            # tests.  Creating CONFIG_DIR here meant a redirected path whose
+            # parent did not already exist failed silently in os.open(),
+            # dropping every event because telemetry is best-effort.
+            TELEMETRY_PATH.parent.mkdir(parents=True, exist_ok=True)
             _rotate_if_needed()
             line = json.dumps(record, sort_keys=True, separators=(",", ":")) + "\n"
             descriptor = os.open(
@@ -213,7 +225,7 @@ def span(name: str, **attributes: Any) -> Iterator[str]:
             "output_tokens": usage.get("output_tokens"),
             "reasoning_tokens": usage.get("reasoning_tokens"),
             "cached_input_tokens": usage.get("cached_input_tokens"),
-            "is_retry": int(attrs.get("attempt") or "1") > 1,
+            "is_retry": _is_retry(attrs.get("attempt")),
             "is_fallback": False,
             "actual_provider_cost": None,
             "calculated_cost": None,

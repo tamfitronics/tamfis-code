@@ -30,3 +30,30 @@ def test_nested_operations_share_trace_and_have_unique_spans(tmp_path, monkeypat
     assert {row["trace_id"] for row in rows} == {trace_id}
     assert len({row["span_id"] for row in rows}) == 3
     assert any(row["parent_span_id"] for row in rows)
+
+
+def test_invalid_retry_metadata_does_not_break_the_observed_operation(tmp_path, monkeypatch):
+    monkeypatch.setattr(telemetry, "TELEMETRY_PATH", tmp_path / "events.jsonl")
+
+    with telemetry.span("provider.invoke", attempt="retry"):
+        observed_result = "completed"
+
+    assert observed_result == "completed"
+    invocation = next(
+        row for row in telemetry.read_spans(10) if row["component"] == "main_completion"
+    )
+    assert invocation["is_retry"] is False
+
+
+def test_redirected_telemetry_path_creates_its_own_parent(tmp_path, monkeypatch):
+    path = tmp_path / "nested" / "telemetry" / "events.jsonl"
+    monkeypatch.setattr(telemetry, "TELEMETRY_PATH", path)
+
+    with telemetry.span("tool.invoke", attempt=2):
+        pass
+
+    assert path.is_file()
+    operation = next(
+        row for row in telemetry.read_spans(10) if row["component"] == "tool.invoke"
+    )
+    assert operation["is_retry"] is True
