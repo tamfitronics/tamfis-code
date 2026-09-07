@@ -33,24 +33,55 @@ from openai import AsyncOpenAI
 from .provider_protocols import system_messages_first
 
 
-def _load_project_env() -> None:
-    """Load Tamfis-Code's root .env without requiring python-dotenv.
+def _provider_env_candidates(
+    *, module_file: Optional[Path] = None,
+    deployment_root: Path = Path("/home/tamfiscode"),
+) -> tuple[Path, ...]:
+    """Return trusted provider-env locations in precedence order.
 
-    Existing process environment variables always win. The canonical file is
-    ``/home/tamfiscode/.env`` unless ``TAMFIS_CODE_ENV_FILE`` overrides it.
+    A wheel resolves ``__file__`` inside ``site-packages``. Treating its
+    parent as the project root therefore made the installed CLI miss the
+    deployment's canonical ``/home/tamfiscode/.env`` even though source
+    checkout runs worked. Explicit overrides remain authoritative; the
+    deployment fallback is only considered when neither override is set.
+    The current working directory is intentionally never searched.
     """
 
-    default_root = Path(
-        os.environ.get("TAMFIS_CODE_ROOT") or Path(__file__).resolve().parents[1]
-    ).expanduser()
-    env_path = Path(
-        os.environ.get(
-            "TAMFIS_CODE_ENV_FILE",
-            str(default_root / ".env"),
-        )
-    ).expanduser()
+    explicit_file = os.environ.get("TAMFIS_CODE_ENV_FILE", "").strip()
+    if explicit_file:
+        return (Path(explicit_file).expanduser(),)
 
-    if not env_path.is_file():
+    explicit_root = os.environ.get("TAMFIS_CODE_ROOT", "").strip()
+    if explicit_root:
+        return (Path(explicit_root).expanduser() / ".env",)
+
+    package_root = Path(module_file or __file__).resolve().parents[1]
+    candidates = [package_root / ".env"]
+    canonical = deployment_root.expanduser() / ".env"
+    if canonical != candidates[0]:
+        candidates.append(canonical)
+    return tuple(candidates)
+
+
+def _load_project_env(
+    *, module_file: Optional[Path] = None,
+    deployment_root: Path = Path("/home/tamfiscode"),
+) -> None:
+    """Load the first trusted Tamfis-Code provider env file found.
+
+    Existing process environment variables always win. Source checkouts use
+    their sibling ``.env``; installed packages fall back to the canonical
+    deployment file unless ``TAMFIS_CODE_ENV_FILE`` or ``TAMFIS_CODE_ROOT``
+    explicitly selects another location.
+    """
+
+    env_path = next(
+        (path for path in _provider_env_candidates(
+            module_file=module_file, deployment_root=deployment_root,
+        ) if path.is_file()),
+        None,
+    )
+    if env_path is None:
         return
 
     try:
