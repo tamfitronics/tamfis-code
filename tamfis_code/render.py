@@ -1236,6 +1236,12 @@ class StreamRenderer:
 
         if event_type == "assistant_delta":
             content = str(payload.get("content", ""))
+            # Some OpenAI-compatible providers emit empty or whitespace-only
+            # assistant frames between reasoning/tool chunks. Never open a
+            # visible assistant card until there is actual answer content;
+            # otherwise each later lifecycle event closes another blank box.
+            if not self._assistant_open and not content.strip():
+                return
             if content and self._reasoning_start is not None and self._thought_seconds is None:
                 self._thought_seconds = (self._reasoning_last or self._reasoning_start) - self._reasoning_start
             if not self._assistant_open:
@@ -1256,6 +1262,19 @@ class StreamRenderer:
             self._refresh_live()
             self._assistant_pending += content
             self._flush_assistant()
+            return
+
+        if event_type == "side_question_answer":
+            self._close_assistant()
+            question = str(payload.get("question") or "").strip()
+            content = str(payload.get("content") or "").strip()
+            if not content:
+                return
+            title = "BTW" + (f" · {question[:60]}" if question else "")
+            self.console.print(Panel(
+                Markdown(content), title=Text(title), border_style="magenta",
+                expand=False, padding=(0, 1),
+            ))
             return
 
         if event_type == "plan_step_progress":

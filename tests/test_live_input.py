@@ -4,7 +4,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from rich.console import Console
 from prompt_toolkit.document import Document
@@ -309,6 +309,48 @@ class RotatingChipIsSituationAwareTests(_StatePatchMixin, unittest.TestCase):
 
 
 class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCase):
+    async def test_btw_runs_separately_without_steering_or_queueing(self):
+        renderer = StreamRenderer(_console())
+        renderer.request_steering = Mock()
+        answer = AsyncMock(return_value="A concise side answer.")
+        listener = LiveInputListener(
+            session_id=42,
+            renderer=renderer,
+            cli_config=_config(),
+            side_question_callback=answer,
+        )
+
+        listener._enqueue("/BTW what does this term mean?")
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        answer.assert_awaited_once_with("what does this term mean?")
+        renderer.request_steering.assert_not_called()
+        self.assertEqual(
+            state_module.get_session_state(42).queued_user_instructions, []
+        )
+        rendered = renderer.console.file.getvalue()
+        self.assertIn("A concise side answer.", rendered)
+        self.assertIn("BTW", rendered)
+
+    async def test_bare_btw_reports_usage_without_queueing(self):
+        renderer = StreamRenderer(_console())
+        answer = AsyncMock()
+        listener = LiveInputListener(
+            session_id=43,
+            renderer=renderer,
+            cli_config=_config(),
+            side_question_callback=answer,
+        )
+
+        listener._enqueue("/btw")
+
+        answer.assert_not_awaited()
+        self.assertEqual(
+            state_module.get_session_state(43).queued_user_instructions, []
+        )
+        self.assertIn("Usage: /btw", renderer.console.file.getvalue())
+
     def test_up_recalls_latest_queued_follow_up_for_editing(self):
         first = state_module.enqueue_instruction(42, "check login", classification="follow_up")
         latest = state_module.enqueue_instruction(42, "then inspect billing", classification="follow_up")

@@ -13,7 +13,7 @@ import asyncio
 import contextlib
 import sys
 import time
-from typing import Any, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.document import Document
@@ -58,6 +58,7 @@ _MODE_ON_LABEL = {
 # doesn't need its own duplicate agent-counting logic.
 _ALWAYS = lambda state, agents: True
 _ROTATING_TIPS: tuple[tuple[Callable[[Any, int], bool], str], ...] = (
+    (_ALWAYS, "Tip: Use /btw for a quick side question without interrupting the current task"),
     (lambda state, agents: not state.active_plan_id, "/plan to think before executing"),
     (_ALWAYS, "/model to switch models"),
     (lambda state, agents: bool(state.modified_files), "/diff to review pending changes"),
@@ -305,11 +306,13 @@ class LiveInputListener:
         renderer: StreamRenderer,
         cli_config: Config,
         interrupt_callback: Optional[Callable[[str], None]] = None,
+        side_question_callback: Optional[Callable[[str], Awaitable[str]]] = None,
     ) -> None:
         self.session_id = session_id
         self.renderer = renderer
         self.cli_config = cli_config
         self._interrupt_callback = interrupt_callback
+        self._side_question_callback = side_question_callback
         self._interrupt_classification: Optional[str] = None
         self._is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
         self._input_task: Optional[asyncio.Task] = None
@@ -321,6 +324,10 @@ class LiveInputListener:
         self._last_invalidate = 0.0
         self._status_tick = 0
         self._ticker_task: Optional[asyncio.Task] = None
+        # Side questions run independently from the active agent turn. Keep
+        # strong references so asyncio cannot collect an in-flight answer;
+        # they deliberately are not cancelled when the main turn finishes.
+        self._btw_tasks: set[asyncio.Task] = set()
         self._outcome_status: Optional[str] = None
         self._editing_instruction_id: Optional[str] = None
         # Distinguish a programmatic prompt shutdown (approval/tool UI,
@@ -865,6 +872,10 @@ class LiveInputListener:
             if self._active and not self._paused:
                 self._schedule_prompt()
             return
+        if self._handle_btw_command(text):
+            if self._active and not self._paused:
+                self._schedule_prompt()
+            return
         if self._handle_live_model_command(text):
             if self._active and not self._paused:
                 self._schedule_prompt()
@@ -905,6 +916,56 @@ class LiveInputListener:
         })
         if self._active and not self._paused:
             self._schedule_prompt()
+
+    def _handle_btw_command(self, text: str) -> bool:
+        """Dispatch `/btw` outside the active turn's steering queue.
+
+        The callback uses an independent, read-only model request. This is
+        the key behavioural guarantee: a side question cannot cancel,
+        replace, reprioritise, or append instructions to the running task.
+        """
+        if not (text.lower() == "/btw" or text.lower().startswith("/btw ")):
+            return False
+
+        question = text[len("/btw"):].strip()
+        if not question:
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": "◆ Usage: /btw <quick side question>"},
+            })
+            return True
+        if self._side_question_callback is None:
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": "◆ /btw is unavailable for this task connection."},
+            })
+            return True
+
+        task = asyncio.create_task(self._answer_btw(question))
+        self._btw_tasks.add(task)
+        task.add_done_callback(self._btw_tasks.discard)
+        self.renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": "◆ Answering /btw separately; the active task is still running."},
+        })
+        return True
+
+    async def _answer_btw(self, question: str) -> None:
+        try:
+            answer = (await self._side_question_callback(question)).strip()  # type: ignore[misc]
+            if not answer:
+                raise RuntimeError("The side-question model returned no visible answer.")
+            self.renderer.handle_event({
+                "event_type": "side_question_answer",
+                "payload": {"question": question, "content": answer},
+            })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": f"◆ /btw failed: {exc}"},
+            })
 
     def _recall_latest_queued(self, buffer) -> bool:
         """Load the newest editable queue item into an empty live composer."""

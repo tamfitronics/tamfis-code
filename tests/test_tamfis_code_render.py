@@ -438,6 +438,41 @@ class StreamRendererTests(unittest.TestCase):
 
         self.assertFalse(renderer.streamed_final_text)
 
+    def test_empty_assistant_frames_never_open_blank_terminal_cards(self):
+        console = Console(file=StringIO(), no_color=True, width=100, force_terminal=True)
+        renderer = StreamRenderer(console)
+        renderer.live_input_listener = object()
+
+        for content in ("", " ", "\n", "\t"):
+            renderer.handle_event({
+                "event_type": "assistant_delta", "payload": {"content": content},
+            })
+            renderer.handle_event({
+                "event_type": "diagnostics", "payload": {"content": "still working"},
+            })
+        renderer.finish()
+
+        output = console.file.getvalue()
+        # A bare "Assistant" box border is what the empty-frame guard actually
+        # prevents. A "╭" border does legitimately appear here regardless --
+        # it's the persistent in-task "Input" follow-up panel that
+        # _build_status() always renders while live_input_listener is set
+        # (see render.py's _build_status), unrelated to this regression.
+        self.assertNotIn("Assistant", output)
+        self.assertFalse(renderer.streamed_final_text)
+
+    def test_side_question_answer_has_its_own_nonempty_card(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "side_question_answer",
+            "payload": {"question": "what is a lock?", "content": "A synchronization primitive."},
+        })
+
+        output = console.file.getvalue()
+        self.assertIn("BTW", output)
+        self.assertIn("A synchronization primitive.", output)
+
     def test_assistant_message_and_ai_task_completed_do_not_reprint(self):
         # Regression guard for the "final answer printed twice" bug: the
         # renderer must not re-emit assistant_message/ai_task_completed

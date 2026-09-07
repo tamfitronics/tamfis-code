@@ -103,6 +103,48 @@ class StuckLoopRecoveryTests(_StatePatchMixin, unittest.TestCase):
             ]
             self.assertTrue(any("reconstructing a summary" in d for d in diagnostics))
 
+    def test_fake_tool_call_recovery_answer_falls_back_to_a_reconstructed_summary(self):
+        """Live-reported (tamfis-code, provider-fallback route "TamfisGPT
+        Ultima"): once tools are disabled for the recovery completion, a
+        weak model can still write out a well-formed <tool_call> block as
+        plain text instead of the requested prose answer. Nothing executes
+        it -- tools really are off -- so the turn used to finalize as
+        `completed` with the unexecuted tool call plus a fake-tool-call
+        caveat as its entire visible output, even though the user's actual
+        request (list a directory) was never fulfilled. It must be treated
+        like an empty recovery answer: reconstruct a summary from the real
+        tool evidence already gathered this turn instead of accepting the
+        garbage text as a real answer."""
+        with tempfile.TemporaryDirectory() as ws:
+            path = Path(ws) / "file_0.py"
+            path.write_text("# real content\n")
+
+            rounds = [self._read_round(i, path) for i in range(5)]
+            rounds.append([_chunk(_delta(
+                content="<tool_call><function=list_directory><parameter=path>.</parameter></tool_call>"
+            ))])
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "read file_0.py repeatedly"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertIn("read_file", outcome.summary)
+            self.assertIn("done", outcome.summary)
+            self.assertNotIn("<tool_call>", outcome.summary)
+            diagnostics = [
+                str(e["payload"].get("content"))
+                for e in renderer.events
+                if e["event_type"] == "diagnostics"
+            ]
+            self.assertTrue(any("reconstructing a summary" in d for d in diagnostics))
+
     def test_recovery_answer_falls_over_to_another_provider_on_rate_limit(self):
         """Live-reported: the tools-disabled recovery completion hit a 429
         on an exhausted free-tier OpenRouter route and hard-failed the whole

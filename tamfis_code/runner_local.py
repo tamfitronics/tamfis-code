@@ -5439,18 +5439,42 @@ async def _run_local_agent_turn_impl(
                     "event_type": "diagnostics",
                     "payload": {"content": f"Stuck-loop recovery answer failed ({exc}); retrying with a different provider."},
                 })
-        if not recovery_content.strip():
+        recovery_is_fake_tool_call = bool(recovery_content.strip()) and _looks_like_fake_tool_call(recovery_content)
+        if not recovery_content.strip() or recovery_is_fake_tool_call:
+            # Confirmed live: with tools disabled, a weak fallback model can
+            # still write out a well-formed <tool_call>/function(...) block
+            # as plain text instead of the requested prose answer. Nothing
+            # executes it (tools really are off), so accepting that text as
+            # the final answer produced a "completed" turn whose entire
+            # visible output was an unexecuted tool call plus the fake-
+            # tool-call caveat -- the user's actual request was never
+            # fulfilled. Treat this exactly like an empty recovery answer:
+            # reconstruct a real summary from evidence already gathered
+            # this turn, or fail honestly instead of claiming completion.
             fallback_summary = _synthesize_stuck_recovery_summary(working_messages)
             if fallback_summary:
                 renderer.handle_event({
                     "event_type": "diagnostics",
                     "payload": {
-                        "content": "Tools-disabled recovery answer was empty too -- reconstructing a "
-                                   "summary from actions actually taken this turn instead of failing."
+                        "content": (
+                            "Tools-disabled recovery answer wrote an unexecuted tool call instead of "
+                            "real text -- reconstructing a summary from actions actually taken this "
+                            "turn instead of accepting it."
+                            if recovery_is_fake_tool_call else
+                            "Tools-disabled recovery answer was empty too -- reconstructing a "
+                            "summary from actions actually taken this turn instead of failing."
+                        )
                     },
                 })
                 return await _finalize_completed_answer(fallback_summary, None)
-            message = (f"Detected {stuck_reason}, and the tools-disabled recovery answer was empty too. ""Try narrowing the objective to a specific repository, component, file, or concern.")
+            reason = (
+                "wrote an unexecuted tool call instead of real text"
+                if recovery_is_fake_tool_call else "was empty too"
+            )
+            message = (
+                f"Detected {stuck_reason}, and the tools-disabled recovery answer {reason}. "
+                "Try narrowing the objective to a specific repository, component, file, or concern."
+            )
             orchestrator.fail(message)
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
             return TaskOutcome(status="failed", error=message)

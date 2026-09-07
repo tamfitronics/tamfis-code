@@ -98,6 +98,7 @@ async def _run_cancellable_local_turn(
     renderer: StreamRenderer,
     config: Config,
     turn_coro,
+    side_question_callback=None,
 ) -> TaskOutcome:
     """Run one standalone agent turn with immediate terminal cancellation."""
 
@@ -112,6 +113,7 @@ async def _run_cancellable_local_turn(
         renderer=renderer,
         cli_config=config,
         interrupt_callback=_interrupt,
+        side_question_callback=side_question_callback,
     )
     live_input.start()
 
@@ -151,6 +153,7 @@ async def _run_remote_turn_with_live_ui(
     renderer: StreamRenderer,
     config: Config,
     turn_coro,
+    side_question_callback=None,
 ) -> TaskOutcome:
     """Give Remote Workspace turns the same live composer/footer as local turns.
 
@@ -163,6 +166,7 @@ async def _run_remote_turn_with_live_ui(
         session_id=session_id,
         renderer=renderer,
         cli_config=config,
+        side_question_callback=side_question_callback,
     )
     live_input.start()
     try:
@@ -190,6 +194,7 @@ $ <command>            explicit shell command
 /run <command>          explicit shell command
 /shell <command>        explicit shell command
 /chat <question>         conversational/read-only coding assistance
+/btw <question>          ask a quick side question without interrupting the active task
 /audit <objective>      AI audit mode (read-only)
 /plan <objective>        create and save an executable plan (no changes)
 /plans                   list saved plans for this session
@@ -309,6 +314,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/run", "explicit shell command"),
     ("/shell", "explicit shell command"),
     ("/chat", "conversational/read-only coding assistance"),
+    ("/btw", "ask a quick side question without interrupting the active task"),
     ("/audit", "AI audit mode (read-only)"),
     ("/plan", "create or show a saved executable plan"),
     ("/plans", "list saved plans for this session"),
@@ -1086,6 +1092,72 @@ async def run_interactive(
     )
     force_bottom_toolbar_visible(session)
 
+    async def _answer_side_question(question: str) -> str:
+        """Answer `/btw` through an isolated, read-only provider request.
+
+        A fresh provider manager keeps key rotation, message history, tool
+        state, and cancellation fully separate from the running coding turn.
+        The short system context makes the answer useful without copying the
+        active task's potentially large transcript or attachments.
+
+        Deliberately calls `_run_local_turn_impl` directly rather than the
+        public `run_local_turn` adapter. That adapter routes through
+        `UnifiedAgentRuntime.execute_local_chat`, which takes the same
+        process-wide exclusive lock as a full tool-using agent turn --
+        confirmed live: it raised "an agent execution is already active in
+        this runtime" every time `/btw` was used while a task was running,
+        which is the one situation `/btw` exists for. That lock protects
+        the runtime's shared mutation/session bookkeeping; this call is
+        already isolated from all of that (its own `ProviderManager`,
+        `use_tools=False`, no file or session mutation), so it has nothing
+        to protect against the active task and nothing to be protected
+        from it.
+        """
+        from .local_chat import _run_local_turn_impl, resolve_provider_type
+        from .providers import ProviderManager
+
+        state = local_state.get_session_state(workspace.session_id)
+        active_objective = str((state.active_task or {}).get("objective") or "").strip()
+        context_line = (
+            f"The user's main task is currently: {active_objective[:1000]}"
+            if active_objective else
+            f"The active workspace is {workspace.workspace_root}."
+        )
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Answer this quick side question concisely. It is separate from the active "
+                    "coding task: do not claim to edit files, run tools, or change the main task. "
+                    + context_line
+                ),
+            },
+            {"role": "user", "content": question},
+        ]
+        side_manager = ProviderManager(runtime_mode="standalone")
+        route_name = state.selected_provider or provider or "auto"
+        try:
+            route = resolve_provider_type(route_name)
+            answer = await _run_local_turn_impl(
+                side_manager, route, messages, state.selected_model or model or "auto",
+                console, use_tools=False,
+            )
+            if not answer.strip():
+                raise RuntimeError("No configured AI route returned a visible answer.")
+            return answer
+        finally:
+            # ProviderManager owns AsyncOpenAI clients. Close each unique
+            # transport after this one-shot side request to avoid accumulating
+            # connection pools across repeated /btw calls.
+            clients = {id(item): item for item in side_manager.clients.values()}.values()
+            for side_client in clients:
+                close = getattr(side_client, "close", None)
+                if callable(close):
+                    with suppress(Exception):
+                        result = close()
+                        if inspect.isawaitable(result):
+                            await result
+
     async def _run_saved_plan(plan_id_arg: Optional[str]) -> bool:
         """Execute a saved plan by id (or the most recent if plan_id_arg is
         falsy) -- shared by /execute-plan and the plan-mode "execute now?"
@@ -1111,6 +1183,7 @@ async def run_interactive(
                 session_id=workspace.session_id,
                 renderer=renderer,
                 config=config,
+                side_question_callback=_answer_side_question,
                 turn_coro=run_local_agent_turn(
                     provider_manager, provider_type, model,
                     [*conversation_history, {"role": "user", "content": plan_objective}],
@@ -1130,6 +1203,7 @@ async def run_interactive(
                 session_id=workspace.session_id,
                 renderer=renderer,
                 config=config,
+                side_question_callback=_answer_side_question,
                 turn_coro=run_ai_task_and_stream(
                     client, renderer, console,
                     session_id=workspace.session_id,
@@ -1282,6 +1356,24 @@ async def run_interactive(
                     "[dim]Standalone mode: /model list shows available local provider choices; /pty, diffs/revert, resume, "
                     "agents, retry, delegate, doctor) runs fully locally, no TamfisGPT backend involved.[/dim]"
                 )
+            continue
+        if _ci_equals(text, "/btw") or _ci_startswith(text, "/btw "):
+            question = text[len("/btw"):].strip()
+            if not question:
+                print_error(console, "Usage: /btw <quick side question>")
+                continue
+            try:
+                answer = await _answer_side_question(question)
+            except Exception as exc:
+                print_error(console, f"/btw failed: {exc}")
+                continue
+            if not answer.strip():
+                print_error(console, "/btw returned no visible answer.")
+                continue
+            console.print(Panel(
+                Markdown(answer.strip()), title=Text(f"BTW · {question[:60]}"),
+                border_style="magenta", expand=False, padding=(0, 1),
+            ))
             continue
         if _ci_equals(text, "/sidebar") or _ci_startswith(text, "/sidebar "):
             action = text[len("/sidebar"):].strip().lower()
@@ -2247,6 +2339,7 @@ async def run_interactive(
                     session_id=workspace.session_id,
                     renderer=renderer,
                     config=config,
+                    side_question_callback=_answer_side_question,
                     turn_coro=run_local_agent_turn(
                         provider_manager, provider_type, model,
                         [*conversation_history, {"role": "user", "content": objective}],
@@ -2289,6 +2382,7 @@ async def run_interactive(
                     session_id=workspace.session_id,
                     renderer=renderer,
                     config=config,
+                    side_question_callback=_answer_side_question,
                     turn_coro=retry_task_and_stream(
                         client, renderer, console,
                         session_id=workspace.session_id, task_id=task_id, mode=None,
@@ -2445,6 +2539,7 @@ async def run_interactive(
                         session_id=workspace.session_id,
                         renderer=renderer,
                         config=config,
+                        side_question_callback=_answer_side_question,
                         turn_coro=run_local_agent_turn(
                             provider_manager, provider_type, model,
                             [*conversation_history, {"role": "user", "content": intent.objective}],
@@ -2494,6 +2589,7 @@ async def run_interactive(
                         session_id=workspace.session_id,
                         renderer=renderer,
                         config=config,
+                        side_question_callback=_answer_side_question,
                         turn_coro=run_ai_task_and_stream(
                             client, renderer, console,
                             session_id=workspace.session_id, objective=intent.objective, mode=intent.mode,

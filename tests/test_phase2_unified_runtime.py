@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
 
+from tamfis_code.providers import ProviderType
 from tamfis_code.runtime.unified import ExecutionMode, ExecutionRequest, UnifiedAgentRuntime
 
 
@@ -98,6 +100,106 @@ def test_session_state_falls_back_to_volatile_process_storage(monkeypatch):
     finally:
         state._VOLATILE_STATE.clear()
         state._VOLATILE_STATE.update(original)
+
+
+class _FakeChatClient:
+    """Minimal stand-in for the AsyncOpenAI client `_run_local_turn_impl` calls."""
+
+    def __init__(self, content: str):
+        self.chat = SimpleNamespace(completions=SimpleNamespace(create=self._create))
+        self._content = content
+        self.calls = 0
+
+    async def _create(self, **kwargs):
+        self.calls += 1
+        message = SimpleNamespace(content=self._content, tool_calls=None)
+        choice = SimpleNamespace(message=message)
+        return SimpleNamespace(choices=[choice])
+
+
+class _FakeSideManager:
+    """Stands in for `/btw`'s own isolated ProviderManager -- just enough
+    surface for `_run_local_turn_impl` (get_client, PROVIDERS), independent
+    of the real provider pool / API keys."""
+
+    def __init__(self, client: _FakeChatClient):
+        self._client = client
+        self.PROVIDERS = {
+            ProviderType.NVIDIA: SimpleNamespace(
+                default_model="fake-model", models=(), free_model=None, context_window=32768,
+            ),
+        }
+
+    def get_client(self, provider):
+        return self._client
+
+
+@pytest.mark.asyncio
+async def test_execute_local_chat_rejects_concurrent_call_while_runtime_active():
+    """Documents the bug: the public `run_local_turn` adapter routes through
+    `execute_local_chat`, which takes the same exclusive lock as a full
+    tool-using agent turn. `/btw` used to call that adapter and would fail
+    with exactly this error every time it ran while a task was active --
+    the one situation it exists for."""
+    runtime = UnifiedAgentRuntime()
+    gate = asyncio.Event()
+
+    async def blocking_operation():
+        await gate.wait()
+        return Outcome()
+
+    holder = asyncio.create_task(
+        runtime._run_exclusive(ExecutionRequest(ExecutionMode.LOCAL_AGENT, objective="main task"), blocking_operation)
+    )
+    await asyncio.sleep(0)
+    assert runtime.active
+
+    with pytest.raises(RuntimeError, match="already active"):
+        await runtime.execute_local_chat(
+            manager=_FakeSideManager(_FakeChatClient("side answer")),
+            provider=ProviderType.NVIDIA, messages=[{"role": "user", "content": "hi"}],
+            model="fake-model", console=None, use_tools=False,
+        )
+
+    gate.set()
+    await holder
+
+
+@pytest.mark.asyncio
+async def test_run_local_turn_impl_bypasses_the_runtime_lock_for_side_questions():
+    """The fix: `/btw` (interactive.py's `_answer_side_question`) calls
+    `local_chat._run_local_turn_impl` directly instead of going through
+    `execute_local_chat`, so a side question answers successfully even
+    while the main runtime is mid-execution -- it never touches
+    `UnifiedAgentRuntime` at all, by design (see that function's
+    docstring)."""
+    from tamfis_code.local_chat import _run_local_turn_impl
+
+    runtime = UnifiedAgentRuntime()
+    gate = asyncio.Event()
+
+    async def blocking_operation():
+        await gate.wait()
+        return Outcome()
+
+    holder = asyncio.create_task(
+        runtime._run_exclusive(ExecutionRequest(ExecutionMode.LOCAL_AGENT, objective="main task"), blocking_operation)
+    )
+    await asyncio.sleep(0)
+    assert runtime.active
+
+    client = _FakeChatClient("side answer")
+    answer = await _run_local_turn_impl(
+        _FakeSideManager(client), ProviderType.NVIDIA, [{"role": "user", "content": "who created AI?"}],
+        "fake-model", None, use_tools=False,
+    )
+
+    assert answer == "side answer"
+    assert client.calls == 1
+    assert runtime.active  # the main task is still untouched, still running
+
+    gate.set()
+    await holder
 
 
 def test_execution_request_modes_are_explicit():
