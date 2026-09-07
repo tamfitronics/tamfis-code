@@ -78,7 +78,13 @@ def test_structured_routing_event_contains_only_tamfisgpt_identity():
     parsed = json.loads(output)
     assert parsed["payload"]["provider"] == "TamfisGPT"
     assert parsed["payload"]["model"] == PUBLIC_MODEL_ULTRA
-    assert parsed["payload"]["fallback_chain"] == ["TamfisGPT"] * 3
+    # FIX: distinct real providers in the chain must stay visibly distinct
+    # (nvidia != hf != openrouter) -- collapsing all three to the same
+    # "TamfisGPT" made a genuine 3-provider fallback chain indistinguishable
+    # from one that never switched anything, from the CLI's own event log.
+    assert parsed["payload"]["fallback_chain"] == [
+        "TamfisGPT", "TamfisGPT (alt 2)", "TamfisGPT (alt 3)",
+    ]
     assert not any(marker in output.lower() for marker in PRIVATE_MARKERS)
 
 
@@ -111,3 +117,30 @@ def test_redact_routing_text_still_redacts_bare_provider_mentions_outside_urls()
     assert "Falling back from TamfisGPT to TamfisGPT" in result
     assert "https://openrouter.ai/docs" in result
     assert "nvidia/nemotron" not in result
+
+
+def test_redact_routing_text_keeps_distinct_providers_in_one_message_distinguishable():
+    """FIX: OpenRouter and Anthropic used to both become the bare constant
+    "TamfisGPT", making "Falling back from OpenRouter to Anthropic" read as
+    "Falling back from TamfisGPT to TamfisGPT" -- indistinguishable from a
+    message naming the same backend twice. The second, different real
+    provider mentioned in the same message must render as a distinguishable
+    label without exposing its real name."""
+    result = redact_routing_text("Falling back from OpenRouter to Anthropic.")
+    assert result == "Falling back from TamfisGPT to TamfisGPT (alt 2)."
+    assert not any(marker in result.lower() for marker in PRIVATE_MARKERS)
+
+
+def test_redact_routing_text_collapses_repeated_mentions_of_the_same_provider():
+    result = redact_routing_text("OpenRouter failed; retrying OpenRouter once more.")
+    assert result == "TamfisGPT failed; retrying TamfisGPT once more."
+
+
+def test_sanitize_public_event_collapses_repeated_route_but_keeps_a_new_one_distinct():
+    event = sanitize_public_event({
+        "event_type": "model_selected",
+        "payload": {"fallback_chain": ["nvidia", "nvidia", "openrouter"]},
+    })
+    assert event["payload"]["fallback_chain"] == [
+        "TamfisGPT", "TamfisGPT", "TamfisGPT (alt 2)",
+    ]

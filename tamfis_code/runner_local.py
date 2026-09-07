@@ -5034,14 +5034,24 @@ async def _run_local_agent_turn_impl(
     # command can be refused even when its PID/arguments differ each round.
     port_conflict_seen = False
 
-    async def _finalize_completed_answer(content: str, finish_reason: Optional[str]) -> TaskOutcome:
+    async def _finalize_completed_answer(
+        content: str, finish_reason: Optional[str], *, synthesized: bool = False,
+    ) -> TaskOutcome:
         """Turn accumulated completion output into the turn's final
         TaskOutcome: continue past a length-truncated cut-off, apply the
         fake-tool-call/no-mutation caveats, run orchestrator validation,
         and emit ai_task_completed. Extracted so _handle_stuck_loop's
         tools-disabled recovery synthesis (below) gets the exact same
         finishing treatment as an ordinary "model stopped calling tools"
-        answer, instead of a bare, unvalidated partial answer."""
+        answer, instead of a bare, unvalidated partial answer.
+
+        `synthesized=True` marks content this code wrote itself (from
+        _synthesize_stuck_recovery_summary) rather than model output. Its
+        `name(args) -> status` lines are indistinguishable from
+        _looks_like_fake_tool_call's paren-style pattern by design (it's
+        reporting real, already-executed calls), so that check must not
+        run against them -- otherwise a summary of genuinely completed
+        work gets a false "nothing happened" caveat slapped on it."""
         nonlocal resolved_provider, config, client, resolved_model
         truncation_rounds = 0
         while finish_reason == "length" and truncation_rounds < MAX_TRUNCATION_CONTINUATIONS:
@@ -5120,7 +5130,7 @@ async def _run_local_agent_turn_impl(
                 "the rest."
             )
 
-        if _looks_like_fake_tool_call(content):
+        if not synthesized and _looks_like_fake_tool_call(content):
             caveat = (
                 "\n\n⚠ This response includes what looks like an unexecuted tool call "
                 "(one of this agent's own tool names written out in text/code-block form) "
@@ -5307,7 +5317,15 @@ async def _run_local_agent_turn_impl(
         # Preserve the transcript, plan, completed tools and checkpoints, then
         # try another model (another NIM deployment first) before disabling
         # tools or reporting failure.
-        if _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
+        #
+        # FIX: this was the only escalation path in this file that switched
+        # providers without first checking `provider == ProviderType.AUTO`
+        # -- every other fallback site (narrated-tool-intent, fake-tool-call,
+        # context-window overflow, etc.) respects an explicit provider pin
+        # and fails rather than silently switching away from it. A user who
+        # explicitly selects a provider expects to stay on it; only AUTO
+        # mode should be free to hop routes on a stall.
+        if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
             stalled_routes.add((resolved_provider, resolved_model))
             if hasattr(manager, "record_route_failure"):
                 manager.record_route_failure(
@@ -5466,7 +5484,7 @@ async def _run_local_agent_turn_impl(
                         )
                     },
                 })
-                return await _finalize_completed_answer(fallback_summary, None)
+                return await _finalize_completed_answer(fallback_summary, None, synthesized=True)
             reason = (
                 "wrote an unexecuted tool call instead of real text"
                 if recovery_is_fake_tool_call else "was empty too"

@@ -191,6 +191,34 @@ def public_route_name(provider: Any = None, model: Any = None) -> str:
 _URL_RE = re.compile(r"https?://\S+")
 
 
+def _brand_route_sequence(items: Any) -> list[str]:
+    """Brand each real provider/route value while keeping distinct values
+    visibly distinct.
+
+    FIX: this used to replace every entry with the same constant
+    PUBLIC_PROVIDER_NAME, so a genuine multi-backend fallback chain (e.g.
+    nvidia -> openrouter -> hf) rendered as ["TamfisGPT", "TamfisGPT",
+    "TamfisGPT"] -- indistinguishable from a chain that never actually
+    switched anything. That made exactly the class of bug it should help
+    diagnose (which real backend served a bad response) unreadable from
+    the CLI's own event log. The same real value still always maps to the
+    same label (so repeats are still visibly repeats), and no real vendor
+    name is ever exposed -- only which position in the sequence a new,
+    distinct backend first appeared.
+    """
+    labels: dict[str, str] = {}
+    branded: list[str] = []
+    for item in items or ():
+        key = str(item)
+        if key not in labels:
+            labels[key] = (
+                PUBLIC_PROVIDER_NAME if not labels
+                else f"{PUBLIC_PROVIDER_NAME} (alt {len(labels) + 1})"
+            )
+        branded.append(labels[key])
+    return branded
+
+
 def redact_routing_text(value: Any) -> str:
     """Redact backend names from internal status/error text before display.
 
@@ -233,7 +261,26 @@ def redact_routing_text(value: Any) -> str:
         if clean and _MODEL_HINT_RE.search(clean) and not clean.startswith("TamfisGPT"):
             tokens[index] = token.replace(clean, public_model_name(clean))
     text = "".join(tokens)
-    text = _PROVIDER_RE.sub(PUBLIC_PROVIDER_NAME, text)
+    # FIX: every distinct real provider name used to collapse to the same
+    # constant PUBLIC_PROVIDER_NAME, so "Falling back from OpenRouter to
+    # Anthropic" became "Falling back from TamfisGPT to TamfisGPT" --
+    # indistinguishable from a message that never named a second backend
+    # at all. Track distinct raw mentions (case-insensitively) within this
+    # one message so a genuine switch stays visible as a different label,
+    # while repeated mentions of the same real provider still collapse to
+    # the same one -- no real vendor name is ever exposed either way.
+    provider_labels: dict[str, str] = {}
+
+    def _brand_provider_mention(match: "re.Match[str]") -> str:
+        key = match.group(0).lower()
+        if key not in provider_labels:
+            provider_labels[key] = (
+                PUBLIC_PROVIDER_NAME if not provider_labels
+                else f"{PUBLIC_PROVIDER_NAME} (alt {len(provider_labels) + 1})"
+            )
+        return provider_labels[key]
+
+    text = _PROVIDER_RE.sub(_brand_provider_mention, text)
     for index, url in enumerate(urls):
         text = text.replace(f"\x00URL{index}\x00", url)
     return text
@@ -258,7 +305,7 @@ def sanitize_public_event(event: dict[str, Any]) -> dict[str, Any]:
                 container[key] = public_model_name(container[key])
         for key in ("fallback_chain", "providers", "routes"):
             if key in container:
-                container[key] = [PUBLIC_PROVIDER_NAME for _item in container.get(key) or []]
+                container[key] = _brand_route_sequence(container.get(key))
     if event_type.startswith("orchestrator_") or event_type in {
         "diagnostics", "task_diagnostics", "model_selected", "routing_started",
         "provider_request_started", "provider_unavailable", "model_unavailable",

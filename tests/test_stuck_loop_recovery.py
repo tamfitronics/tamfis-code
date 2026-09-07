@@ -96,6 +96,11 @@ class StuckLoopRecoveryTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(outcome.status, "completed")
             self.assertIn("read_file", outcome.summary)
             self.assertIn("done", outcome.summary)
+            # The reconstructed "name(args) -> done" lines are themselves
+            # paren-style text that _looks_like_fake_tool_call would flag if
+            # re-checked -- this summary reports real, already-executed
+            # calls and must not be second-guessed with that caveat.
+            self.assertNotIn("unexecuted tool call", outcome.summary)
             diagnostics = [
                 str(e["payload"].get("content"))
                 for e in renderer.events
@@ -138,12 +143,60 @@ class StuckLoopRecoveryTests(_StatePatchMixin, unittest.TestCase):
             self.assertIn("read_file", outcome.summary)
             self.assertIn("done", outcome.summary)
             self.assertNotIn("<tool_call>", outcome.summary)
+            # Same false-positive risk as the empty-answer case above: the
+            # reconstructed "read_file(...) -> done" lines must not trip
+            # _looks_like_fake_tool_call a second time on the way out.
+            self.assertNotIn("unexecuted tool call", outcome.summary)
             diagnostics = [
                 str(e["payload"].get("content"))
                 for e in renderer.events
                 if e["event_type"] == "diagnostics"
             ]
             self.assertTrue(any("reconstructing a summary" in d for d in diagnostics))
+
+    def test_stuck_loop_does_not_switch_providers_when_one_was_explicitly_pinned(self):
+        """FIX: _handle_stuck_loop's own provider-fallback branch used to
+        switch to a different provider on a detected stall regardless of
+        whether the caller explicitly pinned one -- the only escalation
+        path in runner_local.py that didn't check `provider ==
+        ProviderType.AUTO` first (every other fallback site does). An
+        explicit provider selection must be respected the same way here:
+        a stall should exhaust the nudge budget and fall through to the
+        tools-disabled recovery completion on the SAME pinned provider,
+        never silently hop to a different one the user didn't choose."""
+        with tempfile.TemporaryDirectory() as ws:
+            path = Path(ws) / "file_0.py"
+            path.write_text("# real content\n")
+
+            rounds = [self._read_round(i, path) for i in range(5)]
+            rounds.append([_chunk(_delta(content="Final answer from the pinned provider."))])
+            pinned_client = _FakeClient(rounds)
+            other_client = _FakeClient([[_chunk(_delta(content="Should never be called."))]])
+            manager = _FallbackCapableManager(
+                {ProviderType.NVIDIA: pinned_client, ProviderType.OPENROUTER: other_client},
+                fallback_order=[ProviderType.OPENROUTER],
+            )
+            for config in manager.PROVIDERS.values():
+                config.context_window = 32768
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "read file_0.py repeatedly"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertIn("Final answer from the pinned provider.", outcome.summary)
+            self.assertEqual(len(other_client.calls), 0)
+            diagnostics = [
+                str(e["payload"].get("content"))
+                for e in renderer.events
+                if e["event_type"] == "diagnostics"
+            ]
+            self.assertTrue(any("disabling tools for one final answer" in d for d in diagnostics))
+            self.assertFalse(any("continuing on another compatible route" in d for d in diagnostics))
 
     def test_recovery_answer_falls_over_to_another_provider_on_rate_limit(self):
         """Live-reported: the tools-disabled recovery completion hit a 429
