@@ -121,6 +121,35 @@ class RoundBudgetExtensionTests(_StatePatchMixin, unittest.TestCase):
             self.assertIn("tool-call rounds", outcome.error or "")
             self.assertIn("1 round-budget extension already granted", outcome.error or "")
 
+    def test_explicit_strict_cap_never_auto_extends(self):
+        with tempfile.TemporaryDirectory() as ws:
+            first = Path(ws) / "first.py"
+            second = Path(ws) / "second.py"
+            first.write_text("# first\n")
+            second.write_text("# second\n")
+            client = _FakeClient([
+                self._read_round(1, first),
+                self._read_round(2, second),
+                [_chunk(_delta(content="This must not be reached."))],
+            ])
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                _FakeManager(client), ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "inspect the files"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto",
+                interactive=False, max_rounds=1, strict_max_rounds=True,
+            ))
+
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn("Stopped after 1 tool-call rounds", outcome.error or "")
+            diagnostics = [
+                str(event["payload"].get("content")) for event in renderer.events
+                if event["event_type"] == "diagnostics"
+            ]
+            self.assertFalse(any("granting" in item.lower() for item in diagnostics))
+
 
 if __name__ == "__main__":
     unittest.main()

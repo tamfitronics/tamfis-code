@@ -4356,6 +4356,7 @@ async def _run_local_agent_turn_impl(
     approval_policy: str = "ask",
     interactive: bool = True,
     max_rounds: int = MAX_AGENT_ROUNDS,
+    strict_max_rounds: bool = False,
     read_only: bool = False,
     cli_config: Optional[Config] = None,
     allow_swarm_tool: bool = False,
@@ -4367,6 +4368,9 @@ async def _run_local_agent_turn_impl(
     delegating to a Remote Workspace backend. Mirrors run_ai_task_and_stream's
     contract (same TaskOutcome shape) so cli.py/interactive.py can drive
     either the local or (while it still exists) remote path interchangeably.
+
+    `strict_max_rounds=True` makes ``max_rounds`` a user-requested hard cap.
+    The default safety cap still auto-extends for large, progressing tasks.
 
     `read_only=True` restricts both the tool schema offered to the model AND
     (defense in depth, in case a model requests a tool it wasn't offered)
@@ -5394,6 +5398,8 @@ async def _run_local_agent_turn_impl(
     while True:
         _round += 1
         if _round >= max_rounds:
+            if strict_max_rounds:
+                break
             snapshot = orchestrator.run.runtime.snapshot if orchestrator.run is not None else None
             if snapshot is not None and _insufficient_novel_evidence(
                 _round, snapshot.novel_observations,
@@ -7616,6 +7622,7 @@ async def run_local_agent_turn(
     approval_policy: str = "ask",
     interactive: bool = True,
     max_rounds: int = MAX_AGENT_ROUNDS,
+    strict_max_rounds: bool = False,
     read_only: bool = False,
     cli_config: Optional[Config] = None,
     allow_swarm_tool: bool = False,
@@ -7628,7 +7635,8 @@ async def run_local_agent_turn(
         manager=manager, provider=provider, model=model, messages=messages,
         console=console, renderer=renderer, workspace_root=workspace_root,
         session_id=session_id, approval_policy=approval_policy,
-        interactive=interactive, max_rounds=max_rounds, read_only=read_only,
+        interactive=interactive, max_rounds=max_rounds,
+        strict_max_rounds=strict_max_rounds, read_only=read_only,
         cli_config=cli_config, allow_swarm_tool=allow_swarm_tool,
         attachment_paths=attachment_paths, image_content_blocks=image_content_blocks,
     )

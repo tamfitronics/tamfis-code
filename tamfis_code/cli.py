@@ -1438,6 +1438,7 @@ async def _run_ai_command(
 async def _run_local_ai_command(
     config: Config, workspace_root: Path, objective: str, mode: str,
     model: str, provider: Optional[str], attachment_paths: tuple[str, ...],
+    max_turns: Optional[int] = None,
 ) -> int:
     """Standalone equivalent of _run_ai_command -- calls a provider directly
     and runs the tool-calling loop locally (runner_local.py), no
@@ -1597,6 +1598,10 @@ async def _run_local_ai_command(
                 "will be described by path only, not actually seen.[/yellow]"
             )
     turn_messages.append({"role": "user", "content": objective})
+    turn_limit_kwargs = (
+        {"max_rounds": max_turns, "strict_max_rounds": True}
+        if max_turns is not None else {}
+    )
     outcome = await run_local_agent_turn(
         manager, provider_type, model if model != "auto" else None, turn_messages,
         console, renderer,
@@ -1607,6 +1612,7 @@ async def _run_local_ai_command(
         cli_config=config, allow_swarm_tool=True,
         attachment_paths=tuple(resolved_attachments),
         image_content_blocks=image_content_blocks,
+        **turn_limit_kwargs,
     )
     if isinstance(renderer, StructuredRenderer):
         renderer.record_outcome(outcome)
@@ -1634,13 +1640,14 @@ def _ai_command(mode: str, help_text: str):
     @click.option("--prompt-file", type=click.Path(exists=True, dir_okay=False, path_type=Path), default=None, help="Read the objective from a UTF-8 text file.")
     @click.option("--attach", "attachment_paths", multiple=True, type=click.Path(exists=True, dir_okay=False), help="Attach an image or document (repeatable; up to 10 files, 10 MB each).")
     @click.option("--bg", "background", is_flag=True, default=False, help="Start in the background and return immediately. Local jobs use `bg-list`/`bg-logs`/`bg-stop`; remote jobs use `agents`/`attach`/`logs`.")
+    @click.option("--max-turns", type=click.IntRange(min=1), default=None, help="Hard-limit model turns for this non-interactive task; progressing tasks are not auto-extended past this cap.")
     @click.option("--model", default="auto", show_default=True, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
     @click.option("--mode", "mode_override", type=click.Choice(["auto", "coding", "chat", "audit", "plan", "agent", "execute"]), default=None, help="Override this command's task mode.")
     @click.option("--provider", type=click.Choice(_PROVIDER_CHOICES), default=None, hidden=True)
     @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend. Deprecated -- standalone (the default) is the supported path going forward.")
     @click.option("--_bg-job-id", "bg_job_id", default=None, hidden=True, help="Internal: set by spawn_background_task on the detached child so it can report its own completion status.")
     @click.pass_context
-    def command(ctx: click.Context, objective: Optional[str], read_stdin: bool, prompt_file: Optional[Path], attachment_paths: tuple[str, ...], background: bool, model: str, mode_override: Optional[str], provider: Optional[str], remote: bool, bg_job_id: Optional[str]):
+    def command(ctx: click.Context, objective: Optional[str], read_stdin: bool, prompt_file: Optional[Path], attachment_paths: tuple[str, ...], background: bool, max_turns: Optional[int], model: str, mode_override: Optional[str], provider: Optional[str], remote: bool, bg_job_id: Optional[str]):
         config: Config = ctx.obj["config"]
         workspace_root: Path = ctx.obj["workspace_root"]
         sources = int(bool(objective and objective != "-")) + int(read_stdin or objective == "-") + int(prompt_file is not None)
@@ -1653,6 +1660,8 @@ def _ai_command(mode: str, help_text: str):
             raise click.UsageError(
                 "Plan creation must stay attached so the completed plan can be saved locally; omit --bg."
             )
+        if max_turns is not None and _use_remote(config, remote):
+            raise click.UsageError("--max-turns is supported by the standalone runtime only; omit --remote.")
         if prompt_file is not None:
             objective_text = prompt_file.read_text(encoding="utf-8")
         elif read_stdin or objective == "-":
@@ -1670,6 +1679,7 @@ def _ai_command(mode: str, help_text: str):
                 session_id=workspace.session_id, workspace_root=Path(workspace.workspace_root),
                 mode=effective_mode, objective=objective_text, model=model, provider=provider,
                 approval_policy=config.approval_policy, attachment_paths=attachment_paths,
+                max_turns=max_turns,
             )
             console = Console(no_color=not config.colour)
             console.print(f"[green]Started in background[/green] · job {job.id} (pid {job.pid})")
@@ -1685,7 +1695,8 @@ def _ai_command(mode: str, help_text: str):
                 ))
             else:
                 exit_code = _run_async(_run_local_ai_command(
-                    config, workspace_root, objective_text, effective_mode, model, provider, attachment_paths,
+                    config, workspace_root, objective_text, effective_mode, model, provider,
+                    attachment_paths, max_turns,
                 ))
         except BaseException:
             if bg_job_id:

@@ -43,6 +43,11 @@ feature union. The former material gaps now have executable surfaces:
 This score remains a feature-presence result. It does not mean every vendor's
 UI or proprietary hosted service has been cloned.
 
+For CI and other bounded automation, one-shot `ask`, `chat`, `audit`, `agent`,
+and `exec` commands accept `--max-turns N`. Unlike the normal safety window,
+which may extend when a long task is still making progress, this is a strict
+caller-owned limit and is preserved when the task is launched with `--bg`.
+
 The behavioral result is intentionally not converted into a competitor score:
 vendor documentation can establish that a surface exists, but not that another
 implementation passes the same local scenarios.

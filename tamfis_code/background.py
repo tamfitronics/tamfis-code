@@ -187,6 +187,7 @@ def spawn_background_task(
     provider: Optional[str],
     approval_policy: str,
     attachment_paths: tuple[str, ...] = (),
+    max_turns: Optional[int] = None,
     goal: bool = False,
 ) -> BackgroundJob:
     """Launch objective as a detached standalone `ask` invocation and return
@@ -209,6 +210,8 @@ def spawn_background_task(
     ]
     if provider:
         argv += ["--provider", provider]
+    if max_turns is not None:
+        argv += ["--max-turns", str(max_turns)]
     for attachment in attachment_paths:
         argv += ["--attach", attachment]
 

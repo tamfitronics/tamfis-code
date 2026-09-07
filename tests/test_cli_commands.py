@@ -470,6 +470,42 @@ class StandaloneDefaultDispatchTests(_CliConfigIsolationMixin, unittest.TestCase
         self.assertIn(fake_job.id, result.output)
         fake_spawn.assert_called_once()
 
+    def test_max_turns_reaches_attached_and_background_standalone_runs(self):
+        from tamfis_code.background import BackgroundJob
+        from tamfis_code.runner import TaskOutcome
+
+        fake_job = BackgroundJob(
+            id="bg-limited", pid=999999, session_id=1, workspace_root="/tmp",
+            mode="coding", objective_preview="bounded", log_path="/tmp/x.log",
+            prompt_path="/tmp/x.prompt", started_at=0.0,
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch(
+                "tamfis_code.runner_local.run_local_agent_turn",
+                new=AsyncMock(return_value=TaskOutcome(status="completed", summary="done")),
+            ) as turn:
+                attached = self.runner.invoke(
+                    cli, ["--cwd", tmp, "ask", "bounded", "--max-turns", "3", "--provider", "nvidia"],
+                )
+            with patch("tamfis_code.background.spawn_background_task", return_value=fake_job) as spawn:
+                detached = self.runner.invoke(
+                    cli, ["--cwd", tmp, "ask", "bounded", "--max-turns", "4", "--bg"],
+                )
+
+        self.assertEqual(attached.exit_code, 0, attached.output)
+        self.assertEqual(turn.call_args.kwargs["max_rounds"], 3)
+        self.assertTrue(turn.call_args.kwargs["strict_max_rounds"])
+        self.assertEqual(detached.exit_code, 0, detached.output)
+        self.assertEqual(spawn.call_args.kwargs["max_turns"], 4)
+
+    def test_max_turns_rejects_remote_runtime(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            result = self.runner.invoke(
+                cli, ["--cwd", tmp, "ask", "bounded", "--max-turns", "2", "--remote"],
+            )
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("standalone runtime only", result.output)
+
     def test_execute_plan_bg_without_remote_spawns_a_detached_job(self):
         from tamfis_code.background import BackgroundJob
 

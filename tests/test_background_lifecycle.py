@@ -1,7 +1,34 @@
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
 from tamfis_code import background, state
+
+
+def test_background_task_preserves_strict_max_turns_in_child_argv():
+    original_jobs = background.JOBS_DIR
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        background.JOBS_DIR = root / "jobs"
+        try:
+            fake_process = type("Process", (), {"pid": 12345})()
+            with patch("tamfis_code.background.subprocess.Popen", return_value=fake_process) as popen:
+                background.spawn_background_task(
+                    session_id=7,
+                    workspace_root=root,
+                    mode="audit",
+                    objective="bounded audit",
+                    model="auto",
+                    provider=None,
+                    approval_policy="auto",
+                    max_turns=6,
+                )
+
+            argv = popen.call_args.args[0]
+            assert argv[argv.index("--max-turns") + 1] == "6"
+            assert argv.index("--max-turns") > argv.index("ask")
+        finally:
+            background.JOBS_DIR = original_jobs
 
 
 def test_background_completion_is_reinjected_once_into_originating_session():
