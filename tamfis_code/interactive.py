@@ -542,7 +542,17 @@ def next_message_suggestion(
         checkpoint = getattr(state, "turn_checkpoint", None) or {}
         checkpoint_status = str(checkpoint.get("status") or "").lower()
         if checkpoint_status in {"interrupted", "failed", "running", "partial"}:
-            error = str(checkpoint.get("last_error") or "").strip()
+            # FIX: turn_checkpoint's last_error is a raw internal message
+            # (e.g. "Provider streaming failed on nvidia /
+            # nvidia/nemotron-3-ultra-550b-a55b: TimeoutError") persisted
+            # straight from runner_local.py, never routed through
+            # sanitize_public_event the way every other rendered event is.
+            # Building the suggested next message directly from it put the
+            # real backend/provider/model name in the user's own message
+            # box, bypassing the TamfisGPT-only branding this module
+            # otherwise enforces everywhere else.
+            from .public_identity import redact_routing_text
+            error = redact_routing_text(checkpoint.get("last_error") or "").strip()
             if error:
                 return f"Continue from the saved checkpoint and resolve: {error}"[:240]
             return "Continue the interrupted task from the latest saved checkpoint"

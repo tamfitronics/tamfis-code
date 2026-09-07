@@ -198,6 +198,31 @@ class NextMessageSuggestionTests(unittest.TestCase):
             "Continue from the saved checkpoint and resolve: provider disconnected",
         )
 
+    def test_interrupted_checkpoint_error_never_leaks_the_real_backend_name(self):
+        """FIX: turn_checkpoint's last_error is a raw internal message
+        persisted straight from runner_local.py (e.g. "Provider streaming
+        failed on nvidia / nvidia/nemotron-3-ultra-550b-a55b: TimeoutError")
+        -- unlike every rendered event, it never passed through
+        sanitize_public_event/redact_routing_text, so the suggested next
+        message put the real provider and model name directly into the
+        user's own message box."""
+        state = SimpleNamespace(
+            turn_checkpoint={
+                "status": "interrupted",
+                "last_error": (
+                    "Provider streaming failed on nvidia / "
+                    "nvidia/nemotron-3-ultra-550b-a55b: TimeoutError. The exact "
+                    "turn and partial response were checkpointed; type "
+                    "`continue` to resume without losing the conversation."
+                ),
+            },
+            saved_plans=[], active_plan_id=None, unresolved_issues=[],
+            validation_results=[], modified_files=[],
+        )
+        suggestion = next_message_suggestion(None, state=state)
+        self.assertNotIn("nvidia", suggestion.lower())
+        self.assertIn("TamfisGPT", suggestion)
+
     def test_active_plan_progress_names_the_actual_next_step(self):
         state = SimpleNamespace(
             turn_checkpoint=None, active_plan_id="plan_1",
