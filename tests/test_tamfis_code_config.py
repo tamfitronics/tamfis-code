@@ -87,6 +87,11 @@ class LoadConfigTests(unittest.TestCase):
         self.assertEqual(cfg.sources["api_base"], "default")
         self.assertEqual(cfg.max_tool_calls, 120)
 
+    def test_approval_policy_defaults_to_auto(self):
+        cfg = config_module.load_config()
+        self.assertEqual(cfg.approval_policy, "auto")
+        self.assertEqual(cfg.sources["approval_policy"], "default")
+
     def test_tool_budget_can_be_set_in_config_file(self):
         config_module.USER_CONFIG_PATH.write_text("max_tool_calls = 240\n")
         cfg = config_module.load_config()
@@ -134,7 +139,7 @@ class LoadConfigTests(unittest.TestCase):
     def test_invalid_approval_policy_in_config_file_is_ignored(self):
         config_module.USER_CONFIG_PATH.write_text('approval_policy = "yolo"\n')
         cfg = config_module.load_config()
-        self.assertEqual(cfg.approval_policy, "ask")  # falls back to the built-in default
+        self.assertEqual(cfg.approval_policy, "auto")  # falls back to the built-in default
 
     def test_subagent_delegation_defaults_to_disabled(self):
         cfg = config_module.load_config()

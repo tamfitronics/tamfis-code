@@ -30,7 +30,8 @@ APPROVAL_MODES = (
 )
 
 # Short, user-facing names for /mode -- map to the policy values above.
-# "ask" is this CLI's actual default/manual mode, "accept-edits" behaves
+# "auto" is the CLI default. "ask" remains the explicit manual mode, and
+# "accept-edits" behaves
 # like "safe" (auto-approve unless the server classifies the action
 # dangerous, which covers ordinary file edits without covering a
 # destructive shell command), "plan" is "plan-only", "auto" is itself.
@@ -129,7 +130,7 @@ def _load_toml(path: Path) -> dict[str, Any]:
 @dataclass
 class Config:
     api_base: str = DEFAULT_API_BASE
-    approval_policy: str = "ask"
+    approval_policy: str = "auto"
     colour: bool = True
     output_mode: str = "text"
     timeout_seconds: float = 120.0

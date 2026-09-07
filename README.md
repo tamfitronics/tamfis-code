@@ -148,6 +148,9 @@ into the wheel.
 
 ## Fine-grained permissions
 
+Tamfis Code starts in `auto` approval mode by default. Use `--approval ask`
+or `/mode manual` when you want a prompt before approval-gated actions.
+
 User `config.toml` and `<project>/.tamfis/config.toml` may contain persistent
 tool rules. Project values extend user values. Rules use `Tool` or
 `Tool(pattern)` syntax with shell-style wildcards:
