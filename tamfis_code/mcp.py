@@ -319,6 +319,16 @@ class MCPServer:
         # None preserves the low-level MCPServer test/debug API. The real
         # agent runtime always supplies the configured policy.
         self.sandbox_policy = sandbox_policy
+        # Set the first time build_sandbox_command raises its fail-closed
+        # RuntimeError (bwrap missing + fail_if_unavailable). Every command
+        # in a turn re-triggers the identical multi-line remediation
+        # paragraph otherwise -- confirmed live: two execute_command calls
+        # in the same turn each returned the full "Install bubblewrap..."
+        # text, which reads as the tool being broken/repeating itself
+        # rather than one already-explained, still-true precondition. The
+        # first failure still gets the full explanation; later ones in the
+        # same turn get a one-line reminder instead.
+        self._sandbox_unavailable_warned = False
         self._external_mcp = _get_shared_mcp_bridge(workspace_root)
         # Per-server, per-root temporary indexes keep find_references
         # incremental across repeated calls without writing cache files into
@@ -969,7 +979,7 @@ class MCPServer:
     ) -> str:
         p = self._resolve_readable_input(path)
         if not p.exists():
-            return f"Error: File '{path}' not found"
+            return f"Error: File '{path}' not found.{self._not_found_hint(path)}"
         if not p.is_file():
             return f"Error: '{path}' is not a file"
         # A null byte anywhere in the first 8000 bytes is the same
@@ -1056,6 +1066,63 @@ class MCPServer:
                 )
         return resolved
 
+    _PATH_SUGGESTION_SKIP_DIRS = {
+        ".git", "node_modules", "__pycache__", ".venv", "venv", "env",
+        "dist", "build", ".mypy_cache", ".pytest_cache", ".ruff_cache",
+        ".idea", ".vscode", ".tox", "htmlcov",
+    }
+
+    def _suggest_similar_paths(self, missing_name: str, *, limit: int = 5) -> list[str]:
+        """Bounded, workspace-relative search for files sharing `missing_name`'s
+        basename.
+
+        A bare "File 'X' not found" invites the same wrong guess again --
+        confirmed live: a model asked to read a project file guessed an
+        absolute host path that didn't exist and had no way to recover the
+        real, workspace-relative one. This gives read_file/edit_file's
+        not-found error something concrete to point at instead of leaving
+        "resolve the canonical path" (orchestrator/repair.py's own repair
+        strategy for this failure class) as an instruction with no tool
+        support behind it. Walk is capped (dirs and total files visited) so
+        a miss on a huge monorepo fails fast instead of stalling the turn.
+        """
+        base = Path(self.workspace_root) if self.workspace_root else Path.cwd()
+        target_name = Path(missing_name).name
+        if not target_name or not base.is_dir():
+            return []
+        matches: list[str] = []
+        visited = 0
+        max_visited = 20000
+        for root, dirnames, filenames in os.walk(base):
+            dirnames[:] = [
+                d for d in dirnames
+                if d not in self._PATH_SUGGESTION_SKIP_DIRS and not d.endswith(".egg-info")
+            ]
+            for name in filenames:
+                visited += 1
+                if visited > max_visited:
+                    return matches
+                if name == target_name:
+                    try:
+                        rel = str(Path(root, name).relative_to(base))
+                    except ValueError:
+                        rel = str(Path(root, name))
+                    matches.append(rel)
+                    if len(matches) >= limit:
+                        return matches
+        return matches
+
+    def _not_found_hint(self, path: str) -> str:
+        suggestions = self._suggest_similar_paths(path)
+        if suggestions:
+            return f" Found '{Path(path).name}' at: {', '.join(suggestions)}."
+        if self.workspace_root:
+            return (
+                f" Workspace root is '{self.workspace_root}'; paths are resolved relative to "
+                "it. Use list_directory or search_code to find the right path."
+            )
+        return ""
+
     def _atomic_write_text(self, target: Path, content: str) -> None:
         target.parent.mkdir(parents=True, exist_ok=True)
         fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent))
@@ -1134,7 +1201,7 @@ class MCPServer:
             return "❌ Error: edit_file requires old_string and new_string, or content for full replacement"
         p = self._resolve_in_workspace(path)
         if not p.is_file():
-            return f"❌ Error: File '{path}' not found"
+            return f"❌ Error: File '{path}' not found.{self._not_found_hint(path)}"
         original_content = p.read_text(encoding="utf-8", errors="ignore")
         occurrences = original_content.count(old_string)
         if occurrences == 0:
@@ -1632,17 +1699,29 @@ class MCPServer:
         # than crashing the whole command.
         if isinstance(environment, dict):
             env.update({str(k): str(v) for k, v in environment.items()})
-        try:
-            sandbox_command = None
-            argv = (shell, "-lc", command)
-            if self.sandbox_policy is not None and self.workspace_root:
+        sandbox_command = None
+        argv = (shell, "-lc", command)
+        if self.sandbox_policy is not None and self.workspace_root:
+            try:
                 sandbox_command = build_sandbox_command(
                     command=command, shell=shell, cwd=run_dir,
                     workspace_root=Path(self.workspace_root).expanduser().resolve(),
                     policy=self.sandbox_policy,
                     require_escalated=sandbox_permissions == "require_escalated",
                 )
-                argv = sandbox_command.argv
+            except RuntimeError as exc:
+                if self._sandbox_unavailable_warned:
+                    return {
+                        "error": (
+                            "OS sandbox still unavailable (see the earlier command's error "
+                            "this turn for remediation) -- not retrying under kernel isolation."
+                        ),
+                        "success": False,
+                    }
+                self._sandbox_unavailable_warned = True
+                return {"error": str(exc), "success": False}
+            argv = sandbox_command.argv
+        try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
                 stdout=asyncio.subprocess.PIPE,
