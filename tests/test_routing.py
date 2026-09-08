@@ -532,6 +532,19 @@ def test_http_422_is_retryable_provider_failure():
     assert ProviderManager.is_retryable_provider_error(UnprocessableEntity("Unprocessable Entity"))
 
 
+def test_message_less_timeout_error_is_retryable():
+    # Live-reproduced: runner_local.py's stream-idle guard raises a bare
+    # `asyncio.TimeoutError()` with no message when a provider stops
+    # sending chunks mid-stream. str(TimeoutError()) == "", which matches
+    # neither the "timeout" nor "timed out" substring markers below --
+    # a real 22-minute hang ended in "Task failed: ... TimeoutError" with
+    # zero fallback attempts, even though the configured pool was healthy.
+    # A message-less TimeoutError/ConnectionError must be classified as
+    # retryable by type, not by message content.
+    assert ProviderManager.is_retryable_provider_error(TimeoutError())
+    assert ProviderManager.is_retryable_provider_error(ConnectionError())
+
+
 def test_check_status_is_an_inspection_requiring_tools():
     profile = classify_task("check your previous status and continue")
     assert profile.task_type == TaskType.INSPECT

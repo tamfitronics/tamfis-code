@@ -3474,7 +3474,18 @@ async def _stream_one_completion_impl(
                 return_when=asyncio.FIRST_COMPLETED,
             )
             if not done:
-                raise asyncio.TimeoutError()
+                # FIX: a message-less TimeoutError() couldn't be told apart
+                # from a permanent failure by ProviderManager.
+                # is_retryable_provider_error's message-substring check
+                # (str(TimeoutError()) == ""), which silently skipped
+                # cross-provider fallback for exactly the hang this guard
+                # exists to recover from. That classification now checks
+                # exception type first, so this message is for operator
+                # diagnostics, not correctness -- but a real message is
+                # strictly better than relying on the bare class name.
+                raise asyncio.TimeoutError(
+                    f"No stream activity for {STREAM_IDLE_TIMEOUT_SECONDS:.0f}s (stream idle timeout)"
+                )
             if steering_task is not None and steering_task in done:
                 next_chunk_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

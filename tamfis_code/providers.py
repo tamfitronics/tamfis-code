@@ -1452,6 +1452,23 @@ class ProviderManager:
         if isinstance(explicit_retryable, bool):
             return explicit_retryable
 
+        # Live-reproduced: runner_local.py's stream-idle guard raises a bare
+        # `asyncio.TimeoutError()` with NO message when a provider stops
+        # sending chunks mid-stream (`raise asyncio.TimeoutError()`, no
+        # args) -- its own comment there assumes the "timeout"/"timed out"
+        # markers below will catch it, but `str(TimeoutError())` is "",
+        # which contains neither substring. That silently defeated the
+        # entire cross-provider fallback for exactly the failure this guard
+        # exists to recover from: a 22-minute hang ended in "Task failed:
+        # ... TimeoutError" with zero fallback attempts, even though the
+        # configured pool (Ollama Cloud/NVIDIA NIM/HF/OpenRouter) was fully
+        # healthy. A message-less TimeoutError/ConnectionError is
+        # unambiguously a transport failure, never evidence the task itself
+        # is impossible, so classify by type first -- this also covers any
+        # other message-less network exception, not just this one call site.
+        if isinstance(exc, (TimeoutError, ConnectionError)):
+            return True
+
         message = str(exc).lower()
         retryable_markers = (
             "insufficient credits",

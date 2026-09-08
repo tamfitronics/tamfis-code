@@ -133,6 +133,44 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
         self.assertEqual(finish_reason, "live_steering")
         self.assertTrue(stream.closed)
 
+    def test_idle_timeout_raises_a_descriptive_timeout_error(self):
+        """FIX: this used to `raise asyncio.TimeoutError()` with no message
+        when a provider stopped sending chunks. str(TimeoutError()) == "",
+        which ProviderManager.is_retryable_provider_error's message-
+        substring check could never match as "timeout"/"timed out" --
+        silently defeating cross-provider fallback for exactly the hang
+        this guard exists to recover from (a real 22-minute stall ended in
+        "Task failed: ... TimeoutError" with zero fallback attempts, even
+        though the configured provider pool was healthy). Classification is
+        now type-based (see test_routing.py's message-less-TimeoutError
+        test), but the raised error should still carry a real message for
+        anyone reading the failure text, not just the bare class name."""
+        class StalledStream:
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                await asyncio.Event().wait()
+
+        class Completions:
+            async def create(self, **_kwargs):
+                return StalledStream()
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+        async def run():
+            import tamfis_code.runner_local as runner_local
+            renderer = StreamRenderer(Console(file=StringIO(), no_color=True))
+            with patch.object(runner_local, "STREAM_IDLE_TIMEOUT_SECONDS", 0.05):
+                await _stream_one_completion(
+                    client, model="test-model", messages=[], tools=[], renderer=renderer,
+                )
+
+        with self.assertRaises(asyncio.TimeoutError) as ctx:
+            asyncio.run(run())
+        self.assertNotEqual(str(ctx.exception), "")
+        self.assertIn("timeout", str(ctx.exception).lower())
+
 
 if __name__ == "__main__":
     unittest.main()
