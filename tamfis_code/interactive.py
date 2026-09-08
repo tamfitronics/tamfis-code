@@ -286,7 +286,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/cwd", "show the current workspace root"),
     ("/cd", "change the working directory for this session"),
     ("/copy", "copy the last assistant response to the clipboard"),
-    ("/doctor", "run connectivity/auth checks"),
+    ("/doctor", "run connectivity/auth/self-health checks (add --heal to auto-repair fixable findings)"),
     ("/resume", "switch to another session"),
     ("/fork", "branch this conversation into a new independent session"),
     ("/retry", "retry a failed task"),
@@ -300,6 +300,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the screen"),
     ("/compact", "compress the thread (fold older turns into the summary, keep recent turns)"),
     ("/summary", "show a structured recap of the conversation so far"),
+    ("/recap", "alias for /summary"),
     ("/sidebar", "toggle or scroll the session sidebar"),
     ("/permissions", "show approval policy and immutable server safeguards"),
     ("/mode", "show or switch the active approval mode"),
@@ -2037,20 +2038,25 @@ async def run_interactive(
             console.print("[green]Thread compressed.[/green] Older turns were folded into the session summary; recent turns are retained in full.")
             console.print(f"[dim]~{len(recap)} char recap saved. Next turn starts from the compressed context.[/dim]")
             continue
-        if _ci_equals(text, "/summary"):
+        if _ci_equals(text, "/summary") or _ci_equals(text, "/recap"):
             recap = local_state.summarize_thread(workspace.session_id)
             console.print(Panel(recap, title="Thread summary", border_style="cyan", expand=False))
             continue
-        if _ci_equals(text, "/doctor"):
+        if _ci_equals(text, "/doctor") or _ci_equals(text, "/doctor --heal"):
             # Full self-health-check in both modes (Claude Code/Codex parity):
             # standalone mode used to only print a one-line provider status,
             # never running the real session/workspace/context/recent-failure
             # diagnostics _diagnose_local_session already provides. Run the
             # actual doctor so a standalone user gets the same PASS/WARNING/
             # FAIL self-diagnosis the --remote path always had.
+            # `--heal` turns this from pure diagnosis into active recovery:
+            # any finding with a known-safe automated fix (see
+            # doctor._HEALABLE_CHECKS) is repaired in place and reported as
+            # HEALED instead of left FAILing for the user to fix by hand.
+            want_heal = text.endswith("--heal")
             await run_doctor(
                 config, console, Path(workspace.workspace_root),
-                session_id=workspace.session_id,
+                session_id=workspace.session_id, heal=want_heal,
             )
             continue
         if _ci_equals(text, "/agents") or _ci_equals(text, "/agents --all"):

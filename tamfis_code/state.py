@@ -26,6 +26,7 @@ import uuid
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Optional
 
 from .config import CONFIG_DIR
@@ -313,10 +314,52 @@ def _load_raw() -> dict[str, Any]:
             file=sys.stderr,
         )
         return _STATE_CACHE if _STATE_CACHE is not None else {}
-    except json.JSONDecodeError:
+    except json.JSONDecodeError as exc:
+        _quarantine_corrupt_state_file(exc)
         return _STATE_CACHE if _STATE_CACHE is not None else {}
     _STATE_CACHE, _STATE_CACHE_KEY = result, cache_key
     return result
+
+
+def _quarantine_corrupt_state_file(exc: json.JSONDecodeError) -> Optional[Path]:
+    """Self-healing for a corrupted state.json (partial write surviving a
+    kill -9, disk-full, or a hand-edit gone wrong): move the unreadable file
+    aside instead of silently discarding it in place, so a session that goes
+    blank after a crash is diagnosable and forensically recoverable rather
+    than just quietly amnesiac (the prior behavior -- see the OSError branch
+    above for the same "surface it" reasoning applied to permission
+    mismatches). The next _save_raw() call then writes a fresh, valid file
+    at STATE_PATH on its own; nothing else needs to react to this.
+    """
+    quarantine_path = STATE_PATH.with_name(
+        f"{STATE_PATH.name}.corrupted-{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%SZ')}.bak"
+    )
+    try:
+        STATE_PATH.replace(quarantine_path)
+    except OSError:
+        return None
+    print(
+        f"⚠ Local session state at {STATE_PATH} was corrupted ({exc}) and has been "
+        f"quarantined to {quarantine_path} for recovery. Continuing with a blank "
+        "session -- prior plan/task memory is unavailable until this is investigated.",
+        file=sys.stderr,
+    )
+    try:
+        from .runtime.journal import RuntimeEvent, append_event
+
+        append_event(RuntimeEvent(
+            event="state_self_healed",
+            execution_id="state-corruption",
+            mode="self_heal",
+            session_id=0,
+            timestamp=datetime.now(timezone.utc).isoformat(),
+            status="healed",
+            error=str(exc),
+            summary=f"quarantined corrupt state.json to {quarantine_path.name}",
+        ))
+    except Exception:
+        pass
+    return quarantine_path
 
 
 def _save_raw(data: dict[str, Any]) -> None:

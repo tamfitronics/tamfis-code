@@ -37,12 +37,40 @@ from source, using a TamfisGPT tenancy, and the release process.
 
 ```
 tamfis-code login                                   # activate TamfisGPT models
-tamfis-code doctor                                  # check model-service connectivity
+tamfis-code doctor                                  # self-diagnose connectivity, auth, and on-disk state
+tamfis-code doctor --heal                           # + auto-repair any fixable finding
 tamfis-code update                                  # install a newer configured checkout, if available
 tamfis-code ask "explain what this repo does"
 tamfis-code agent "add a health-check endpoint"     # full read/write/execute loop
+tamfis-code recap                                   # structured recap of the last session in this workspace
 tamfis-code                                         # interactive REPL
 ```
+
+### Self-diagnosis, self-healing, and recovery
+
+`tamfis-code doctor` (and `/doctor` in the REPL) runs a full self-health-check,
+not just model-service connectivity: session state writability, the runtime
+execution journal, the context-rollover evidence store, the local tool
+registry, and the background job registry are all checked against real
+on-disk artefacts. Add `--heal` (`/doctor --heal`) to turn that from
+diagnosis into active recovery -- any finding with a known-safe automated fix
+is repaired in place and reported as `HEALED`. Heal only ever repairs
+tamfis-code's own on-disk state under its config directory; it never guesses
+at your repository or infrastructure.
+
+Some recovery is automatic and needs no flag: a corrupted `state.json` (a
+partial write surviving a kill -9, a full disk, or a bad hand-edit) is
+quarantined to a timestamped `.bak` file and logged to the runtime journal
+the moment it's detected, instead of silently going blank. A background job
+still reported "running" after its process has actually died is corrected
+the next time it's listed. Durable per-turn checkpoints (`turn_checkpoint`)
+let a fresh process resume a task after Ctrl+C, SSH loss, a provider
+disconnect, or the process dying outright, without repeating completed work.
+
+Use `tamfis-code recap` (`/summary` or `/recap` in the REPL) at any time for
+a structured, bounded recap of a session -- recent turns, files touched,
+active plan progress, and unresolved issues -- computed from durable local
+state with no provider call and no network latency.
 
 ### TamfisGPT subscription access
 

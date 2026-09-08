@@ -27,6 +27,7 @@ import httpx
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.markup import escape
+from rich.panel import Panel
 from rich.table import Table
 
 from . import __version__, state as local_state
@@ -834,16 +835,17 @@ async def init(ctx: click.Context, remote: bool):
 @cli.command()
 @click.option("--provider", default="auto", hidden=True)
 @click.option("--remote", is_flag=True, default=False, help="Check the legacy TamfisGPT Remote Workspace backend instead of the local model service.")
+@click.option("--heal", is_flag=True, default=False, help="Attempt automated recovery of any fixable finding (repairs tamfis-code's own on-disk state; never touches your repository).")
 @click.pass_context
 @async_command
-async def doctor(ctx: click.Context, provider: str, remote: bool):
+async def doctor(ctx: click.Context, provider: str, remote: bool, heal: bool):
     """Validate TamfisGPT model connectivity (or the legacy remote backend)."""
     config: Config = ctx.obj["config"]
     workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
-        from .doctor import _STATUS_STYLE, _diagnose_local_session
+        from .doctor import _STATUS_STYLE, _diagnose_local_session, _diagnose_self_health, _attempt_heal, _HEALABLE_CHECKS
         from .local_chat import resolve_provider_type
         from .providers import get_provider_status
         from .workspace import resolve_local_workspace
@@ -866,10 +868,22 @@ async def doctor(ctx: click.Context, provider: str, remote: bool):
         console.print(f"[green]Local session ready[/green]  session_id={workspace.session_id}  workspace_root={workspace.workspace_root}")
         # Session-local diagnostics from actual recorded local turns
         # (context usage, tool-call success rate, plan progress,
-        # unresolved validation issues) -- this default/local branch used
-        # to stop at provider connectivity and never report any of this,
-        # even though state.py already records it all during real runs.
-        for result in _diagnose_local_session(workspace_root):
+        # unresolved validation issues), plus the deep self-health-check of
+        # tamfis-code's own subsystems (state writability, runtime journal,
+        # evidence store, tool registry, background job registry) -- this
+        # default/local branch used to stop at provider connectivity and
+        # never report any of this, even though state.py/doctor.py already
+        # record/compute it all during real runs and `/doctor` in the REPL
+        # already showed it. `tamfis-code doctor` now has the same depth.
+        local_results = _diagnose_local_session(workspace_root) + _diagnose_self_health(workspace_root)
+        if heal:
+            for result in local_results:
+                if result.status == "FAIL" and result.name in _HEALABLE_CHECKS:
+                    outcome = _attempt_heal(result.name)
+                    if outcome:
+                        result.status = "HEALED"
+                        result.detail = f"{outcome} -- {result.detail}".strip(" -")
+        for result in local_results:
             style = _STATUS_STYLE[result.status]
             console.print(
                 f"[{style}]{result.status:8}[/{style}] {result.name}  "
@@ -877,6 +891,8 @@ async def doctor(ctx: click.Context, provider: str, remote: bool):
             )
         if not any_configured:
             print_error(console, "TamfisGPT model service is not configured on this installation. Contact the administrator.")
+            raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
+        if any(r.status == "FAIL" for r in local_results):
             raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
         return
 
@@ -896,7 +912,7 @@ async def doctor(ctx: click.Context, provider: str, remote: bool):
             except (AuthRequiredError, RemoteAPIError):
                 pass
 
-    ok = await run_doctor(config, console, workspace_root, session_id=session_id)
+    ok = await run_doctor(config, console, workspace_root, session_id=session_id, heal=heal)
     if not ok:
         raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
 
@@ -1139,6 +1155,31 @@ def reports_command(ctx: click.Context):
         table.add_row(str(report.get("modified_at", ""))[:10], str(report.get("verification", "unverified")),
                       str(report.get("title", "")), str(report.get("path", "")))
     console.print(table)
+
+
+@cli.command(name="recap")
+@click.option("--session", "session_id_opt", type=int, default=None, help="Recap a specific session id instead of this workspace's most recent one.")
+@click.pass_context
+def recap_command(ctx: click.Context, session_id_opt: Optional[int]):
+    """Print a structured recap of a session: recent turns, files touched,
+    active plan progress, and unresolved issues. Non-interactive counterpart
+    to `/summary` (`/recap`) in the REPL -- reads only durable local
+    SessionState (no provider call, no network), so it works even for a
+    session from a REPL that already exited."""
+    config: Config = ctx.obj["config"]
+    root: Path = ctx.obj["workspace_root"]
+    console = Console(no_color=not config.colour)
+    if session_id_opt is not None:
+        session_id = session_id_opt
+    else:
+        matching = [sid for sid in local_state.all_known_session_ids()
+                    if local_state.get_session_state(sid).workspace_root == str(root)]
+        if not matching:
+            console.print("[dim]No local session recorded for this workspace yet.[/dim]")
+            return
+        session_id = matching[-1]
+    recap = local_state.summarize_thread(session_id)
+    console.print(Panel(recap, title=f"Recap · session {session_id}", border_style="cyan", expand=False))
 
 
 @cli.command(name="plans")

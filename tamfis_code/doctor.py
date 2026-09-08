@@ -9,6 +9,7 @@ just "is the process up."
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -32,7 +33,38 @@ class CheckResult:
     detail: str = ""
 
 
-_STATUS_STYLE = {"PASS": "green", "WARNING": "yellow", "FAIL": "red"}
+_STATUS_STYLE = {"PASS": "green", "WARNING": "yellow", "FAIL": "red", "HEALED": "cyan"}
+
+# Checks with a known-safe, fully-automated fix that --heal/`/doctor --heal`
+# is allowed to apply on the user's behalf without confirmation: recreating
+# or repairing permissions on directories tamfis-code itself owns under
+# CONFIG_DIR. Deliberately excludes anything that would touch the user's
+# actual workspace/repository (e.g. "Workspace directory") or requires a
+# real code fix (e.g. "Local tool registry") -- heal must never guess at
+# those.
+_HEALABLE_CHECKS = {"Session state writability", "Context-rollover evidence store"}
+
+
+def _attempt_heal(name: str) -> Optional[str]:
+    """Best-effort automated remediation for one known-fixable doctor
+    finding, named in _HEALABLE_CHECKS. Returns a short description of what
+    was repaired, or None if the fix could not be applied (e.g. the
+    underlying filesystem is still unwritable -- a real infra problem heal
+    cannot paper over)."""
+    import os as _os
+    import stat as _stat
+
+    from .config import CONFIG_DIR as _CONFIG_DIR
+    from .evidence import EVIDENCE_DIR as _EVIDENCE_DIR
+
+    target = _CONFIG_DIR if name == "Session state writability" else _EVIDENCE_DIR
+    try:
+        target.mkdir(parents=True, exist_ok=True)
+        if _stat.S_IMODE(_os.stat(target).st_mode) != _stat.S_IRWXU:
+            _os.chmod(target, _stat.S_IRWXU)
+        return f"recreated/repaired permissions on {target}"
+    except OSError:
+        return None
 
 _REUSABLE_SESSION_STATUSES = {"idle", "active"}
 
@@ -285,6 +317,39 @@ def _diagnose_self_health(workspace_root: Optional[Path] = None) -> list[CheckRe
     except Exception as exc:
         results.append(CheckResult("Local tool registry", "FAIL", f"could not initialize MCPServer: {exc}"))
 
+    # 5. Background job registry -- background.list_jobs()/read_job() already
+    #    self-heal a job stuck reporting "running" forever after its process
+    #    actually died (killed, crashed, machine rebooted, no
+    #    update_job_status ever ran): they detect the dead pid and persist
+    #    the corrected status. Simply running this check performs that heal
+    #    as a side effect and surfaces the result, instead of leaving ghost
+    #    "running" jobs invisible until someone happens to run `bg-list`.
+    try:
+        from . import background as _background
+
+        before = {
+            Path(p).stem: json.loads(Path(p).read_text(encoding="utf-8")).get("status")
+            for p in _background.JOBS_DIR.glob("*.json")
+        } if _background.JOBS_DIR.exists() else {}
+        jobs = _background.list_jobs()
+        healed = [
+            j for j in jobs
+            if before.get(j.get("id"), j.get("status")) == "running" and j.get("status") != "running"
+        ]
+        running = [j for j in jobs if j.get("status") == "running"]
+        if healed:
+            results.append(CheckResult(
+                "Background job registry", "PASS",
+                f"self-healed {len(healed)} stale 'running' job(s) whose process had died; "
+                f"{len(running)}/{len(jobs)} still genuinely running",
+            ))
+        elif jobs:
+            results.append(CheckResult("Background job registry", "PASS", f"{len(jobs)} job(s) tracked, {len(running)} running"))
+        else:
+            results.append(CheckResult("Background job registry", "PASS", "no background jobs recorded"))
+    except Exception as exc:
+        results.append(CheckResult("Background job registry", "WARNING", f"could not inspect: {exc}"))
+
     return results
 
 
@@ -294,6 +359,7 @@ async def run_doctor(
     workspace_root: Optional[Path] = None,
     *,
     session_id: Optional[int] = None,
+    heal: bool = False,
 ) -> bool:
     results: list[CheckResult] = []
 
@@ -374,6 +440,21 @@ async def run_doctor(
     # public health endpoint on port 9555 to hit from here without a session
     # already existing; a real ai-task submission is what proves the chain.
     results.append(CheckResult("TamfisGPT agent runtime", "WARNING", "verified when a real `tamfis-code ask` is run"))
+
+    if heal:
+        # Active recovery pass, not just diagnosis: for the bounded set of
+        # findings in _HEALABLE_CHECKS, apply the fix and mark the result
+        # HEALED rather than silently leaving a FAIL a user has to go fix by
+        # hand. Anything outside that set (a real code defect, a workspace
+        # problem outside CONFIG_DIR) is deliberately left untouched -- heal
+        # only ever repairs tamfis-code's own on-disk state, never guesses
+        # at the user's repository or infrastructure.
+        for result in results:
+            if result.status == "FAIL" and result.name in _HEALABLE_CHECKS:
+                outcome = _attempt_heal(result.name)
+                if outcome:
+                    result.status = "HEALED"
+                    result.detail = f"{outcome} -- {result.detail}".strip(" -")
 
     for result in results:
         style = _STATUS_STYLE[result.status]
