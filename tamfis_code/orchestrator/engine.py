@@ -210,7 +210,22 @@ class AgentOrchestrator:
             "reason": reason,
             "fallback_chain": fallback_chain or [],
         }
-        local_state.save_session_state(self.session_id, selected_provider=provider, selected_model=model)
+        # FIX: this used to also call
+        # local_state.save_session_state(self.session_id, selected_provider=
+        # provider, selected_model=model) on every single round -- including
+        # every automatic AUTO-mode resolution and every mid-turn fallback,
+        # not just an explicit `/model` selection. selected_provider/
+        # selected_model is the field `/model <provider> <model>` sets to
+        # record the user's deliberate override (read back by, e.g.,
+        # interactive.py's `/btw` side-question routing and the remote-mode
+        # turn dispatch); overwriting it here on every round made a plain
+        # AUTO session that never touched `/model` silently look, to any
+        # later reader of that field, exactly like the user had explicitly
+        # pinned whatever provider AUTO most recently happened to resolve
+        # to (deterministically NVIDIA most of the time -- see providers.py).
+        # This run's actual requested-vs-effective route is already tracked
+        # correctly and separately in `self.run.route` above; nothing needs
+        # a second, conflated copy in the explicit-preference field.
 
     def start_execution(self) -> None:
         assert self.run is not None

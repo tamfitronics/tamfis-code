@@ -155,6 +155,43 @@ def test_fallback_keeps_requested_and_effective_route_distinct(monkeypatch):
     assert orchestrator.run.route["fallback_reason"] == "NIM stream failed with HTTP 503"
 
 
+def test_record_route_never_overwrites_the_explicit_model_preference(tmp_path, monkeypatch):
+    """FIX: record_route() used to also persist the just-resolved provider/
+    model into session_state.selected_provider/selected_model on every
+    single round -- including every automatic AUTO resolution and every
+    mid-turn fallback, not just an explicit `/model` selection. That field
+    is what `/model <provider> <model>` sets to record the user's
+    deliberate override (read back by, e.g., the standalone `/btw`
+    side-question routing and remote-mode turn dispatch), so a plain AUTO
+    session that never touched `/model` ended up looking, to any later
+    reader of that field, exactly as if the user had explicitly pinned
+    whatever provider AUTO most recently resolved to."""
+    monkeypatch.setattr(state_module, "CONFIG_DIR", tmp_path)
+    monkeypatch.setattr(state_module, "STATE_PATH", tmp_path / "state.json")
+
+    orchestrator = AgentOrchestrator.__new__(AgentOrchestrator)
+    orchestrator.session_id = 9001
+    orchestrator.run = SimpleNamespace(route={})
+    monkeypatch.setattr(orchestrator, "transition", lambda *_args, **_kwargs: None)
+
+    before = state_module.get_session_state(9001)
+    assert before.selected_provider is None
+    assert before.selected_model == "auto"
+
+    orchestrator.record_route(
+        provider="nvidia", model="nvidia/nemotron-3-ultra-550b-a55b",
+        requested_provider="auto", requested_model="auto",
+        reason="capability-aware automatic routing",
+    )
+
+    after = state_module.get_session_state(9001)
+    assert after.selected_provider is None
+    assert after.selected_model == "auto"
+    # The per-turn requested-vs-effective route is still tracked correctly,
+    # just not leaked into the explicit-preference field.
+    assert orchestrator.run.route["effective_provider"] == "nvidia"
+
+
 def test_real_agent_loop_survives_primary_nim_stream_failure_without_duplicate_mutation(
     tmp_path, monkeypatch,
 ):
