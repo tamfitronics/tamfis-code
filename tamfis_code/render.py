@@ -1609,6 +1609,35 @@ class StreamRenderer:
         if event_type in ("ai_task_completed", "assistant_message", "task_cancelled", "heartbeat", "stream_closed"):
             return  # runner.py owns lifecycle decisions for these; nothing new to print
 
+        if event_type == "diagnostics":
+            # Confirmed live (2026-09): raw internal narration -- "Repository
+            # reconnaissance completed before plan generation.", "Planning
+            # request failed (Error code: 429 ...); retrying with a
+            # different provider." -- was reaching the ordinary console via
+            # the unrecognised-event catch-all below, exposing retry/
+            # provider-fallback/checkpoint/context-window plumbing a user
+            # never asked to see. Same rule this renderer already applies to
+            # "model_selected" above (no raw provider/429 detail unless
+            # --debug): these runner_local.py-emitted planning/recovery
+            # notes are for developers, not end users, so they're silent
+            # unless --debug.
+            #
+            # The one carve-out is content already prefixed "◆" -- the
+            # convention live_input.py's own diagnostics events (e.g.
+            # "Steering update sent", "Updated queued instruction") already
+            # use to mark a direct, always-visible acknowledgment of
+            # something the user just did, as opposed to backend narration
+            # about what the agent is doing internally. Those must keep
+            # showing regardless of --debug.
+            content = str(payload.get("content") or "")
+            if content.startswith("◆"):
+                self._close_assistant()
+                self.console.print(f"[dim]{escape(content)}[/dim]")
+            elif self.debug and content:
+                self._close_assistant()
+                self.console.print(f"[dim]· diagnostics: {escape(content)}[/dim]")
+            return
+
         # Unrecognised event type: show it plainly rather than silently
         # dropping it -- a gap in this renderer should be visible, not hidden.
         self._close_assistant()

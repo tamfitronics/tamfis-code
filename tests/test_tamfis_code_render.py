@@ -461,6 +461,49 @@ class StreamRendererTests(unittest.TestCase):
         self.assertNotIn("Assistant", output)
         self.assertFalse(renderer.streamed_final_text)
 
+    def test_backend_diagnostics_narration_is_hidden_by_default(self):
+        # Confirmed live (2026-09): "Repository reconnaissance completed
+        # before plan generation." and "Planning request failed (Error
+        # code: 429 ...); retrying with a different provider." reached the
+        # ordinary console -- internal planning/retry/provider-fallback
+        # narration a user never asked to see. These must stay silent
+        # unless --debug is on.
+        console = _console()
+        renderer = StreamRenderer(console)
+        self.assertFalse(renderer.debug)
+
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": "Repository reconnaissance completed before plan generation."},
+        })
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {
+                "content": "Planning request failed (Error code: 429 - {'status': 429}); retrying with a different provider."
+            },
+        })
+
+        output = console.file.getvalue()
+        self.assertNotIn("reconnaissance", output)
+        self.assertNotIn("Planning request failed", output)
+        self.assertNotIn("429", output)
+
+    def test_diagnostics_prefixed_with_diamond_marker_always_shows(self):
+        # The "◆" prefix (live_input.py's convention for a direct
+        # acknowledgment of something the user just did, e.g. "Steering
+        # update sent") must stay visible regardless of --debug -- only
+        # unmarked backend narration is hidden by default.
+        console = _console()
+        renderer = StreamRenderer(console)
+        self.assertFalse(renderer.debug)
+
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": "◆ Applying your steering update now…"},
+        })
+
+        self.assertIn("Applying your steering update now", console.file.getvalue())
+
     def test_side_question_answer_has_its_own_nonempty_card(self):
         console = _console()
         renderer = StreamRenderer(console)

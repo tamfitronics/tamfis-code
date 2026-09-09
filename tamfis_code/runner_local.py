@@ -6169,7 +6169,11 @@ async def _run_local_agent_turn_impl(
             })
             renderer.handle_event({
                 "event_type": "diagnostics",
-                "payload": {"content": "Applying your steering update now…"},
+                # "◆" marks this as a direct acknowledgment of the user's own
+                # live steering action (see render.py's diagnostics handler)
+                # -- always shown, not gated behind --debug like the
+                # backend-narration diagnostics elsewhere in this file.
+                "payload": {"content": "◆ Applying your steering update now…"},
             })
             _persist_turn_checkpoint(partial_assistant=content, status="running")
             continue
