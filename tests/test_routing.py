@@ -200,33 +200,54 @@ def _manager_with(*providers):
     return manager
 
 
-def test_auto_is_deterministically_nim_first_and_declares_85_percent_floor():
+def test_auto_is_weighted_85_percent_nim_first_when_alternatives_are_healthy():
+    # AUTO mirrors TamfisGPT Remote's live selector: NIM keeps an exact 85%
+    # draw probability whenever a healthy alternative is eligible, with the
+    # rest spread across the other operator-approved providers. It is no
+    # longer a deterministic 100%-NIM floor -- see providers.py's
+    # `_select_best_provider`.
     manager = _manager_with(
         ProviderType.NVIDIA, ProviderType.OLLAMA_CLOUD, ProviderType.HF,
         ProviderType.OPENROUTER, ProviderType.GROK, ProviderType.TAMFIS,
     )
     ProviderManager.reset_runtime_routing_state()
+    n = 5000
     selected = [
         manager._select_best_provider(classify_task("audit the whole repository"))
-        for _ in range(1000)
+        for _ in range(n)
     ]
 
-    assert set(selected) == {ProviderType.NVIDIA}
     assert ProviderManager.AUTO_PROVIDER_WEIGHTS[ProviderType.NVIDIA] >= 85
-    assert sum(ProviderManager.AUTO_PROVIDER_WEIGHTS.values()) == 100
+    nim_share = selected.count(ProviderType.NVIDIA) / n
+    # Statistically tight band around the exact 85% draw probability (well
+    # outside variance at n=5000, so this should never be flaky).
+    assert 0.80 <= nim_share <= 0.90
+    # The remaining ~15% is spread across other eligible providers, not
+    # collapsed onto a single deterministic fallback.
+    assert len(set(selected) - {ProviderType.NVIDIA}) > 1
+
     telemetry = manager.routing_telemetry()
-    assert telemetry.nim_eligible_requests == 1000
-    assert telemetry.nim_selected_requests == 1000
-    assert telemetry.nim_share_of_eligible == 1.0
+    assert telemetry.nim_eligible_requests == n
+    assert telemetry.nim_selected_requests == selected.count(ProviderType.NVIDIA)
+    assert 0.80 <= telemetry.nim_share_of_eligible <= 0.90
 
 
 def test_legacy_ollama_auto_primary_flag_cannot_bypass_nim_first_auto(monkeypatch):
+    # The deprecated TAMFIS_CODE_OLLAMA_AUTO_PRIMARY flag must not force AUTO
+    # onto Ollama, nor bypass NIM's ~85% weighted share of AUTO traffic.
     monkeypatch.setenv("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_PREMIUM", "true")
     monkeypatch.setenv("TAMFIS_CODE_OLLAMA_AUTO_PRIMARY", "true")
     manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
-    resolved, _ = manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))
-    assert resolved == ProviderType.NVIDIA
+    ProviderManager.reset_runtime_routing_state()
+    n = 2000
+    resolved = [
+        manager.resolve_route(ProviderType.AUTO, classify_task("fix the API"))[0]
+        for _ in range(n)
+    ]
+    assert set(resolved) <= {ProviderType.NVIDIA, ProviderType.OLLAMA_CLOUD}
+    nim_share = resolved.count(ProviderType.NVIDIA) / n
+    assert 0.78 <= nim_share <= 0.92
 
 
 def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
@@ -307,7 +328,15 @@ def test_premium_ollama_remains_enabled_without_auto_primary(monkeypatch):
             manager.PROVIDERS[ProviderType.OLLAMA_CLOUD], profile
         ) == "kimi-k2.7-code:cloud"
 
-    # AUTO must use NIM-first rather than force Ollama when this flag is off.
+    # AUTO must remain NIM-first-eligible rather than force Ollama when this
+    # flag is off. NIM's 85% weighting itself is covered statistically in
+    # test_auto_is_weighted_85_percent_nim_first_when_alternatives_are_healthy;
+    # pin the draw here so this test only asserts the flag doesn't force
+    # Ollama as a hard override of that policy.
+    monkeypatch.setattr(
+        "tamfis_code.providers.random.choices",
+        lambda population, weights=None, k=1: [population[0]],
+    )
     manager_with_nim = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
     resolved, _ = manager_with_nim.resolve_route(
         ProviderType.AUTO, classify_task("fix the API"),
@@ -360,10 +389,17 @@ def test_unavailable_premium_ollama_is_removed_from_weighted_auto(monkeypatch):
 
 
 def test_auto_uses_next_low_cost_provider_when_nim_is_unavailable():
+    # With NIM unavailable, the remaining AUTO_PROVIDER_WEIGHTS are drawn
+    # from directly (HF:4 vs OPENROUTER:2) rather than deterministically
+    # picking priority order -- HF should still win a clear majority.
     manager = _manager_with(ProviderType.OPENROUTER, ProviderType.HF)
-    assert manager._select_best_provider(
-        classify_task("fix and refactor the code"),
-    ) == ProviderType.HF
+    ProviderManager.reset_runtime_routing_state()
+    profile = classify_task("fix and refactor the code")
+    n = 2000
+    selected = [manager._select_best_provider(profile) for _ in range(n)]
+    hf_share = selected.count(ProviderType.HF) / n
+    assert 0.55 <= hf_share <= 0.78
+    assert ProviderType.OPENROUTER in selected
 
 
 def test_openrouter_default_is_not_openai_family():

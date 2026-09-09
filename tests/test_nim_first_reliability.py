@@ -106,7 +106,14 @@ def test_all_nim_unavailable_falls_to_next_healthy_capable_provider():
     ]
 
 
-def test_route_telemetry_distinguishes_eligible_selected_success_and_fallback():
+def test_route_telemetry_distinguishes_eligible_selected_success_and_fallback(monkeypatch):
+    # Telemetry bookkeeping is under test here, not AUTO's 85/15 weighting
+    # (see test_routing.py for that) -- pin the draw to NIM so the assertions
+    # below are deterministic.
+    monkeypatch.setattr(
+        "tamfis_code.providers.random.choices",
+        lambda population, weights=None, k=1: [population[0]],
+    )
     manager = _manager_with(ProviderType.NVIDIA, ProviderType.HF)
     profile = classify_task("inspect the repository")
     selected = manager._select_best_provider(profile)
@@ -271,6 +278,13 @@ def test_real_agent_loop_survives_primary_nim_stream_failure_without_duplicate_m
             self.events.append(event)
 
     renderer = Renderer()
+    # This test exercises the fallback-after-stream-failure path, not AUTO's
+    # 85/15 weighting -- pin the initial draw to NIM (see test_routing.py
+    # for the weighting coverage).
+    monkeypatch.setattr(
+        "tamfis_code.providers.random.choices",
+        lambda population, weights=None, k=1: [population[0]],
+    )
     monkeypatch.setattr("tamfis_code.runner_local.should_plan", lambda *_args: False)
     async def no_sleep(_seconds):
         return None

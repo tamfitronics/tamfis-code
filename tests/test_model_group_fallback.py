@@ -1,7 +1,7 @@
 from types import SimpleNamespace
 
 from tamfis_code.providers import ProviderType
-from tamfis_code.public_identity import PUBLIC_MODEL_ULTIMA
+from tamfis_code.public_identity import PUBLIC_MODEL_SMART, PUBLIC_MODEL_ULTIMA
 from tamfis_code.runner_local import (
     _public_model_fallback_message,
     _select_public_group_model,
@@ -26,17 +26,35 @@ def _config(*models, default):
     )
 
 
-def test_public_group_selection_skips_a_provider_without_requested_tier():
+def test_public_group_selection_allows_lower_tier_models_under_the_ceiling():
+    # Cumulative ceiling, not an exact-tier match: a provider whose only
+    # model sits below the requested group must still be selected, mirroring
+    # TamfisGPT Remote's "Ultima includes every lower group" policy.
     manager = _Manager()
     smart_only = _config("tamfis-gpt-smart", default="tamfis-gpt-smart")
-    ultima = _config("tamfis-gpt-pro", "tamfis-gpt-ultima", default="tamfis-gpt-pro")
 
     assert _select_public_group_model(
         manager, ProviderType.HF, smart_only, None, PUBLIC_MODEL_ULTIMA,
-    ) is None
+    ) == "tamfis-gpt-smart"
+
+
+def test_public_group_selection_skips_a_provider_above_the_requested_ceiling():
+    manager = _Manager()
+    ultima_only = _config("tamfis-gpt-ultima", default="tamfis-gpt-ultima")
+
     assert _select_public_group_model(
+        manager, ProviderType.HF, ultima_only, None, PUBLIC_MODEL_SMART,
+    ) is None
+
+
+def test_public_group_selection_picks_among_eligible_models_under_ceiling():
+    manager = _Manager()
+    ultima = _config("tamfis-gpt-pro", "tamfis-gpt-ultima", default="tamfis-gpt-pro")
+
+    result = _select_public_group_model(
         manager, ProviderType.TAMFIS, ultima, None, PUBLIC_MODEL_ULTIMA,
-    ) == "tamfis-gpt-ultima"
+    )
+    assert result in {"tamfis-gpt-pro", "tamfis-gpt-ultima"}
 
 
 def test_fallback_diagnostic_names_model_groups_not_generic_provider():

@@ -4,10 +4,10 @@ Supports Ollama Cloud, xAI Grok, NVIDIA NIM, Hugging Face, OpenRouter, the
 TamfisGPT subscription API, and the internal Tier IV orchestration service
 through a canonical OpenAI-compatible client interface.
 
-Automatic standalone routing is deterministic NVIDIA NIM-first after
-capability, configuration and live-health filtering. Other providers are an
-ordered resilience chain, not routine random traffic. Tamfis/Tier IV/local
-routes remain explicitly selectable compatibility routes, not AUTO candidates.
+Authenticated automatic routing delegates to the TamfisGPT subscription
+gateway so plan entitlement, grouping, provider cost, and credit billing have
+one source of truth. BYOK-only standalone routing mirrors its 85/15 weighted
+provider policy locally.
 
 Ollama Cloud is accessed through the signed-in local Ollama daemon at
 ``http://127.0.0.1:11434/v1``. The daemon forwards ``:cloud`` models to
@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import itertools
 import os
+import random
 import threading
 import time
 from dataclasses import dataclass, field
@@ -363,17 +364,14 @@ class ProviderManager:
         ProviderType.TIER_IV,
     )
 
-    # AUTO is deterministic NIM-first after capability and live-health
-    # filtering. These weights remain compatibility/diagnostic metadata;
-    # they are not used to randomly divert healthy NIM-eligible traffic.
-    # The >=85% economic target is therefore a floor: healthy eligible AUTO
-    # traffic is 100% NIM, while the ordered chain remains available for a
-    # genuine route failure or capability gap.
+    # Mirror TamfisGPT Remote's live weights for providers this standalone
+    # client can call directly. NIM's value is an absolute probability;
+    # available fallback weights are normalized into the remaining 15%.
     AUTO_PROVIDER_WEIGHTS: dict[ProviderType, int] = {
         ProviderType.NVIDIA: 85,
-        ProviderType.OLLAMA_CLOUD: 5,
-        ProviderType.HF: 5,
-        ProviderType.OPENROUTER: 3,
+        ProviderType.OLLAMA_CLOUD: 3,
+        ProviderType.HF: 4,
+        ProviderType.OPENROUTER: 2,
         ProviderType.GROK: 2,
     }
 
@@ -1285,7 +1283,18 @@ class ProviderManager:
     ) -> tuple[ProviderType, ProviderConfig]:
         """Resolve AUTO to a concrete provider and configuration."""
 
-        if provider == ProviderType.AUTO and self.ollama_cloud_is_premium_primary():
+        # A signed-in user must stay on the subscription gateway for Auto.
+        # It owns the authoritative plan-to-group mapping and cost+margin
+        # ledger; silently falling through to deployment-owned direct keys
+        # would bypass both controls.
+        if (
+            provider == ProviderType.AUTO
+            and ProviderType.TAMFIS in self.clients
+            and self._has_valid_api_key(ProviderType.TAMFIS)
+            and self.route_is_healthy(ProviderType.TAMFIS, "*")
+        ):
+            resolved = ProviderType.TAMFIS
+        elif provider == ProviderType.AUTO and self.ollama_cloud_is_premium_primary():
             resolved = ProviderType.OLLAMA_CLOUD
             if resolved not in self.clients:
                 raise ValueError(
@@ -1323,7 +1332,12 @@ class ProviderManager:
         quality_mode: str = "quality",
         allowed_providers: Optional[tuple[ProviderType, ...]] = None,
     ) -> ProviderType:
-        """Select the first healthy capability-compatible AUTO provider."""
+        """Select a healthy capability-compatible BYOK AUTO provider.
+
+        NIM keeps an exact 85% probability whenever an alternative is
+        eligible. If either side is unavailable, the healthy side naturally
+        receives the full draw. This mirrors TamfisGPT Remote's selector.
+        """
 
         available = [
             provider
@@ -1363,7 +1377,28 @@ class ProviderManager:
         with _HEALTH_LOCK:
             if ProviderType.NVIDIA in eligible:
                 _ROUTING_TELEMETRY.nim_eligible_requests += 1
-        selected = next(provider for provider in self.routing_order if provider in eligible)
+        ordered = [provider for provider in self.routing_order if provider in eligible]
+        base_weights = {
+            candidate: max(1.0, float(self.AUTO_PROVIDER_WEIGHTS[candidate]))
+            for candidate in ordered
+        }
+        if ProviderType.NVIDIA in ordered and len(ordered) > 1:
+            nim_probability = min(
+                100.0, max(0.0, base_weights[ProviderType.NVIDIA]),
+            )
+            other_total = sum(
+                weight for candidate, weight in base_weights.items()
+                if candidate != ProviderType.NVIDIA
+            )
+            weights = [
+                nim_probability
+                if candidate == ProviderType.NVIDIA
+                else (100.0 - nim_probability) * base_weights[candidate] / other_total
+                for candidate in ordered
+            ]
+        else:
+            weights = [base_weights[candidate] for candidate in ordered]
+        selected = random.choices(ordered, weights=weights, k=1)[0]
         with _HEALTH_LOCK:
             if selected == ProviderType.NVIDIA:
                 _ROUTING_TELEMETRY.nim_selected_requests += 1

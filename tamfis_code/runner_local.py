@@ -28,6 +28,7 @@ import contextlib
 import inspect
 import json
 import os
+import random
 import re
 import shlex
 import tempfile
@@ -76,6 +77,7 @@ from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk, system_messages_first
 from .public_identity import (
     PUBLIC_MODEL_AUTO,
+    model_is_within_public_group,
     parse_public_model_alias,
     public_model_name,
 )
@@ -3382,15 +3384,21 @@ def _select_public_group_model(
         getattr(config, "default_model", None),
     ])))
     route_is_healthy = getattr(manager, "route_is_healthy", None)
+    eligible: list[str] = []
     for candidate in candidates:
-        if public_model_name(candidate) != requested_group:
+        if not model_is_within_public_group(
+            candidate, requested_group, provider=provider,
+        ):
             continue
         if callable(route_is_healthy) and not route_is_healthy(provider, candidate):
             continue
         if requires_vision and not _model_supports_vision(manager, config, candidate):
             continue
-        return str(candidate)
-    return None
+        eligible.append(str(candidate))
+    # Match TamfisGPT Remote: spread fresh turns across the eligible models
+    # inside the chosen capability ceiling instead of pinning everyone to
+    # the first catalog entry.
+    return random.choice(eligible) if eligible else None
 
 
 def _public_model_fallback_message(failed_model: str, candidate_model: str, reason: str) -> str:

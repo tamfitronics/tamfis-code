@@ -60,6 +60,10 @@ PUBLIC_MODEL_TIERS = (
     PUBLIC_MODEL_ULTIMA,
 )
 
+_PUBLIC_MODEL_TIER_RANK = {
+    tier: rank for rank, tier in enumerate(PUBLIC_MODEL_TIERS, start=1)
+}
+
 _PUBLIC_MODEL_INPUTS = {
     "auto": PUBLIC_MODEL_AUTO,
     "smart": PUBLIC_MODEL_SMART,
@@ -147,6 +151,32 @@ def public_model_name(model: Any = None) -> str:
     if any(token in lowered for token in ("pro", "k3", "reasoning", "vision", "omni", "gemini", "gemma")):
         return PUBLIC_MODEL_PRO
     return PUBLIC_MODEL_ULTRA
+
+
+def model_is_within_public_group(
+    model: Any,
+    requested_group: Any,
+    *,
+    provider: Any = None,
+) -> bool:
+    """Return whether *model* belongs to a cumulative public model group.
+
+    This mirrors TamfisGPT Remote's capability policy: Pro includes Smart,
+    Ultra includes Smart/Pro, and Ultima includes every lower group. NIM
+    account-capacity models are shared across every public group because
+    their capacity is covered independently of per-call subscription spend.
+    Subscription entitlement remains enforced by the TamfisGPT gateway.
+    """
+    requested = parse_public_model_alias(requested_group)
+    if requested not in _PUBLIC_MODEL_TIER_RANK:
+        return False
+
+    provider_name = str(getattr(provider, "value", provider) or "").strip().lower()
+    if provider_name in {"nvidia", "nvidia_nim"}:
+        return True
+
+    actual = public_model_name(model)
+    return _PUBLIC_MODEL_TIER_RANK.get(actual, 0) <= _PUBLIC_MODEL_TIER_RANK[requested]
 
 
 def parse_public_model_alias(value: Any) -> str | None:
