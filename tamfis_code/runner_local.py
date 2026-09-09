@@ -4792,7 +4792,14 @@ async def _run_local_agent_turn_impl(
     })
     if resumed_from_checkpoint or resumed_from_legacy or _requests_autonomous_execution(incoming_objective):
         working_messages.insert(insert_at + 1, {"role": "system", "content": RESUME_EXECUTION_INSTRUCTION})
-    checkpoint_mode = str(prior_checkpoint.get("mode") or ("read_only" if turn_read_only else "execute"))
+    # A resumed turn is governed by the mode/classification in effect now,
+    # not by the stale label stored by the interrupted turn. In particular,
+    # an old audit checkpoint can be resumed after the user explicitly asks
+    # to implement the findings; preserving its "read_only" label forever
+    # made every subsequent checkpoint misleading and could re-infect later
+    # resumes. `turn_read_only` already combines the explicit CLI mode with
+    # the freshly classified objective, so it is the authoritative value.
+    checkpoint_mode = "read_only" if turn_read_only else "execute"
     checkpoint_partial_parts: list[str] = []
     last_checkpoint_at = 0.0
 

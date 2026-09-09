@@ -1521,7 +1521,19 @@ class StreamRenderer:
             )
             diff_text = payload.get("diff")
             if diff_text:
-                print_unified_diff(self.console, str(diff_text), title="Proposed change")
+                # Approval is an interactive boundary, so its input prompt
+                # must remain on screen.  A full-file write can produce
+                # thousands of diff lines and previously pushed that prompt
+                # out of the terminal, leaving what looked like a blank,
+                # hung session.  Keep enough context to make the decision
+                # safely while bounding this particular preview; the full
+                # mutation is still available through the normal diff view.
+                print_unified_diff(
+                    self.console,
+                    str(diff_text),
+                    title="Proposed change",
+                    max_lines=80,
+                )
             return
 
         if event_type == "context_rollover":
@@ -1636,6 +1648,34 @@ class StreamRenderer:
             elif self.debug and content:
                 self._close_assistant()
                 self.console.print(f"[dim]· diagnostics: {escape(content)}[/dim]")
+            elif "retrying with a different provider" in content.lower():
+                # Keep raw HTTP/provider plumbing private, but do not leave
+                # a user staring at an apparently blank terminal while a
+                # planning or completion request changes routes. This is a
+                # durable, sanitized progress line; the transient spinner
+                # alone can disappear when prompt_toolkit and Rich repaint
+                # the same terminal region.
+                self._close_assistant()
+                self.console.print(
+                    "[dim]· Switching TamfisGPT route; task is still running…[/dim]"
+                )
+            return
+
+        if event_type == "orchestrator_repair":
+            action = str(payload.get("action") or "").lower()
+            if (
+                "falling back from" in action
+                or "recovering an empty continuation" in action
+                or "provider/tool round" in action
+            ):
+                # Same visibility guarantee as the sanitized diagnostics
+                # case above, covering fallback/recovery initiated inside
+                # the main model/tool loop. Never render the raw action: it
+                # may contain backend names or HTTP response details.
+                self._close_assistant()
+                self.console.print(
+                    "[dim]· Recovering with another TamfisGPT route; task is still running…[/dim]"
+                )
             return
 
         # Unrecognised event type: show it plainly rather than silently
@@ -1780,7 +1820,13 @@ def print_recent_thread(console: Console, messages: list[dict[str, Any]], limit:
         console.print()
 
 
-def print_unified_diff(console: Console, diff_text: str, *, title: str = "Changes") -> None:
+def print_unified_diff(
+    console: Console,
+    diff_text: str,
+    *,
+    title: str = "Changes",
+    max_lines: Optional[int] = None,
+) -> None:
     """Render a unified diff as a bordered card (file path as the panel
     title, +/-/@@ lines coloured), matching how plan/approval/failure
     output is already boxed elsewhere in this renderer -- a diff printed
@@ -1791,8 +1837,18 @@ def print_unified_diff(console: Console, diff_text: str, *, title: str = "Change
     if not diff_text.strip():
         body: Any = Text("(empty diff)", style=None if no_color else "dim")
     else:
+        raw_lines = diff_text.splitlines()
+        if max_lines is not None and max_lines > 2 and len(raw_lines) > max_lines:
+            head_count = max_lines * 2 // 3
+            tail_count = max_lines - head_count - 1
+            omitted = len(raw_lines) - head_count - tail_count
+            raw_lines = [
+                *raw_lines[:head_count],
+                f"… {omitted} diff lines omitted; use /diff after approval to inspect the full change …",
+                *raw_lines[-tail_count:],
+            ]
         lines: list[Text] = []
-        for line in diff_text.splitlines():
+        for line in raw_lines:
             if line.startswith("+++") or line.startswith("---"):
                 style = "bold"
             elif line.startswith("+"):

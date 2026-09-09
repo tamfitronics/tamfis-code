@@ -199,6 +199,7 @@ class AsyncApprovalDecisionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(decision, "approve_once")
         prompt_async.assert_awaited_once()
+        self.assertIn("Approval input required", console.file.getvalue())
 
     async def test_no_config_console_input_runs_without_nested_event_loop(self):
         console = _console()

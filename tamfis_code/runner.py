@@ -285,6 +285,13 @@ def _prompt(
         )
 
     session: PromptSession = PromptSession(key_bindings=bindings)
+    # Keep an ordinary, durable console line immediately above the
+    # prompt_toolkit prompt. Rich's transient Live display and a very large
+    # approval diff could otherwise leave the terminal looking blank while
+    # the task was actually waiting for y/n input.
+    console.print(
+        "[bold yellow]Approval input required — type y, n, or a, then press Enter.[/bold yellow]"
+    )
     while True:
         raw_answer = session.prompt(_message)
         if raw_answer == _MODE_SWITCH_SENTINEL:
@@ -359,6 +366,12 @@ async def _prompt_async(
         )
 
     session: PromptSession = PromptSession(key_bindings=bindings)
+    # This line is intentionally outside prompt_toolkit's transient prompt:
+    # it remains visible even when a terminal repaint or a long preceding
+    # diff confuses the interactive footer.
+    console.print(
+        "[bold yellow]Approval input required — type y, n, or a, then press Enter.[/bold yellow]"
+    )
     while True:
         raw_answer = await session.prompt_async(_message)
         if raw_answer == _MODE_SWITCH_SENTINEL:

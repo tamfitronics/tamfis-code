@@ -487,6 +487,28 @@ class StreamRendererTests(unittest.TestCase):
         self.assertNotIn("reconnaissance", output)
         self.assertNotIn("Planning request failed", output)
         self.assertNotIn("429", output)
+        self.assertIn("Switching TamfisGPT route; task is still running", output)
+
+    def test_provider_repair_is_visible_without_raw_backend_details(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+
+        renderer.handle_event({
+            "event_type": "orchestrator_repair",
+            "payload": {
+                "phase": "repair",
+                "action": "Falling back from nvidia to hf (HTTP 429)",
+            },
+        })
+
+        output = console.file.getvalue()
+        self.assertIn(
+            "Recovering with another TamfisGPT route; task is still running",
+            output,
+        )
+        self.assertNotIn("nvidia", output.lower())
+        self.assertNotIn("hf", output.lower())
+        self.assertNotIn("429", output)
 
     def test_diagnostics_prefixed_with_diamond_marker_always_shows(self):
         # The "◆" prefix (live_input.py's convention for a direct
@@ -631,6 +653,26 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("Proposed change", output)
         self.assertIn("-old", output)
         self.assertIn("+new", output)
+
+    def test_approval_required_bounds_a_large_diff_so_prompt_stays_visible(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        diff_lines = ["--- a/large.ts", "+++ b/large.ts"] + [
+            f"+line {index}" for index in range(200)
+        ]
+        renderer.handle_event({
+            "event_type": "approval_required",
+            "payload": {
+                "command": "write_file(path='large.ts')",
+                "risk_level": "medium",
+                "diff": "\n".join(diff_lines),
+            },
+        })
+        output = console.file.getvalue()
+        self.assertIn("diff lines omitted", output)
+        self.assertIn("+line 0", output)
+        self.assertIn("+line 199", output)
+        self.assertNotIn("+line 100\n", output)
 
     def test_approval_required_without_a_diff_renders_no_diff_panel(self):
         console = _console()
