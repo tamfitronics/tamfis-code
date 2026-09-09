@@ -616,6 +616,23 @@ def test_system_message_ordering_400_is_retryable():
     assert ProviderManager.is_retryable_provider_error(exc)
 
 
+def test_provider_side_unterminated_json_400_is_retryable():
+    # Live failure from a long TamfisSEO upgrade turn (2026-09-10). The
+    # provider rejected JSON generated inside its route; the user's prompt
+    # and Tamfis-Code's SDK-serialized request were otherwise valid. Do not
+    # abandon the checkpointed job when another provider can continue it.
+    class BadRequest(Exception):
+        status_code = 400
+
+    exc = BadRequest(
+        "Error code: 400 - {'error': {'message': 'Unterminated string "
+        "starting at: line 1 column 63 (char 62)', 'type': "
+        "'BadRequestError', 'param': None, 'code': 400}}"
+    )
+
+    assert ProviderManager.is_retryable_provider_error(exc)
+
+
 def test_http_422_is_retryable_provider_failure():
     # 422 was previously missing from the explicit retryable status set --
     # it hit the same "Provider streaming failed ... type `continue` to

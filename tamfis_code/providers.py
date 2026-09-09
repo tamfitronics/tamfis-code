@@ -1431,6 +1431,15 @@ class ProviderManager:
                 if (
                     "degraded function cannot be invoked" in message
                     or "function cannot be invoked" in message
+                    # Live-reported (2026-09-10): one TamfisGPT Ultra
+                    # backend rejected an otherwise valid long-running
+                    # coding turn after attempting to parse malformed JSON
+                    # produced inside that route. The SDK exposed HTTP 400
+                    # with Python's exact JSON parser diagnostic below. This
+                    # is provider/model output corruption, not an invalid
+                    # user objective; another configured route can continue
+                    # from the durable checkpoint and completed tool results.
+                    or "unterminated string starting at" in message
                     # FIX (2026-09-05, operator report): tamfis-code appends
                     # a role="system" correction/nudge message mid-
                     # conversation in ~15 places (NARRATED_TOOL_CORRECTION,

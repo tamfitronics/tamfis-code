@@ -59,6 +59,19 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
             )
         )
 
+    def test_retryable_malformed_json_400_moves_directly_to_fallback(self):
+        class MalformedProviderJson(Exception):
+            status_code = 400
+
+        self.assertFalse(
+            _same_route_reconnectable(
+                _FakeManager(),
+                MalformedProviderJson(
+                    "Unterminated string starting at: line 1 column 63 (char 62)"
+                ),
+            )
+        )
+
     def test_transient_server_failure_still_reconnects_same_route(self):
         class ServiceUnavailableError(Exception):
             status_code = 503

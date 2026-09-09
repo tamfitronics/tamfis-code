@@ -1393,7 +1393,12 @@ def _same_route_reconnectable(manager: Any, exc: Exception) -> bool:
     # A missing/retired deployment will not repair itself by repeating the
     # identical route. Move directly to cross-provider fallback, avoiding
     # several silent reconnect delays before reporting or recovering.
-    return status not in {401, 402, 403, 404, 429}
+    # Every HTTP 400 that reaches here has already passed the manager's
+    # narrow retryability allow-list (provider function degradation,
+    # message-order incompatibility, or malformed provider-side JSON). A
+    # same-route reconnect only repeats the same deterministic rejection;
+    # move immediately to a sibling model/provider instead.
+    return status not in {400, 401, 402, 403, 404, 429}
 
 
 async def _stream_completion_with_reconnect(
