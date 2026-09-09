@@ -49,6 +49,26 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
             _same_route_reconnectable(_FakeManager(), NotFoundError("Error code: 404"))
         )
 
+    def test_429_skips_backoff_and_moves_to_provider_fallback(self):
+        class RateLimitError(Exception):
+            status_code = 429
+
+        self.assertFalse(
+            _same_route_reconnectable(
+                _FakeManager(), RateLimitError("Error code: 429 - Too Many Requests"),
+            )
+        )
+
+    def test_transient_server_failure_still_reconnects_same_route(self):
+        class ServiceUnavailableError(Exception):
+            status_code = 503
+
+        self.assertTrue(
+            _same_route_reconnectable(
+                _FakeManager(), ServiceUnavailableError("temporarily unavailable"),
+            )
+        )
+
     def _run_one_retry_then_succeed(self, *, debug: bool) -> _EventCollectingRenderer:
         renderer = _EventCollectingRenderer(debug=debug)
         attempts = {"count": 0}

@@ -1383,12 +1383,15 @@ def _same_route_reconnectable(manager: Any, exc: Exception) -> bool:
     if not manager.is_retryable_provider_error(exc):
         return False
     status = manager.provider_error_status(exc) if hasattr(manager, "provider_error_status") else None
-    # Credentials/payment will not repair themselves after a sleep.  AUTO can
-    # move to the next external route immediately for these statuses.
+    # Credentials/payment/rate limits will not repair themselves within the
+    # short reconnect window. AUTO can move to the next external route
+    # immediately for these statuses. In particular, retrying a 429 here used
+    # to impose the full 5/15/30-second backoff before the already-configured
+    # fallback path was even considered.
     # A missing/retired deployment will not repair itself by repeating the
     # identical route. Move directly to cross-provider fallback, avoiding
     # several silent reconnect delays before reporting or recovering.
-    return status not in {401, 402, 403, 404}
+    return status not in {401, 402, 403, 404, 429}
 
 
 async def _stream_completion_with_reconnect(
