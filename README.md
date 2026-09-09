@@ -156,6 +156,11 @@ Users select stable product aliases: **TamfisGPT Auto**, **TamfisGPT Fast**,
 `/model list` in the interactive REPL, or pass `--model auto|fast|code|pro|vision`.
 TamfisGPT Auto is the default and chooses the appropriate model for the task.
 
+Reasoning effort is adaptive by default: complex debugging, architecture, and
+multi-component changes use deeper reasoning, while routine requests retain
+lower latency. Set `TAMFIS_CODE_REASONING_EFFORT=low|medium|high` to pin a
+specific effort level for providers and models that support it.
+
 Interrupted model streams remain attached to the same task: clean partial
 text is checkpointed to `.memory`, reconnects use visible 5/15/30-second
 backoff, and continuation output is de-duplicated. If all configured routes

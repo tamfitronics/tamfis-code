@@ -275,7 +275,9 @@ class PlannerEvidence:
 _FORMAL_PLAN_RE = re.compile(
     r"\b(?:multi[- ]file|multiple files|several files|across (?:the )?(?:repo|repository|stack)|"
     r"end[- ]to[- ]end|architecture|architectural|migrat(?:e|ion)|redesign|large[- ]scale|"
-    r"whole (?:repo|repository|stack)|entire (?:repo|repository|stack)|complex|roadmap)\b",
+    r"whole (?:repo|repository|stack)|entire (?:repo|repository|stack)|complex|roadmap|"
+    r"coding agent|reasoning (?:ability|abilities|quality)|agentic (?:ability|abilities|workflow)|"
+    r"developer experience)\b",
     re.IGNORECASE,
 )
 _FILE_REFERENCE_RE = re.compile(r"(?<![\w.-])[\w@+-]+(?:/[\w@+.-]+)*\.[A-Za-z0-9]{1,10}\b")

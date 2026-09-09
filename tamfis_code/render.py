@@ -43,7 +43,7 @@ from .safety import redact_secrets
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 
 # Which backend actually served a Remote turn (Ollama Cloud, OpenRouter,
-# NVIDIA NIM, a raw model id like "glm-5.2:cloud"...) is internal routing
+# NVIDIA NIM, a raw model id like "glm-5.3:cloud"...) is internal routing
 # detail. TamfisGPT is the product; every place that would otherwise print
 # a raw provider/model id to the user prints this branded label instead.
 BRANDED_PROVIDER_LABEL = PUBLIC_PROVIDER_NAME
@@ -1588,7 +1588,17 @@ class StreamRenderer:
                 # Persist the authoritative route in the scrollback -- users
                 # need to know a route was resolved -- but never the raw
                 # backend/model id behind it; TamfisGPT owns that identity.
-                self.console.print(f"[dim]· Using {BRANDED_PROVIDER_LABEL}[/dim]")
+                # FIX (2026-09-08): this always printed the bare brand label
+                # regardless of which of the five public tiers (Auto/Smart/
+                # Pro/Ultra/Ultima) -- or which fallback attempt -- actually
+                # got selected, even though self._model (just computed above)
+                # already holds the real tier name. Every turn read "Using
+                # TamfisGPT" identically whether Auto, Ultra, or a post-429
+                # fallback resolved, making a silent same-route retry loop
+                # indistinguishable from a genuine tier switch. self._model
+                # is itself already public_model_name()'d (a tier label, not
+                # a raw catalog id), so this leaks nothing new.
+                self.console.print(f"[dim]· Using {escape(self._model)}[/dim]")
             return
 
         if event_type == "ai_task_failed":

@@ -109,7 +109,10 @@ _EXPLICIT_READ_ONLY_RE = re.compile(
 _ADDITIONAL_CONTEXT_MARKER = "additional user context:"
 _EXPLICIT_MUTATION_RE = re.compile(
     r"(?:\bfix\b|\brepair\b|\bpatch\b|\bimplement\b|\bapply\b.{0,24}\bfix\b|"
-    r"\bmake\b.{0,24}\bchanges?\b|\bedit\b|\bmodify\b|\brewrite\b|"
+    r"\b(?:improve|enhance|upgrade|optimise|optimize|moderni[sz]e|polish)\b|"
+    r"\bmake\b.{0,80}\b(?:better|faster|smarter|safer|like|resemble|changes?)\b|"
+    r"\bresemble\b|\bedit\b|\bmodify\b|\brewrite\b|\brefactor\b|"
+    r"\bcreate\b|\badd\b|\bremove\b|\bdelete\b|\bchange\b|"
     r"\bwrite\b.{0,24}\bfiles?\b|\bcommit\b|\bpush\b|\brestart\b|\binstall\b)",
     re.IGNORECASE,
 )
@@ -184,6 +187,15 @@ def estimate_complexity(text: str, task_type: TaskType) -> ComplexityLevel:
         bool(re.search(r"\b(?:retry|replan|repair loop|independent review|subagents?)\b", lowered)),
     )
     score += sum(independent_signals)
+    # Improving the agent/runtime itself is architectural even when phrased
+    # as one short sentence: intent routing, prompts, tool policy, planning,
+    # and validation are coupled downstream capabilities.
+    if re.search(
+        r"\b(?:coding agent|agentic (?:ability|abilities|workflow)|"
+        r"reasoning (?:ability|abilities|quality)|developer experience)\b",
+        lowered,
+    ):
+        score += 2
     if len(raw) >= 600:
         score += 1
     if len(raw) >= 1800:
@@ -216,6 +228,21 @@ def is_explicit_read_only_request(text: str) -> bool:
         if _EXPLICIT_MUTATION_RE.search(latest) and not _EXPLICIT_READ_ONLY_RE.search(latest):
             return False
     return _EXPLICIT_READ_ONLY_RE.search(value) is not None
+
+
+def is_mutation_request(text: str) -> bool:
+    """Recognize natural requests to change a project.
+
+    This deliberately lives beside the read-only override so routing, task
+    contracts, and future callers share one interpretation.  In particular,
+    product-level requests are often phrased as "improve", "upgrade", or
+    "make it more like ..." rather than with the narrow CRUD verbs that the
+    original classifier understood.
+    """
+    value = text or ""
+    if is_explicit_read_only_request(value):
+        return False
+    return _EXPLICIT_MUTATION_RE.search(value) is not None
 
 
 def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
@@ -257,7 +284,7 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
         return profile(TaskType.AUDIT, True, True, True, True, "frontier")
     if has(("debug", "fix", "repair", "bug", "traceback", "exception", "failing")):
         return profile(TaskType.DEBUG, True, True, True, True, "frontier")
-    if has(("implement", "edit", "modify", "refactor", "rewrite", "add ", "create ", "remove ", "delete ", "patch")) and not read_only:
+    if is_mutation_request(text) and not read_only:
         return profile(TaskType.EDIT, True, True, True, True, "frontier")
     if has(("pytest", "test suite", "run tests", "fix tests", "lint", "typecheck", "type check")):
         return profile(TaskType.TEST, True, True, False, True, "high")

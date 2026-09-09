@@ -24,11 +24,11 @@ from .model_registry import MODELS as _MODEL_REGISTRY
 
 
 PUBLIC_PROVIDER_NAME = "TamfisGPT"
-PUBLIC_MODEL_AUTO = "TamfisGPT Auto"
-PUBLIC_MODEL_SMART = "TamfisGPT Smart"
-PUBLIC_MODEL_PRO = "TamfisGPT Pro"
-PUBLIC_MODEL_ULTRA = "TamfisGPT Ultra"
-PUBLIC_MODEL_ULTIMA = "TamfisGPT Ultima"
+PUBLIC_MODEL_AUTO = "TamfisGPT-Auto"
+PUBLIC_MODEL_SMART = "TamfisGPT-Smart"
+PUBLIC_MODEL_PRO = "TamfisGPT-Pro"
+PUBLIC_MODEL_ULTRA = "TamfisGPT-Ultra"
+PUBLIC_MODEL_ULTIMA = "TamfisGPT-Ultima"
 
 # FIX 2026-08-11: the TAMFIS provider's real per-tier catalog ids (see
 # providers.py's ProviderConfig.models for ProviderType.TAMFIS) -- added
@@ -163,6 +163,7 @@ def resolve_public_model_alias(
     models: Any = (),
     default_model: Any = None,
     free_model: Any = None,
+    strict: bool = False,
 ) -> str | None:
     """Resolve a public alias to a private catalog id at the request edge.
 
@@ -178,6 +179,8 @@ def resolve_public_model_alias(
     for candidate in candidates:
         if candidate and public_model_name(candidate) == alias:
             return str(candidate)
+    if strict:
+        return None
     return str(default_model or free_model or "").strip() or None
 
 

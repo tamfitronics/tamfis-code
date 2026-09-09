@@ -1688,10 +1688,10 @@ async def run_interactive(
                 table.add_column("STATUS")
                 uses = {
                     PUBLIC_MODEL_AUTO: "Automatic selection",
-                    "TamfisGPT Smart": "Low-latency, low-cost tasks",
-                    "TamfisGPT Pro": "Everyday coding and agent tasks",
-                    "TamfisGPT Ultra": "Heavy multi-file / tool-heavy work",
-                    "TamfisGPT Ultima": "Frontier reasoning -- top subscription tier only",
+                    "TamfisGPT-Smart": "Low-latency, low-cost tasks",
+                    "TamfisGPT-Pro": "Everyday coding and agent tasks",
+                    "TamfisGPT-Ultra": "Heavy multi-file / tool-heavy work",
+                    "TamfisGPT-Ultima": "Frontier reasoning -- top subscription tier only",
                 }
                 if standalone:
                     # No TamfisGPT subscription applies to a standalone (BYOK)
@@ -1731,7 +1731,7 @@ async def run_interactive(
                 if parts[0].lower() == "auto":
                     provider_type = ProviderType.AUTO
                     local_state.save_session_state(workspace.session_id, selected_model="auto", selected_provider=None)
-                    console.print("[green]Model set to TamfisGPT Auto.[/green]")
+                    console.print("[green]Model set to TamfisGPT-Auto.[/green]")
                     continue
                 try:
                     provider_type = _resolve_provider_type(parts[0])
@@ -1754,7 +1754,7 @@ async def run_interactive(
                 local_state.save_session_state(
                     workspace.session_id, selected_model="auto", selected_provider=None,
                 )
-                console.print("[green]Model set to TamfisGPT Auto.[/green]")
+                console.print("[green]Model set to TamfisGPT-Auto.[/green]")
                 continue
             route = parts[0].lower()
             if route not in ("hf", "openrouter", "ollama_cloud", "nvidia", "nvidia_nim", "gemini", "apiframe"):

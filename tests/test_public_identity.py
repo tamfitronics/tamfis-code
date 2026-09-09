@@ -62,6 +62,15 @@ def test_subscription_tier_ids_round_trip_without_collapsing_to_auto():
         ) == model_id
 
 
+def test_strict_tier_resolution_does_not_silently_change_groups():
+    assert resolve_public_model_alias(
+        PUBLIC_MODEL_ULTIMA,
+        models=("tamfis-gpt-smart", "tamfis-gpt-pro"),
+        default_model="tamfis-gpt-pro",
+        strict=True,
+    ) is None
+
+
 def test_structured_routing_event_contains_only_tamfisgpt_identity():
     stream = StringIO()
     renderer = StructuredRenderer(mode="jsonl", stream=stream)

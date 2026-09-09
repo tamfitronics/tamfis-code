@@ -25,6 +25,16 @@ def test_task_contract_requires_mutation_and_validation_evidence():
     assert {c.criterion_id for c in contract.criteria} >= {"objective", "evidence", "mutation", "validation"}
 
 
+def test_task_contract_recognizes_product_improvement_as_mutation():
+    contract = TaskContract.derive(
+        "Enhance the coding agent and make it more like Codex",
+        read_only=False,
+        approval_policy="ask",
+    )
+    assert contract.requested_mutation is True
+    assert contract.intent == "engineering_change"
+
+
 def test_independent_review_blocks_unsupported_completion():
     contract = TaskContract.derive("Implement a fix", read_only=False, approval_policy="ask")
     graph = EvidenceGraph()

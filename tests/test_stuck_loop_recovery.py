@@ -109,7 +109,7 @@ class StuckLoopRecoveryTests(_StatePatchMixin, unittest.TestCase):
             self.assertTrue(any("reconstructing a summary" in d for d in diagnostics))
 
     def test_fake_tool_call_recovery_answer_falls_back_to_a_reconstructed_summary(self):
-        """Live-reported (tamfis-code, provider-fallback route "TamfisGPT
+        """Live-reported (tamfis-code, provider-fallback route "TamfisGPT-
         Ultima"): once tools are disabled for the recovery completion, a
         weak model can still write out a well-formed <tool_call> block as
         plain text instead of the requested prose answer. Nothing executes

@@ -58,7 +58,7 @@ from .public_identity import PUBLIC_MODEL_ALIASES, PUBLIC_MODEL_AUTO, public_mod
 # validation and then failed with "Unknown local provider" inside
 # resolve_provider_type every time.
 _PROVIDER_CHOICES = sorted(_PROVIDER_ALIASES.keys())
-_PROVIDER_HELP = "Internal compatibility route override. TamfisGPT Auto is recommended."
+_PROVIDER_HELP = "Internal compatibility route override. TamfisGPT-Auto is recommended."
 
 EXIT_OK = 0
 EXIT_TASK_FAILED = 1

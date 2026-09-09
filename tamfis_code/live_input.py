@@ -838,7 +838,7 @@ class LiveInputListener:
         parts = arg.split()
         if parts[0].lower() == "auto":
             local_state.save_session_state(self.session_id, selected_model="auto", selected_provider=None)
-            _report("Model set to TamfisGPT Auto -- takes effect on the next turn.")
+            _report("Model set to TamfisGPT-Auto -- takes effect on the next turn.")
             return True
 
         if parts[0].lower() == "list":

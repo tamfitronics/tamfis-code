@@ -52,7 +52,13 @@ from .render import (
     suspend_live_async_if_active,
     suspend_live_if_active,
 )
-from .routing import TaskType, is_explicit_read_only_request
+from .routing import (
+    ComplexityLevel,
+    TaskProfile,
+    TaskType,
+    complexity_at_least,
+    is_explicit_read_only_request,
+)
 from .orchestrator import (
     AgentOrchestrator,
     ApprovalAction,
@@ -68,6 +74,11 @@ from .orchestrator.planner import create_plan
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk, system_messages_first
+from .public_identity import (
+    PUBLIC_MODEL_AUTO,
+    parse_public_model_alias,
+    public_model_name,
+)
 from .permissions import decide_permission
 from .runner import TaskOutcome, resolve_approval_decision_async
 from .safety import (
@@ -110,11 +121,10 @@ MAX_AGENT_ROUNDS = 40
 # loop below, not the orchestrator's internal budget.
 MAX_AGENT_ROUND_EXTENSIONS = 2
 
-# High reasoning is valuable for deliberate architecture work but makes the
-# interactive terminal feel stalled on ordinary audits/edits. Medium is the
-# responsive default; set TAMFIS_CODE_REASONING_EFFORT=high when depth matters
-# more than first-token latency.
-DEFAULT_REASONING_EFFORT = os.environ.get("TAMFIS_CODE_REASONING_EFFORT", "medium").strip().lower()
+# Match reasoning depth to task complexity by default: routine work remains
+# responsive while architecture, debugging, and multi-component tasks get the
+# provider's deeper reasoning mode. Operators can still pin low/medium/high.
+DEFAULT_REASONING_EFFORT = os.environ.get("TAMFIS_CODE_REASONING_EFFORT", "auto").strip().lower()
 
 
 def _audit_evidence_targets(records: list[ToolEnvelope]) -> set[str]:
@@ -163,10 +173,20 @@ def _read_only_audit_has_sufficient_evidence(
     )
 
 
-def _reasoning_effort(provider: ProviderType, model: str) -> Optional[str]:
+def _reasoning_effort(
+    provider: ProviderType,
+    model: str,
+    task_profile: Optional[TaskProfile] = None,
+) -> Optional[str]:
     if not reasoning_effort_capable(provider, model):
         return None
-    return DEFAULT_REASONING_EFFORT if DEFAULT_REASONING_EFFORT in {"low", "medium", "high"} else "medium"
+    if DEFAULT_REASONING_EFFORT in {"low", "medium", "high"}:
+        return DEFAULT_REASONING_EFFORT
+    if task_profile is not None and complexity_at_least(
+        task_profile.complexity, ComplexityLevel.COMPLEX,
+    ):
+        return "high"
+    return "medium"
 
 # If the model requests the exact same tool call(s) (name + arguments,
 # unordered) this many rounds in a row, stop rather than let it spin: a
@@ -2436,7 +2456,7 @@ async def _recover_empty_continuation(
             "event_type": "diagnostics",
             "payload": {
                 "content": (
-                    f"Provider {resolved_provider.value} returned an empty continuation; "
+                    f"{public_model_name(model)} returned an empty continuation; "
                     f"retrying the same route ({attempt}/{MAX_EMPTY_CONTINUATION_RETRIES})."
                 )
             },
@@ -2510,6 +2530,7 @@ async def _recover_empty_continuation(
 
     if requested_provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
         failed_provider = resolved_provider
+        failed_model = model
         for candidate in manager.fallback_candidates(failed_provider, task_profile):
             candidate_client = manager.get_client(candidate)
             candidate_config = manager.PROVIDERS.get(candidate)
@@ -2520,8 +2541,8 @@ async def _recover_empty_continuation(
                 "event_type": "diagnostics",
                 "payload": {
                     "content": (
-                        f"Provider {failed_provider.value} produced no continuation; "
-                        f"falling back to {candidate.value} / {candidate_model}."
+                        f"{public_model_name(failed_model)} produced no continuation; "
+                        f"falling back to {public_model_name(candidate_model)}."
                     )
                 },
             })
@@ -2557,6 +2578,7 @@ async def _recover_empty_continuation(
             except Exception as exc:
                 last_error = exc
                 failed_provider = candidate
+                failed_model = candidate_model
                 continue
 
     if last_error is not None:
@@ -3326,6 +3348,53 @@ def _select_fallback_model(
         return str(config.free_model)
     return _select_model(
         manager, config, task_profile, requires_vision=requires_vision,
+    )
+
+
+def _select_public_group_model(
+    manager: Any,
+    provider: ProviderType,
+    config: Any,
+    task_profile: Any,
+    requested_model: Any,
+    *,
+    requires_vision: bool = False,
+) -> str | None:
+    """Resolve an explicit public model group inside one provider bucket.
+
+    Returning ``None`` when that bucket has no member is intentional: a
+    fallback must continue searching the other configured providers instead
+    of silently substituting this provider's default (and therefore changing
+    Smart/Pro/Ultra/Ultima behind the user's back).
+    """
+    requested_group = parse_public_model_alias(requested_model)
+    if requested_group is None or requested_group == PUBLIC_MODEL_AUTO:
+        return _select_fallback_model(
+            manager, config, task_profile, requires_vision=requires_vision,
+        )
+
+    candidates = list(dict.fromkeys(filter(None, [
+        getattr(config, "free_model", None),
+        *(getattr(config, "models", ()) or ()),
+        getattr(config, "default_model", None),
+    ])))
+    route_is_healthy = getattr(manager, "route_is_healthy", None)
+    for candidate in candidates:
+        if public_model_name(candidate) != requested_group:
+            continue
+        if callable(route_is_healthy) and not route_is_healthy(provider, candidate):
+            continue
+        if requires_vision and not _model_supports_vision(manager, config, candidate):
+            continue
+        return str(candidate)
+    return None
+
+
+def _public_model_fallback_message(failed_model: str, candidate_model: str, reason: str) -> str:
+    """Describe fallback in product model groups, never backend vocabulary."""
+    return (
+        f"{public_model_name(failed_model)} unavailable for this turn ({reason}); "
+        f"falling back to {public_model_name(candidate_model)}."
     )
 
 
@@ -4864,7 +4933,11 @@ async def _run_local_agent_turn_impl(
                             model = selected_model
                         break
         if not client or config is None:
-            error = f"Provider {resolved_provider.value} is not available (no client / no valid credentials)."
+            unavailable_group = (
+                parse_public_model_alias(model)
+                or public_model_name(getattr(config, "default_model", None))
+            )
+            error = f"{unavailable_group} is not available (no client / no valid credentials)."
             orchestrator.fail(error)
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
             return TaskOutcome(status="failed", error=error)
@@ -4879,17 +4952,49 @@ async def _run_local_agent_turn_impl(
             requires_vision=bool(image_content_blocks),
         )
     )
-    from .public_identity import resolve_public_model_alias
-
-    if resolved_provider == ProviderType.OLLAMA_CLOUD and model in {"glm-5.2", "glm-5.2:cloud", "glm-5.2-cloud"}:
-        model = "glm-5.3:cloud"
-
-    resolved_model = resolve_public_model_alias(
+    requested_group_model = _select_public_group_model(
+        manager,
+        resolved_provider,
+        config,
+        task_profile,
         model,
-        models=getattr(config, "models", ()),
-        default_model=selected_default_model,
-        free_model=getattr(config, "free_model", None),
-    ) or selected_default_model
+        requires_vision=bool(image_content_blocks),
+    )
+    # AUTO chooses a backend before it sees the public model group. If that
+    # first backend has no healthy member of the requested group, search the
+    # remaining configured routes instead of collapsing to its default.
+    explicit_public_group = parse_public_model_alias(model)
+    if (
+        requested_group_model is None
+        and explicit_public_group not in {None, PUBLIC_MODEL_AUTO}
+        and provider == ProviderType.AUTO
+    ):
+        for candidate in _fallback_candidates_for_turn(
+            manager, resolved_provider, task_profile,
+        ):
+            candidate_config = manager.PROVIDERS.get(candidate)
+            candidate_client = manager.get_client(candidate)
+            if candidate_config is None or candidate_client is None:
+                continue
+            candidate_model = _select_public_group_model(
+                manager,
+                candidate,
+                candidate_config,
+                task_profile,
+                model,
+                requires_vision=bool(image_content_blocks),
+            )
+            if candidate_model is None:
+                continue
+            resolved_provider, config, client = candidate, candidate_config, candidate_client
+            requested_group_model = candidate_model
+            break
+    if requested_group_model is None:
+        error = f"No configured route has an available {explicit_public_group} model."
+        orchestrator.fail(error)
+        renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+        return TaskOutcome(status="failed", error=error)
+    resolved_model = requested_group_model
     configured_models = set(getattr(config, "models", None) or [])
     if (resumed_from_checkpoint or resumed_from_legacy) and model and configured_models and model not in configured_models:
         renderer.handle_event({
@@ -4954,7 +5059,7 @@ async def _run_local_agent_turn_impl(
             session_id=session_id, renderer=renderer,
             reconnaissance_summary=planning_reconnaissance,
             evidence_summary=resumed_evidence_summary,
-            reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
+            reasoning_effort=_reasoning_effort(resolved_provider, resolved_model, task_profile),
             scope_roots=scope_roots,
             manager=manager, provider=resolved_provider,
         )
@@ -5075,7 +5180,7 @@ async def _run_local_agent_turn_impl(
                 more_content, _more_calls, finish_reason = await _stream_one_completion(
                     client, model=resolved_model, messages=continuation_messages, tools=[],
                     renderer=renderer,
-                    reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
+                    reasoning_effort=_reasoning_effort(resolved_provider, resolved_model, task_profile),
                     emit=False,
                 )
             except Exception as exc:
@@ -5096,7 +5201,11 @@ async def _run_local_agent_turn_impl(
                         candidate_config = manager.PROVIDERS.get(candidate)
                         if candidate_client is None or candidate_config is None:
                             continue
-                        candidate_model = _select_fallback_model(manager, candidate_config, task_profile)
+                        candidate_model = _select_public_group_model(
+                            manager, candidate, candidate_config, task_profile, model,
+                        )
+                        if candidate_model is None:
+                            continue
                         try:
                             more_content, _more_calls, finish_reason = await _stream_one_completion(
                                 candidate_client,
@@ -5104,7 +5213,7 @@ async def _run_local_agent_turn_impl(
                                 messages=continuation_messages,
                                 tools=[],
                                 renderer=renderer,
-                                reasoning_effort=_reasoning_effort(candidate, candidate_model),
+                                reasoning_effort=_reasoning_effort(candidate, candidate_model, task_profile),
                                 emit=False,
                             )
                         except Exception as candidate_exc:
@@ -5437,7 +5546,7 @@ async def _run_local_agent_turn_impl(
             try:
                 recovery_content, _recovery_calls, recovery_finish_reason = await _stream_one_completion(
                     recovery_client, model=recovery_model, messages=working_messages, tools=[], renderer=renderer,
-                    reasoning_effort=_reasoning_effort(recovery_provider, recovery_model),
+                    reasoning_effort=_reasoning_effort(recovery_provider, recovery_model, task_profile),
                 )
                 break
             except Exception as exc:
@@ -5724,7 +5833,12 @@ async def _run_local_agent_turn_impl(
                     candidate_budget = int(candidate_config.context_window * _CONTEXT_SAFETY_MARGIN) - MAX_TOKENS_PER_REQUEST
                     if input_tokens > candidate_budget:
                         continue
-                    candidate_model = _select_fallback_model(manager, candidate_config, task_profile)
+                    candidate_model = _select_public_group_model(
+                        manager, candidate, candidate_config, task_profile, model,
+                        requires_vision=bool(image_content_blocks),
+                    )
+                    if candidate_model is None:
+                        continue
                     renderer.handle_event({
                         "event_type": "diagnostics",
                         "payload": {
@@ -5782,7 +5896,7 @@ async def _run_local_agent_turn_impl(
                     if _model_supports_vision(manager, config, resolved_model) else working_messages
                 ),
                 tools=tools_for_round, renderer=renderer,
-                reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
+                reasoning_effort=_reasoning_effort(resolved_provider, resolved_model, task_profile),
                 progress_callback=_remember_stream_delta,
             )
             # Do not wait for the next tool round/final answer: if the process
@@ -5897,6 +6011,7 @@ async def _run_local_agent_turn_impl(
             fallback_succeeded = False
             last_error: Exception = root_exc
             failed_provider = resolved_provider
+            failed_model = resolved_model
             if can_fallback:
                 candidates = _fallback_candidates_for_turn(
                     manager,
@@ -5909,10 +6024,12 @@ async def _run_local_agent_turn_impl(
                     candidate_config = manager.PROVIDERS.get(candidate)
                     if candidate_client is None or candidate_config is None:
                         continue
-                    candidate_model = _select_model(
-                        manager, candidate_config, task_profile,
+                    candidate_model = _select_public_group_model(
+                        manager, candidate, candidate_config, task_profile, model,
                         requires_vision=bool(image_content_blocks),
                     )
+                    if candidate_model is None:
+                        continue
                     if (
                         failed_provider == ProviderType.OLLAMA_CLOUD
                         and premium_choices
@@ -5930,9 +6047,8 @@ async def _run_local_agent_turn_impl(
                     renderer.handle_event({
                         "event_type": "diagnostics",
                         "payload": {
-                            "content": (
-                                f"Provider {failed_provider.value} unavailable for this turn ({reason}); "
-                                f"falling back to {candidate.value} / {candidate_model}."
+                            "content": _public_model_fallback_message(
+                                failed_model, candidate_model, reason,
                             )
                         },
                     })
@@ -5966,7 +6082,7 @@ async def _run_local_agent_turn_impl(
                             ),
                             tools=tools if getattr(candidate_config, "tool_calling", True) else [],
                             renderer=renderer,
-                            reasoning_effort=_reasoning_effort(candidate, candidate_model),
+                            reasoning_effort=_reasoning_effort(candidate, candidate_model, task_profile),
                             progress_callback=_remember_stream_delta,
                             initial_partial=interrupted_partial,
                         )
@@ -5991,6 +6107,7 @@ async def _run_local_agent_turn_impl(
                                 tool_call=bool(tools),
                             )
                         failed_provider = candidate
+                        failed_model = candidate_model
                         if not manager.is_retryable_provider_error(last_error):
                             break
                         continue
@@ -6013,7 +6130,7 @@ async def _run_local_agent_turn_impl(
                     orchestrator.mark_repair(f"Provider/tool round failed, no fallback available: {last_error}")
                 detail = str(last_error).strip() or type(last_error).__name__
                 message = (
-                    f"Provider streaming failed on {failed_provider.value} / {resolved_model}: {detail}. "
+                    f"{public_model_name(failed_model)} streaming failed: {detail}. "
                     "The exact turn and partial response were checkpointed; type `continue` to resume "
                     "without losing the conversation or completed tool results."
                 )
@@ -6099,10 +6216,16 @@ async def _run_local_agent_turn_impl(
                     candidate_config = manager.PROVIDERS.get(candidate)
                     if candidate_client is None or candidate_config is None:
                         continue
+                    candidate_model = _select_public_group_model(
+                        manager, candidate, candidate_config, task_profile, model,
+                        requires_vision=bool(image_content_blocks),
+                    )
+                    if candidate_model is None:
+                        continue
                     resolved_provider = candidate
                     config = candidate_config
                     client = candidate_client
-                    resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
+                    resolved_model = candidate_model
                     orchestrator.mark_repair(
                         f"Discarding invalid output from {failed_quality_provider.value}; retrying on {candidate.value}",
                         provider_switch=True,
@@ -6137,7 +6260,7 @@ async def _run_local_agent_turn_impl(
                 else "a degenerate repetition loop"
             )
             error = (
-                f"Provider {failed_quality_provider.value} produced {reason_text}. "
+                f"{public_model_name(resolved_model)} produced {reason_text}. "
                 "The invalid completion was discarded, and no clean fallback provider was available. "
                 "The turn is checkpointed; type `continue` after enabling another provider."
             )
@@ -6292,10 +6415,16 @@ async def _run_local_agent_turn_impl(
                         if candidate_client is None or candidate_config is None:
                             continue
                         old_provider = resolved_provider
+                        candidate_model = _select_public_group_model(
+                            manager, candidate, candidate_config, task_profile, model,
+                            requires_vision=bool(image_content_blocks),
+                        )
+                        if candidate_model is None:
+                            continue
                         resolved_provider = candidate
                         config = candidate_config
                         client = candidate_client
-                        resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
+                        resolved_model = candidate_model
                         orchestrator.mark_repair(
                             f"Falling back from {old_provider.value}: model repeatedly narrated tools without calling them",
                             provider_switch=True,
@@ -6363,10 +6492,16 @@ async def _run_local_agent_turn_impl(
                         if candidate_client is None or candidate_config is None:
                             continue
                         old_provider = resolved_provider
+                        candidate_model = _select_public_group_model(
+                            manager, candidate, candidate_config, task_profile, model,
+                            requires_vision=bool(image_content_blocks),
+                        )
+                        if candidate_model is None:
+                            continue
                         resolved_provider = candidate
                         config = candidate_config
                         client = candidate_client
-                        resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
+                        resolved_model = candidate_model
                         orchestrator.mark_repair(
                             f"Falling back from {old_provider.value}: model repeatedly wrote fake tool calls as text",
                             provider_switch=True,
@@ -6434,10 +6569,16 @@ async def _run_local_agent_turn_impl(
                         if candidate_client is None or candidate_config is None:
                             continue
                         old_provider = resolved_provider
+                        candidate_model = _select_public_group_model(
+                            manager, candidate, candidate_config, task_profile, model,
+                            requires_vision=bool(image_content_blocks),
+                        )
+                        if candidate_model is None:
+                            continue
                         resolved_provider = candidate
                         config = candidate_config
                         client = candidate_client
-                        resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
+                        resolved_model = candidate_model
                         orchestrator.mark_repair(
                             f"Falling back from {old_provider.value}: model fabricated a tool result/refusal without calling it",
                             provider_switch=True,
@@ -6513,10 +6654,16 @@ async def _run_local_agent_turn_impl(
                         if candidate_client is None or candidate_config is None:
                             continue
                         old_provider = resolved_provider
+                        candidate_model = _select_public_group_model(
+                            manager, candidate, candidate_config, task_profile, model,
+                            requires_vision=bool(image_content_blocks),
+                        )
+                        if candidate_model is None:
+                            continue
                         resolved_provider = candidate
                         config = candidate_config
                         client = candidate_client
-                        resolved_model = _select_fallback_model(manager, candidate_config, task_profile)
+                        resolved_model = candidate_model
                         orchestrator.mark_repair(
                             f"Falling back from {old_provider.value}: model gave up without trying a tool",
                             provider_switch=True,
@@ -7665,7 +7812,7 @@ async def _run_local_agent_turn_impl(
                 session_id=session_id, renderer=renderer,
                 reconnaissance_summary=planning_reconnaissance,
                 evidence_summary=_summarise_progress_for_rollover(session_id),
-                reasoning_effort=_reasoning_effort(resolved_provider, resolved_model),
+                reasoning_effort=_reasoning_effort(resolved_provider, resolved_model, task_profile),
                 scope_roots=scope_roots,
                 manager=manager, provider=resolved_provider,
             )

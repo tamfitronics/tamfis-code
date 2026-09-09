@@ -5,6 +5,7 @@ from tamfis_code.routing import (
     classify_task,
     estimate_complexity,
     is_explicit_read_only_request,
+    is_mutation_request,
 )
 from tamfis_code.orchestrator.planner import should_plan
 from tamfis_code.tool_policy import allowed_tools
@@ -68,6 +69,36 @@ def test_genuine_debug_request_is_unaffected():
     profile = classify_task("please fix the bug in calc.py")
     assert profile.task_type == TaskType.DEBUG
     assert profile.requires_tools
+
+
+def test_natural_product_improvement_requests_receive_engineering_tools():
+    requests = (
+        "Improve the coding and reasoning abilities of tamfis-code",
+        "Enhance the agent's repository intelligence",
+        "Upgrade this CLI to resemble Codex and Claude Code",
+        "Make tamfis-code smarter and more like Codex",
+        "Optimize the coding workflow",
+    )
+    for text in requests:
+        profile = classify_task(text)
+        assert is_mutation_request(text), text
+        assert profile.task_type == TaskType.EDIT, text
+        assert profile.requires_tools, text
+        assert profile.requires_repository_context, text
+        assert profile.requires_validation, text
+        assert "edit_file" in allowed_tools(profile, read_only=False), text
+
+
+def test_read_only_constraint_overrides_improvement_language():
+    text = "Review how to improve the coding agent, recommendations only"
+    assert not is_mutation_request(text)
+    assert classify_task(text).task_type == TaskType.INSPECT
+
+
+def test_agent_capability_upgrade_gets_a_grounded_plan():
+    text = "Improve this coding agent's reasoning abilities and developer experience"
+    profile = classify_task(text)
+    assert should_plan(profile, text)
 
 
 def test_explicit_no_edit_status_review_is_inspection_even_when_filename_contains_fix():

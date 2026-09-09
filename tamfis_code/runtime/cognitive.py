@@ -10,6 +10,8 @@ from dataclasses import asdict, dataclass, field
 from enum import Enum
 from typing import Any, Iterable
 
+from ..routing import is_mutation_request
+
 
 class RequirementStatus(str, Enum):
     PENDING = "pending"
@@ -45,9 +47,7 @@ class TaskContract:
         metadata: dict[str, Any] | None = None,
     ) -> "TaskContract":
         text = " ".join(objective.split())
-        lowered = text.lower()
-        mutation_words = ("fix", "edit", "change", "implement", "create", "write", "refactor", "remove", "add")
-        requested_mutation = (not read_only) and any(word in lowered for word in mutation_words)
+        requested_mutation = (not read_only) and is_mutation_request(text)
         if read_only:
             intent = "audit"
         elif requested_mutation:

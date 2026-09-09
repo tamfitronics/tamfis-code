@@ -433,7 +433,7 @@ class ProviderManager:
                 # agentic-capability refresh of the DeepSeek V4 Flash line --
                 # reliable tool calling at long contexts, three selectable
                 # reasoning_effort tiers (low/high/max), hosted US+EU with
-                # zero data retention. Explicit-select route like glm-5.2 and
+                # zero data retention. Explicit-select route like glm-5.3 and
                 # minimax-m3 above, not the default, since it hasn't been
                 # live-verified against this CLI's own tool-calling loop yet.
                 "deepseek-v4-flash:0731-cloud",
@@ -1722,10 +1722,6 @@ class ProviderManager:
                 else self.select_model(config, task_profile)
             )
         )
-
-        if resolved == ProviderType.OLLAMA_CLOUD and selected_model in {"glm-5.2", "glm-5.2:cloud", "glm-5.2-cloud"}:
-            # Migrate saved sessions and inherited shell overrides too.
-            selected_model = "glm-5.3:cloud"
 
         request_kwargs: Dict[str, Any] = {
             "model": selected_model,
