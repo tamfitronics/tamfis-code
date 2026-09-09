@@ -159,10 +159,42 @@ def test_read_only_fix_recommendations_do_not_become_a_debug_task():
         assert classify_task(text).task_type == TaskType.INSPECT, text
 
 
-def test_audit_requires_frontier_long_context_tools():
+def test_audit_then_implementation_is_mixed_and_keeps_engineering_tools():
     profile = classify_task("audit the entire stack and implement fixes")
-    assert profile.task_type == TaskType.AUDIT
+    assert profile.task_type == TaskType.MIXED
     assert profile.requires_tools
+    assert profile.requires_validation
+    assert "execute_command" in allowed_tools(profile, read_only=False)
+    assert "edit_file" in allowed_tools(profile, read_only=False)
+
+
+def test_production_audit_then_fix_request_does_not_become_read_only():
+    text = (
+        "You are working on the production system. FIRST AUDIT WHAT ALREADY "
+        "EXISTS. THEN IMPLEMENT THE MISSING HIGH-VALUE FEATURES. TEST "
+        "EVERYTHING. DO NOT STOP AT THE AUDIT. MAKE THE SYSTEM WORK."
+    )
+    profile = classify_task(text)
+
+    assert profile.task_type == TaskType.MIXED
+    assert profile.requires_repository_context
+    assert profile.requires_long_context
+    assert profile.requires_validation
+    tools = allowed_tools(profile, read_only=False)
+    assert "execute_command" in tools
+    assert "write_file" in tools
+    assert "edit_file" in tools
+
+
+def test_explicit_read_only_mode_still_restricts_audit_then_fix_request():
+    profile = classify_task(
+        "audit the entire stack and implement fixes",
+        read_only=True,
+    )
+
+    assert profile.task_type == TaskType.AUDIT
+    assert "execute_command" not in allowed_tools(profile, read_only=True)
+    assert "edit_file" not in allowed_tools(profile, read_only=True)
 
 
 def test_explicit_web_search_request_is_research_not_inspect():

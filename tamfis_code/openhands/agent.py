@@ -74,13 +74,19 @@ class TamfisAgent:
         except ValueError as exc:
             raise ValueError(f"unsupported provider: {provider}") from exc
         try:
+            # UnifiedAgentRuntime deliberately exposes a keyword-only adapter
+            # (`execute_local(**kwargs)`) so interface callers cannot depend
+            # on the private runner's positional parameter order.  This
+            # OpenHands adapter predated that contract and still passed the
+            # first six values positionally, making every real agent-server
+            # `/run` request fail immediately with TypeError.
             outcome = await get_unified_runtime().execute_local(
-                manager,
-                selected,
-                model,
-                [{"role": "user", "content": objective}],
-                Console(quiet=True),
-                renderer,
+                manager=manager,
+                provider=selected,
+                model=model,
+                messages=[{"role": "user", "content": objective}],
+                console=Console(quiet=True),
+                renderer=renderer,
                 workspace_root=str(self.conversation.workspace.root),
                 session_id=abs(hash(self.conversation.id)) % 2_000_000_000,
                 approval_policy=approval_policy,

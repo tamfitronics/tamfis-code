@@ -281,6 +281,17 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
             return profile(TaskType.AUDIT, True, True, True, False, "frontier")
         return profile(TaskType.INSPECT, True, True, False, False, "high")
     if has(("audit", "entire stack", "whole repository", "whole repo", "end-to-end", "end to end")):
+        # Large implementation requests commonly require an audit first
+        # ("audit what exists, then implement/fix the gaps").  Treating the
+        # word "audit" as the whole turn used to classify that workflow as
+        # AUDIT, and runner_local/tool_policy deliberately make every AUDIT
+        # read-only.  The result was a self-inflicted dead end: after useful
+        # reconnaissance the agent had no execute/edit tools and handed the
+        # work back to the user.  Preserve genuinely read-only audits, but
+        # represent combined audit + mutation objectives as MIXED so one
+        # autonomous turn can inspect, change, and validate.
+        if is_mutation_request(text) and not read_only:
+            return profile(TaskType.MIXED, True, True, True, True, "frontier")
         return profile(TaskType.AUDIT, True, True, True, True, "frontier")
     if has(("debug", "fix", "repair", "bug", "traceback", "exception", "failing")):
         return profile(TaskType.DEBUG, True, True, True, True, "frontier")

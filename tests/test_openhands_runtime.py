@@ -1,10 +1,12 @@
 import asyncio
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from tamfis_code.openhands.automation import Automation, AutomationStore
+from tamfis_code.openhands.agent import TamfisAgent
 from tamfis_code.openhands.conversation import ConversationManager, ConversationState
 from tamfis_code.openhands.events import EventKind, EventStore
 from tamfis_code.openhands.leases import LeaseManager
@@ -131,6 +133,57 @@ def test_conversation_lifecycle_and_events(tmp_path: Path):
     conversation.cancel()
     assert conversation.state == ConversationState.CANCELLED
     assert len(conversation.replay()) >= 5
+
+
+@pytest.mark.asyncio
+async def test_agent_server_adapter_calls_unified_runtime_with_keywords(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    """Regression for the production `/run` adapter/runtime signature.
+
+    UnifiedAgentRuntime.execute_local is intentionally keyword-only.  The
+    adapter previously passed six positional values, a gap unit tests missed
+    because none exercised TamfisAgent.run through the real interface.
+    """
+    project = tmp_path / "project"
+    project.mkdir()
+    conversation = ConversationManager(tmp_path / "server").create(project)
+    captured = {}
+
+    class FakeRuntime:
+        async def execute_local(self, **kwargs):
+            captured.update(kwargs)
+            return SimpleNamespace(status="completed", summary="done", error=None)
+
+    monkeypatch.setattr(
+        "tamfis_code.runtime.unified.get_unified_runtime",
+        lambda: FakeRuntime(),
+    )
+    monkeypatch.setattr(
+        "tamfis_code.providers.ProviderManager",
+        lambda: object(),
+    )
+
+    result = await TamfisAgent(conversation).run(
+        "audit the repository, then implement and test the fix",
+        provider="auto",
+        approval_policy="accept-edits",
+        read_only=False,
+        max_rounds=42,
+    )
+
+    assert result.status == "completed"
+    assert conversation.state == ConversationState.COMPLETED
+    assert captured["manager"] is not None
+    assert captured["provider"].value == "auto"
+    assert captured["messages"] == [{
+        "role": "user",
+        "content": "audit the repository, then implement and test the fix",
+    }]
+    assert captured["workspace_root"] == str(project)
+    assert captured["approval_policy"] == "accept-edits"
+    assert captured["read_only"] is False
+    assert captured["max_rounds"] == 42
 
 
 def test_leases_are_exclusive_and_releasable(tmp_path: Path):
