@@ -1,9 +1,9 @@
 """One test per declared dangerous-command pattern in safety.py.
 
 test_safety.py exercises classify_command_risk's behaviour broadly, but
-only 4 of the 12 entries in _DANGEROUS_COMMAND_PATTERNS had a directly
-attributable test (rm -rf, force push, sudo, curl-pipe-shell, ssh key
-access -- 5 of 12, counting sudo). The other 7 (`git reset --hard`,
+only 4 of the original 12 entries in _DANGEROUS_COMMAND_PATTERNS had a
+directly attributable test (rm -rf, force push, sudo, curl-pipe-shell, ssh
+key access -- 5 of 12, counting sudo). The other 7 (`git reset --hard`,
 `git clean -fd`, `chmod -R 777`, `dd if=`, `mkfs`, the fork-bomb shape,
 `> /dev/sdX`, `.aws/credentials`/`.env`) had no test naming them at all --
 a regex typo'd during a future refactor could silently stop matching and
@@ -11,6 +11,14 @@ nothing would fail. This file is the manifest: it walks the real
 _DANGEROUS_COMMAND_PATTERNS list and asserts each one still fires on a
 representative real-world command, plus one adjacent "looks similar but
 isn't" case per pattern to keep it from being trivially over-broad.
+
+Confirmed live (2026-09): two patterns were added for daemonizing a
+process outside the tool call's own lifetime (nohup/setsid/disown, and a
+bare trailing `&`) -- this is how an unattended "auto"-policy run started
+a long-lived root process outside systemd with zero approval prompt,
+because starting it was only ever classified `medium`. See runner.py's
+_decision_for_policy for the matching "auto" no-longer-bypasses-dangerous
+fix.
 """
 from __future__ import annotations
 
@@ -34,7 +42,7 @@ class DangerousPatternManifestTests(unittest.TestCase):
         # A change in count here means a pattern was added or removed --
         # deliberately loud, so this file gets updated alongside it rather
         # than silently drifting out of sync with the real list.
-        self.assertEqual(len(_DANGEROUS_COMMAND_PATTERNS), 12)
+        self.assertEqual(len(_DANGEROUS_COMMAND_PATTERNS), 14)
 
     def test_git_force_push_is_dangerous(self):
         self.assertEqual(classify_command_risk("git push --force origin main"), RISK_DANGEROUS)
@@ -104,6 +112,21 @@ class DangerousPatternManifestTests(unittest.TestCase):
 
     def test_halt_is_dangerous(self):
         self.assertEqual(classify_command_risk("halt"), RISK_DANGEROUS)
+
+    def test_nohup_is_dangerous(self):
+        self.assertEqual(classify_command_risk("nohup node server.js > out.log 2>&1 &"), RISK_DANGEROUS)
+
+    def test_setsid_is_dangerous(self):
+        self.assertEqual(classify_command_risk("setsid python3 app.py"), RISK_DANGEROUS)
+
+    def test_disown_is_dangerous(self):
+        self.assertEqual(classify_command_risk("npm start & disown"), RISK_DANGEROUS)
+
+    def test_trailing_background_ampersand_is_dangerous(self):
+        self.assertEqual(classify_command_risk("npm run dev &"), RISK_DANGEROUS)
+
+    def test_double_ampersand_chain_is_not_treated_as_backgrounding(self):
+        self.assertEqual(classify_command_risk("echo hi && echo bye"), "medium")
 
 
 if __name__ == "__main__":

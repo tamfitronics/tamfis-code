@@ -124,8 +124,26 @@ def _decision_for_policy(policy: str, risk: str, interactive: bool) -> Optional[
     through resolve_approval_decision into itself."""
 
     risk = (risk or "medium").lower()
-    if policy in {"auto", "full-auto"}:
+    if policy == "full-auto":
+        # Explicit, separate opt-in from "auto" below -- a user who has
+        # chosen the "full-auto" tier specifically wants zero stops ever,
+        # dangerous risk included. Leave this one alone.
         return "approve_once"
+    if policy == "auto":
+        # Confirmed live (2026-09): "auto" -- the actual CLI default, not an
+        # explicit opt-in -- approved a dangerous-risk execute_command (a
+        # process daemonized outside systemd, running as root) with zero
+        # prompt and zero log a human could have caught. "auto" is meant to
+        # skip confirmation on ordinary automation, not to auto-approve
+        # irreversible/credential/daemonizing actions that every other
+        # lenient policy below already stops for. Dangerous risk now falls
+        # through to the same deny-if-unattended/prompt-if-live handling
+        # "safe"/"accept-edits" already use. "full-auto" above is the
+        # separate, explicit escape hatch for anyone who wants the old
+        # no-guardrails behaviour back.
+        if risk != "dangerous":
+            return "approve_once"
+        return "deny" if not interactive else None
     if policy in {"safe", "workspace", "accept-edits"}:
         if risk != "dangerous":
             return "approve_once"

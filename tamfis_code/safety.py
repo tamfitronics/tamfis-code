@@ -51,6 +51,18 @@ _DANGEROUS_COMMAND_PATTERNS = [
     re.compile(r">\s*/dev/sd[a-z]\b"),
     re.compile(r"\.ssh/(id_|authorized_keys)|\.aws/credentials|(^|\s)\.env\b"),
     re.compile(r"\bshutdown\b|\breboot\b|\bhalt\b"),
+    # Daemonizing a process outside the tool call's own lifetime -- nohup,
+    # setsid, disown, or a trailing background `&` (not `&&`) -- is how an
+    # unattended run can start a long-lived process (an app server, a dev
+    # build watcher) that outlives this turn, keeps running as whatever user
+    # tamfis-code itself runs as (root, by default), and bypasses whatever
+    # process manager (systemd, pm2, etc.) is supposed to own that service.
+    # Confirmed live (2026-09): this is exactly how a rogue root process
+    # ended up running a production app outside its systemd unit, leaving
+    # root-owned build artifacts and a stale DATABASE_URL behind with no
+    # approval prompt, because starting it was only ever classified medium.
+    re.compile(r"\bnohup\b|\bsetsid\b|\bdisown\b"),
+    re.compile(r"(?<!&)&(?!&)\s*$"),
 ]
 
 
@@ -254,13 +266,25 @@ def redact_secrets(command: str) -> str:
     return text
 
 
-def classify_path_risk(path: str, workspace_root: str) -> str:
-    """`dangerous` if the target resolves outside workspace_root, else `medium`.
+def classify_path_risk(path: str, workspace_root: str, *, extra_safe_roots: tuple[Path, ...] = ()) -> str:
+    """`dangerous` if the target resolves outside workspace_root (and outside
+    every root in `extra_safe_roots`), else `medium`.
 
     Mirrors the workspace-boundary check `mcp.py`'s `_write_file` never had
     (see the rebuild plan's Phase 2 goal) -- a path that escapes the
     workspace is exactly the case a local agent loop has no server-side
     backstop for anymore.
+
+    `extra_safe_roots` exists for the session's scratch_root: that directory
+    is deliberately outside workspace_root but "always granted" (see
+    workspace.py's scratch_root docstring and runner_local.py's
+    _apply_mcp_task_scope), the same way Claude Code's own scratchpad needs
+    no per-task grant. Confirmed live (2026-09): before this parameter
+    existed, a scratch-root write was silently misclassified `dangerous` --
+    harmless while "auto" policy ignored risk entirely, but once "auto"
+    started respecting `dangerous` risk (see runner.py's
+    _decision_for_policy) that misclassification turned into a real
+    regression, denying an intentionally always-allowed write.
     """
     try:
         candidate = Path(path)
@@ -270,15 +294,29 @@ def classify_path_risk(path: str, workspace_root: str) -> str:
         root = Path(workspace_root).resolve()
     except (OSError, ValueError, RuntimeError):
         return RISK_DANGEROUS
-    if resolved != root and root not in resolved.parents:
-        return RISK_DANGEROUS
-    return RISK_MEDIUM
+    if resolved == root or root in resolved.parents:
+        return RISK_MEDIUM
+    for safe_root in extra_safe_roots:
+        try:
+            safe_resolved = safe_root.resolve()
+        except (OSError, ValueError, RuntimeError):
+            continue
+        if resolved == safe_resolved or safe_resolved in resolved.parents:
+            return RISK_MEDIUM
+    return RISK_DANGEROUS
 
 
-def classify_tool_call_risk(name: str, arguments: dict[str, Any], *, workspace_root: str) -> str:
+def classify_tool_call_risk(
+    name: str, arguments: dict[str, Any], *, workspace_root: str,
+    extra_safe_roots: tuple[Path, ...] = (),
+) -> str:
     """Single entry point the standalone loop consults before executing any
     tool call -- feeds `runner.py`'s existing `resolve_approval_decision`
-    exactly the way a server-supplied `risk_level` used to."""
+    exactly the way a server-supplied `risk_level` used to.
+
+    `extra_safe_roots` is forwarded to classify_path_risk -- see that
+    function's docstring for why (the session's always-granted scratch
+    root)."""
     # The scope resolver attaches this internal marker when a tool targets a
     # path outside the turn's approved roots. Reading may be non-mutating,
     # but crossing the workspace boundary still requires explicit consent.
@@ -299,7 +337,7 @@ def classify_tool_call_risk(name: str, arguments: dict[str, Any], *, workspace_r
             if name != "extract_archive" or not paths[-1]:
                 return RISK_DANGEROUS
             paths = [paths[-1]]
-        risks = [classify_path_risk(path, workspace_root) for path in paths]
+        risks = [classify_path_risk(path, workspace_root, extra_safe_roots=extra_safe_roots) for path in paths]
         return RISK_DANGEROUS if RISK_DANGEROUS in risks else RISK_MEDIUM
     if name == "execute_command":
         if arguments.get("sandbox_permissions") == "require_escalated":
