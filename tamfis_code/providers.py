@@ -958,12 +958,12 @@ class ProviderManager:
         return _valid_api_key_value(self._get_api_key(provider_type))
 
     def _check_ollama_available(self) -> bool:
-        """Return True when the local Ollama daemon is reachable.
+        """Return True when the configured Ollama API is reachable.
 
-        A successful daemon health check does not guarantee that every cloud
-        model is included in the current account plan. A model-specific 403 is
-        therefore handled as a retryable provider error and AUTO falls back to
-        NVIDIA, Hugging Face, then OpenRouter.
+        Supports both the local daemon's OpenAI-compatible endpoint and
+        Ollama's official direct cloud endpoint. A successful health check
+        does not guarantee that every cloud model is included in the current
+        account plan; model-specific failures still fall through normally.
         """
 
         explicit = os.environ.get("TAMFIS_PROVIDER_OLLAMA_CLOUD_ENABLED")
@@ -976,15 +976,36 @@ class ProviderManager:
 
         import httpx
 
-        base = config.base_url
-        if base.endswith("/v1"):
-            base = base[:-3]
-
         try:
-            response = httpx.get(f"{base}/api/tags", timeout=3.0)
+            base = config.base_url.rstrip("/")
+            if "ollama.com" in base.lower():
+                response = httpx.get(
+                    f"{base}/models",
+                    headers={
+                        "Authorization": f"Bearer {self._get_api_key(ProviderType.OLLAMA_CLOUD)}",
+                    },
+                    timeout=3.0,
+                )
+            else:
+                if base.endswith("/v1"):
+                    base = base[:-3]
+                response = httpx.get(f"{base}/api/tags", timeout=3.0)
             return response.status_code == 200
         except httpx.HTTPError:
             return False
+
+    def normalize_model_for_endpoint(
+        self, provider: ProviderType, model: str,
+    ) -> str:
+        """Translate local-daemon cloud aliases for Ollama's direct API."""
+        if provider != ProviderType.OLLAMA_CLOUD:
+            return model
+        config = self.PROVIDERS.get(provider)
+        if config is None or "ollama.com" not in config.base_url.lower():
+            return model
+        if model.endswith(":cloud") or model.endswith("-cloud"):
+            return model[:-6]
+        return model
 
     def _check_tier_iv_available(self) -> bool:
         """Return True when Tier IV is reachable, unless explicitly disabled.
@@ -1772,6 +1793,7 @@ class ProviderManager:
                 else self.select_model(config, task_profile)
             )
         )
+        selected_model = self.normalize_model_for_endpoint(resolved, selected_model)
 
         request_kwargs: Dict[str, Any] = {
             "model": selected_model,

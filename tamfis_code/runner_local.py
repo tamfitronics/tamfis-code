@@ -3343,14 +3343,27 @@ def _select_model(
     `hasattr(manager, "fallback_candidates")` checks, since the many
     lightweight fake managers across the test suite only implement the
     handful of ProviderManager methods each specific test actually needs."""
+    selected: str
     if requires_vision:
         select_vision = getattr(manager, "select_vision_model", None)
         if select_vision is not None:
-            return select_vision(config, task_profile)
-    select = getattr(manager, "select_model", None)
-    if select is None:
-        return config.default_model
-    return select(config, task_profile)
+            selected = select_vision(config, task_profile)
+        else:
+            selected = config.default_model
+    else:
+        select = getattr(manager, "select_model", None)
+        selected = config.default_model if select is None else select(config, task_profile)
+    normalize = getattr(manager, "normalize_model_for_endpoint", None)
+    if not callable(normalize):
+        return selected
+    provider = next(
+        (
+            kind for kind, known in getattr(manager, "PROVIDERS", {}).items()
+            if known is config
+        ),
+        None,
+    )
+    return normalize(provider, selected) if provider is not None else selected
 
 
 def _select_fallback_model(
@@ -3411,7 +3424,11 @@ def _select_public_group_model(
     # Match TamfisGPT Remote: spread fresh turns across the eligible models
     # inside the chosen capability ceiling instead of pinning everyone to
     # the first catalog entry.
-    return random.choice(eligible) if eligible else None
+    if not eligible:
+        return None
+    selected = random.choice(eligible)
+    normalize = getattr(manager, "normalize_model_for_endpoint", None)
+    return normalize(provider, selected) if callable(normalize) else selected
 
 
 def _fresh_fallback_route(
@@ -4400,7 +4417,9 @@ async def _attempt_reasoning_plan(
                     if candidate_client is None or candidate_config is None:
                         continue
                     fallback_client = candidate_client
-                    fallback_model = manager.select_model(candidate_config, task_profile)
+                    fallback_model = _select_model(
+                        manager, candidate_config, task_profile,
+                    )
                     provider = candidate
                     break
             if fallback_client is None:
@@ -5635,7 +5654,9 @@ async def _run_local_agent_turn_impl(
                         if candidate_client is None or candidate_config is None:
                             continue
                         fallback_client = candidate_client
-                        fallback_model = manager.select_model(candidate_config, task_profile)
+                        fallback_model = _select_model(
+                            manager, candidate_config, task_profile,
+                        )
                         recovery_provider = candidate
                         break
                 if fallback_client is None:

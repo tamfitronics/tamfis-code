@@ -295,6 +295,29 @@ def test_ollama_primary_uses_kimi_k27_without_extra_usage(monkeypatch):
         ) == "kimi-k2.7-code:cloud"
 
 
+def test_direct_ollama_cloud_endpoint_removes_local_daemon_suffix():
+    manager = ProviderManager.__new__(ProviderManager)
+    direct_config = type("Config", (), {"base_url": "https://ollama.com/v1"})()
+    manager.PROVIDERS = {ProviderType.OLLAMA_CLOUD: direct_config}
+
+    assert manager.normalize_model_for_endpoint(
+        ProviderType.OLLAMA_CLOUD, "kimi-k2.7-code:cloud",
+    ) == "kimi-k2.7-code"
+    assert manager.normalize_model_for_endpoint(
+        ProviderType.OLLAMA_CLOUD, "deepseek-v4-flash:0731-cloud",
+    ) == "deepseek-v4-flash:0731"
+
+
+def test_local_ollama_daemon_keeps_cloud_model_suffix():
+    manager = ProviderManager.__new__(ProviderManager)
+    local_config = type("Config", (), {"base_url": "http://127.0.0.1:11434/v1"})()
+    manager.PROVIDERS = {ProviderType.OLLAMA_CLOUD: local_config}
+
+    assert manager.normalize_model_for_endpoint(
+        ProviderType.OLLAMA_CLOUD, "kimi-k2.7-code:cloud",
+    ) == "kimi-k2.7-code:cloud"
+
+
 def test_researched_provider_routes_expose_exact_vision_models():
     expected = {
         ProviderType.OLLAMA_CLOUD: {
