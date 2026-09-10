@@ -17,6 +17,7 @@ from tamfis_code.runner_local import (
     _scope_tool_arguments,
 )
 from tamfis_code.workspace import classify_root
+from tamfis_code.safety import classify_tool_call_risk
 
 
 def _make_project(root: Path, name: str, *, marker: str = "pyproject.toml") -> Path:
@@ -55,6 +56,18 @@ class ClassifyRootTests(unittest.TestCase):
 
 
 class DetectWorkspaceScopeTests(unittest.TestCase):
+    def test_explicit_project_scope_is_not_dangerous_when_launching_from_admin_root(self):
+        """A named project outside the launch cwd is an authorised scope,
+        not a dangerous path once scope resolution has accepted it."""
+        with tempfile.TemporaryDirectory() as parent, tempfile.TemporaryDirectory() as admin:
+            project = Path(parent) / "tamfisseo"
+            project.mkdir()
+            risk = classify_tool_call_risk(
+                "write_file", {"path": str(project / "page.py")},
+                workspace_root=admin, extra_safe_roots=(project,),
+            )
+            self.assertEqual(risk, "medium")
+
     def test_multi_stack_discovery_selects_only_active_project_roots(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)

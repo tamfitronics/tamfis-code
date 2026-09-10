@@ -7158,7 +7158,7 @@ async def _run_local_agent_turn_impl(
             )
             _tc_risk = classify_tool_call_risk(
                 _tc.name, _tc_args, workspace_root=workspace_root,
-                extra_safe_roots=(scratch_root(session_id),),
+                extra_safe_roots=(scratch_root(session_id), *scope_roots),
             )
             _turn_batch.add(ApprovalAction(
                 _tc.name, _tc_args, purpose=f"Execute {_tc.name}", risk=_tc_risk,
@@ -7196,7 +7196,7 @@ async def _run_local_agent_turn_impl(
                 _tc.call_id for _tc in tool_calls
                 if classify_tool_call_risk(
                     _tc.name, _turn_batch_args[_tc.call_id], workspace_root=workspace_root,
-                    extra_safe_roots=(scratch_root(session_id),),
+                    extra_safe_roots=(scratch_root(session_id), *scope_roots),
                 ) != "read_only"
             }
             if _batch_decision == "approve_session":
@@ -7744,7 +7744,7 @@ async def _run_local_agent_turn_impl(
 
             risk = classify_tool_call_risk(
                 tc.name, arguments, workspace_root=workspace_root,
-                extra_safe_roots=(scratch_root(session_id),),
+                extra_safe_roots=(scratch_root(session_id), *scope_roots),
             )
             permission_decision = _turn_permission_decisions.get(tc.call_id)
 
