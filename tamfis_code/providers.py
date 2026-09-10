@@ -375,6 +375,16 @@ class ProviderManager:
         ProviderType.GROK: 2,
     }
 
+    # Per-model context overrides. ProviderConfig.context_window is a
+    # conservative bucket default; NVIDIA's current Kimi K3 NIM model card
+    # explicitly documents 1,048,576 input tokens.
+    MODEL_CONTEXT_WINDOWS: dict[str, int] = {
+        "moonshotai/kimi-k3": 1_048_576,
+        "deepseek-ai/deepseek-v4-pro": 1_000_000,
+        "deepseek-ai/deepseek-v4-flash": 1_000_000,
+        "nvidia/nemotron-3-ultra-550b-a55b": 1_000_000,
+    }
+
     PROVIDERS: Dict[ProviderType, ProviderConfig] = {
         ProviderType.OLLAMA_CLOUD: ProviderConfig(
             name="Ollama Cloud",
@@ -1164,7 +1174,7 @@ class ProviderManager:
                 getattr(task_profile, "required_context_tokens", 0) or 0
             )
             context_windows = {
-                "moonshotai/kimi-k3": 128000,
+                "moonshotai/kimi-k3": 1_048_576,
                 "deepseek-ai/deepseek-v4-pro": 1000000,
                 "deepseek-ai/deepseek-v4-flash": 1000000,
                 "nvidia/nemotron-3-ultra-550b-a55b": 1000000,
@@ -1182,6 +1192,14 @@ class ProviderManager:
         if config.free_model and not _task_needs_paid_tier(task_profile):
             return config.free_model
         return config.default_model
+
+    def context_window_for_model(
+        self, provider: ProviderType, model: str, config: Optional[ProviderConfig] = None,
+    ) -> int:
+        """Return the route-specific context limit, never a guessed larger one."""
+        if provider == ProviderType.NVIDIA:
+            return self.MODEL_CONTEXT_WINDOWS.get(model, (config or self.PROVIDERS[provider]).context_window)
+        return (config or self.PROVIDERS[provider]).context_window
 
     def model_supports_vision(self, config: ProviderConfig, model: str) -> bool:
         """Return image-input support for the selected model, not merely

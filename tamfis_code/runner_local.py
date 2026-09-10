@@ -5846,7 +5846,12 @@ async def _run_local_agent_turn_impl(
         # max_new_tokens(4096) > 32769 after a long tool-calling session grew
         # working_messages unchecked. Try reclaiming budget from old, large
         # tool outputs first; only give up if that's not enough.
-        token_budget = int(config.context_window * _CONTEXT_SAFETY_MARGIN) - MAX_TOKENS_PER_REQUEST
+        context_window = (
+            manager.context_window_for_model(resolved_provider, resolved_model, config)
+            if hasattr(manager, "context_window_for_model")
+            else config.context_window
+        )
+        token_budget = int(context_window * _CONTEXT_SAFETY_MARGIN) - MAX_TOKENS_PER_REQUEST
         input_tokens = _estimate_tokens(working_messages)
         # Persisted so `tamfis-code doctor` can report real (if estimated,
         # not provider-reported -- no provider response in this codebase
@@ -5948,7 +5953,7 @@ async def _run_local_agent_turn_impl(
                         "payload": {
                             "content": (
                                 f"This turn no longer fits {resolved_provider.value}'s "
-                                f"~{config.context_window}-token context window; switching to "
+                                f"~{context_window}-token context window; switching to "
                                 f"{candidate.value} / {candidate_model} "
                                 f"(~{candidate_config.context_window}-token window) to continue."
                             )
@@ -5956,19 +5961,24 @@ async def _run_local_agent_turn_impl(
                     })
                     resolved_provider, config, client = candidate, candidate_config, candidate_client
                     resolved_model = candidate_model
+                    context_window = (
+                        manager.context_window_for_model(resolved_provider, resolved_model, config)
+                        if hasattr(manager, "context_window_for_model")
+                        else config.context_window
+                    )
                     orchestrator.record_route(
                         provider=resolved_provider.value, model=resolved_model,
                         reason="larger-context provider fallback",
                         fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
                     )
-                    token_budget = candidate_budget
+                    token_budget = int(context_window * _CONTEXT_SAFETY_MARGIN) - MAX_TOKENS_PER_REQUEST
                     break
 
             if input_tokens > token_budget:
                 message = (
                     f"Stopping before round {_round + 1}: this turn has grown to "
                     f"~{input_tokens} estimated tokens, too large for "
-                    f"{resolved_provider.value}'s ~{config.context_window}-token context "
+                    f"{resolved_provider.value}'s ~{context_window}-token context "
                     "window even after compacting tool calls, tool outputs, assistant content, "
                     "old completed cycles, an internal context rollover, and provider fallback. "
                     "Start a new turn to continue (e.g. narrow the objective, or /clear stale context)."

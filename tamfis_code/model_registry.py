@@ -64,7 +64,7 @@ MODELS: dict[str, ModelRecord] = {
     # providers.py) for the same reason.
     "moonshotai/kimi-k3": ModelRecord(
         "moonshotai/kimi-k3", "nvidia",
-        ModelCapabilities(vision=True), 128000,
+        ModelCapabilities(vision=True, long_context=True), 1048576,
         ("multi_file_edit", "planning", "vision_assisted_coding"), "frontier", "medium",
     ),
     # Keep direct xAI and OpenRouter relay routes distinct. TamfisGPT's live
