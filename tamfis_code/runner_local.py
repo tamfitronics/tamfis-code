@@ -3421,12 +3421,22 @@ def _select_public_group_model(
         if requires_vision and not _model_supports_vision(manager, config, candidate):
             continue
         eligible.append(str(candidate))
-    # Match TamfisGPT Remote: spread fresh turns across the eligible models
-    # inside the chosen capability ceiling instead of pinning everyone to
-    # the first catalog entry.
+    # Match TamfisGPT Remote's provider policy. Kimi K3 NIM is the flagship
+    # general-purpose NIM route and wins whenever it survives the capability,
+    # health, and vision filters above. Filtering happens first so a request
+    # that needs a different modality or context is never forced onto Kimi.
     if not eligible:
         return None
-    selected = random.choice(eligible)
+    if provider == ProviderType.NVIDIA:
+        selected = next(
+            (candidate for candidate in eligible
+             if str(candidate).strip().lower() == "moonshotai/kimi-k3"),
+            None,
+        )
+        if selected is None:
+            selected = random.choice(eligible)
+    else:
+        selected = random.choice(eligible)
     normalize = getattr(manager, "normalize_model_for_endpoint", None)
     return normalize(provider, selected) if callable(normalize) else selected
 

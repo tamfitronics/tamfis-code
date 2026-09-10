@@ -36,6 +36,11 @@ def test_tier_is_derived_from_capability_registry_not_hardcoded_per_model():
     assert public_model_name("google/gemini-2.5-flash") == PUBLIC_MODEL_PRO
 
 
+def test_grok_46_routes_have_distinct_live_tier_metadata():
+    assert public_model_name("grok-4.6") == PUBLIC_MODEL_ULTIMA
+    assert public_model_name("x-ai/grok-4.6") == PUBLIC_MODEL_ULTRA
+
+
 def test_public_alias_resolves_to_private_catalog_id_only_at_request_edge():
     selected = resolve_public_model_alias(
         "TamfisGPT Ultra",

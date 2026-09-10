@@ -67,6 +67,21 @@ MODELS: dict[str, ModelRecord] = {
         ModelCapabilities(vision=True), 128000,
         ("multi_file_edit", "planning", "vision_assisted_coding"), "frontier", "medium",
     ),
+    # Keep direct xAI and OpenRouter relay routes distinct. TamfisGPT's live
+    # catalogue classifies direct Grok 4.6 as a Premium-accessible frontier
+    # route (Ultima-quality), while the cheaper relay remains Ultra-quality.
+    "grok-4.6": ModelRecord(
+        "grok-4.6", "grok",
+        ModelCapabilities(vision=True, long_context=True), 500000,
+        ("repository_audit", "multi_file_edit", "debugging", "planning"),
+        "frontier", "high",
+    ),
+    "x-ai/grok-4.6": ModelRecord(
+        "x-ai/grok-4.6", "openrouter",
+        ModelCapabilities(vision=True, long_context=True), 500000,
+        ("repository_audit", "multi_file_edit", "debugging", "planning"),
+        "frontier", "medium",
+    ),
     "moonshotai/Kimi-K2.6": ModelRecord(
         "moonshotai/Kimi-K2.6", "hf",
         ModelCapabilities(parallel_tool_calls=True, long_context=True), 128000,

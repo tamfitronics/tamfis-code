@@ -1152,7 +1152,29 @@ class ProviderManager:
             # A failed NIM deployment is a model-route failure first, not a
             # reason to abandon NIM. The bounded cooldown automatically
             # makes it probe-eligible again later.
+            # Kimi K3 is the flagship general-purpose NIM route, but a
+            # long-context task must not be silently truncated to keep it.
+            # ``requires_long_context`` is a qualitative repository/task
+            # signal in the existing classifier, not proof that this turn
+            # exceeds 128K. Only apply the hard 200K exclusion when a caller
+            # supplies an actual token estimate; otherwise preserve the
+            # established Kimi-first route and let the runner's existing
+            # bounded context accounting decide whether a retry is needed.
+            required_context_tokens = int(
+                getattr(task_profile, "required_context_tokens", 0) or 0
+            )
+            context_windows = {
+                "moonshotai/kimi-k3": 128000,
+                "deepseek-ai/deepseek-v4-pro": 1000000,
+                "deepseek-ai/deepseek-v4-flash": 1000000,
+                "nvidia/nemotron-3-ultra-550b-a55b": 1000000,
+            }
             candidates = [config.default_model, *config.models]
+            if required_context_tokens >= 200000:
+                candidates = [
+                    candidate for candidate in candidates
+                    if context_windows.get(candidate, config.context_window) >= 200000
+                ]
             for candidate in dict.fromkeys(item for item in candidates if item):
                 if self.route_is_healthy(ProviderType.NVIDIA, candidate):
                     return candidate

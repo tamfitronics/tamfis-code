@@ -58,6 +58,19 @@ def test_public_group_selection_picks_among_eligible_models_under_ceiling():
     assert result in {"tamfis-gpt-pro", "tamfis-gpt-ultima"}
 
 
+def test_nim_public_group_prefers_kimi_k3_after_capability_filters():
+    manager = _Manager()
+    nim = _config(
+        "nvidia/nemotron-3-ultra-550b-a55b",
+        "moonshotai/kimi-k3",
+        default="nvidia/nemotron-3-ultra-550b-a55b",
+    )
+
+    assert _select_public_group_model(
+        manager, ProviderType.NVIDIA, nim, None, PUBLIC_MODEL_ULTIMA,
+    ) == "moonshotai/kimi-k3"
+
+
 def test_fallback_diagnostic_names_model_groups_not_generic_provider():
     message = _public_model_fallback_message(
         "tamfis-gpt-pro", "tamfis-gpt-ultima", "HTTP 429",
