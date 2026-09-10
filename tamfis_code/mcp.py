@@ -1721,6 +1721,17 @@ class MCPServer:
                 self._sandbox_unavailable_warned = True
                 return {"error": str(exc), "success": False}
             argv = sandbox_command.argv
+            if sandbox_command.env_overrides:
+                # Corrects HOME/USER/LOGNAME to the workspace's owning
+                # account when this command is running dropped-to that uid
+                # (see sandbox.py's resolve_workspace_owner) -- applied
+                # after the caller's own `environment` override so this
+                # always wins for these specific keys; the process uid
+                # itself is already correct by this point (bwrap --uid/
+                # --gid, or the runuser wrapper), this just keeps tools
+                # like npm/git from resolving config/cache against root's
+                # home directory despite running as a different uid.
+                env.update(sandbox_command.env_overrides)
         try:
             proc = await asyncio.create_subprocess_exec(
                 *argv,
