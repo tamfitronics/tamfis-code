@@ -1385,6 +1385,14 @@ def _same_route_reconnectable(manager: Any, exc: Exception) -> bool:
     if not manager.is_retryable_provider_error(exc):
         return False
     status = manager.provider_error_status(exc) if hasattr(manager, "provider_error_status") else None
+    # A provider SDK timeout has already consumed the request's complete
+    # network timeout (120 seconds in the OpenAI-compatible clients used by
+    # this runtime). Repeating that identical route three more times caused
+    # one live task to spend over eight minutes on a dead deployment before
+    # trying a healthy provider. Treat it like 429/402: retryable across
+    # providers, but not on the same route.
+    if isinstance(exc, TimeoutError) or "timeout" in type(exc).__name__.lower():
+        return False
     # Credentials/payment/rate limits will not repair themselves within the
     # short reconnect window. AUTO can move to the next external route
     # immediately for these statuses. In particular, retrying a 429 here used
@@ -3404,6 +3412,47 @@ def _select_public_group_model(
     # inside the chosen capability ceiling instead of pinning everyone to
     # the first catalog entry.
     return random.choice(eligible) if eligible else None
+
+
+def _fresh_fallback_route(
+    manager: Any,
+    current: ProviderType,
+    task_profile: Any,
+    requested_model: Any,
+    *,
+    requires_vision: bool = False,
+    allow_premium_primary: bool = False,
+) -> tuple[ProviderType, Any, Any, str] | None:
+    """Re-evaluate provider health after an exhausted fallback snapshot.
+
+    A fallback chain can take minutes. Its candidate list was previously
+    captured only once, so a route whose short circuit-breaker expired while
+    another provider timed out was never reconsidered; the turn failed and
+    required a manual ``continue`` even though a usable route was healthy by
+    then. This performs one fresh, policy-filtered lookup. The caller bounds
+    its use to one recovery sweep per turn, preventing retry loops.
+    """
+    for candidate in _fallback_candidates_for_turn(
+        manager,
+        current,
+        task_profile,
+        allow_premium_primary=allow_premium_primary,
+    ):
+        candidate_client = manager.get_client(candidate)
+        candidate_config = manager.PROVIDERS.get(candidate)
+        if candidate_client is None or candidate_config is None:
+            continue
+        candidate_model = _select_public_group_model(
+            manager,
+            candidate,
+            candidate_config,
+            task_profile,
+            requested_model,
+            requires_vision=requires_vision,
+        )
+        if candidate_model is not None:
+            return candidate, candidate_config, candidate_client, candidate_model
+    return None
 
 
 def _public_model_fallback_message(failed_model: str, candidate_model: str, reason: str) -> str:
@@ -5658,6 +5707,7 @@ async def _run_local_agent_turn_impl(
     _round = -1
     _round_extensions_used = 0
     _round_window_size = max_rounds
+    provider_exhaustion_recoveries = 0
     while True:
         _round += 1
         if _round >= max_rounds:
@@ -6149,6 +6199,66 @@ async def _run_local_agent_turn_impl(
                     fallback_succeeded = True
                     break
             if not fallback_succeeded:
+                # Candidate health is dynamic. The list used by the loop
+                # above was a snapshot taken before potentially lengthy
+                # timeouts/reconnects. Re-evaluate it once before declaring
+                # the whole task failed; in the live incident that motivated
+                # this, a previously cooled route had recovered while four
+                # 120-second requests ran, but was absent from the stale
+                # list and the user was unnecessarily told to type continue.
+                recovered_route = None
+                if (
+                    can_fallback
+                    and provider_exhaustion_recoveries < 1
+                    and manager.is_retryable_provider_error(last_error)
+                ):
+                    recovered_route = _fresh_fallback_route(
+                        manager,
+                        failed_provider,
+                        task_profile,
+                        model,
+                        requires_vision=bool(image_content_blocks),
+                        allow_premium_primary=manager.is_quota_or_rate_limit_error(last_error),
+                    )
+                if recovered_route is not None:
+                    provider_exhaustion_recoveries += 1
+                    (
+                        resolved_provider,
+                        config,
+                        client,
+                        resolved_model,
+                    ) = recovered_route
+                    if interrupted_partial.strip():
+                        working_messages.extend([
+                            {"role": "assistant", "content": interrupted_partial},
+                            {"role": "system", "content": STREAM_RECONNECT_INSTRUCTION},
+                        ])
+                        interrupted_partial = ""
+                    checkpoint_partial_parts.clear()
+                    orchestrator.mark_repair(
+                        "Provider snapshot exhausted; a route recovered during fallback, "
+                        f"continuing on {resolved_provider.value}",
+                        provider_switch=True,
+                    )
+                    orchestrator.record_route(
+                        provider=resolved_provider.value,
+                        model=resolved_model,
+                        reason="fresh provider-health recovery after fallback exhaustion",
+                        fallback_chain=_standalone_fallback_chain_names(
+                            manager, resolved_provider,
+                        ),
+                    )
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {
+                            "content": (
+                                "A TamfisGPT route recovered while other routes were being tried; "
+                                "continuing the checkpointed task automatically."
+                            ),
+                        },
+                    })
+                    _persist_turn_checkpoint(status="running")
+                    continue
                 if not can_fallback:
                     orchestrator.mark_repair(f"Provider/tool round failed, no fallback available: {last_error}")
                 detail = str(last_error).strip() or type(last_error).__name__

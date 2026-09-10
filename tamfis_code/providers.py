@@ -1440,6 +1440,12 @@ class ProviderManager:
                     # user objective; another configured route can continue
                     # from the durable checkpoint and completed tool results.
                     or "unterminated string starting at" in message
+                    # Alternate parser wording for a streamed tool call
+                    # checkpointed before its JSON argument string closed.
+                    # The next provider request repairs that history in
+                    # provider_protocols.system_messages_first.
+                    or "must be a valid json object string" in message
+                    or "eof while parsing a string" in message
                     # FIX (2026-09-05, operator report): tamfis-code appends
                     # a role="system" correction/nudge message mid-
                     # conversation in ~15 places (NARRATED_TOOL_CORRECTION,

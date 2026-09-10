@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from tamfis_code.provider_protocols import (
@@ -50,6 +52,44 @@ def test_system_message_with_list_content_is_flattened_to_text():
 def test_no_system_messages_returns_transcript_unchanged():
     messages = [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "hello"}]
     assert system_messages_first(messages) == messages
+
+
+def test_malformed_checkpointed_tool_arguments_are_repaired_for_provider():
+    messages = [{
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": "call-1",
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "arguments": '{"path":"/tmp/example","content":"truncated',
+            },
+        }],
+    }]
+
+    normalized = system_messages_first(messages)
+    arguments = normalized[0]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(arguments) == {
+        "_tamfis_code_recovered": "malformed historical tool arguments omitted",
+    }
+    # Provider normalization must not corrupt the durable checkpoint object.
+    assert messages[0]["tool_calls"][0]["function"]["arguments"].endswith("truncated")
+
+
+def test_dictionary_tool_arguments_are_serialized_as_json_object_string():
+    messages = [{
+        "role": "assistant",
+        "tool_calls": [{
+            "id": "call-1",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": {"path": "a.py"}},
+        }],
+    }]
+
+    normalized = system_messages_first(messages)
+    arguments = normalized[0]["tool_calls"][0]["function"]["arguments"]
+    assert json.loads(arguments) == {"path": "a.py"}
 
 
 def test_blank_system_messages_do_not_produce_an_empty_leading_message():

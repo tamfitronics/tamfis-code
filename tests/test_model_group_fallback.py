@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from tamfis_code.providers import ProviderType
 from tamfis_code.public_identity import PUBLIC_MODEL_SMART, PUBLIC_MODEL_ULTIMA
 from tamfis_code.runner_local import (
+    _fresh_fallback_route,
     _public_model_fallback_message,
     _select_public_group_model,
 )
@@ -67,3 +68,36 @@ def test_fallback_diagnostic_names_model_groups_not_generic_provider():
         "falling back to TamfisGPT-Ultima."
     )
     assert "Provider TamfisGPT" not in message
+
+
+def test_fresh_fallback_route_rechecks_current_provider_health_snapshot():
+    recovered_client = object()
+    recovered_config = _config("tamfis-gpt-pro", default="tamfis-gpt-pro")
+
+    class RecoveryManager(_Manager):
+        PROVIDERS = {ProviderType.GROK: recovered_config}
+
+        def fallback_candidates(
+            self, current, task_profile, *, allow_premium_primary=False,
+        ):
+            assert current == ProviderType.OPENROUTER
+            assert allow_premium_primary is True
+            return [ProviderType.GROK]
+
+        def get_client(self, provider):
+            return recovered_client if provider == ProviderType.GROK else None
+
+    route = _fresh_fallback_route(
+        RecoveryManager(),
+        ProviderType.OPENROUTER,
+        None,
+        PUBLIC_MODEL_ULTIMA,
+        allow_premium_primary=True,
+    )
+
+    assert route is not None
+    provider, config, client, model = route
+    assert provider == ProviderType.GROK
+    assert config is recovered_config
+    assert client is recovered_client
+    assert model == "tamfis-gpt-pro"

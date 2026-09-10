@@ -633,6 +633,19 @@ def test_provider_side_unterminated_json_400_is_retryable():
     assert ProviderManager.is_retryable_provider_error(exc)
 
 
+def test_checkpointed_tool_argument_eof_400_is_retryable():
+    class BadRequest(Exception):
+        status_code = 400
+
+    exc = BadRequest(
+        "Validation: `messages[48].tool_calls[0].function.arguments` must be "
+        "a valid JSON object string: EOF while parsing a string at line 1 "
+        "column 17234"
+    )
+
+    assert ProviderManager.is_retryable_provider_error(exc)
+
+
 def test_http_422_is_retryable_provider_failure():
     # 422 was previously missing from the explicit retryable status set --
     # it hit the same "Provider streaming failed ... type `continue` to

@@ -1,6 +1,7 @@
 """Provider-specific stream normalization into canonical internal events."""
 from __future__ import annotations
 
+import json
 from typing import Any
 
 
@@ -46,7 +47,69 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
         for message in messages
         if message.get("role") == "system"
     ]
-    remainder = [message for message in messages if message.get("role") != "system"]
+
+    def _provider_safe_message(message: dict[str, Any]) -> dict[str, Any]:
+        """Repair only malformed historical function arguments.
+
+        An interrupted streamed tool call can be checkpointed after its
+        name/id arrive but before its JSON argument string closes. Sending
+        that truncated history verbatim makes every provider reject the
+        conversation before it can continue. The corresponding tool result
+        remains in the transcript, so replace only the malformed arguments
+        with an explicit, valid object and leave the durable checkpoint
+        untouched.
+        """
+        if message.get("role") != "assistant" or not message.get("tool_calls"):
+            return message
+        repaired_calls: list[Any] = []
+        changed = False
+        for call in message.get("tool_calls") or []:
+            if not isinstance(call, dict):
+                repaired_calls.append(call)
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                repaired_calls.append(call)
+                continue
+            arguments = function.get("arguments", "")
+            valid = False
+            if isinstance(arguments, str):
+                try:
+                    valid = isinstance(json.loads(arguments), dict)
+                except (TypeError, ValueError):
+                    valid = False
+                if valid:
+                    repaired_calls.append(call)
+                    continue
+            elif isinstance(arguments, dict):
+                arguments = json.dumps(arguments, separators=(",", ":"))
+                valid = True
+            if valid:
+                repaired_calls.append({
+                    **call,
+                    "function": {**function, "arguments": arguments},
+                })
+                changed = True
+                continue
+            repaired_calls.append({
+                **call,
+                "function": {
+                    **function,
+                    "arguments": json.dumps({
+                        "_tamfis_code_recovered": (
+                            "malformed historical tool arguments omitted"
+                        ),
+                    }),
+                },
+            })
+            changed = True
+        return {**message, "tool_calls": repaired_calls} if changed else message
+
+    remainder = [
+        _provider_safe_message(message)
+        for message in messages
+        if message.get("role") != "system"
+    ]
     combined_text = "\n\n".join(text for text in system_texts if text.strip())
     if not combined_text:
         return remainder

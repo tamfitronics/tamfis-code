@@ -82,6 +82,16 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
             )
         )
 
+    def test_provider_timeout_moves_directly_to_cross_provider_fallback(self):
+        class APITimeoutError(Exception):
+            pass
+
+        self.assertFalse(
+            _same_route_reconnectable(
+                _FakeManager(), APITimeoutError("Request timed out"),
+            )
+        )
+
     def _run_one_retry_then_succeed(self, *, debug: bool) -> _EventCollectingRenderer:
         renderer = _EventCollectingRenderer(debug=debug)
         attempts = {"count": 0}
