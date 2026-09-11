@@ -18,7 +18,7 @@ class GuardDecision:
     fingerprint: str = ""
     # True only when `terminal` was caused by the wall-clock budget running
     # out -- one of two failure modes a caller may recover from by granting a
-    # fresh window (extend_runtime/extend_tool_call_budget) instead of ending
+    # fresh window (renew_epoch/extend_tool_call_budget) instead of ending
     # the task. Every other terminal reason (repeated actions, stalls)
     # reflects the agent making no real progress and must stay a hard
     # failure.
@@ -27,6 +27,11 @@ class GuardDecision:
     # (see max_tool_call_extensions on RuntimeBudgets for why this needed its
     # own extension, separate from the wall-clock one).
     tool_call_budget_exhausted: bool = False
+    # True when the controller is asking the caller to checkpoint and renew
+    # the execution epoch (a bounded wall-clock window) rather than fail the
+    # task. This is the recoverable form of time exhaustion: the task itself
+    # is healthy and making progress; only the epoch expired.
+    epoch_renewal_requested: bool = False
 
 
 @dataclass(frozen=True)
@@ -49,28 +54,63 @@ class ExecutionController:
         self.started_at = time.monotonic()
         self._last_action = ""
         self._last_observation = ""
+        # Execution-epoch tracking: each epoch is a bounded wall-clock window
+        # inside one task. A task may span many epochs; only genuine
+        # no-progress conditions (not elapsed time) end the task.
+        self.epoch_index = 0
+        self.epoch_started_at = time.monotonic()
+        self.epoch_renewals = 0
+        self._epoch_renewal_requested = False
 
     def _fail(self, reason: str) -> None:
         if not self.snapshot.terminal:
             self.snapshot.failure_reason = reason
             self.snapshot.transition(RuntimePhase.FAILED)
 
-    def extend_runtime(self) -> bool:
-        """Grant one more turn's worth of wall-clock budget instead of
-        ending the task, when the only reason execution stopped is time.
+    # ------------------------------------------------------------------
+    # Execution-epoch lifecycle
+    # ------------------------------------------------------------------
 
-        Returns False once the extension allowance itself is exhausted --
-        at that point the caller must treat the timeout as final. A
-        successful extension clears a FAILED phase that was set purely by
-        `_check_time()` so execution can resume; it bypasses the normal
-        transition table on purpose, since FAILED has no legal outgoing
-        transitions and this is the one case where that's meant to be
-        reversible.
+    def epoch_elapsed(self) -> float:
+        return time.monotonic() - self.epoch_started_at
+
+    def epoch_remaining(self) -> float:
+        return max(0.0, self.budgets.max_runtime_seconds - self.epoch_elapsed())
+
+    def epoch_exhausted(self) -> bool:
+        return self.epoch_elapsed() >= self.budgets.max_runtime_seconds
+
+    def epoch_renewal_due(self) -> bool:
+        """True when the current epoch is at/inside the grace threshold and
+        the task is healthy (making progress), so the caller should
+        checkpoint and renew the epoch instead of failing the task."""
+        if self._epoch_renewal_requested:
+            return True
+        grace = self.budgets.runtime_renewal_grace_seconds
+        return self.epoch_remaining() <= grace
+
+    def request_epoch_renewal(self) -> None:
+        """Mark that the next guard check should ask for a checkpoint +
+        epoch renewal instead of failing the task on time."""
+        self._epoch_renewal_requested = True
+
+    def renew_epoch(self) -> bool:
+        """Close the exhausted epoch and open a fresh bounded one.
+
+        This is the canonical runtime-renewal mechanism: one bounded epoch
+        at a time, renewed only while the task is healthy and making
+        progress. Bounded by max_runtime_extensions so a runaway task
+        cannot renew forever; every other guard (repeated actions, empty
+        observations, stalls) still applies across the whole task.
         """
         if self.snapshot.runtime_extensions >= self.budgets.max_runtime_extensions:
             return False
         self.snapshot.runtime_extensions += 1
-        self.started_at = time.monotonic()
+        self.epoch_index += 1
+        self.epoch_renewals += 1
+        self.epoch_started_at = time.monotonic()
+        self.started_at = self.epoch_started_at
+        self._epoch_renewal_requested = False
         if self.snapshot.phase == RuntimePhase.FAILED and self.snapshot.failure_reason.startswith(
             "Runtime budget exhausted"
         ):
@@ -78,11 +118,20 @@ class ExecutionController:
             self.snapshot.failure_reason = ""
         return True
 
+    def extend_runtime(self) -> bool:
+        """Grant one more turn's worth of wall-clock budget instead of
+        ending the task, when the only reason execution stopped is time.
+
+        Alias of renew_epoch(): kept for backward compatibility with
+        existing call sites (orchestrator/engine.py's guard_tool_call).
+        """
+        return self.renew_epoch()
+
     def extend_tool_call_budget(self) -> bool:
         """Grant one more window of tool calls instead of ending the task,
         when the only reason execution stopped is the raw tool-call count.
 
-        Mirrors extend_runtime(). Safe to grant unconditionally (bounded by
+        Mirrors renew_epoch(). Safe to grant unconditionally (bounded by
         max_tool_call_extensions) the same way the wall-clock extension is:
         a genuinely stalled or looping agent is still caught by the
         repeated-action and empty-observation guards regardless of this
@@ -103,7 +152,7 @@ class ExecutionController:
         return True
 
     def _check_time(self) -> str:
-        elapsed = time.monotonic() - self.started_at
+        elapsed = self.epoch_elapsed()
         if elapsed >= self.budgets.max_runtime_seconds:
             return f"Runtime budget exhausted after {int(elapsed)} seconds."
         return ""
@@ -119,8 +168,12 @@ class ExecutionController:
     def guard_action(self, tool_name: str, arguments: dict[str, Any]) -> GuardDecision:
         timeout = self._check_time()
         if timeout:
-            self._fail(timeout)
-            return GuardDecision(False, True, timeout, time_budget_exhausted=True)
+            # Time exhaustion is recoverable: ask for checkpoint + epoch
+            # renewal instead of failing the task outright.
+            self._epoch_renewal_requested = True
+            return GuardDecision(
+                False, True, timeout, time_budget_exhausted=True, epoch_renewal_requested=True,
+            )
         if self.snapshot.terminal:
             return GuardDecision(False, True, self.snapshot.failure_reason or "Runtime is terminal.")
         effective_tool_call_budget = self.budgets.max_tool_calls * (1 + self.snapshot.tool_call_extensions)
@@ -228,7 +281,7 @@ class ExecutionController:
         max_repair_extensions -- see budgets.py for why record_repair's
         counter is shared across unrelated recovery classes and can run out
         on infra noise before the model gets a real shot at the actual
-        failure. Like extend_runtime(), reverses a FAILED phase that was
+        failure. Like renew_epoch(), reverses a FAILED phase that was
         set purely by this exhaustion so execution can resume."""
         if self.snapshot.repair_extensions >= self.budgets.max_repair_extensions:
             return False

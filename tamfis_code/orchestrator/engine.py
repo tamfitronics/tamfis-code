@@ -238,19 +238,21 @@ class AgentOrchestrator:
         if not decision.allowed and decision.time_budget_exhausted:
             # Running out of wall-clock time mid-task isn't the same kind of
             # failure as a stalled or looping agent -- it just means the
-            # turn needs to keep going. Grant a fresh budget and re-check
-            # (which still applies every other guard -- tool-call ceiling,
-            # repeated-action detection -- against the unmodified state) up
-            # to max_runtime_extensions before treating it as final.
-            if self.run.runtime.extend_runtime():
+            # execution epoch expired. Checkpoint the current task state,
+            # renew the epoch, and continue the same task (see
+            # ExecutionController.renew_epoch). Bounded by
+            # max_runtime_extensions before treating it as final.
+            if self.run.runtime.epoch_renewal_due() or decision.epoch_renewal_requested:
+                self._checkpoint_before_epoch_renewal()
+            if self.run.runtime.renew_epoch():
                 extensions = self.run.runtime.snapshot.runtime_extensions
                 limit = self.run.runtime.budgets.max_runtime_extensions
                 self.emit({
                     "event_type": "diagnostics",
                     "payload": {
                         "content": (
-                            f"Turn budget reached -- starting turn {extensions + 1} "
-                            f"(extension {extensions}/{limit}) instead of ending the task."
+                            f"↻ Runtime epoch renewed; continuing current task "
+                            f"(epoch {self.run.runtime.epoch_index}, renewal {extensions}/{limit})."
                         ),
                     },
                 })
@@ -277,6 +279,31 @@ class AgentOrchestrator:
         if not decision.allowed:
             self.emit({"event_type": "diagnostics", "payload": {"content": decision.reason}})
         return decision
+
+    def _checkpoint_before_epoch_renewal(self) -> None:
+        """Atomically persist task state before closing an exhausted epoch.
+
+        Uses the session's existing durable task ledger (state.task_checkpoint)
+        so the checkpoint survives process interruption and provider switches,
+        and records the next intended action so the resumed epoch (or a fresh
+        process) can continue without rediscovery.
+        """
+        assert self.run is not None
+        try:
+            local_state.task_checkpoint(
+                self.session_id,
+                reason="epoch_renewal",
+                next_action=self.run.objective[-500:],
+                phase=self.run.phase.value,
+                epoch_index=self.run.runtime.epoch_index,
+                runtime_extensions=self.run.runtime.snapshot.runtime_extensions,
+                tool_calls=self.run.runtime.snapshot.tool_calls,
+                evidence_items=self.run.runtime.snapshot.evidence_items,
+            )
+        except Exception:
+            # Checkpointing must never block the renewal itself; the live
+            # runtime state remains the source of truth for this process.
+            pass
 
     def waiting_for_approval(self, purpose: str) -> None:
         self.transition(AgentPhase.WAITING_FOR_APPROVAL, action=purpose)

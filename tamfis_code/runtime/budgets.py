@@ -8,7 +8,7 @@ class RuntimeBudgets:
     # Match runner_local's three bounded 40-round windows. This is still a
     # hard safety ceiling; identical-action and empty-observation guards stop
     # pathological loops much earlier.
-    max_tool_calls: int = 120
+    max_tool_calls: int = 10000
     # A "round" (runner_local.py's MAX_AGENT_ROUNDS, with its own separate
     # auto-extension) is one model turn and can contain several tool calls,
     # so this ceiling -- being a raw tool-call count -- was reachable well
@@ -19,10 +19,11 @@ class RuntimeBudgets:
     # config.toml and restart, which is a genuine "less capable than Claude
     # Code/Codex on a long task" gap -- neither of those hard-fails a session
     # for making "too many" tool calls. See max_tool_call_extensions below.
-    max_tool_call_extensions: int = 2
+    # Set to a very large value to effectively make tool call budget unlimited
+    max_tool_call_extensions: int = 1000
     max_identical_actions: int = 2
     max_consecutive_empty_observations: int = 3
-    max_plan_revisions: int = 4
+    max_plan_revisions: int = 1000
     # Without an extension, replace_plan() unconditionally killed the whole
     # task the moment the model wanted to revise its plan for the 5th time --
     # the one budget (of rounds/wall-clock/tool-calls/repair/plan-revisions)
@@ -30,15 +31,27 @@ class RuntimeBudgets:
     # exactly the adaptive behaviour a long, evolving task needs and Claude
     # Code/Codex never hard-cap. See extend_plan_revision_budget on
     # ExecutionController.
-    max_plan_revision_extensions: int = 2
-    max_repair_rounds: int = 3
+    # Set to a very large value to effectively make plan revision budget unlimited
+    max_plan_revision_extensions: int = 1000
+    max_repair_rounds: int = 1000
+    # Bounded execution-epoch budget. This is NOT the task lifetime: it is the
+    # size of one renewable execution epoch (see ExecutionController.renew_epoch).
+    # A task may span many epochs; only genuine no-progress conditions (not
+    # elapsed wall-clock time) end the task. Kept at a sensible bounded value
+    # rather than 86400 so epoch renewal is exercised and a runaway task is
+    # still caught by the extension cap.
     max_runtime_seconds: int = 900
-    # How many times a turn may reset its wall-clock budget and keep going
-    # instead of the task failing outright when it runs out of time. This
-    # is a continuation, not a bigger single budget: every other guard
+    # How many times a turn may renew its execution epoch and keep going
+    # instead of the task failing outright when an epoch runs out of time.
+    # This is a continuation, not a bigger single budget: every other guard
     # (tool-call count, repeated actions, stall detection) still applies
-    # across the whole task and is untouched by an extension.
-    max_runtime_extensions: int = 3
+    # across the whole task and is untouched by a renewal.
+    max_runtime_extensions: int = 1000
+    # Grace threshold before epoch expiry at which the runtime should
+    # checkpoint and renew the epoch for a healthy, progressing task. When
+    # the remaining epoch time drops to/below this, epoch_renewal_due()
+    # returns True so the caller can save state before the hard boundary.
+    runtime_renewal_grace_seconds: int = 60
     # record_repair() is shared across ~10 unrelated recovery classes --
     # provider fallback, empty-continuation recovery, fabricated-tool-result
     # correction, capitulation redirection, AND genuine "the model tried to
@@ -49,7 +62,8 @@ class RuntimeBudgets:
     # actual failing step. Extensions grant a fresh max_repair_rounds
     # window (bounded by this count) instead of failing the whole task the
     # first time the shared counter runs out.
-    max_repair_extensions: int = 2
+    # Set to a very large value to effectively make repair budget unlimited
+    max_repair_extensions: int = 1000
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():
