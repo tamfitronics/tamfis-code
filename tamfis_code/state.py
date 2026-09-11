@@ -714,12 +714,47 @@ def _derive_session_title(text: str) -> str:
     return seed[:60] + ("…" if len(seed) > 60 else "")
 
 
+def best_effort_session_label(state: SessionState) -> str:
+    """One-line summary of what a session was/is doing, straight from
+    already-recorded activity (active_task objective, then
+    conversation_summary, then the last user turn) -- no persisted
+    session_title required. Empty string if nothing usable is recorded yet
+    (a session with no turns at all). Each seed is whitespace-collapsed
+    onto one line and capped by _derive_session_title, so a multi-line
+    objective can never inject a raw newline into the resume picker's or
+    footer's single-line rendering.
+
+    Shared by session_display_title's fallback below and workspace.py's
+    `_describe_session_activity` (its "detail" line): confirmed live, a
+    session whose first turn hadn't finished yet (or predates the
+    session_title feature) showed as a bare "Session 1380884423" in the
+    resume picker and footer -- unusable for telling several such sessions
+    apart -- even though its active_task objective or last message was
+    sitting right there in state.json the whole time.
+    """
+    objective = str((state.active_task or {}).get("objective") or "").strip()
+    if objective:
+        return _derive_session_title(objective)
+    if state.conversation_summary:
+        last_line = state.conversation_summary.strip().splitlines()[-1]
+        if last_line:
+            return _derive_session_title(last_line)
+    for entry in reversed(state.conversation_history):
+        if entry.get("role") == "user" and str(entry.get("content") or "").strip():
+            return _derive_session_title(str(entry["content"]).strip().splitlines()[0])
+    return ""
+
+
 def session_display_title(session_id: int) -> str:
     """Stable display name for a session, for the resume picker, the
-    `sessions` listing, and the persistent footer. Falls back to a generic
-    label before the session's first turn has completed and set
-    `session_title` for good."""
-    return get_session_state(session_id).session_title or f"Session {session_id}"
+    `sessions` listing, and the persistent footer. Prefers the persisted
+    session_title (set once, from the first completed turn); before that
+    exists, falls back to best_effort_session_label's live snapshot of
+    current activity, and only when even that is empty (a session with
+    nothing recorded yet) to a generic "Session N" label.
+    """
+    state = get_session_state(session_id)
+    return state.session_title or best_effort_session_label(state) or f"Session {session_id}"
 
 
 def set_session_archived(session_id: int, archived: bool) -> None:

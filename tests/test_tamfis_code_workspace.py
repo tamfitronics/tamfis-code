@@ -568,6 +568,18 @@ class ListResumableLocalSessionsTests(unittest.TestCase):
         infos = list_resumable_local_sessions()
         self.assertEqual(infos[0].title, "Fix the flaky auth test")
 
+    def test_title_falls_back_to_live_activity_before_session_title_is_set(self):
+        # A session mid-task (or interrupted before its first turn ever
+        # completed) has no session_title yet, but its active_task
+        # objective is already known -- the picker must show that, not a
+        # bare "Session 5" indistinguishable from every other such session.
+        state_module.save_session_state(
+            5, workspace_root="/a",
+            active_task={"objective": "Fix intelligent routing pipeline"},
+        )
+        infos = list_resumable_local_sessions()
+        self.assertEqual(infos[0].title, "Fix intelligent routing pipeline")
+
 
 class ResolveSwarmSubtaskWorkspaceTests(unittest.TestCase):
     """Unlike resolve_local_workspace, this must NEVER reuse an existing

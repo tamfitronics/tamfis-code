@@ -513,17 +513,7 @@ def _describe_session_activity(state: local_state.SessionState) -> str:
     picker -- the same information `/resume` already prints (active_task
     objective, then conversation_summary, then the last user turn) but
     trimmed to a single short line instead of a full recap block."""
-    objective = str((state.active_task or {}).get("objective") or "").strip()
-    if objective:
-        return objective[:100]
-    if state.conversation_summary:
-        last_line = state.conversation_summary.strip().splitlines()[-1]
-        if last_line:
-            return last_line[:100]
-    for entry in reversed(state.conversation_history):
-        if entry.get("role") == "user" and str(entry.get("content") or "").strip():
-            return str(entry["content"]).strip().splitlines()[0][:100]
-    return "no recent activity"
+    return local_state.best_effort_session_label(state) or "no recent activity"
 
 
 def _session_status(state: local_state.SessionState) -> str:
