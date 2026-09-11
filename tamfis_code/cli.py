@@ -1923,7 +1923,7 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
                 raise SystemExit(EXIT_TASK_FAILED)
             from .resume_picker import run_resume_picker
 
-            action, picked_id = run_resume_picker(candidates)
+            action, picked_id = await run_resume_picker(candidates)
             if action == "quit":
                 console.print("[dim]Cancelled.[/dim]")
                 return

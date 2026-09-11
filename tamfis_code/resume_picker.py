@@ -215,16 +215,24 @@ def render_picker(state: PickerState, *, width: int) -> list[tuple[str, str]]:
     return fragments
 
 
-def run_resume_picker(
+async def run_resume_picker(
     rows: list[ResumableSessionInfo], *, input: Any = None, output: Any = None,
 ) -> tuple[Action, Optional[int]]:
     """Run the full-screen picker to completion and return the chosen
     action ("resume"/"new"/"quit") plus a session id (only for "resume").
-    Blocks until the user resumes a session, asks to start a new one
+    Awaits until the user resumes a session, asks to start a new one
     (Esc), or cancels (Ctrl+C) -- thin prompt_toolkit glue over PickerState/
     render_picker above, not itself unit tested for the same reason
     interactive.py's own REPL loop isn't: the logic worth testing already
     lives in the pure functions it calls.
+
+    Must be awaited, never driven via the synchronous `Application.run()`:
+    the caller (cli.py's `resume` command) is itself a coroutine already
+    running inside `asyncio.run()` (see async_command/_run_async), and
+    `Application.run()` starts its own `asyncio.run()` internally -- which
+    raises "asyncio.run() cannot be called from a running event loop" the
+    moment it's invoked from inside one, confirmed live the first time
+    `tamfis-code resume` was actually run after this was added.
 
     `input`/`output` are forwarded to prompt_toolkit's Application
     unchanged (its own testing hooks -- e.g. create_pipe_input()/
@@ -329,5 +337,5 @@ def run_resume_picker(
         layout=layout, key_bindings=bindings, full_screen=True,
         mouse_support=False, style=style, input=input, output=output,
     )
-    app.run()
+    await app.run_async()
     return result["action"], result["session_id"]
