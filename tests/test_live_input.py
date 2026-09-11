@@ -223,6 +223,21 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertEqual(cfg.approval_policy, "accept-edits")
         self.assertEqual(renderer._mode_label, "accept-edits")
 
+    def test_second_ctrl_c_during_enqueue_control_does_not_crash(self):
+        # Regression test: a rapid second/third Ctrl+C while this write is
+        # still in flight used to raise a raw KeyboardInterrupt mid-call
+        # (confirmed live, inside state.py's redact_secrets) -- this call
+        # site is itself already reacting to the first interrupt, so a
+        # further one here must not escape as an unhandled crash.
+        renderer = StreamRenderer(_console())
+        cfg = _config("ask")
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=cfg)
+        with patch(
+            "tamfis_code.live_input.local_state.enqueue_instruction",
+            side_effect=KeyboardInterrupt,
+        ):
+            listener._enqueue_control("cancel")  # must not raise
+
     def test_incomplete_escape_sequence_is_not_dropped_prematurely(self):
         renderer = StreamRenderer(_console())
         cfg = _config("ask")

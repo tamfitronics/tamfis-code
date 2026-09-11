@@ -70,6 +70,35 @@ async def test_runtime_cancel_cancels_active_operation():
 
 
 @pytest.mark.asyncio
+async def test_a_second_ctrl_c_during_cancellation_cleanup_does_not_crash(monkeypatch, isolated_state):
+    """Regression test: a rapid second/third Ctrl+C from an impatient user
+    used to raise a raw KeyboardInterrupt *inside* this cleanup block's own
+    state-writing calls (confirmed live, inside state.py's redact_secrets
+    mid regex substitution) -- crashing the graceful-cancellation path
+    with an ugly nested traceback instead of completing the shutdown. The
+    caller must still see exactly one asyncio.CancelledError, never a
+    KeyboardInterrupt escaping in its place."""
+    import tamfis_code.runtime.unified as unified
+
+    monkeypatch.setattr(
+        unified.local_state, "mark_turn_checkpoint_interrupted",
+        lambda *a, **k: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    runtime = UnifiedAgentRuntime()
+    request = ExecutionRequest(ExecutionMode.LOCAL_AGENT, session_id=11, objective="cancel")
+
+    async def operation():
+        await asyncio.Event().wait()
+
+    task = asyncio.create_task(runtime._run_exclusive(request, operation))
+    await asyncio.sleep(0)
+    assert runtime.cancel() is True
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert not runtime.active
+
+
+@pytest.mark.asyncio
 async def test_runtime_does_not_turn_unavailable_telemetry_into_task_failure(monkeypatch):
     import tamfis_code.runtime.unified as unified
 

@@ -8,6 +8,7 @@ controller contract.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 import uuid
 from dataclasses import dataclass, field
@@ -171,14 +172,28 @@ class UnifiedAgentRuntime:
                     result = await self._active_task
                 except asyncio.CancelledError:
                     self.controller.fail("Execution cancelled by user.")
-                    if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
-                        local_state.mark_turn_checkpoint_interrupted(
-                            request.session_id, error="Execution cancelled by user.",
-                        )
-                    duration_ms = int((time.monotonic() - started) * 1000)
-                    self.history.append(ExecutionRecord(request.mode, "cancelled", request.session_id, error="cancelled", execution_id=execution_id, duration_ms=duration_ms))
-                    self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="cancelled", objective=request.objective, workspace_root=request.workspace_root, error="cancelled", duration_ms=duration_ms))
-                    self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="cancelled", unresolved=["Execution cancelled by user."], metadata=request.metadata))
+                    # This block is already reacting to one interrupt (the
+                    # CancelledError above); a second/third rapid Ctrl+C
+                    # from an impatient user can raise a raw
+                    # KeyboardInterrupt *inside* these state-writing calls
+                    # themselves (confirmed live: it landed inside
+                    # state.py's redact_secrets, mid regex substitution),
+                    # crashing the cleanup path with an ugly traceback
+                    # instead of the graceful shutdown the CancelledError
+                    # path is meant to produce. state.py's own writes are
+                    # already tempfile+os.replace atomic, so an interrupted
+                    # write here cannot corrupt state.json -- it just means
+                    # this particular checkpoint write is best-effort once
+                    # the user has clearly signalled "stop" more than once.
+                    with contextlib.suppress(KeyboardInterrupt):
+                        if request.mode == ExecutionMode.LOCAL_AGENT and request.session_id:
+                            local_state.mark_turn_checkpoint_interrupted(
+                                request.session_id, error="Execution cancelled by user.",
+                            )
+                        duration_ms = int((time.monotonic() - started) * 1000)
+                        self.history.append(ExecutionRecord(request.mode, "cancelled", request.session_id, error="cancelled", execution_id=execution_id, duration_ms=duration_ms))
+                        self._append_event(RuntimeEvent(event="execution_finished", execution_id=execution_id, mode=request.mode.value, session_id=request.session_id, timestamp=_utc_now(), status="cancelled", objective=request.objective, workspace_root=request.workspace_root, error="cancelled", duration_ms=duration_ms))
+                        self._save_checkpoint(ExecutionCheckpoint(execution_id=execution_id, session_id=request.session_id, mode=request.mode.value, objective=request.objective, workspace_root=request.workspace_root, status="cancelled", unresolved=["Execution cancelled by user."], metadata=request.metadata))
                     raise
                 except Exception as exc:
                     message = f"{type(exc).__name__}: {exc}"

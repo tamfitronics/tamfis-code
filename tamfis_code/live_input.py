@@ -816,13 +816,22 @@ class LiveInputListener:
             self._interrupt_callback(classification)
 
     def _enqueue_control(self, classification: str) -> None:
-        item = local_state.enqueue_instruction(
-            self.session_id, "", classification=classification,
-        )
-        self.renderer.handle_event({
-            "event_type": "diagnostics",
-            "payload": {"content": f"◆ Queued {classification} for the running task ({item.id})."},
-        })
+        # A rapid second/third Ctrl+C while this write is still in flight
+        # can raise a raw KeyboardInterrupt mid-call (confirmed live,
+        # inside state.py's redact_secrets) -- this call site is itself
+        # already reacting to the first interrupt, so a further one here
+        # just reconfirms "stop", not a reason to crash the interrupt
+        # handler with an ugly traceback. state.py's writes are tempfile+
+        # os.replace atomic, so an interrupted write here cannot corrupt
+        # state.json.
+        with contextlib.suppress(KeyboardInterrupt):
+            item = local_state.enqueue_instruction(
+                self.session_id, "", classification=classification,
+            )
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": f"◆ Queued {classification} for the running task ({item.id})."},
+            })
 
     def _handle_live_model_command(self, text: str) -> bool:
         """Handle `/model ...` typed into the live in-task follow-up prompt.
