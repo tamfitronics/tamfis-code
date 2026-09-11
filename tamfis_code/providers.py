@@ -739,6 +739,12 @@ class ProviderManager:
                 # (see providers.py's NVIDIA default_model comment) doesn't
                 # have to mean losing access to this model entirely.
                 "moonshotai/Kimi-K2.6",
+                # Vision-capable Qwen route pinned to HF's novita backend
+                # (the ":novita" suffix, HF Router's explicit-provider
+                # syntax). Confirmed live 2026-09-11: a real image+text
+                # chat.completions call against this exact model id
+                # returned a correct vision description.
+                "Qwen/Qwen3.8-27B:novita",
             ],
             priority=4,
             weight=15,
@@ -751,6 +757,7 @@ class ProviderManager:
                 "meta-llama/Llama-3.2-11B-Vision-Instruct",
                 "Qwen/Qwen2-VL-7B-Instruct",
                 "moonshotai/Kimi-K2.6",
+                "Qwen/Qwen3.8-27B:novita",
             ],
             context_window=262144,
             coding_quality=5,

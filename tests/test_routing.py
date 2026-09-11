@@ -336,6 +336,7 @@ def test_researched_provider_routes_expose_exact_vision_models():
             "meta-llama/Llama-3.2-11B-Vision-Instruct",
             "Qwen/Qwen2-VL-7B-Instruct",
             "moonshotai/Kimi-K2.6",
+            "Qwen/Qwen3.8-27B:novita",
         },
     }
 
