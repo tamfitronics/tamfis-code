@@ -151,6 +151,24 @@ def _mode_and_agents_html(
     return f"{mode_line}{agents_suffix}"
 
 
+_FOOTER_TITLE_MAX_CHARS = 28
+
+
+def _session_title_prefix(session_id: Optional[int]) -> str:
+    """Persistent "which conversation is this" label for the far left of
+    the footer -- shown at all times (idle prompt and mid-task), the same
+    way Codex/Claude Code keep a session's name pinned in their status bar
+    instead of only showing it once at startup."""
+    if session_id is None:
+        return ""
+    from xml.sax.saxutils import escape as _xml_escape
+
+    title = local_state.session_display_title(session_id)
+    if len(title) > _FOOTER_TITLE_MAX_CHARS:
+        title = title[: _FOOTER_TITLE_MAX_CHARS - 1] + "…"
+    return f"<ansicyan>{_xml_escape(title)}</ansicyan> <ansigray>·</ansigray> "
+
+
 def idle_bottom_toolbar(
     cli_config: Config,
     session_id: int,
@@ -173,7 +191,8 @@ def idle_bottom_toolbar(
         _active_agent_count(session_id) if active_agents is None else active_agents
     )
     left = (
-        f" <ansigray>ready · {public_model_name(model)} ·</ansigray> "
+        f" {_session_title_prefix(session_id)}"
+        f"<ansigray>ready · {public_model_name(model)} ·</ansigray> "
         f"{_mode_and_agents_html(cli_config, session_id, active_agents=resolved_agents)}"
         f"{suggestion_hint}"
     )
@@ -559,7 +578,8 @@ class LiveInputListener:
             active_agents=self._active_agents,
         )
         left = (
-            f" <ansigray>{status} · ↑ edit queued · esc to interrupt ·</ansigray> "
+            f" {_session_title_prefix(self.session_id)}"
+            f"<ansigray>{status} · ↑ edit queued · esc to interrupt ·</ansigray> "
             f"{mode_and_agents_html}"
         )
         chip = _right_chip(self.session_id, self._active_agents)

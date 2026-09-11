@@ -253,6 +253,53 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertEqual(cfg.approval_policy, "ask")  # unchanged
 
 
+class SessionTitleFooterPrefixTests(_StatePatchMixin, unittest.TestCase):
+    """The session's name must always be visible in the footer -- idle and
+    mid-task alike -- so the user always knows which conversation they're
+    in, the same way Codex/Claude Code keep a session's title pinned in
+    their own status bar."""
+
+    def test_idle_toolbar_shows_the_generic_label_before_any_turn(self):
+        fragments = idle_bottom_toolbar(
+            _config("ask"), 7, provider="ollama_cloud", model="kimi",
+        ).__pt_formatted_text__()
+        rendered = "".join(text for _style, text in fragments)
+        self.assertIn("Session 7", rendered)
+
+    def test_idle_toolbar_shows_the_persisted_title_once_set(self):
+        state_module.remember_conversation_turn(
+            7, objective="Fix the flaky auth test", answer="Done.",
+        )
+        fragments = idle_bottom_toolbar(
+            _config("ask"), 7, provider="ollama_cloud", model="kimi",
+        ).__pt_formatted_text__()
+        rendered = "".join(text for _style, text in fragments)
+        self.assertIn("Fix the flaky auth test", rendered)
+        self.assertNotIn("Session 7", rendered)
+
+    def test_long_title_is_truncated_in_the_footer(self):
+        state_module.remember_conversation_turn(
+            7, objective="x" * 100, answer="Done.",
+        )
+        fragments = idle_bottom_toolbar(
+            _config("ask"), 7, provider="ollama_cloud", model="kimi",
+        ).__pt_formatted_text__()
+        rendered = "".join(text for _style, text in fragments)
+        self.assertIn("x" * 27 + "…", rendered)
+        self.assertNotIn("x" * 28, rendered)
+
+    def test_in_task_toolbar_also_shows_the_session_title(self):
+        state_module.remember_conversation_turn(
+            9, objective="Refactor the auth middleware", answer="Done.",
+        )
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=9, renderer=renderer, cli_config=_config("ask"))
+        rendered = "".join(
+            text for _style, text in listener._bottom_toolbar().__pt_formatted_text__()
+        )
+        self.assertIn("Refactor the auth middleware", rendered)
+
+
 class RotatingChipIsSituationAwareTests(_StatePatchMixin, unittest.TestCase):
     """The corner chip must not advertise a command that has nothing to act
     on in the current session/thread -- e.g. "/diff" with no modified files,

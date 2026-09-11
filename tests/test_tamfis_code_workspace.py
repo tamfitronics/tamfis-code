@@ -8,8 +8,8 @@ from tamfis_code import state as state_module
 from tamfis_code.workspace import (
     _detect_sibling_projects, _indexable_files, _project_metadata, blocking_dirty_files,
     build_system_prompt, classify_root, context_from_session, discover_local_repository,
-    find_resumable_session, recent_local_sessions_for_workspace, resolve_local_workspace,
-    resolve_workspace, scratch_root,
+    find_resumable_session, list_resumable_local_sessions, recent_local_sessions_for_workspace,
+    resolve_local_workspace, resolve_workspace, scratch_root,
 )
 
 
@@ -513,6 +513,60 @@ class RecentLocalSessionsForWorkspaceTests(unittest.TestCase):
             state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
             infos = recent_local_sessions_for_workspace(Path(proj))
         self.assertEqual(infos[0].description, "no recent activity")
+
+
+class ListResumableLocalSessionsTests(unittest.TestCase):
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        self.tmp.cleanup()
+
+    def test_excludes_swarm_children_only(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.save_session_state(2, workspace_root="/b", is_swarm_child=True)
+        infos = list_resumable_local_sessions()
+        self.assertEqual([info.session_id for info in infos], [1])
+
+    def test_never_scoped_to_one_workspace_unlike_recent_local_sessions(self):
+        with tempfile.TemporaryDirectory() as proj:
+            state_module.save_session_state(1, workspace_root="/somewhere/else")
+            state_module.save_session_state(2, workspace_root=str(Path(proj).resolve()))
+            infos = list_resumable_local_sessions(Path(proj))
+        self.assertEqual({info.session_id for info in infos}, {1, 2})
+
+    def test_current_workspace_sessions_are_listed_before_others_regardless_of_recency(self):
+        import time
+
+        with tempfile.TemporaryDirectory() as proj:
+            root = str(Path(proj).resolve())
+            state_module.save_session_state(1, workspace_root="/somewhere/else")
+            time.sleep(0.01)
+            state_module.save_session_state(2, workspace_root=root)
+            infos = list_resumable_local_sessions(Path(proj))
+        # Session 1 has the more recent updated_at, but session 2 belongs to
+        # the current workspace and must still come first.
+        self.assertEqual([info.session_id for info in infos], [2, 1])
+        self.assertTrue(infos[0].in_current_workspace)
+        self.assertFalse(infos[1].in_current_workspace)
+
+    def test_title_falls_back_to_a_generic_label_before_first_turn(self):
+        state_module.save_session_state(5, workspace_root="/a")
+        infos = list_resumable_local_sessions()
+        self.assertEqual(infos[0].title, "Session 5")
+
+    def test_title_reflects_the_persisted_session_title(self):
+        state_module.save_session_state(5, workspace_root="/a")
+        state_module.remember_conversation_turn(
+            5, objective="Fix the flaky auth test", answer="Done.",
+        )
+        infos = list_resumable_local_sessions()
+        self.assertEqual(infos[0].title, "Fix the flaky auth test")
 
 
 class ResolveSwarmSubtaskWorkspaceTests(unittest.TestCase):

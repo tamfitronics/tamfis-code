@@ -136,14 +136,32 @@ the model receives a compact preview and can search or page through the exact
 archived content without overflowing its context window. Legacy `--remote`
 mode retains its 1,000,000-character request limit.
 
-Use `tamfis-code clear-session <session_id>` to remove a stopped or stale local
-session from active listings and prevent it from being reused for that
-workspace. A session that still appears live is protected unless `--force` is
-given. Recovery checkpoints, evidence, and the last `.memory` snapshot are
-retained. Choosing **Start a new session** at the interactive startup picker
-shows a separate confirmation gate naming the replaceable old session IDs. If
-approved, those old sessions are erased from active listings after the new
-session is created; declining the gate resumes the most recent old session.
+A bare `tamfis-code` always opens a brand new local session -- it never
+prompts and never erases or replaces an old one. Every session it has ever
+created stays selectable: run `tamfis-code sessions` to list them all (each
+with its title, status, and workspace root), or `tamfis-code resume` with no
+id to open a full-screen picker of named sessions -- type to search by
+title; `Filter: Cwd/All` scopes the list to the current workspace or every
+directory; `Status: Active/Archived` shows or hides sessions you've
+archived; `Sort: Updated/Created` changes the ordering. Tab moves focus
+between the list and those three filter/sort groups, and Left/Right (or
+Up/Down) flips the focused group's option. From the list itself: Enter
+resumes the highlighted session, Ctrl+A archives or restores it (a
+reversible hide, not a deletion), Ctrl+E expands it to show a one-line
+preview, and Esc starts a brand new session instead -- the same convention
+Codex/Claude Code use, distinct from Ctrl+C, which cancels outright.
+`tamfis-code resume <session_id>` still jumps straight to a specific one
+from anywhere, bypassing the picker. A session's title is set once, from
+its first message, and shown in the picker, the `sessions` table, and
+always in the interactive prompt's footer, so it's never ambiguous which
+conversation is active.
+
+Use `tamfis-code clear-session <session_id>` to explicitly remove a stopped or
+stale local session from active listings and prevent it from being reused for
+that workspace -- this is the only thing that erases a session, and it always
+requires that explicit command. A session that still appears live is
+protected unless `--force` is given. Recovery checkpoints, evidence, and the
+last `.memory` snapshot are retained regardless.
 
 Job status is one of `running`, `completed`, `failed`, or `stopped`. `--bg`
 is not available while creating a plan (the completed plan must first be

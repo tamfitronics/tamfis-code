@@ -538,11 +538,10 @@ def recent_local_sessions_for_workspace(
     workspace_root: Path, *, limit: int = 3,
 ) -> list[RecentSessionInfo]:
     """The most recently touched local sessions already pointed at this
-    workspace root, most-recent first -- feeds the startup picker in cli.py
-    so a user opening tamfis-code in a directory with existing work sees
-    what's there (and whether it's still running elsewhere or was cut off)
-    instead of silently landing wherever resolve_local_workspace's own
-    single-match reuse rule happens to put them.
+    workspace root, most-recent first -- the in-workspace half of the
+    `tamfis-code resume` picker (see list_resumable_local_sessions) and
+    available to any other caller that wants a directory-scoped view of
+    local session activity.
 
     Excludes swarm children for the same reason resolve_local_workspace's
     own match does -- not a session an ordinary caller should ever resume
@@ -562,6 +561,64 @@ def recent_local_sessions_for_workspace(
             description=_describe_session_activity(state),
             status=_session_status(state),
             updated_at=state.updated_at,
+        )
+        for state in candidates[:limit]
+    ]
+
+
+@dataclass
+class ResumableSessionInfo:
+    session_id: int
+    workspace_root: str
+    title: str
+    description: str
+    status: str
+    updated_at: str
+    created_at: str
+    archived: bool
+    # True when this session's workspace_root/primary_workspace matches the
+    # directory `tamfis-code resume` was launched from -- lets the picker
+    # group "here" first without hiding conversations from other projects.
+    in_current_workspace: bool
+
+
+def list_resumable_local_sessions(
+    workspace_root: Optional[Path] = None, *, limit: int = 500,
+) -> list[ResumableSessionInfo]:
+    """Every resumable local session (never swarm children), most-recent
+    first, with sessions rooted at `workspace_root` sorted ahead of the
+    rest -- the full listing behind `tamfis-code resume`'s picker.
+
+    Unlike recent_local_sessions_for_workspace, this never excludes a
+    session just because it belongs to a different directory: `resume
+    <id>` has always worked from anywhere, so the picker it replaces (a
+    bare `tamfis-code resume`) must be able to offer every one of those
+    sessions too, not only the current directory's.
+    """
+    root = str(Path(workspace_root).resolve()) if workspace_root is not None else None
+    candidates = [
+        state for sid in local_state.all_known_session_ids()
+        if not (state := local_state.get_session_state(sid)).is_swarm_child
+    ]
+    candidates.sort(key=lambda state: state.updated_at or "", reverse=True)
+    if root is not None:
+        candidates.sort(
+            key=lambda state: 0 if (state.primary_workspace == root or state.workspace_root == root) else 1,
+        )
+    return [
+        ResumableSessionInfo(
+            session_id=state.session_id,
+            workspace_root=state.workspace_root or state.primary_workspace,
+            title=local_state.session_display_title(state.session_id),
+            description=_describe_session_activity(state),
+            status=_session_status(state),
+            updated_at=state.updated_at,
+            created_at=state.created_at,
+            archived=state.archived,
+            in_current_workspace=bool(
+                root is not None
+                and (state.primary_workspace == root or state.workspace_root == root)
+            ),
         )
         for state in candidates[:limit]
     ]

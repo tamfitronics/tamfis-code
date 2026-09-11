@@ -47,7 +47,7 @@ from .runner import (
     run_ai_task_and_stream, run_shell_command, submit_ai_task_background,
 )
 from .tasks import find_recent_task
-from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, recent_local_sessions_for_workspace, resolve_local_workspace, resolve_workspace
+from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, list_resumable_local_sessions, resolve_local_workspace, resolve_workspace
 from .local_chat import _PROVIDER_ALIASES
 from .public_identity import PUBLIC_MODEL_ALIASES, PUBLIC_MODEL_AUTO, public_model_name, redact_routing_text
 
@@ -102,6 +102,20 @@ def async_command(fn):
     return wrapper
 
 
+def _is_interactive_tty() -> bool:
+    """True when both stdin and stdout are real terminals -- gates opening
+    a full-screen picker (`resume`) or a plain confirmation prompt on a
+    piped/scripted invocation. A thin, directly-patchable seam rather than
+    inlining `sys.stdin.isatty() and sys.stdout.isatty()` at each call site:
+    Click's CliRunner (used in tests) swaps `sys.stdin`/`sys.stdout` for its
+    own streams only for the duration of `invoke()`, which makes patching
+    `sys.stdin.isatty` from outside that call a no-op -- patching this
+    function instead works regardless of what object stdin/stdout are at
+    call time.
+    """
+    return sys.stdin.isatty() and sys.stdout.isatty()
+
+
 def _print_local_sessions(console: Console, *, show_all: bool) -> None:
     """Render local sessions without invoking another Click command.
 
@@ -113,13 +127,18 @@ def _print_local_sessions(console: Console, *, show_all: bool) -> None:
     boundaries.
     """
     table = Table(show_header=True, header_style="bold")
-    for col in ("ID", "Workspace Root"):
+    for col in ("ID", "Title", "Status", "Workspace Root"):
         table.add_column(col)
     for sid in local_state.all_known_session_ids():
         sess_state = local_state.get_session_state(sid)
         if sess_state.is_swarm_child and not show_all:
             continue
-        table.add_row(str(sid), sess_state.workspace_root or sess_state.primary_workspace)
+        table.add_row(
+            str(sid),
+            local_state.session_display_title(sid),
+            sess_state.execution_status,
+            sess_state.workspace_root or sess_state.primary_workspace,
+        )
     console.print(table)
 
 
@@ -175,97 +194,6 @@ def cli(
         _run_async(_interactive_entry(config, workspace_root, provider, model, remote))
 
 
-_SESSION_STATUS_LABEL = {
-    "running": ("cyan", "running in background"),
-    "interrupted": ("yellow", "interrupted"),
-    "idle": ("dim", "idle"),
-}
-
-
-def _replaceable_session_ids(workspace_root: Path) -> list[int]:
-    """Old local sessions that may be erased behind an explicit user gate.
-
-    Recheck liveness both when presenting the gate and immediately before
-    deletion: a session that another process has started using must never be
-    erased because it happened to be stale when the picker first rendered.
-    """
-    root = str(workspace_root.resolve())
-    replaceable: list[int] = []
-    for session_id in local_state.all_known_session_ids():
-        state = local_state.get_session_state(session_id)
-        if state.is_swarm_child:
-            continue
-        if (state.primary_workspace or state.workspace_root) != root:
-            continue
-        if local_state.is_session_actively_running(state):
-            continue
-        replaceable.append(session_id)
-    return replaceable
-
-
-def _approve_new_session_replacement(
-    console: Console, workspace_root: Path, candidates,
-) -> int:
-    replaceable = _replaceable_session_ids(workspace_root)
-    if replaceable and not click.confirm(
-        "Start a new session and erase old local session"
-        f"{'s' if len(replaceable) != 1 else ''} "
-        f"{', '.join(str(item) for item in replaceable)} from active listings? "
-        "Recovery checkpoints and evidence will be retained.",
-        default=False,
-    ):
-        console.print(
-            f"[dim]New session cancelled; resuming session {candidates[0].session_id}.[/dim]"
-        )
-        return candidates[0].session_id
-    return 0
-
-
-def _offer_recent_session_picker(console: Console, workspace_root: Path) -> Optional[int]:
-    """On a bare `tamfis-code` launch, show up to 3 of the most recently
-    touched local sessions already pointed at this workspace and let the
-    user resume one instead of silently landing wherever
-    resolve_local_workspace's own single-match reuse rule would put them.
-
-    Each entry's status distinguishes a session actively running in another
-    terminal right now from one a killed process/crash left interrupted, so
-    the user isn't guessing which is safe to pick back up. Returns the
-    chosen session id, ``0`` when the user explicitly asks to start new, or
-    None to fall through to the normal non-interactive resolve/reuse flow.
-
-    Skipped outright for non-interactive invocations (piped stdin/stdout,
-    CI, scripted `--output-mode json`) and when there is nothing to offer.
-    """
-    if not sys.stdin.isatty() or not sys.stdout.isatty():
-        return None
-    candidates = recent_local_sessions_for_workspace(workspace_root, limit=3)
-    if not candidates:
-        return None
-
-    console.print("[bold]Recent sessions in this workspace[/bold]")
-    for index, info in enumerate(candidates, 1):
-        style, label = _SESSION_STATUS_LABEL[info.status]
-        console.print(
-            f"  [bold]{index}[/bold]. session {info.session_id} "
-            f"[{style}]({label})[/{style}] -- {escape(info.description)}"
-        )
-    console.print("  [bold]n[/bold]. Start a new session")
-    choice = click.prompt(
-        "Resume which session?", default="n", show_default=False,
-    ).strip().lower()
-    if choice in ("", "n", "new"):
-        return _approve_new_session_replacement(console, workspace_root, candidates)
-    try:
-        index = int(choice)
-    except ValueError:
-        console.print(f"[dim]'{choice}' not recognised -- starting a new session.[/dim]")
-        return _approve_new_session_replacement(console, workspace_root, candidates)
-    if not (1 <= index <= len(candidates)):
-        console.print(f"[dim]No option {choice} -- starting a new session.[/dim]")
-        return _approve_new_session_replacement(console, workspace_root, candidates)
-    return candidates[index - 1].session_id
-
-
 async def _interactive_entry(
     config: Config, workspace_root: Path, provider: str = "auto",
     model: Optional[str] = None, remote: bool = False,
@@ -275,32 +203,11 @@ async def _interactive_entry(
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
-        chosen_session_id = _offer_recent_session_picker(console, workspace_root)
-        replaced_session_ids = (
-            _replaceable_session_ids(workspace_root)
-            if chosen_session_id == 0 else []
-        )
-        workspace = resolve_local_workspace(
-            workspace_root,
-            session_id=chosen_session_id or None,
-            force_new=chosen_session_id == 0,
-        )
-        cleared_session_ids = []
-        for old_session_id in replaced_session_ids:
-            # Liveness is deliberately checked again after the approval gate
-            # to close the race where another terminal resumes the old row.
-            old_state = local_state.get_session_state(old_session_id)
-            if local_state.is_session_actively_running(old_state):
-                continue
-            if local_state.clear_session_state(old_session_id):
-                cleared_session_ids.append(old_session_id)
-        if cleared_session_ids:
-            console.print(
-                "[dim]Cleared replaced local session"
-                f"{'s' if len(cleared_session_ids) != 1 else ''}: "
-                f"{', '.join(str(item) for item in cleared_session_ids)}. "
-                "Recovery archives retained.[/dim]"
-            )
+        # A bare `tamfis-code` always opens a brand new session -- it never
+        # prompts to erase or reuse an existing one. Prior sessions for this
+        # (or any other) workspace stay exactly as they were and remain
+        # selectable via `tamfis-code resume` / `tamfis-code sessions`.
+        workspace = resolve_local_workspace(workspace_root, force_new=True)
         await run_interactive(None, config, workspace, provider=provider, model=model)
         return
 
@@ -1993,10 +1900,13 @@ async def bridge(ctx: click.Context):
 @click.pass_context
 @async_command
 async def resume(ctx: click.Context, session_id: Optional[int], provider: str, model: Optional[str], remote: bool):
-    """Resume an interrupted or previous session (most recent if no id given), then continue interactively."""
+    """Resume a previous session -- a full-screen picker of named local
+    sessions when no id is given (search, Cwd/All and Active/Archived
+    filters, sort by updated/created), most-recently-updated first."""
     from .interactive import run_interactive
 
     config: Config = ctx.obj["config"]
+    workspace_root: Path = ctx.obj["workspace_root"]
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
@@ -2006,16 +1916,36 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
                 print_error(console, f"No known local session {session_id}. Use `tamfis-code sessions` to list known sessions.")
                 raise SystemExit(EXIT_TASK_FAILED)
             target_id = session_id
-        else:
-            if not known:
-                print_error(console, "No sessions to resume.")
+        elif _is_interactive_tty():
+            candidates = list_resumable_local_sessions(workspace_root)
+            if not candidates:
+                print_error(console, "No sessions to resume. Run `tamfis-code` to start one.")
                 raise SystemExit(EXIT_TASK_FAILED)
-            target_id = known[-1]
+            from .resume_picker import run_resume_picker
+
+            action, picked_id = run_resume_picker(candidates)
+            if action == "quit":
+                console.print("[dim]Cancelled.[/dim]")
+                return
+            if action == "new":
+                # Esc in the picker means "start a new session", the same
+                # convention Codex/Claude Code use -- not a plain cancel.
+                workspace = resolve_local_workspace(workspace_root, force_new=True)
+                await run_interactive(None, config, workspace, provider=provider, model=model)
+                return
+            target_id = picked_id
+        else:
+            fallback = list_resumable_local_sessions(workspace_root, limit=1)
+            if not fallback:
+                print_error(console, "No sessions to resume. Run `tamfis-code` to start one.")
+                raise SystemExit(EXIT_TASK_FAILED)
+            target_id = fallback[0].session_id
         target_state = local_state.get_session_state(target_id)
         workspace = WorkspaceContext(session_id=target_id, workspace_root=target_state.workspace_root or target_state.primary_workspace)
-        console.print(f"[green]Resumed session {workspace.session_id}[/green]  workspace_root={workspace.workspace_root}")
-        if target_state.conversation_summary:
-            console.print(f"[dim]{target_state.conversation_summary[-1000:]}[/dim]")
+        console.print(
+            f"[green]Resumed \"{escape(local_state.session_display_title(target_id))}\"[/green]  "
+            f"session {workspace.session_id} · workspace_root={workspace.workspace_root}"
+        )
         print_resume_plan_status(console, target_state)
         await run_interactive(None, config, workspace, provider=provider, model=model)
         return

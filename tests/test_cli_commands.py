@@ -13,7 +13,6 @@ from tamfis_code.cli import (
     _apply_pending_update_after_login,
     _explicit_absolute_paths,
     _interactive_entry,
-    _offer_recent_session_picker,
     _print_bg_hint,
     _project_root_for_target,
     _session_for_primary,
@@ -140,94 +139,37 @@ class SessionForPrimaryTests(unittest.TestCase):
             self.assertEqual(_session_for_primary(root), 2)
 
 
-class OfferRecentSessionPickerTests(unittest.TestCase):
+class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
     def setUp(self):
         self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
         state_module.CONFIG_DIR = base / ".config"
         state_module.STATE_PATH = base / ".config" / "state.json"
-        from io import StringIO
-
-        self._console = Console(no_color=True, file=StringIO())
 
     def tearDown(self):
         state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
         self.tmp.cleanup()
 
-    def test_skips_entirely_when_not_an_interactive_tty(self):
-        with tempfile.TemporaryDirectory() as proj:
-            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
-            with patch("sys.stdin.isatty", return_value=False), \
-                 patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt") as prompt:
-                result = _offer_recent_session_picker(self._console, Path(proj))
-        self.assertIsNone(result)
-        prompt.assert_not_called()
-
-    def test_returns_none_with_nothing_to_offer(self):
-        with tempfile.TemporaryDirectory() as proj:
-            with patch("sys.stdin.isatty", return_value=True), \
-                 patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt") as prompt:
-                result = _offer_recent_session_picker(self._console, Path(proj))
-        self.assertIsNone(result)
-        prompt.assert_not_called()
-
-    def test_default_choice_declines_and_starts_a_new_session(self):
-        with tempfile.TemporaryDirectory() as proj:
-            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
-            with patch("sys.stdin.isatty", return_value=True), \
-                 patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt", return_value="n"), \
-                 patch("click.confirm", return_value=True) as confirm:
-                result = _offer_recent_session_picker(self._console, Path(proj))
-        self.assertEqual(result, 0)
-        confirm.assert_called_once()
-
-    def test_declining_erase_gate_resumes_old_session_instead(self):
-        with tempfile.TemporaryDirectory() as proj:
-            state_module.save_session_state(7, workspace_root=str(Path(proj).resolve()))
-            with patch("sys.stdin.isatty", return_value=True), \
-                 patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt", return_value="n"), \
-                 patch("click.confirm", return_value=False):
-                result = _offer_recent_session_picker(self._console, Path(proj))
-        self.assertEqual(result, 7)
-
-    def test_numeric_choice_returns_the_matching_session_id(self):
-        with tempfile.TemporaryDirectory() as proj:
-            root = str(Path(proj).resolve())
-            state_module.save_session_state(1, workspace_root=root)
-            state_module.save_session_state(2, workspace_root=root)
-            with patch("sys.stdin.isatty", return_value=True), \
-                 patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt", return_value="1"):
-                result = _offer_recent_session_picker(self._console, Path(proj))
-        # Most-recently-updated session is listed first (session 2).
-        self.assertEqual(result, 2)
-
-    def test_out_of_range_choice_falls_back_to_a_new_session(self):
-        with tempfile.TemporaryDirectory() as proj:
-            state_module.save_session_state(1, workspace_root=str(Path(proj).resolve()))
-            with patch("sys.stdin.isatty", return_value=True), \
-                 patch("sys.stdout.isatty", return_value=True), \
-                 patch("click.prompt", return_value="9"), \
-                 patch("click.confirm", return_value=True):
-                result = _offer_recent_session_picker(self._console, Path(proj))
-        self.assertEqual(result, 0)
-
-    def test_approved_new_session_erases_replaced_hot_state(self):
+    def test_bare_launch_never_prompts_and_never_erases_an_old_session(self):
         with tempfile.TemporaryDirectory() as proj:
             root = Path(proj).resolve()
             state_module.save_session_state(1, workspace_root=str(root))
             run_interactive = AsyncMock()
-            with patch("tamfis_code.cli._offer_recent_session_picker", return_value=0), \
+            with patch("click.prompt") as prompt, \
+                 patch("click.confirm") as confirm, \
                  patch("tamfis_code.interactive.run_interactive", new=run_interactive):
                 asyncio.run(_interactive_entry(Config(), root))
 
-        self.assertEqual(state_module.all_known_session_ids(), [2])
+        prompt.assert_not_called()
+        confirm.assert_not_called()
+        # Both the old session and the freshly minted one remain known and
+        # selectable -- nothing is erased from active listings.
+        self.assertEqual(state_module.all_known_session_ids(), [1, 2])
         run_interactive.assert_awaited_once()
+        _, kwargs = run_interactive.call_args
+        started_workspace = run_interactive.call_args.args[2]
+        self.assertEqual(started_workspace.session_id, 2)
 
 
 class PrintBgHintTests(unittest.TestCase):
@@ -270,6 +212,99 @@ class _CliConfigIsolationMixin:
         self.tmp.cleanup()
         if self._env_token is not None:
             os.environ["TAMFIS_CODE_TOKEN"] = self._env_token
+
+
+class ResumeCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
+    """`tamfis-code resume` delegates the interactive case to the
+    full-screen picker in resume_picker.py (its own filtering/sorting logic
+    is tested directly in test_resume_picker.py) -- these tests cover how
+    the `resume` command dispatches on the picker's ("resume"/"new"/"quit")
+    result, and its non-interactive fallback."""
+
+    def setUp(self):
+        super().setUp()
+        self.runner = CliRunner()
+        self.proj = tempfile.TemporaryDirectory()
+        self.addCleanup(self.proj.cleanup)
+        self.root = str(Path(self.proj.name).resolve())
+
+    def test_explicit_session_id_skips_the_picker_entirely(self):
+        state_module.save_session_state(3, workspace_root=self.root)
+        run_interactive = AsyncMock()
+        with patch("tamfis_code.resume_picker.run_resume_picker") as picker, \
+             patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+            result = self.runner.invoke(cli, ["--cwd", self.root, "resume", "3"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        picker.assert_not_called()
+        run_interactive.assert_awaited_once()
+
+    def test_unknown_explicit_session_id_fails(self):
+        result = self.runner.invoke(cli, ["--cwd", self.root, "resume", "999"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No known local session 999", result.output)
+
+    def test_no_sessions_at_all_fails_without_opening_the_picker(self):
+        with patch("tamfis_code.cli._is_interactive_tty", return_value=True), \
+             patch("tamfis_code.resume_picker.run_resume_picker") as picker:
+            result = self.runner.invoke(cli, ["--cwd", self.root, "resume"])
+        self.assertNotEqual(result.exit_code, 0)
+        self.assertIn("No sessions to resume", result.output)
+        picker.assert_not_called()
+
+    def test_picker_quit_cancels_without_starting_anything(self):
+        state_module.save_session_state(1, workspace_root=self.root)
+        run_interactive = AsyncMock()
+        with patch("tamfis_code.cli._is_interactive_tty", return_value=True), \
+             patch("tamfis_code.resume_picker.run_resume_picker", return_value=("quit", None)) as picker, \
+             patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+            result = self.runner.invoke(cli, ["--cwd", self.root, "resume"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        self.assertIn("Cancelled", result.output)
+        picker.assert_called_once()
+        run_interactive.assert_not_awaited()
+
+    def test_picker_new_starts_a_brand_new_session_not_the_old_one(self):
+        # Esc in the picker means "start a new session" (Codex/Claude Code's
+        # own convention), not a plain cancel -- distinct from Ctrl+C.
+        state_module.save_session_state(1, workspace_root=self.root)
+        run_interactive = AsyncMock()
+        with patch("tamfis_code.cli._is_interactive_tty", return_value=True), \
+             patch("tamfis_code.resume_picker.run_resume_picker", return_value=("new", None)), \
+             patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+            result = self.runner.invoke(cli, ["--cwd", self.root, "resume"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        run_interactive.assert_awaited_once()
+        started_workspace = run_interactive.call_args.args[2]
+        self.assertNotEqual(started_workspace.session_id, 1)
+        # Nothing is erased: both the old and the new session are known.
+        self.assertEqual(
+            sorted(state_module.all_known_session_ids()), [1, started_workspace.session_id],
+        )
+
+    def test_picker_resume_jumps_to_the_chosen_session(self):
+        state_module.save_session_state(1, workspace_root=self.root)
+        state_module.save_session_state(2, workspace_root=self.root)
+        run_interactive = AsyncMock()
+        with patch("tamfis_code.cli._is_interactive_tty", return_value=True), \
+             patch("tamfis_code.resume_picker.run_resume_picker", return_value=("resume", 1)), \
+             patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+            result = self.runner.invoke(cli, ["--cwd", self.root, "resume"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        started_workspace = run_interactive.call_args.args[2]
+        self.assertEqual(started_workspace.session_id, 1)
+
+    def test_non_interactive_invocation_skips_the_picker_and_uses_most_recent(self):
+        state_module.save_session_state(1, workspace_root=self.root)
+        state_module.save_session_state(2, workspace_root=self.root)
+        run_interactive = AsyncMock()
+        with patch("tamfis_code.cli._is_interactive_tty", return_value=False), \
+             patch("tamfis_code.resume_picker.run_resume_picker") as picker, \
+             patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+            result = self.runner.invoke(cli, ["--cwd", self.root, "resume"])
+        self.assertEqual(result.exit_code, 0, result.output)
+        picker.assert_not_called()
+        started_workspace = run_interactive.call_args.args[2]
+        self.assertEqual(started_workspace.session_id, 2)
 
 
 class ClearSessionCommandTests(_CliConfigIsolationMixin, unittest.TestCase):

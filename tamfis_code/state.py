@@ -193,6 +193,26 @@ class SessionState:
     session_id: int
     workspace_root: str = ""
     primary_workspace: str = ""
+    # Stable, one-time-assigned display name for this conversation, set from
+    # its first completed turn's objective (see remember_conversation_turn)
+    # and never overwritten afterwards -- the
+    # same "name a session after its first message" convention Codex/Claude
+    # Code use, so `tamfis-code resume` and the persistent footer can show a
+    # human-readable label instead of a bare session id. Empty until that
+    # first turn completes; session_display_title() below supplies the
+    # fallback for that window.
+    session_title: str = ""
+    # Set exactly once, the first time this session is ever persisted (see
+    # put_session_state) -- distinct from updated_at, which changes on every
+    # write. Backs the resume picker's "Sort: Created" option.
+    created_at: str = ""
+    # True once the user archives this session from the resume picker
+    # (Ctrl+A there) -- a soft, reversible hide from the picker's default
+    # "Active" view, never a deletion: archived sessions stay fully known,
+    # resumable by id, and listed under "Status: Archived". Distinct from
+    # `tamfis-code clear-session`, which is the only thing that actually
+    # erases a session from active listings.
+    archived: bool = False
     allowed_workspaces: list[str] = field(default_factory=list)
     repository_root: Optional[str] = None
     current_working_directory: str = ""
@@ -404,6 +424,7 @@ def _save_memory_snapshot(state: SessionState) -> None:
     payload = _sanitize({
         "schema_version": 1,
         "session_id": state.session_id,
+        "session_title": state.session_title,
         "workspace_root": state.workspace_root,
         "primary_workspace": state.primary_workspace,
         "updated_at": state.updated_at,
@@ -558,6 +579,15 @@ def put_session_state(state: SessionState) -> None:
         state.saved_plans = sorted(
             merged_plans.values(), key=lambda item: item.get("created_at", "")
         )[-MAX_SAVED_PLANS:]
+    if not state.created_at:
+        # First-ever write for this session id. Prefer the existing row's
+        # own created_at if one is already on disk (a concurrent writer may
+        # have raced this one to the first write) so two processes creating
+        # the same brand-new session id can never disagree about when it
+        # was created.
+        state.created_at = (
+            latest.get("created_at") if isinstance(latest, dict) else None
+        ) or _now()
     state.updated_at = _now()
     # Defense-in-depth caps + eviction of long-stale sessions, applied before
     # every write (see _enforce_state_caps/_prune_stale_sessions docstrings).
@@ -674,11 +704,42 @@ def clear_turn_checkpoint(session_id: int) -> None:
 
 
 
+def _derive_session_title(text: str) -> str:
+    """`text` (usually a multi-line objective), whitespace-collapsed onto
+    one line and capped -- the same short-label convention Codex/Claude
+    Code use for naming a conversation after its opening message."""
+    seed = " ".join((text or "").split()).strip()
+    if not seed:
+        return ""
+    return seed[:60] + ("…" if len(seed) > 60 else "")
+
+
+def session_display_title(session_id: int) -> str:
+    """Stable display name for a session, for the resume picker, the
+    `sessions` listing, and the persistent footer. Falls back to a generic
+    label before the session's first turn has completed and set
+    `session_title` for good."""
+    return get_session_state(session_id).session_title or f"Session {session_id}"
+
+
+def set_session_archived(session_id: int, archived: bool) -> None:
+    """Soft-hide (or restore) a session from the resume picker's default
+    "Active" view -- Ctrl+A there. Reversible and non-destructive: every
+    other field, including conversation history, is untouched. Distinct
+    from `tamfis-code clear-session`, the only operation that actually
+    erases a session from active listings."""
+    state = get_session_state(session_id)
+    state.archived = archived
+    put_session_state(state)
+
+
 def remember_conversation_turn(
     session_id: int, *, objective: str, answer: str, clear_checkpoint: bool = False,
 ) -> None:
     """Append a completed local turn to durable, bounded session memory."""
     state = get_session_state(session_id)
+    if not state.session_title:
+        state.session_title = _derive_session_title(objective)
     history = [*state.conversation_history, {"role": "user", "content": objective}]
     if answer:
         history.append({"role": "assistant", "content": answer})
