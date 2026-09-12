@@ -414,6 +414,8 @@ class LiveInputListener:
             # animated footer directly with one durable timing summary.
             if hasattr(self.renderer, "print_work_summary"):
                 self.renderer.print_work_summary(self._outcome_status)
+            if hasattr(self.renderer, "print_recap"):
+                self.renderer.print_recap(self.session_id)
         else:
             self.renderer.resume_live()
 

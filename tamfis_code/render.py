@@ -716,6 +716,41 @@ class StreamRenderer:
             highlight=False,
         )
 
+    def print_recap(self, session_id: int) -> None:
+        """One concise Claude Code-style recap after the timing line: what
+        changed, what validated, what's next -- not a re-narration of every
+        tool call. Reads the durable TaskLedger (see runtime/ledger.py and
+        AgentOrchestrator.save_task_ledger) rather than re-deriving this
+        from scratch, so it can never drift from what /status shows for the
+        same session. Silently prints nothing when no ledger exists yet
+        (e.g. a read-only/no-plan turn never created one).
+        """
+        try:
+            from .runtime.ledger import load_ledger
+            ledger = load_ledger(str(session_id))
+        except Exception:
+            return
+        if ledger is None:
+            return
+        lines: list[str] = []
+        if ledger.plan_steps:
+            done = sum(1 for s in ledger.plan_steps if s.status == "completed")
+            lines.append(f"Plan: {done}/{len(ledger.plan_steps)} steps done")
+        edited = [e.file for e in ledger.edits if e.applied]
+        if edited:
+            shown = ", ".join(edited[:5])
+            more = f" (+{len(edited) - 5} more)" if len(edited) > 5 else ""
+            lines.append(f"Changed: {shown}{more}")
+        tests_run = [t for t in ledger.tests if t.status != "not_run"]
+        if tests_run:
+            passed = sum(1 for t in tests_run if t.status == "passed")
+            lines.append(f"Tests: {passed}/{len(tests_run)} passed")
+        if ledger.status in {"running", "partial", "blocked", "checkpointing"} and ledger.next_action:
+            lines.append(f"Next: {ledger.next_action}")
+        if not lines:
+            return
+        self.console.print(Text("\n".join(lines), style="dim"), highlight=False)
+
     def conclude(self, status: str) -> None:
         """Clear transient activity before the terminal returns to the REPL."""
         self._round_tool_counts = {}

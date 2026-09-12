@@ -102,6 +102,27 @@ class TaskLedgerLifecycleTests(_IsolatedStorage):
         self.assertEqual(ledger.plan_steps[0].status, "completed")
         self.assertGreaterEqual(ledger.current_step_index, 1)
 
+    def test_real_edits_are_reflected_in_the_ledger(self):
+        # Reuses safety.py's real record_mutation (the same call site every
+        # actual file-edit tool goes through) rather than hand-writing a
+        # modified_files entry, so this proves the ledger stays in sync
+        # with what real edits actually record.
+        from tamfis_code.safety import record_mutation
+
+        orchestrator = _orchestrator(7)
+        orchestrator.begin(objective="edit a file", messages=[], read_only=False)
+        record_mutation(
+            7, path="tamfis_code/foo.py", operation="edit",
+            original_content="old", new_content="new",
+        )
+
+        orchestrator._checkpoint_before_epoch_renewal()
+
+        ledger = ledger_module.load_ledger(str(7))
+        self.assertEqual(len(ledger.edits), 1)
+        self.assertEqual(ledger.edits[0].file, "tamfis_code/foo.py")
+        self.assertTrue(ledger.edits[0].applied)
+
     def test_ledger_survives_across_orchestrator_instances(self):
         # A fresh process (or a new AgentOrchestrator for the same session
         # after a crash) must see the same durable ledger -- this is the

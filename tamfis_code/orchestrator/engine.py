@@ -330,7 +330,7 @@ class AgentOrchestrator:
         same facts; never raises (checkpointing must not block execution).
         """
         assert self.run is not None
-        from ..runtime.ledger import PlanStep as _LedgerPlanStep, TaskLedger, load_ledger, save_ledger
+        from ..runtime.ledger import LedgerEdit, PlanStep as _LedgerPlanStep, TaskLedger, load_ledger, save_ledger
 
         task_id = str(self.session_id)
         ledger = load_ledger(task_id) or TaskLedger(
@@ -346,6 +346,26 @@ class AgentOrchestrator:
             ]
             completed = sum(1 for s in ledger.plan_steps if s.status == "completed")
             ledger.current_step_index = min(completed, max(len(ledger.plan_steps) - 1, 0))
+        # Reuses the same modified_files list safety.py's record_mutation
+        # already maintains per session -- a real recap needs to show real
+        # changed files, not a second, separately-tracked copy that could
+        # drift from what actually happened.
+        try:
+            modified = local_state.get_session_state(self.session_id).modified_files
+        except Exception:
+            modified = []
+        ledger.edits = [
+            LedgerEdit(
+                file=str(item.get("path") or ""),
+                description=(
+                    f"{item.get('operation', 'edit')} "
+                    f"(+{item.get('lines_added', 0)}/-{item.get('lines_removed', 0)})"
+                ),
+                applied=True,
+                mutation_id=str(item.get("mutation_id") or ""),
+            )
+            for item in modified if item.get("path")
+        ]
         if self.run.route:
             ledger.current_provider = str(self.run.route.get("provider") or ledger.current_provider)
             ledger.current_model = str(self.run.route.get("model") or ledger.current_model)

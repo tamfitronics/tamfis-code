@@ -1,5 +1,7 @@
+import tempfile
 import unittest
 from io import StringIO
+from pathlib import Path
 
 from rich.console import Console
 
@@ -21,6 +23,84 @@ from tamfis_code.interactive import contextualize_short_reply
 
 def _console() -> Console:
     return Console(file=StringIO(), no_color=True, width=200)
+
+
+class PrintRecapTests(unittest.TestCase):
+    """StreamRenderer.print_recap: the "must have a recap too" request --
+    a concise end-of-task summary (plan progress / changed files / next
+    action) read from the durable TaskLedger, printed once at the same
+    finalization point print_work_summary already uses (live_input.py's
+    _stop_async)."""
+
+    def setUp(self):
+        from tamfis_code.runtime import ledger as ledger_module
+        self._ledger_module = ledger_module
+        self._orig_ledger_dir = ledger_module.LEDGER_DIR
+        self.tmp = tempfile.TemporaryDirectory()
+        ledger_module.LEDGER_DIR = Path(self.tmp.name) / "ledgers"
+
+    def tearDown(self):
+        self._ledger_module.LEDGER_DIR = self._orig_ledger_dir
+        self.tmp.cleanup()
+
+    def test_no_ledger_prints_nothing(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.print_recap(999)
+        self.assertEqual(console.file.getvalue(), "")
+
+    def test_recap_shows_plan_progress_and_next_action(self):
+        from tamfis_code.runtime.ledger import PlanStep, TaskLedger, save_ledger
+
+        ledger = TaskLedger(
+            task_id="42", session_id=42, objective="fix the bug", status="partial",
+            plan_steps=[
+                PlanStep(index=1, name="inspect", status="completed"),
+                PlanStep(index=2, name="fix", status="pending"),
+            ],
+            next_action="run the test suite",
+        )
+        save_ledger(ledger)
+
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.print_recap(42)
+        output = console.file.getvalue()
+        self.assertIn("Plan: 1/2 steps done", output)
+        self.assertIn("Next: run the test suite", output)
+
+    def test_recap_shows_changed_files(self):
+        from tamfis_code.runtime.ledger import LedgerEdit, TaskLedger, save_ledger
+
+        ledger = TaskLedger(
+            task_id="7", session_id=7, objective="add feature", status="completed",
+            edits=[LedgerEdit(file="tamfis_code/foo.py", description="edit (+3/-1)", applied=True)],
+        )
+        save_ledger(ledger)
+
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.print_recap(7)
+        self.assertIn("Changed: tamfis_code/foo.py", console.file.getvalue())
+
+    def test_completed_ledger_omits_next_action_line(self):
+        # A finished task's stale next_action ("run the test suite") would
+        # be actively misleading in the recap once the task is done.
+        from tamfis_code.runtime.ledger import PlanStep, TaskLedger, save_ledger
+
+        ledger = TaskLedger(
+            task_id="9", session_id=9, objective="done task", status="completed",
+            plan_steps=[PlanStep(index=1, name="do it", status="completed")],
+            next_action="none",
+        )
+        save_ledger(ledger)
+
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.print_recap(9)
+        output = console.file.getvalue()
+        self.assertIn("Plan: 1/1 steps done", output)
+        self.assertNotIn("Next:", output)
 
 
 class PrintResumePlanStatusTests(unittest.TestCase):
