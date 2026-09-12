@@ -3978,15 +3978,44 @@ def _summarise_progress_for_rollover(session_id: int) -> str:
     return "\n".join(lines) if lines else "No prior tool activity recorded yet."
 
 
-def _plan_created_payload(plan: Any, *, title: str) -> dict[str, Any]:
-    """render.py's plan_created handler expects {"title", "items": [{"step","status"}]}."""
+def _plan_created_payload(plan: Any, *, title: str, continuation: bool = False) -> dict[str, Any]:
+    """render.py's plan_created handler expects {"title", "items": [{"step","status"}]}.
+
+    `continuation=True` tells render.py this turn's plan follows an already
+    active, unfinished plan from an earlier turn in the same session --
+    render.py shows a compact one-line status instead of a full durable
+    panel in that case (see _has_active_prior_plan's call site below).
+    """
     return {
         "title": title,
         "items": [{"step": step.name, "status": step.status} for step in plan.steps],
         "assumptions": list(getattr(plan, "assumptions", []) or []),
         "risks": list(getattr(plan, "risks", []) or []),
         "validation_criteria": list(getattr(plan, "validation_criteria", []) or []),
+        "continuation": continuation,
     }
+
+
+def _has_active_prior_plan(session_id: int) -> bool:
+    """True when this session already has a saved plan with at least one
+    step not yet completed, persisted BEFORE this turn's own planning runs.
+
+    Used to distinguish a genuinely new task (show the full plan panel)
+    from an ordinary follow-up message continuing an in-progress task in
+    the same interactive session (show a compact status line instead --
+    every interactive turn used to regenerate and reprint a brand-new
+    "Execution plan" panel, even for a small continuation, since
+    should_plan() is evaluated fresh per turn with no notion of "this
+    session already has an active plan.")
+    """
+    try:
+        plans = local_state.get_session_state(session_id).saved_plans
+    except Exception:
+        return False
+    if not plans:
+        return False
+    steps = plans[-1].get("steps") or []
+    return any(isinstance(s, dict) and s.get("status") != "completed" for s in steps)
 
 
 def _plan_message_content(plan: Any, *, heading: str) -> str:
@@ -4758,6 +4787,11 @@ async def _run_local_agent_turn_impl(
             max_repair_extensions=_turn_budget_config.max_repair_extensions,
         ),
     )
+    # Snapshot BEFORE begin(): begin() itself immediately persists a fresh
+    # deterministic template plan for this turn via local_state.save_plan(),
+    # which would otherwise make _has_active_prior_plan see this turn's own
+    # brand-new plan and wrongly call it "already active."
+    _prior_plan_was_active = _has_active_prior_plan(session_id)
     orchestration = orchestrator.begin(objective=objective, messages=messages, read_only=read_only)
     task_profile = orchestration.profile
     turn_read_only = read_only or getattr(task_profile.task_type, "value", "") in {
@@ -5181,7 +5215,7 @@ async def _run_local_agent_turn_impl(
             working_messages.insert(working_messages.index(scope_message) + 1, plan_message)
             renderer.handle_event({
                 "event_type": "plan_created",
-                "payload": _plan_created_payload(selected_plan, title="Plan"),
+                "payload": _plan_created_payload(selected_plan, title="Plan", continuation=_prior_plan_was_active),
             })
 
     previous_tool_calls_signature: Optional[tuple[tuple[str, str], ...]] = None

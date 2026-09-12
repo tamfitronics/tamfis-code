@@ -1306,6 +1306,23 @@ class StreamRenderer:
             if items:
                 self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
                 self._refresh_live()
+                if payload.get("continuation"):
+                    # This turn's plan follows an already-active, unfinished
+                    # plan from an earlier turn in the same session (see
+                    # runner_local.py's _has_active_prior_plan) -- a
+                    # follow-up message continuing in-progress work, not a
+                    # new task. A full durable "Execution plan" panel here
+                    # every single turn was the actual "plans are bloated"
+                    # complaint; an in-situ one-line status (matching how
+                    # plan_step_progress already updates in place) is enough
+                    # since the live view already reflects current step
+                    # status above.
+                    done = sum(1 for i in self._plan_steps if i.get("status") == "completed")
+                    self.console.print(Text(
+                        f"→ Continuing: {done}/{len(self._plan_steps)} plan steps done",
+                        style="dim",
+                    ))
+                    return
                 # Rich's TTY Live region is transient and is stopped when
                 # assistant output begins. Always print a durable snapshot;
                 # otherwise the plan disappears at execution start.

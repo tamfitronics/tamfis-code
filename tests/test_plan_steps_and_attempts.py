@@ -106,5 +106,56 @@ class AttemptTrackingTests(_StatePatchMixin, unittest.TestCase):
         self.assertEqual(state.unresolved_issues, [])
 
 
+class HasActivePriorPlanTests(_StatePatchMixin, unittest.TestCase):
+    """runner_local._has_active_prior_plan is the signal render.py uses to
+    show a compact continuation line instead of a full plan panel on an
+    interactive follow-up -- see test_tamfis_code_render.py's
+    test_plan_created_continuation_shows_compact_line_not_full_panel."""
+
+    def test_no_saved_plan_is_not_active(self):
+        from tamfis_code.runner_local import _has_active_prior_plan
+        self.assertFalse(_has_active_prior_plan(1))
+
+    def test_plan_with_incomplete_step_is_active(self):
+        from tamfis_code.runner_local import _has_active_prior_plan
+        save_plan(1, objective="x", content="1. do it", steps=[{"step": "do it", "status": "pending"}])
+        self.assertTrue(_has_active_prior_plan(1))
+
+    def test_fully_completed_plan_is_not_active(self):
+        from tamfis_code.runner_local import _has_active_prior_plan
+        save_plan(1, objective="x", content="1. do it", steps=[{"step": "do it", "status": "completed"}])
+        self.assertFalse(_has_active_prior_plan(1))
+
+    def test_only_the_latest_saved_plan_is_considered(self):
+        from tamfis_code.runner_local import _has_active_prior_plan
+        save_plan(1, objective="old", content="1. old step", steps=[{"step": "old step", "status": "pending"}])
+        save_plan(1, objective="new", content="1. new step", steps=[{"step": "new step", "status": "completed"}])
+        self.assertFalse(_has_active_prior_plan(1))
+
+
+class PlanCreatedPayloadContinuationTests(unittest.TestCase):
+    def test_continuation_defaults_to_false(self):
+        from tamfis_code.runner_local import _plan_created_payload
+        from tamfis_code.orchestrator.planner import ExecutionPlan, PlanStep
+
+        plan = ExecutionPlan(
+            objective="x", assumptions=[], components=[],
+            steps=[PlanStep(1, "do it")], validation_criteria=[], risks=[],
+        )
+        payload = _plan_created_payload(plan, title="Plan")
+        self.assertFalse(payload["continuation"])
+
+    def test_continuation_flag_is_threaded_through(self):
+        from tamfis_code.runner_local import _plan_created_payload
+        from tamfis_code.orchestrator.planner import ExecutionPlan, PlanStep
+
+        plan = ExecutionPlan(
+            objective="x", assumptions=[], components=[],
+            steps=[PlanStep(1, "do it")], validation_criteria=[], risks=[],
+        )
+        payload = _plan_created_payload(plan, title="Plan", continuation=True)
+        self.assertTrue(payload["continuation"])
+
+
 if __name__ == "__main__":
     unittest.main()

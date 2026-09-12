@@ -829,6 +829,52 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("◉", output)
         self.assertIn("Fix", output)
 
+    def test_plan_created_continuation_shows_compact_line_not_full_panel(self):
+        # Owner directive: an interactive follow-up continuing an
+        # already-active plan must not reprint a full "Execution plan"
+        # panel every turn -- only a genuinely new plan gets the durable
+        # panel. runner_local.py sets payload["continuation"] via
+        # _has_active_prior_plan; render.py must honour it.
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.handle_event({
+                "event_type": "plan_created",
+                "payload": {
+                    "title": "Plan", "continuation": True,
+                    "items": [
+                        {"step": "Inspect", "status": "completed"},
+                        {"step": "Fix", "status": "pending"},
+                    ],
+                },
+            })
+        finally:
+            renderer.finish()
+        output = console.file.getvalue()
+        self.assertIn("Continuing", output)
+        self.assertIn("1/2", output)
+        # The full durable panel (bordered "Execution plan"/"Plan" title
+        # box) must NOT appear -- the live status area still legitimately
+        # shows step names/markers in situ (the same in-place update
+        # plan_step_progress already does), just not a fresh bordered panel.
+        self.assertNotIn("╭", output)
+
+    def test_plan_created_without_continuation_still_shows_full_panel(self):
+        # A genuinely new plan (continuation absent/False) keeps today's
+        # full durable panel -- this flag must not suppress it globally.
+        console = Console(file=StringIO(), no_color=True, width=200, force_terminal=True)
+        renderer = StreamRenderer(console)
+        try:
+            renderer.handle_event({
+                "event_type": "plan_created",
+                "payload": {"title": "Plan", "items": [{"step": "Inspect", "status": "pending"}]},
+            })
+        finally:
+            renderer.finish()
+        output = console.file.getvalue()
+        self.assertIn("Inspect", output)
+        self.assertNotIn("Continuing", output)
+
     def test_approval_gate_suspends_and_resumes_the_live_status_line(self):
         # Regression guard: Rich's Live redraws on its own timer, independent
         # of a blocking console.input() approval prompt -- without suspending
