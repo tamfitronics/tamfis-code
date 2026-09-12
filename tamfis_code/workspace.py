@@ -1088,7 +1088,9 @@ def _discover_project_type(workspace_root: Path) -> dict[str, Any]:
     return result("unknown", package_manager=None)
 
 
-def _detect_sibling_projects(root: Path, *, limit: int = 12) -> list[tuple[str, dict[str, Any]]]:
+def _detect_sibling_projects(
+    root: Path, *, limit: int = 12, max_children_scanned: int = 200,
+) -> list[tuple[str, dict[str, Any]]]:
     """One bounded level below `root`, list immediate subdirectories that
     are themselves independently-recognizable projects.
 
@@ -1104,15 +1106,27 @@ def _detect_sibling_projects(root: Path, *, limit: int = 12) -> list[tuple[str, 
     parent root across every sibling at once. Reuses _discover_project_type
     per child (the same bounded, root-only signal check, never recursive)
     rather than a new detection mechanism.
+
+    `max_children_scanned` bounds worst-case cost independently of `limit`:
+    without it, a root with hundreds/thousands of non-project subdirectories
+    (a large uploads/output/tmp-style directory, or a home directory with
+    many unrelated dot-dirs) was scanned in full -- one _discover_project_type
+    call (several glob()/exists() filesystem round trips each) per child --
+    before giving up, since the old loop only capped how many *matches* it
+    kept, not how many candidates it inspected.
     """
     try:
         children = sorted(p for p in root.iterdir() if p.is_dir())
     except OSError:
         return []
     found: list[tuple[str, dict[str, Any]]] = []
+    scanned = 0
     for child in children:
         if child.name in IGNORED_PARTS or child.name.startswith("."):
             continue
+        if scanned >= max_children_scanned:
+            break
+        scanned += 1
         detected = _discover_project_type(child)
         if detected.get("language") and detected["language"] != "unknown":
             found.append((child.name, detected))

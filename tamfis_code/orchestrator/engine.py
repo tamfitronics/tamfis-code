@@ -99,6 +99,11 @@ class AgentOrchestrator:
                 steps=[{"index": s.index, "step": s.name, "status": s.status} for s in self.run.plan.steps],
             )
             self.run.plan_id = saved.id
+        # Re-anchor the first epoch's clock now that one-time task setup
+        # (state persistence, planning, context building) is actually done,
+        # so that setup latency is never silently deducted from the first
+        # epoch's own execution budget.
+        self.run.runtime.begin_epoch_clock()
         return self.run
 
     def replace_plan(self, plan: ExecutionPlan) -> None:

@@ -7541,6 +7541,30 @@ async def _run_local_agent_turn_impl(
                     _flush_outcome = await _flush_dispatch_queue()
                     if _flush_outcome is not None:
                         return _flush_outcome
+                    if guard.time_budget_exhausted:
+                        # Elapsed execution-epoch time alone is a recoverable
+                        # control signal, never a terminal task failure (see
+                        # ExecutionController._fail's absolute guard and
+                        # guard_tool_call's renewal path). If the guard still
+                        # reports time exhaustion here, the extension cap was
+                        # reached: checkpoint as resumable and surface an
+                        # informational event -- the user (or an automatic
+                        # resume) continues the SAME task from the checkpoint
+                        # instead of the task being marked FAILED.
+                        _persist_turn_checkpoint(status="checkpointing", last_error=guard.reason)
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    f"↻ Execution epoch budget reached after "
+                                    f"{orchestrator.run.runtime.epoch_elapsed():.0f}s "
+                                    f"(extension cap {orchestrator.run.runtime.snapshot.runtime_extensions}/"
+                                    f"{orchestrator.run.runtime.budgets.max_runtime_extensions}). "
+                                    f"Task state checkpointed for continuation."
+                                ),
+                            },
+                        })
+                        return TaskOutcome(status="partial", error=guard.reason)
                     _persist_turn_checkpoint(status="failed", last_error=guard.reason)
                     orchestrator.fail(guard.reason)
                     renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": guard.reason}})

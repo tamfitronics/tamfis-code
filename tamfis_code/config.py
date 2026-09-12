@@ -149,7 +149,14 @@ class Config:
     # mid-execution. Purely a safety cap on the continuation loop --
     # unrelated budgets (tool-call count, repeated actions, stalls) are
     # untouched by an extension and still fail the task normally.
-    max_runtime_extensions: int = 3
+    # Raised from 3: with the 900s epoch that capped a healthy task at
+    # 60 minutes wall-clock, which a real long audit/build legitimately
+    # exceeds (confirmed live: a 74-minute task hit the cap and was
+    # wrongly reported as "Runtime budget exhausted" task failure).
+    # 100 extensions x 900s = ~15 days of continuous execution headroom;
+    # genuine no-progress stalls are still caught independently by the
+    # repeated-action/empty-observation guards long before this matters.
+    max_runtime_extensions: int = 100
     # How many times the shared repair-attempt counter (runtime/budgets.py's
     # max_repair_rounds -- covers provider fallback, empty-continuation
     # recovery, and genuine fix-the-actual-failure repairs alike) may renew

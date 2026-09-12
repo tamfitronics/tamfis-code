@@ -113,6 +113,39 @@ def _sanitize(value: Any) -> Any:
     return value
 
 
+# Per-session-row sanitized-output cache, keyed by session id -> (id(raw_row),
+# sanitized_row). _save_raw used to call _sanitize() on the *entire* on-disk
+# store (every session, not just the one being written) on every single
+# write. Confirmed live: a store with 14 sessions/21MB, several individual
+# sessions multiple MB each, cost 11.5s of pure regex work per write --
+# almost all of it re-redacting OTHER sessions' rows that were already
+# redacted the previous time and have not changed since. _load_raw() returns
+# the exact same cached dict object (same row objects, stable id()) across
+# calls in one process as long as the on-disk mtime hasn't moved underneath
+# it, so caching by id() is safe: an unrelated session's row is only ever
+# re-sanitized when its own object identity changes (a fresh disk load, or
+# that session actually being written).
+_SANITIZED_ROW_CACHE: dict[str, tuple[int, Any]] = {}
+
+
+def _sanitize_store(data: dict[str, Any]) -> dict[str, Any]:
+    """Sanitize a full session-id -> row store, reusing cached output for
+    rows whose object identity is unchanged since the last write."""
+    result: dict[str, Any] = {}
+    for key, row in data.items():
+        cached = _SANITIZED_ROW_CACHE.get(key)
+        if cached is not None and cached[0] == id(row):
+            result[key] = cached[1]
+            continue
+        sanitized_row = _sanitize(row)
+        _SANITIZED_ROW_CACHE[key] = (id(row), sanitized_row)
+        result[key] = sanitized_row
+    stale = _SANITIZED_ROW_CACHE.keys() - data.keys()
+    for stale_key in stale:
+        del _SANITIZED_ROW_CACHE[stale_key]
+    return result
+
+
 def _compact_memory_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Bound durable memory while retaining protocol shape and recent detail.
 
@@ -395,7 +428,7 @@ def _save_raw(data: dict[str, Any]) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=CONFIG_DIR)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(_sanitize(data), handle, indent=2, sort_keys=True)
+            json.dump(_sanitize_store(data), handle, indent=2, sort_keys=True)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temp_name, stat.S_IRUSR | stat.S_IWUSR)

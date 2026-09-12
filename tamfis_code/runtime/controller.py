@@ -51,6 +51,13 @@ class ExecutionController:
     def __init__(self, budgets: RuntimeBudgets | None = None) -> None:
         self.budgets = budgets or RuntimeBudgets()
         self.snapshot = RuntimeSnapshot()
+        # Task-lifetime start: set exactly once, for the whole task's
+        # duration -- never touched by renew_epoch(). Distinct from
+        # epoch_started_at (which resets every renewal): conflating the two
+        # (a prior version of renew_epoch() overwrote started_at with the
+        # fresh epoch start on every renewal) would make "how long has this
+        # task actually been running" impossible to answer after the first
+        # renewal.
         self.started_at = time.monotonic()
         self._last_action = ""
         self._last_observation = ""
@@ -58,11 +65,40 @@ class ExecutionController:
         # inside one task. A task may span many epochs; only genuine
         # no-progress conditions (not elapsed time) end the task.
         self.epoch_index = 0
+        # Provisional -- begin_epoch_clock() re-anchors this once one-time
+        # task setup (state persistence, context building, workspace
+        # discovery) has finished, so that setup latency is never silently
+        # deducted from the first epoch's budget.
         self.epoch_started_at = time.monotonic()
         self.epoch_renewals = 0
         self._epoch_renewal_requested = False
 
+    def begin_epoch_clock(self) -> None:
+        """Re-anchor the first epoch's clock to "now".
+
+        Call once, right after one-time task setup finishes and before the
+        agent's first real action -- never on renewal (renew_epoch() already
+        re-anchors on every subsequent epoch). Without this, epoch_started_at
+        is set at __init__ time, before begin()'s own setup work (session
+        state persistence, context building, workspace discovery) runs;
+        confirmed live that setup alone can take single-digit seconds, which
+        a tight epoch budget would otherwise silently spend before the agent
+        takes its first action.
+        """
+        self.epoch_started_at = time.monotonic()
+
     def _fail(self, reason: str) -> None:
+        # Absolute terminal-state guard (defence in depth): a
+        # runtime-budget-exhaustion event ALONE is never permitted to move
+        # a healthy running task into terminal FAILED state. Elapsed epoch
+        # time is a recoverable control signal (checkpoint + renew_epoch),
+        # not a task failure. If a rogue caller routes the raw exhaustion
+        # string here, convert it into an epoch-renewal request instead of
+        # a terminal transition -- the next guard_action call will then
+        # surface time_budget_exhausted and the orchestrator will renew.
+        if reason.startswith("Runtime budget exhausted"):
+            self._epoch_renewal_requested = True
+            return
         if not self.snapshot.terminal:
             self.snapshot.failure_reason = reason
             self.snapshot.transition(RuntimePhase.FAILED)
@@ -109,7 +145,6 @@ class ExecutionController:
         self.epoch_index += 1
         self.epoch_renewals += 1
         self.epoch_started_at = time.monotonic()
-        self.started_at = self.epoch_started_at
         self._epoch_renewal_requested = False
         if self.snapshot.phase == RuntimePhase.FAILED and self.snapshot.failure_reason.startswith(
             "Runtime budget exhausted"
