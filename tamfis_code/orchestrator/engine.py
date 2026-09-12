@@ -104,6 +104,10 @@ class AgentOrchestrator:
         # so that setup latency is never silently deducted from the first
         # epoch's own execution budget.
         self.run.runtime.begin_epoch_clock()
+        try:
+            self.save_task_ledger(status="running", next_action="begin executing the plan")
+        except Exception:
+            pass
         return self.run
 
     def replace_plan(self, plan: ExecutionPlan) -> None:
@@ -309,6 +313,46 @@ class AgentOrchestrator:
             # Checkpointing must never block the renewal itself; the live
             # runtime state remains the source of truth for this process.
             pass
+        try:
+            self.save_task_ledger(
+                status="checkpointing",
+                next_action=f"renew execution epoch {self.run.runtime.epoch_index + 1} and continue",
+            )
+        except Exception:
+            pass
+
+    def save_task_ledger(self, *, status: str, next_action: str) -> None:
+        """Persist the structured TaskLedger (Layer A durable facts) at a
+        checkpoint boundary -- the compaction-safe anchor thread compression
+        rebuilds active context from (see runtime/ledger.py's module
+        docstring). Reuses self.run's own plan/route/objective as the single
+        source of truth rather than tracking a second, parallel copy of the
+        same facts; never raises (checkpointing must not block execution).
+        """
+        assert self.run is not None
+        from ..runtime.ledger import PlanStep as _LedgerPlanStep, TaskLedger, load_ledger, save_ledger
+
+        task_id = str(self.session_id)
+        ledger = load_ledger(task_id) or TaskLedger(
+            task_id=task_id, session_id=self.session_id, objective=self.run.objective,
+            repo_roots=[self.workspace_root], cwd=self.workspace_root,
+        )
+        ledger.objective = self.run.objective
+        ledger.status = status
+        if self.run.plan is not None:
+            ledger.plan_steps = [
+                _LedgerPlanStep(index=step.index, name=step.name, status=step.status)
+                for step in self.run.plan.steps
+            ]
+            completed = sum(1 for s in ledger.plan_steps if s.status == "completed")
+            ledger.current_step_index = min(completed, max(len(ledger.plan_steps) - 1, 0))
+        if self.run.route:
+            ledger.current_provider = str(self.run.route.get("provider") or ledger.current_provider)
+            ledger.current_model = str(self.run.route.get("model") or ledger.current_model)
+        ledger.current_action = f"epoch {self.run.runtime.epoch_index} ({self.run.phase.value})"
+        ledger.next_action = next_action
+        ledger.checkpoint_version += 1
+        save_ledger(ledger)
 
     def waiting_for_approval(self, purpose: str) -> None:
         self.transition(AgentPhase.WAITING_FOR_APPROVAL, action=purpose)
@@ -547,6 +591,13 @@ class AgentOrchestrator:
             phase=AgentPhase.COMPLETED.value, status="completed",
             completion_evidence=list((local_state.get_session_state(self.session_id).task_state or {}).get("completion_evidence") or []) + ["final delivery emitted"],
         )
+        try:
+            self.save_task_ledger(
+                status="failed" if report.severity == "error" else "completed",
+                next_action="none",
+            )
+        except Exception:
+            pass
         return report
 
     def fail(self, error: str) -> None:
@@ -564,3 +615,7 @@ class AgentOrchestrator:
             phase=AgentPhase.FAILED.value, status="failed",
             failures=list((local_state.get_session_state(self.session_id).task_state or {}).get("failures") or []) + [{"category": classify_failure(error), "error": error[-1200:]}],
         )
+        try:
+            self.save_task_ledger(status="failed", next_action="diagnose and resume")
+        except Exception:
+            pass

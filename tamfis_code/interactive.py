@@ -1527,6 +1527,21 @@ async def run_interactive(
                 f"approval_policy={config.approval_policy}  provider={PUBLIC_PROVIDER_NAME}"
                 if standalone else f"approval_policy={config.approval_policy}  api_base={config.api_base}"
             )
+            ledger_line = ""
+            try:
+                from .runtime.ledger import load_ledger
+                ledger = load_ledger(str(workspace.session_id))
+                if ledger is not None:
+                    plan_total = len(ledger.plan_steps)
+                    plan_done = sum(1 for s in ledger.plan_steps if s.status == "completed")
+                    ledger_line = (
+                        f"\ntask={ledger.task_id}  ledger_status={ledger.status}  "
+                        f"plan={plan_done}/{plan_total}  checkpoint={ledger.checkpoint_version}\n"
+                        f"current_action={ledger.current_action or '-'}\n"
+                        f"next_action={ledger.next_action or '-'}"
+                    )
+            except Exception:
+                pass
             console.print(
                 f"{identity_line}\n"
                 f"workspace_root={workspace.workspace_root}\n"
@@ -1537,6 +1552,7 @@ async def run_interactive(
                 f"saved_plans={len(state.saved_plans)}  active_plan={state.active_plan_id or '-'}\n"
                 f"{backend_line}\n"
                 f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
+                f"{ledger_line}"
             )
             continue
         if _ci_equals(text, "/usage"):
