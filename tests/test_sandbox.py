@@ -1,5 +1,7 @@
 import os
 import pwd
+import shutil
+import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
@@ -7,6 +9,8 @@ import pytest
 
 from tamfis_code.sandbox import SandboxPolicy, build_sandbox_command, resolve_workspace_owner
 from tamfis_code.safety import RISK_DANGEROUS, classify_tool_call_risk
+
+_REAL_BWRAP = shutil.which("bwrap")
 
 
 def test_workspace_write_uses_bubblewrap_and_blocks_network(tmp_path):
@@ -208,3 +212,69 @@ def test_no_privilege_drop_when_this_process_is_not_root(tmp_path, monkeypatch):
     assert "--uid" not in result.argv
     assert result.env_overrides == {}
     assert result.backend == "bubblewrap"
+
+
+@pytest.mark.skipif(not _REAL_BWRAP, reason="requires a real bubblewrap binary")
+class TestRealBwrapEnforcement:
+    """Every other test in this file mocks shutil.which to force the
+    bubblewrap code path and only asserts on the *argv it builds* -- proof
+    the Python side constructs the right flags, not proof the resulting
+    sandbox actually enforces anything at the kernel level. These tests run
+    the real, unmocked bwrap binary this box has installed and assert on
+    what the sandboxed process can and cannot actually do -- closing the
+    Codex `landlock.rs`/`bundled_bwrap.rs` parity gap.
+
+    Confirmed live before writing these (2026-09-13): a write outside
+    workspace_root/writable_roots fails because the path doesn't exist
+    inside the sandbox at all (the outer read-only bind still gets its
+    /tmp replaced by an empty --tmpfs, so an unrelated real tmp directory
+    is simply invisible -- "No such file or directory", not a permission
+    error), a write inside workspace_root succeeds, and network access
+    with policy.network_access=False fails immediately ("Network is
+    unreachable") because of --unshare-net, without needing real
+    connectivity to any external host.
+    """
+
+    def test_write_outside_the_workspace_is_actually_blocked(self, tmp_path):
+        outside = tmp_path.parent / f"{tmp_path.name}_outside"
+        outside.mkdir()
+        try:
+            policy = SandboxPolicy(mode="workspace-write", network_access=False)
+            cmd = build_sandbox_command(
+                command=f"echo blocked > {outside}/hack.txt",
+                shell="bash", cwd=tmp_path, workspace_root=tmp_path, policy=policy,
+            )
+            result = subprocess.run(cmd.argv, capture_output=True, text=True, timeout=10)
+            assert result.returncode != 0
+            assert not (outside / "hack.txt").exists()
+        finally:
+            shutil.rmtree(outside, ignore_errors=True)
+
+    def test_write_inside_the_workspace_actually_succeeds(self, tmp_path):
+        policy = SandboxPolicy(mode="workspace-write", network_access=False)
+        cmd = build_sandbox_command(
+            command=f"echo allowed > {tmp_path}/inside.txt",
+            shell="bash", cwd=tmp_path, workspace_root=tmp_path, policy=policy,
+        )
+        result = subprocess.run(cmd.argv, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0
+        assert (tmp_path / "inside.txt").read_text() == "allowed\n"
+
+    def test_network_access_false_actually_blocks_a_connection(self, tmp_path):
+        policy = SandboxPolicy(mode="workspace-write", network_access=False)
+        cmd = build_sandbox_command(
+            command="timeout 3 bash -c 'exec 3<>/dev/tcp/8.8.8.8/53'",
+            shell="bash", cwd=tmp_path, workspace_root=tmp_path, policy=policy,
+        )
+        result = subprocess.run(cmd.argv, capture_output=True, text=True, timeout=10)
+        assert result.returncode != 0
+        assert "unreachable" in result.stderr.lower()
+
+    def test_network_access_true_does_not_add_unshare_net(self, tmp_path):
+        policy = SandboxPolicy(mode="workspace-write", network_access=True)
+        cmd = build_sandbox_command(
+            command="true", shell="bash", cwd=tmp_path, workspace_root=tmp_path, policy=policy,
+        )
+        assert "--unshare-net" not in cmd.argv
+        result = subprocess.run(cmd.argv, capture_output=True, text=True, timeout=10)
+        assert result.returncode == 0

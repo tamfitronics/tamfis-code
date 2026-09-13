@@ -28,11 +28,11 @@ Changelog at the bottom — do not just delete the history.
 | Codex category | tamfis-code feature | Verdict |
 |---|---|---|
 | `sandbox.rs`, `sandbox_tty.rs`, `sandbox_network_proxy.rs`, `sandbox_cloud_config.rs` | `sandbox.py`, `SandboxPolicy` | COVERED — `test_sandbox.py` |
-| `landlock.rs`, `bundled_bwrap.rs` | bwrap invocation in `config.py`/`mcp.py`/`sandbox.py` | GAP — only Python-side policy is tested; no test proves the underlying bwrap process actually blocks a real syscall/path |
+| `landlock.rs`, `bundled_bwrap.rs` | bwrap invocation in `sandbox.py`'s `build_sandbox_command` | COVERED (fixed 2026-09-13) — `test_sandbox.py`'s `TestRealBwrapEnforcement` runs the real, unmocked bwrap binary and confirms live: a write outside workspace_root/writable_roots fails (path invisible inside the sandbox), a write inside succeeds, `network_access=False` actually blocks a connection attempt ("Network is unreachable"), and `network_access=True` omits `--unshare-net` and allows the command to run |
 | `windows_sandbox.rs` | none | N/A — Linux-only |
 | `managed_proxy.rs` | none | N/A — no network-proxy concept |
-| execpolicy DSL (`basic.rs`, `execpolicy.rs`, `exec_policy.rs`, `cyber_exec_policy.rs`) | `tool_policy.py` (tool-category gating) | N/A — different architecture (tool-level gating vs. command-argument policy DSL) |
-| `extension_sandbox.rs` | none | N/A — plugins aren't sandboxed separately |
+| execpolicy DSL (`basic.rs`, `execpolicy.rs`, `exec_policy.rs`, `cyber_exec_policy.rs`) | `tool_policy.py` (56 lines, pure tool-category allow-listing) + `safety.py`'s `classify_command_risk` (a 3-tier read_only/medium/dangerous heuristic used to gate approval prompts) | N/A — confirmed by reading both files: neither is a declarative per-argument command policy DSL the way Codex's execpolicy crate is; architecturally different, not a missing test |
+| `extension_sandbox.rs` | `plugins.py` | N/A — confirmed by reading `plugins.py` in full: a plugin's tool handler is registered directly into the same `server.tools` dict as every built-in tool (`register_plugin_tools`) and runs in-process with full privileges; there is no isolation boundary at all to test |
 
 ## Apply-patch / file mutation
 
@@ -142,3 +142,8 @@ Changelog at the bottom — do not just delete the history.
   part of the same pass: symlink-escape write/edit tests (`test_mcp.py`),
   hook-execution-timeout test (`test_hooks.py`), `doctor` PATH
   world-writable check + tests (`doctor.py`, `test_doctor_session_diagnostics.py`).
+- 2026-09-13: Sandbox theme resolved. `landlock.rs`/`bundled_bwrap.rs`
+  closed with 4 new real-bwrap-execution tests in `test_sandbox.py`
+  (`TestRealBwrapEnforcement`, skipped if bwrap isn't installed). execpolicy
+  DSL and `extension_sandbox.rs` N/A verdicts confirmed by reading
+  `tool_policy.py`/`safety.py`/`plugins.py` in full rather than by grep.
