@@ -66,6 +66,50 @@ def _attempt_heal(name: str) -> Optional[str]:
     except OSError:
         return None
 
+def check_path_safety() -> CheckResult:
+    """Flag a world-writable, non-sticky directory on PATH.
+
+    execute_command resolves bare command names (git, python3, npm, ...)
+    against PATH just like a shell would. If any directory earlier in PATH
+    than the real binary's location is writable by any local user and
+    lacks the sticky bit (unlike /tmp, which is world-writable but
+    sticky-protected), another local user could plant a same-named binary
+    there and have it silently run instead of the real one, on behalf of
+    whatever tamfis-code (or the agent it drives) shells out to next.
+    Mirrors Codex's own `doctor_path_safety` check, which tamfis-code had
+    no equivalent of at all before this.
+    """
+    import os as _os
+    import stat as _stat
+
+    raw_path = _os.environ.get("PATH", "")
+    entries = [entry for entry in raw_path.split(_os.pathsep) if entry]
+    if not entries:
+        return CheckResult("PATH safety", "WARNING", "PATH is empty or unset")
+
+    unsafe: list[str] = []
+    for entry in entries:
+        try:
+            info = _os.stat(entry)
+        except OSError:
+            continue
+        world_writable = bool(info.st_mode & _stat.S_IWOTH)
+        sticky = bool(info.st_mode & _stat.S_ISVTX)
+        if world_writable and not sticky:
+            unsafe.append(entry)
+
+    if unsafe:
+        plural = "y" if len(unsafe) == 1 else "ies"
+        return CheckResult(
+            "PATH safety", "FAIL",
+            f"world-writable, non-sticky director{plural} on PATH -- any local user could "
+            f"plant a binary here to hijack a command tamfis-code shells out to: "
+            + ", ".join(unsafe),
+        )
+    plural = "y" if len(entries) == 1 else "ies"
+    return CheckResult("PATH safety", "PASS", f"{len(entries)} PATH director{plural}, none world-writable")
+
+
 _REUSABLE_SESSION_STATUSES = {"idle", "active"}
 
 
@@ -381,6 +425,7 @@ async def run_doctor(
         results.append(CheckResult("Remote Workspace authentication", "PASS", f"credentials present for {creds.email or creds.user_id or 'unknown user'}"))
 
     results.extend(_diagnose_local_providers())
+    results.append(check_path_safety())
     if workspace_root is not None:
         results.extend(_diagnose_local_session(workspace_root))
         # Deep self-health-check of the CLI's own subsystems (state

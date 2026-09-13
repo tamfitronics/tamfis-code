@@ -6,6 +6,7 @@ verified the CLI's own claimed state (active session, workspace snapshot,
 event replay) actually held up.
 """
 import asyncio
+import os
 import tempfile
 import unittest
 from io import StringIO
@@ -18,7 +19,7 @@ from tamfis_code import state as state_module
 from tamfis_code.config import Config
 from tamfis_code.doctor import (
     CheckResult, _diagnose_local_providers, _diagnose_local_session,
-    _diagnose_session, check_event_sequence_integrity, run_doctor,
+    _diagnose_session, check_event_sequence_integrity, check_path_safety, run_doctor,
 )
 
 
@@ -218,6 +219,57 @@ class DiagnoseLocalSessionTests(unittest.TestCase):
         self.assertEqual(by_name["Local session context usage"].status, "WARNING")
         self.assertEqual(by_name["Local tool-call success rate"].status, "WARNING")
         self.assertNotIn("Active plan step progress", by_name)
+
+
+class PathSafetyTests(unittest.TestCase):
+    """Mirrors Codex's own `doctor_path_safety` check, which tamfis-code had
+    no equivalent of: execute_command resolves bare command names (git,
+    python3, npm, ...) against PATH just like a shell would, so a
+    world-writable, non-sticky directory on PATH is a real local
+    privilege-escalation vector -- another local user could plant a
+    same-named binary there and have it silently run instead of the real
+    one on tamfis-code's behalf."""
+
+    def setUp(self):
+        self._original_path = os.environ.get("PATH", "")
+
+    def tearDown(self):
+        os.environ["PATH"] = self._original_path
+
+    def test_passes_when_every_path_directory_is_safe(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o755)
+            os.environ["PATH"] = tmp
+            result = check_path_safety()
+        self.assertEqual(result.status, "PASS")
+
+    def test_fails_on_a_world_writable_non_sticky_directory(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o777)
+            os.environ["PATH"] = tmp
+            result = check_path_safety()
+        self.assertEqual(result.status, "FAIL")
+        self.assertIn(tmp, result.detail)
+
+    def test_world_writable_but_sticky_directory_is_exempt(self):
+        # Mirrors /tmp itself: world-writable but sticky-protected, so
+        # another user can create files but can never replace or delete
+        # someone else's -- the classic safe shared-tmp pattern.
+        with tempfile.TemporaryDirectory() as tmp:
+            os.chmod(tmp, 0o1777)
+            os.environ["PATH"] = tmp
+            result = check_path_safety()
+        self.assertEqual(result.status, "PASS")
+
+    def test_empty_path_is_a_warning_not_a_failure(self):
+        os.environ["PATH"] = ""
+        result = check_path_safety()
+        self.assertEqual(result.status, "WARNING")
+
+    def test_a_missing_path_directory_is_skipped_not_raised(self):
+        os.environ["PATH"] = "/definitely/does/not/exist/anywhere"
+        result = check_path_safety()
+        self.assertEqual(result.status, "PASS")
 
 
 if __name__ == "__main__":
