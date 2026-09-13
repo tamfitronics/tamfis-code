@@ -216,6 +216,77 @@ Changelog at the bottom — do not just delete the history.
   `TestRunSessionHooks` and `test_round_budget_extension.py`'s new
   end-to-end integration test.
 
+## Claude Code comparison
+
+Unlike Codex, Claude Code's own source and internal test suite are not
+public, so this section is not a test-file diff. Ground truth instead
+comes from what is actually installed and inspectable on this same box:
+the official `plugin-dev` plugin's developer documentation
+(`~/.claude/plugins/marketplaces/claude-plugins-official/plugins/plugin-dev/skills/*/SKILL.md`
+— authoritative first-party specs for hooks, agents, skills, commands,
+settings, and MCP integration), real `hooks.json` configs from six other
+official plugins, the 6,679-line `~/.claude/cache/changelog.md`, and
+`claude --help`'s full CLI reference. Because Claude Code is a more
+mature product in some of these areas, "GAP" here more often means a
+genuine missing *feature*, not just missing tests for an existing one —
+each row says which.
+
+### Hooks
+
+Claude Code's authoritative event list (`hook-development/SKILL.md`'s own
+Quick Reference table): PreToolUse, PostToolUse, UserPromptSubmit, Stop,
+SubagentStop, SessionStart, SessionEnd, PreCompact, Notification. Real
+plugin configs on this box also use `PostToolUseFailure` and
+`UserPromptExpansion`, seen in practice but not in that skill's own table.
+
+| Claude Code capability | tamfis-code feature | Verdict |
+|---|---|---|
+| PreToolUse | `hooks.py`'s `pre_tool_use` | COVERED |
+| PostToolUse | `hooks.py`'s `post_tool_use` | COVERED |
+| UserPromptSubmit (block a turn or add context before it reaches a provider) | `hooks.py`'s new `user_prompt_submit` + `run_user_prompt_submit_hooks()` | COVERED (added 2026-09-13) — fires once per turn in `runner_local.py` right after the resumed/fresh objective is finalized; exit code 2 blocks the turn before any provider call, other output is folded into the objective as added context. Confirmed live end-to-end in `tests/test_claude_parity_hooks.py`: a blocking hook stops the turn with zero provider calls, and a context-adding hook's text is proven to reach the actual provider request payload |
+| Stop (can force the agent to keep working via `{"decision": "block"}`, re-injecting into the same round loop) | none | GAP (feature) — the block-and-continue half of Stop has no analog; would require resuming a turn `runner_local.py` already believes is finished, a substantially larger change than this pass's scope. Not built |
+| Stop (observe-only half: fires on successful completion) | `hooks.py`'s new `session_completed` + `run_session_completed_hooks()` | COVERED (added 2026-09-13) — deliberately only the observe-only half of Stop's contract; fires from `_finalize_completed_answer`, the one real successful-completion return path in `_run_local_agent_turn_impl`. Confirmed live in `tests/test_claude_parity_hooks.py` that a real on-disk hook fires with the correct summary |
+| SubagentStop | none | GAP (feature) — no equivalent fires when a delegated swarm sub-task finishes; `swarm.py`'s delegation has no hook point at all today |
+| SessionStart (load context, persist env vars via `$CLAUDE_ENV_FILE`) | none | GAP (feature) — no hook fires when a tamfis-code session/process starts |
+| SessionEnd | none | GAP (feature) — no hook fires when a session ends (as distinct from a single turn completing, which `session_completed` now covers) |
+| PreCompact (add critical info to preserve before context compaction) | none | GAP (feature) — `state.py`'s conversation compaction (see `test_thread_compression.py`) has no hook point before it runs |
+| Notification (react when Claude sends a notification) | none | GAP (feature) — no equivalent; tamfis-code has no generalized notification-event concept for hooks to observe |
+| PostToolUseFailure, UserPromptExpansion | none | GAP (feature), lower priority — narrower/newer events seen in real plugin configs but not central to the documented spec |
+| Prompt-based hooks (`{"type": "prompt", "prompt": "..."}` — an LLM call decides the outcome instead of a shell command) | none | GAP (feature) — every tamfis-code hook is a `command`-type shell subprocess only |
+| Parallel hook execution (all matching hooks for an event run concurrently) | sequential (`for hook in hooks: ...`, awaited one at a time) | GAP (feature) — a design choice difference (this session's implementations lean toward deterministic ordering, e.g. `session_interrupted`'s "first blocking hook stops evaluation" semantics), not obviously a defect, but worth the user knowing it's not matched |
+| `if`-conditional matching (gate a hook on the actual command being run, e.g. `"if": "Bash(git commit:*)"`, not just the tool name) | tamfis-code's `matcher` is a regex against `tool_name` only | GAP (feature) — no equivalent of matching against the command/argument content itself |
+| `asyncRewake` (a hook runs in the background and later "wakes" the agent back up with its findings, mid-or-after an already-answered turn) | none | GAP (feature), largest of this list — no background/suspend-resume mechanism exists in tamfis-code's synchronous per-turn hook firing at all; would need genuinely new runtime infrastructure, not a small addition |
+| PreToolUse's `updatedInput` (a hook can rewrite the tool call's arguments before it runs, not just approve/deny it) | none | GAP (feature) — tamfis-code's pre_tool_use can only block, never mutate, the pending tool call |
+| Hooks loaded once at session start, require a restart to pick up changes | tamfis-code reads hooks.toml fresh every turn | Not a gap — tamfis-code's behavior here is arguably better (edit hooks.toml and the very next turn uses it, no restart), noted for completeness rather than tabulated as COVERED/GAP |
+
+### Broader feature areas (lighter-touch, verified against source but not test-audited to the same depth as hooks)
+
+| Area | Claude Code | tamfis-code | Verdict |
+|---|---|---|---|
+| Subagents | `.claude/agents/*.md`, `--agent`/`--agents` CLI flags | `agent_definitions.py`'s `load_agent_definitions` — user + project markdown files, read fresh (no restart needed), consumed by `swarm.py` delegation | COVERED — same convention, tamfis-code's fresher-reload behavior is again arguably ahead |
+| Skills (auto-discovered SKILL.md packages, triggered by description match) | `skills/<name>/SKILL.md` auto-discovery, per `plugin-structure/SKILL.md` | `plugins.py` declares a `skill_roots` field on plugin manifests, but confirmed by grep: nothing in `tamfis_code/*.py` actually reads a SKILL.md-like file from those roots or exposes anything to the model from them — `skill_roots` is only ever displayed in a status listing (`cli.py`'s plugin status output), never consumed | GAP (feature) — the plumbing for a skills concept was started (a config field exists) but the actual auto-discovery/invocation mechanism was never built |
+| Custom slash commands | `commands/*.md`, project + user, `$ARGUMENTS` substitution | `custom_commands.py` — explicitly modeled on this exact convention (its own docstring says "Claude Code/Codex-style"), same discovery paths, same `$ARGUMENTS` substitution, project overrides user by name | COVERED |
+| MCP integration | full external server config (stdio/HTTP), per `mcp-integration/SKILL.md` | `mcp_client.py`'s `StandaloneMCPBridge` — stdio and HTTP server support, config-file-based | COVERED for the core config/dispatch mechanism (OAuth/elicitation gaps already covered in the Codex section above, which apply equally here since Claude Code's MCP integration also documents those capabilities) |
+| Settings/permission model | `.claude/settings.json` (hooks, permissions.allow/deny, env, model), plugin `plugin-settings/SKILL.md` | `config.py` (`.tamfis/config.toml` layering) + `permissions.py` (`decide_permission` allow/ask/deny rules) | COVERED at a comparable depth for the core allow/ask/deny + config-layering mechanism |
+| Session management CLI (`--bg`/`--background`, `attach`, `logs`, `stop`, `rm`, `agents` listing) | documented in `claude --help` | tamfis-code has background-job support (`background.py`, referenced throughout this session's doctor/test work) with comparable list/attach-style operations | COVERED at a comparable level — not re-verified flag-by-flag in this pass; flagged as lighter-touch than the hooks section |
+
+### What was fixed this pass vs. documented as a future feature investment
+
+Fixed and deployed: `user_prompt_submit` and `session_completed` hook
+events, both wired into real `runner_local.py` call sites with unit tests
+(`test_hooks.py`) and a real end-to-end integration test
+(`test_claude_parity_hooks.py`) proving the wiring, not just the isolated
+functions.
+
+Deliberately not attempted this pass (each is a genuine, separate feature
+investment, not a fast/high-value fix): Stop's block-and-continue
+semantics, SubagentStop, SessionStart, SessionEnd, PreCompact,
+Notification, prompt-based (LLM-driven) hooks, parallel hook execution,
+`if`-conditional command matching, `asyncRewake`, and PreToolUse's
+`updatedInput` mutation. The skills auto-discovery/invocation gap
+(`plugins.py`'s unused `skill_roots` field) is likewise flagged but not
+built here.
+
 ## Summary
 
 Every row in this document has now been resolved to a definitive verdict
@@ -223,9 +294,13 @@ Every row in this document has now been resolved to a definitive verdict
 pass: symlink-escape write/edit tests, hook-execution-timeout test,
 `doctor` PATH-safety check, real-bwrap sandbox enforcement tests, MCP
 startup-grace test, quota-classifier tests, token-budget tests,
-same-path-write dispatch-conflict test, the `session_interrupted` hook
-event (closing the one flagged feature gap), `load_instruction_text` refresh
-test, and a full vision/image-attachment test file. One genuine future
-FEATURE gap was flagged for the user rather than silently built:
-`interrupt_hooks.rs` has no tamfis-code equivalent (no hook event fires on
-task interruption/cancellation).
+same-path-write dispatch-conflict test, the `session_interrupted`,
+`user_prompt_submit`, and `session_completed` hook events (Codex's
+`interrupt_hooks.rs` and two Claude-Code-parity additions), `load_instruction_text` refresh
+test, and a full vision/image-attachment test file. Several genuine future
+FEATURE gaps remain flagged for the user rather than silently built --
+see the Claude Code comparison section above for the full list (Stop's
+block-and-continue semantics, SubagentStop, SessionStart, SessionEnd,
+PreCompact, Notification, prompt-based hooks, parallel hook execution,
+`if`-conditional matching, `asyncRewake`, PreToolUse input mutation, and
+skills auto-discovery).
