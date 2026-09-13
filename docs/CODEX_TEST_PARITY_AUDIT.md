@@ -59,8 +59,8 @@ Changelog at the bottom — do not just delete the history.
 | `approvals.rs`, `network_approval*.rs` | `permissions.py`, approval flow | COVERED |
 | `safety_check_downgrade.rs`, `safety_buffering.rs` | `safety.py`, safety manifest | COVERED |
 | `skill_approval.rs`, `skills*.rs` | none | N/A — no skills marketplace |
-| `request_user_input*.rs` | `ask_user_question`-equivalent | GAP — standalone coverage unconfirmed |
-| `request_permissions*.rs` | likely same mechanism as approvals | GAP — needs confirmation it's actually distinct before deciding N/A vs GAP |
+| `request_user_input*.rs` | `mcp.py`'s `_ask_user_question` tool | COVERED (confirmed 2026-09-13) — `test_mcp.py`'s `TestAskUserQuestionTool` has 5 tests: unavailable without an attached console, unavailable when non-interactive, free-text answer, numeric option selection, free text still accepted when options are offered |
+| `request_permissions*.rs` | `permissions.py`'s `decide_permission` -- a distinct, persisted allow/ask/deny rule engine, separate from the interactive live approval-prompt flow that `approvals.rs` maps to | COVERED (confirmed 2026-09-13) — `test_permissions.py` covers deny-precedes-ask-and-allow, scoped tool/path rule matching, protected-path forcing "ask" even under an allow rule, explicit deny still winning for a protected path, and a shell command merely mentioning a protected path also requiring approval |
 | `permissions_messages.rs`, `catalog_permission_messages.rs` | none (inlined copy, not catalog-driven) | N/A |
 
 ## Hooks
@@ -152,3 +152,10 @@ Changelog at the bottom — do not just delete the history.
   alongside it (`test_standalone_mcp_client.py`). `mcp_tool_cache.rs` and
   OAuth-refresh N/A verdicts tightened with concrete full-text-search
   evidence instead of a prior grep pass's "not found."
+- 2026-09-13: Approvals/permissions theme resolved. Both `request_user_input*.rs`
+  and `request_permissions*.rs` reclassified GAP -> COVERED after reading
+  `test_mcp.py`'s `TestAskUserQuestionTool` and `test_permissions.py` in
+  full: both already have real edge-case coverage, not just happy-path.
+  Confirmed `decide_permission` (persisted allow/ask/deny rules) and the
+  interactive approval-prompt flow are two genuinely distinct mechanisms,
+  each separately tested.
