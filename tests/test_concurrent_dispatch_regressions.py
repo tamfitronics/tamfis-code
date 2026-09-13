@@ -82,6 +82,66 @@ class ConcurrentWriteFileMutationEventTests(_StatePatchMixin, unittest.TestCase)
             name = Path(event["payload"]["path"]).name
             self.assertEqual(event["payload"]["lines_added"], 1, name)
 
+    def test_two_writes_to_the_same_path_never_dispatch_in_the_same_group(self):
+        # Closes the Codex tool_parallelism.rs parity gap: the test above
+        # only proves the no-conflict (different paths) case actually runs
+        # concurrently. This proves the other half -- _conflicts's path-
+        # overlap rule actually forces two mutating calls to the SAME path
+        # into separate groups (each its own asyncio.gather call of size 1),
+        # rather than racing two writers against one file. Verified by
+        # recording every asyncio.gather call's argument count rather than
+        # reaching into private dispatch-queue state, so this stays a
+        # black-box behavioral proof, not an implementation-detail assertion.
+        with tempfile.TemporaryDirectory() as workspace:
+            root = Path(workspace)
+            write_a = json.dumps({"path": "a.py", "content": "print('first')\n"})
+            write_b = json.dumps({"path": "a.py", "content": "print('second')\n"})
+            verify_args = json.dumps({"command": "true"})
+            rounds = [
+                [_chunk(_delta(tool_calls=[
+                    _tool_call_delta(0, call_id="wa", name="write_file", arguments=write_a),
+                    _tool_call_delta(1, call_id="wb", name="write_file", arguments=write_b),
+                ]))],
+                [_chunk(_delta(tool_calls=[
+                    _tool_call_delta(0, call_id="verify", name="execute_command", arguments=verify_args),
+                ]))],
+                [_chunk(_delta(content="Wrote a.py twice."), finish_reason="stop")],
+            ]
+            client = _FakeClient(rounds)
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            group_sizes: list[int] = []
+            real_gather = asyncio.gather
+
+            async def _recording_gather(*coros, **kwargs):
+                group_sizes.append(len(coros))
+                return await real_gather(*coros, **kwargs)
+
+            with patch("tamfis_code.runner_local.should_plan", return_value=False), \
+                 patch("tamfis_code.runner_local.detect_validation_commands", return_value=[]), \
+                 patch("tamfis_code.runner_local.asyncio.gather", side_effect=_recording_gather):
+                outcome = asyncio.run(run_local_agent_turn(
+                    manager,
+                    ProviderType.NVIDIA,
+                    None,
+                    [{"role": "user", "content": "edit a.py twice"}],
+                    Console(file=StringIO(), no_color=True, width=200),
+                    renderer,
+                    workspace_root=str(root),
+                    session_id=1,
+                    approval_policy="auto",
+                    interactive=False,
+                ))
+            final_content = root.joinpath("a.py").read_text()
+
+        self.assertEqual(outcome.status, "completed")
+        # The two same-path writes must never appear together in a single
+        # gather call (group size >= 2) -- every group touching them is
+        # exactly 1.
+        self.assertTrue(all(size <= 1 for size in group_sizes), group_sizes)
+        self.assertEqual(final_content, "print('second')\n")
+
 
 if __name__ == "__main__":
     unittest.main()

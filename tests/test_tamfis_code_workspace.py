@@ -8,8 +8,8 @@ from tamfis_code import state as state_module
 from tamfis_code.workspace import (
     _detect_sibling_projects, _indexable_files, _project_metadata, blocking_dirty_files,
     build_system_prompt, classify_root, context_from_session, discover_local_repository,
-    find_resumable_session, list_resumable_local_sessions, recent_local_sessions_for_workspace,
-    resolve_local_workspace, resolve_workspace, scratch_root,
+    find_resumable_session, list_resumable_local_sessions, load_instruction_text,
+    recent_local_sessions_for_workspace, resolve_local_workspace, resolve_workspace, scratch_root,
 )
 
 
@@ -727,6 +727,26 @@ class BuildSystemPromptTests(_StatePatchMixin, unittest.TestCase):
             prompt = build_system_prompt(1, root)
         self.assertIn("OVERRIDE-AGENT-RULE", prompt)
         self.assertNotIn("BASE-AGENT-RULE", prompt)
+
+    def test_load_instruction_text_always_re_reads_from_disk(self):
+        # Closes the Codex agents_md_refresh.rs parity gap: load_instruction_text
+        # (consumed by orchestrator/engine.py's validate() and runner_local.py's
+        # preflight validation, both on every completion-validation pass, not
+        # once per session) has no cache/memoization anywhere -- it calls
+        # Path.read_text fresh on every call. A mid-session edit to AGENTS.md
+        # therefore takes effect on the very next validation pass, with
+        # nothing to invalidate. Verified live before writing this.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "AGENTS.md").write_text("OLD-RULE: restart service X")
+            with patch("tamfis_code.workspace._git") as git:
+                git.side_effect = lambda _cwd, *args: str(root) if args == ("rev-parse", "--show-toplevel") else ""
+                first = load_instruction_text(root)
+                (root / "AGENTS.md").write_text("NEW-RULE: restart service Y")
+                second = load_instruction_text(root)
+        self.assertIn("OLD-RULE", first)
+        self.assertIn("NEW-RULE", second)
+        self.assertNotIn("OLD-RULE", second)
 
     def test_unrelated_nested_instructions_are_not_loaded(self):
         with tempfile.TemporaryDirectory() as tmp:

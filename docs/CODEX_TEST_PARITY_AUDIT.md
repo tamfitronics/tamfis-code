@@ -95,19 +95,21 @@ Changelog at the bottom — do not just delete the history.
 | Codex category | tamfis-code feature | Verdict |
 |---|---|---|
 | `unified_exec*` family (one PTY+approval+stdin-review tool) | `pty.py`/`local_pty.py` + separate `execute_command` (two tools, different architecture) | N/A (borderline) — literal port doesn't make sense; underlying scenarios (approval mid-command, stdin review) not confirmed tested either way |
-| `tool_parallelism.rs` (concurrent tool_calls in one turn) | unconfirmed | GAP — concurrent tool-call ordering/semantics not confirmed tested |
+| `tool_parallelism.rs` (concurrent tool_calls in one turn) | `runner_local.py`'s `_dispatch_queue`/`_conflicts`/`_flush_dispatch_queue` -- a real, non-trivial feature: independent tool calls in one round run concurrently via `asyncio.gather`, split into "maximal conflict-free groups" (two calls conflict if they touch overlapping paths and either isn't read-only, or an `execute_command` is paired with any non-read-only mutation) | COVERED (fixed 2026-09-13) — `test_concurrent_dispatch_regressions.py` already covered the no-conflict/concurrent-success case; added `test_two_writes_to_the_same_path_never_dispatch_in_the_same_group`, which records every real `asyncio.gather` call's argument count (black-box, not reaching into private dispatch-queue state) and confirms two same-path writes are always split into separate size-1 groups, never raced against each other |
 | `tool_lifecycle.rs`, `tool_harness.rs` | distributed across many tool-specific test files | COVERED |
-| `turn_state.rs`, `turn_input_submission.rs`, `pending_input.rs`, `direct_tool_metadata.rs` | unconfirmed | GAP — needs investigation before classifying |
+| `turn_input_submission.rs`, `pending_input.rs` | `state.py`'s `enqueue_instruction`/`queued_user_instructions` -- mid-turn follow-up messages are queued (priority-ordered, durable) rather than lost while a task is running | COVERED — exercised across 7 test files including a dedicated `test_live_input.py` |
+| `direct_tool_metadata.rs` | `mcp.py`'s `list_tools`/`tool_schemas_openai`/`external_tool_schemas_openai` | COVERED (as a general concept) — exercised across `test_mcp.py`, `test_integration_new.py`, `test_mcp_stdio_server.py`, `test_standalone_mcp_client.py`; Codex's exact scenario in this file wasn't individually confirmed since the Codex source wasn't re-read line-by-line here, but the underlying tool-metadata-exposure surface is real and tested |
+| `turn_state.rs` | none, as a distinct concept | N/A — no separate "turn state" abstraction exists; the underlying concerns (round budget, dispatch queue, checkpoint) are already audited individually elsewhere in this document |
 
 ## Context / prompt engineering
 
 | Codex category | tamfis-code feature | Verdict |
 |---|---|---|
-| `agents_md.rs`, `agents_md_refresh.rs` | `workspace.py` `load_instruction_text`/`_instruction_chain` | GAP — hot-refresh mid-session (re-reading after a live edit) not confirmed tested |
-| `additional_context.rs`, `context_annotations.rs`, `current_time_reminder.rs`, `personality.rs`, `collaboration_instructions.rs`, `git_enrichment.rs` | not found | N/A — needs one more confirmation pass before fully closing |
-| `truncation.rs` | truncation logic in `providers.py`/`runner_local.py` | GAP — unclear which test covers this specifically |
+| `agents_md.rs`, `agents_md_refresh.rs` | `workspace.py`'s `load_instruction_text` | COVERED (fixed 2026-09-13) — confirmed live and now tested: `load_instruction_text` has no cache/memoization at all, calling `Path.read_text` fresh on every call (both call sites, `orchestrator/engine.py`'s `validate()` and `runner_local.py`'s preflight validation, invoke it fresh on every validation pass, not once per session) -- a mid-session AGENTS.md edit takes effect on the very next validation with nothing to invalidate. New `test_tamfis_code_workspace.py::test_load_instruction_text_always_re_reads_from_disk` |
+| `additional_context.rs`, `context_annotations.rs`, `current_time_reminder.rs`, `personality.rs`, `collaboration_instructions.rs`, `git_enrichment.rs` | none | N/A — confirmed by full-text search across all of `tamfis_code/*.py`: zero hits for "current_time", "collaboration_instruction", "git_enrichment", or "personality" as a concept; none of these exist under any name |
+| `truncation.rs` | Context-budget truncation is `_trim_tool_outputs`/`_estimate_tokens` (`runner_local.py`) -- already closed under Resilience's `token_budget.rs` row above | COVERED (via the token_budget.rs fix) -- note: `_truncate_degenerate_repetition`/`_corrupted_lexical_stream_index` also exist in `runner_local.py` but solve a different problem entirely (detecting and truncating repetitive/corrupted model output, a quality-control guard, not context-window truncation) and were left untested as out of scope for this row |
 | `audio_truncation.rs` | none (audio not a real input modality) | N/A |
-| `view_image.rs` | vision/image_content_blocks support across `cli.py`/`render.py`/`providers.py`/`mcp.py`/`runner_local.py` | GAP — feature clearly exists, no dedicated test file found |
+| `view_image.rs` | `is_vision_image_path`/`build_vision_content_blocks`/`_messages_with_vision_content` (`runner_local.py`) | COVERED (fixed 2026-09-13) — new `tests/test_vision_attachments.py` (13 tests): recognised/unrecognised image extensions, a real image becoming a base64 data URI block, a non-image path and a missing path both silently skipped, an oversized image skipped, mixed-path filtering, splicing into the target user message without mutating the original, no-op when there are no blocks or no target index, and a non-user target message left untouched |
 | `web_search.rs`, `search_tool.rs` | both implemented | COVERED |
 
 ## Multi-agent / delegation
@@ -171,3 +173,22 @@ Changelog at the bottom — do not just delete the history.
   6 tests). `_estimate_tokens`/`_trim_tool_outputs` never had any test at
   all (`tests/test_token_budget_trimming.py`, 9 new tests) -- confirmed
   distinct from the existing round-count budget tests.
+- 2026-09-13: Tool execution mechanics theme resolved. `tool_parallelism.rs`
+  closed with a new test proving two same-path writes never dispatch in
+  the same concurrent group (`test_concurrent_dispatch_regressions.py`,
+  verified via a real `asyncio.gather` call-count recorder rather than
+  private state). `turn_input_submission.rs`/`pending_input.rs` reclassified
+  COVERED (the queued-instruction mechanism, tested across 7 files).
+  `direct_tool_metadata.rs` reclassified COVERED (general tool-metadata
+  exposure, tested across 4 files). `turn_state.rs` confirmed N/A (no
+  distinct abstraction; underlying concerns audited elsewhere).
+- 2026-09-13: Context/prompt-engineering theme resolved. `agents_md_refresh.rs`
+  closed -- confirmed `load_instruction_text` has no caching at all, so a
+  mid-session edit is always picked up on the next read; new test added.
+  `truncation.rs` reclassified COVERED via the token_budget.rs fix above
+  (same underlying functions). `view_image.rs` closed with a new dedicated
+  `tests/test_vision_attachments.py` (13 tests). Remaining N/A rows
+  (`additional_context.rs`, `context_annotations.rs`, `current_time_reminder.rs`,
+  `personality.rs`, `collaboration_instructions.rs`, `git_enrichment.rs`)
+  confirmed via a full-text search across all of `tamfis_code/*.py` --
+  none exist under any name.
