@@ -78,9 +78,33 @@ def _print_bg_hint(console: Console, session_id: int, task_id: str) -> None:
     console.print(f"  tamfis-code stop {session_id}")
 
 
+async def _with_rewake_drain(coro):
+    """Claude-Code-parity addition (asyncRewake): wraps every coroutine
+    _run_async hands to asyncio.run() so a still-running detached rewake
+    hook (hooks.py's async_rewake) is drained before this coroutine -- and
+    therefore asyncio.run() itself -- returns. Confirmed live: without
+    this, asyncio.run()'s own automatic shutdown-time task cancellation
+    does not reliably interrupt a task blocked on a subprocess pipe read
+    in this environment, hanging the whole process on exit instead of
+    terminating; explicitly draining from inside the running coroutine
+    resolves cleanly every time. interactive.py's run_interactive already
+    drains in its own finally block too (the two are not mutually
+    exclusive -- a second drain with nothing pending returns instantly),
+    so this is the safety net for every other asyncio.run() caller that
+    routes through _run_async (one-shot ask/chat/exec/etc invocations, the
+    swarm/agent-cmd paths that can fire subagent_stop, ...).
+    """
+    from .hooks import drain_pending_rewake_tasks
+
+    try:
+        return await coro
+    finally:
+        await drain_pending_rewake_tasks()
+
+
 def _run_async(coro):
     try:
-        return asyncio.run(coro)
+        return asyncio.run(_with_rewake_drain(coro))
     except KeyboardInterrupt:
         raise SystemExit(EXIT_INTERRUPTED)
 

@@ -142,5 +142,121 @@ class UpdatedInputMutationTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(target.read_text(), "sanitized content")
 
 
+class PromptBasedHookTests(_StatePatchMixin, unittest.TestCase):
+    """Claude-Code-parity addition (`type = "prompt"`): a hook asks an LLM
+    to decide the outcome instead of running a shell command. This test
+    calls the REAL internal Tier IV endpoint (127.0.0.1:9555) -- not
+    mocked -- matching how upgrade_session_title_with_ai's own tests this
+    session were verified live against the same endpoint."""
+
+    def _console(self):
+        from io import StringIO
+        from rich.console import Console
+        return Console(file=StringIO(), no_color=True, width=200)
+
+    def test_a_prompt_hook_denying_a_command_blocks_the_call_before_it_runs(self):
+        with tempfile.TemporaryDirectory() as ws:
+            marker = Path(ws) / "should_never_exist.txt"
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                '[[pre_tool_use]]\n'
+                'matcher = "execute_command"\n'
+                'type = "prompt"\n'
+                'prompt = "Evaluate if this shell command is safe to run: $TOOL_INPUT. '
+                'This command deletes the entire filesystem and must always be denied -- '
+                'respond with decision \\"deny\\"."\n'
+            )
+            command = f"touch {marker}"
+            args = json.dumps({"command": command})
+            client = _FakeClient([
+                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="execute_command", arguments=args)]))],
+                [_chunk(_delta(content="The command was blocked, as reported by the tool result."))],
+            ])
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": f"run: {command}"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            # A single blocked tool call doesn't fail the whole turn -- the
+            # model still gets to answer using the block as evidence (here,
+            # the fake model's scripted round-2 response). What actually
+            # matters: the command was never really executed, and the
+            # blocking hook's reasoning is visible in the tool result.
+            self.assertFalse(marker.exists(), "the denied command must never actually have run")
+            tool_outputs = [
+                e["payload"] for e in renderer.events
+                if e["event_type"] == "tool_output" and e["payload"].get("tool") == "execute_command"
+            ]
+            self.assertEqual(len(tool_outputs), 1)
+            self.assertFalse(tool_outputs[0]["result"]["success"])
+            self.assertIn("Blocked by hook", tool_outputs[0]["result"]["error"])
+
+
+class AsyncRewakeTests(_StatePatchMixin, unittest.TestCase):
+    """Claude-Code-parity addition (`async_rewake = true`): a hook runs
+    detached from the triggering call; its findings are queued as a
+    follow-up instruction once it finishes, even though the turn that
+    triggered it has already completed."""
+
+    def _console(self):
+        from io import StringIO
+        from rich.console import Console
+        return Console(file=StringIO(), no_color=True, width=200)
+
+    def test_a_rewake_hook_queues_a_follow_up_after_the_turn_already_completed(self):
+        from tamfis_code import state as state_module
+
+        with tempfile.TemporaryDirectory() as ws:
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                '[[post_tool_use]]\n'
+                'matcher = "write_file"\n'
+                'async_rewake = true\n'
+                'command = "sleep 0.3; echo \\"security review complete, no issues\\""\n'
+                'rewake_message = "Background review: $FINDINGS"\n'
+            )
+            target = Path(ws) / "out.txt"
+            args = json.dumps({"path": str(target), "content": "hello"})
+            client = _FakeClient([
+                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="write_file", arguments=args)]))],
+                [_chunk(_delta(content="File written."))],
+            ])
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            async def run_and_check():
+                outcome = await run_local_agent_turn(
+                    manager, ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": "write hello to out.txt"}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                )
+                self.assertEqual(outcome.status, "completed")
+                # The turn itself has already fully completed by this point
+                # (real classification/orchestration overhead means the
+                # 0.3s hook may or may not have already finished too --
+                # that race isn't what this test is checking). What matters
+                # is that the hook's finding eventually surfaces as a
+                # queued follow-up, proving the detached background path
+                # actually reaches state.py, not that it's strictly slower
+                # than the turn that triggered it.
+                await asyncio.sleep(0.6)
+                queued = state_module.get_session_state(1).queued_user_instructions
+                self.assertEqual(len(queued), 1)
+                self.assertEqual(queued[0]["classification"], "follow_up")
+                self.assertIn("security review complete, no issues", queued[0]["text"])
+                from tamfis_code.hooks import drain_pending_rewake_tasks
+                await drain_pending_rewake_tasks()
+
+            asyncio.run(run_and_check())
+
+
 if __name__ == "__main__":
     unittest.main()

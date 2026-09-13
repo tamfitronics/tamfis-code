@@ -856,7 +856,7 @@ async def run_interactive(
     invocations are a different, much shorter-lived concept and are not
     covered by these two events.
     """
-    from .hooks import load_hooks, run_session_end_hooks, run_session_start_hooks
+    from .hooks import drain_pending_rewake_tasks, load_hooks, run_session_end_hooks, run_session_start_hooks
 
     configured_hooks = load_hooks(workspace.workspace_root)
     hook_console = Console(no_color=not config.colour)
@@ -874,6 +874,14 @@ async def run_interactive(
             await run_session_end_hooks(
                 end_hooks, session_id=workspace.session_id, workspace_root=workspace.workspace_root,
             )
+        # Claude-Code-parity addition (asyncRewake): explicitly drain any
+        # still-running detached rewake hooks before this coroutine (and
+        # therefore the asyncio.run() call wrapping it) returns -- see
+        # hooks.py's _PENDING_REWAKE_TASKS/drain_pending_rewake_tasks for
+        # why this can't be left to asyncio.run()'s own shutdown
+        # cancellation, which does not reliably interrupt a task blocked
+        # on a subprocess pipe read.
+        await drain_pending_rewake_tasks()
 
 
 async def _run_interactive_impl(

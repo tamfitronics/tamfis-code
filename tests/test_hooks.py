@@ -2,22 +2,37 @@
 (hooks.py) -- a real Claude-Code-style PreToolUse/PostToolUse parity gap
 that had no equivalent in this codebase at all before this module."""
 
+import asyncio
 import sys
 import os
 import tempfile
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 
 from tamfis_code import hooks as hooks_module
+from tamfis_code import state as state_module
 from tamfis_code.hooks import (
     HookDefinition, load_hooks, run_notification_hooks, run_pre_compact_hooks,
     run_session_completed_hooks, run_session_end_hooks, run_session_hooks,
     run_session_start_hooks, run_subagent_stop_hooks, run_tool_hooks,
     run_user_prompt_submit_hooks,
 )
+
+
+def _fake_async_client(post_side_effect):
+    """Mirrors test_mcp.py's/test_session_title.py's own helper of the
+    same name -- stands in for ``async with httpx.AsyncClient(...) as
+    client: await client.post(...)``."""
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=post_side_effect)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm)
 
 
 class TestLoadHooks:
@@ -781,3 +796,291 @@ class TestRunNotificationHooks:
         finally:
             hooks_module.HOOK_TIMEOUT_SECONDS = original
         assert "timed out" in results[0].message
+
+
+def _prompt_hook(**overrides):
+    fields = dict(
+        event="pre_tool_use", matcher="execute_command", command="", source="user config",
+        hook_type="prompt", prompt="Evaluate: $TOOL_INPUT",
+    )
+    fields.update(overrides)
+    return HookDefinition(**fields)
+
+
+class TestLoadHooksPromptAndRewakeFields:
+    def test_loads_a_prompt_type_hook(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text(
+            '[[pre_tool_use]]\ntype = "prompt"\nprompt = "Evaluate: $TOOL_INPUT"\n'
+        )
+        loaded = load_hooks()
+        assert len(loaded) == 1
+        assert loaded[0].hook_type == "prompt"
+        assert loaded[0].prompt == "Evaluate: $TOOL_INPUT"
+
+    def test_a_prompt_type_hook_with_no_prompt_text_is_skipped(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text('[[pre_tool_use]]\ntype = "prompt"\n')
+        assert load_hooks() == []
+
+    def test_command_type_is_the_default_and_unaffected(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text('[[pre_tool_use]]\ncommand = "echo hi"\n')
+        loaded = load_hooks()
+        assert loaded[0].hook_type == "command"
+        assert loaded[0].prompt == ""
+
+    def test_loads_async_rewake_and_rewake_message(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text(
+            '[[post_tool_use]]\ncommand = "echo hi"\nasync_rewake = true\n'
+            'rewake_message = "Found: $FINDINGS"\n'
+        )
+        loaded = load_hooks()
+        assert loaded[0].async_rewake is True
+        assert loaded[0].rewake_message == "Found: $FINDINGS"
+
+    def test_async_rewake_defaults_to_false(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text('[[post_tool_use]]\ncommand = "echo hi"\n')
+        loaded = load_hooks()
+        assert loaded[0].async_rewake is False
+        assert loaded[0].rewake_message == ""
+
+
+class TestSubstituteTemplate:
+    def test_substitutes_available_payload_keys(self):
+        text = hooks_module._substitute_template(
+            "Tool input was $TOOL_INPUT, reason was $REASON",
+            {"tool_input": {"path": "x.py"}, "reason": "boom"},
+        )
+        assert '"path": "x.py"' in text
+        assert "boom" in text
+
+    def test_missing_keys_are_left_as_literal_text(self):
+        text = hooks_module._substitute_template("Summary: $SUMMARY", {})
+        assert text == "Summary: $SUMMARY"
+
+    def test_findings_placeholder_uses_the_findings_kwarg(self):
+        text = hooks_module._substitute_template("Found: $FINDINGS", {}, findings="a bug")
+        assert text == "Found: a bug"
+
+
+class TestPromptBasedHooks:
+    """Claude-Code-parity addition: a `type = "prompt"` hook asks an LLM
+    to decide the outcome instead of running a shell command, via the
+    same internal Tier IV endpoint state.py's upgrade_session_title_with_ai
+    already uses."""
+
+    @pytest.mark.asyncio
+    async def test_approve_decision_does_not_block(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"decision": "approve", "reason": "looks safe"}'}}],
+        }
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        hook = _prompt_hook()
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            results = await run_tool_hooks(
+                [hook], "pre_tool_use", tool_name="execute_command",
+                tool_input={"command": "ls"}, session_id=1, workspace_root=".",
+            )
+        assert results[0].blocked is False
+        assert results[0].message == "looks safe"
+
+    @pytest.mark.asyncio
+    async def test_deny_decision_blocks_a_blocking_capable_event(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"decision": "deny", "reason": "too risky"}'}}],
+        }
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        hook = _prompt_hook()
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            results = await run_tool_hooks(
+                [hook], "pre_tool_use", tool_name="execute_command",
+                tool_input={"command": "rm -rf /"}, session_id=1, workspace_root=".",
+            )
+        assert results[0].blocked is True
+        assert results[0].message == "too risky"
+
+    @pytest.mark.asyncio
+    async def test_deny_decision_never_blocks_a_non_blocking_capable_event(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": '{"decision": "deny", "reason": "flagged"}'}}],
+        }
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        hook = _prompt_hook(event="post_tool_use")
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            results = await run_tool_hooks(
+                [hook], "post_tool_use", tool_name="execute_command",
+                tool_input={"command": "ls"}, tool_output={"success": True}, session_id=1, workspace_root=".",
+            )
+        assert results[0].blocked is False
+        assert results[0].message == "flagged"
+
+    @pytest.mark.asyncio
+    async def test_unreachable_endpoint_fails_open_with_a_diagnostic(self):
+        import httpx as httpx_module
+
+        async def fake_post(*args, **kwargs):
+            raise httpx_module.ConnectError("boom")
+
+        hook = _prompt_hook()
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            results = await run_tool_hooks(
+                [hook], "pre_tool_use", tool_name="execute_command",
+                tool_input={"command": "ls"}, session_id=1, workspace_root=".",
+            )
+        assert results[0].blocked is False
+        assert "could not be evaluated" in results[0].message
+        assert "fail open" in results[0].message
+
+    @pytest.mark.asyncio
+    async def test_malformed_json_response_fails_open_with_a_diagnostic(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "not json at all"}}]}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        hook = _prompt_hook()
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            results = await run_tool_hooks(
+                [hook], "pre_tool_use", tool_name="execute_command",
+                tool_input={"command": "ls"}, session_id=1, workspace_root=".",
+            )
+        assert results[0].blocked is False
+        assert "fail open" in results[0].message
+
+    @pytest.mark.asyncio
+    async def test_non_200_response_fails_open_with_a_diagnostic(self):
+        response = MagicMock()
+        response.status_code = 500
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        hook = _prompt_hook()
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            results = await run_tool_hooks(
+                [hook], "pre_tool_use", tool_name="execute_command",
+                tool_input={"command": "ls"}, session_id=1, workspace_root=".",
+            )
+        assert results[0].blocked is False
+        assert "HTTP 500" in results[0].message
+        assert "fail open" in results[0].message
+
+
+class TestAsyncRewake:
+    """Claude-Code-parity addition: a hook with async_rewake=true runs
+    completely detached from the triggering call, and its findings are
+    queued as a classification="follow_up" instruction once it finishes."""
+
+    def setup_method(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        state_module._STATE_CACHE = None
+        state_module._STATE_CACHE_KEY = None
+
+    def teardown_method(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        state_module._STATE_CACHE = None
+        state_module._STATE_CACHE_KEY = None
+        self._tmp.cleanup()
+
+    async def _drain(self):
+        # Every test in this class must let its rewake task(s) finish (or
+        # explicitly drain them) before returning -- pytest-asyncio tears
+        # down its event loop per test the same way asyncio.run() does,
+        # and a still-pending subprocess-backed task left dangling at that
+        # point reproduces the exact hang drain_pending_rewake_tasks
+        # exists to prevent (confirmed live against a bare minimal repro
+        # during development of this feature).
+        await hooks_module.drain_pending_rewake_tasks()
+
+    @pytest.mark.asyncio
+    async def test_returns_immediately_without_waiting_for_the_rewake_hook(self):
+        import time
+        state_module.save_session_state(1, workspace_root=".")
+        hook = HookDefinition(
+            event="post_tool_use", matcher="", command="sleep 0.5; echo done",
+            source="user config", async_rewake=True,
+        )
+        start = time.monotonic()
+        results = await run_tool_hooks(
+            [hook], "post_tool_use", tool_name="write_file", tool_input={},
+            tool_output={"success": True}, session_id=1, workspace_root=".",
+        )
+        elapsed = time.monotonic() - start
+        try:
+            assert results == []
+            assert elapsed < 0.3, f"should not have waited for the backgrounded hook (took {elapsed:.2f}s)"
+        finally:
+            await self._drain()
+
+    @pytest.mark.asyncio
+    async def test_findings_are_queued_as_a_follow_up_once_the_hook_finishes(self):
+        state_module.save_session_state(1, workspace_root=".")
+        hook = HookDefinition(
+            event="post_tool_use", matcher="", command="sleep 0.3; echo 'found a bug'",
+            source="user config", async_rewake=True, rewake_message="Background review: $FINDINGS",
+        )
+        await run_tool_hooks(
+            [hook], "post_tool_use", tool_name="write_file", tool_input={},
+            tool_output={"success": True}, session_id=1, workspace_root=".",
+        )
+        assert state_module.get_session_state(1).queued_user_instructions == []
+        await asyncio.sleep(0.6)
+        queued = state_module.get_session_state(1).queued_user_instructions
+        assert len(queued) == 1
+        assert queued[0]["classification"] == "follow_up"
+        assert queued[0]["text"] == "Background review: found a bug"
+
+    @pytest.mark.asyncio
+    async def test_a_hook_with_no_output_and_no_rewake_message_queues_nothing(self):
+        state_module.save_session_state(1, workspace_root=".")
+        hook = HookDefinition(
+            event="post_tool_use", matcher="", command="true",
+            source="user config", async_rewake=True,
+        )
+        await run_tool_hooks(
+            [hook], "post_tool_use", tool_name="write_file", tool_input={},
+            tool_output={"success": True}, session_id=1, workspace_root=".",
+        )
+        await asyncio.sleep(0.3)
+        assert state_module.get_session_state(1).queued_user_instructions == []
+
+    @pytest.mark.asyncio
+    async def test_a_synchronous_hook_alongside_a_rewake_hook_still_returns_normally(self):
+        state_module.save_session_state(1, workspace_root=".")
+        hooks = [
+            HookDefinition(event="post_tool_use", matcher="", command='echo "sync message" 1>&2', source="user config"),
+            HookDefinition(event="post_tool_use", matcher="", command="sleep 0.3; echo done", source="project config", async_rewake=True),
+        ]
+        try:
+            results = await run_tool_hooks(
+                hooks, "post_tool_use", tool_name="write_file", tool_input={},
+                tool_output={"success": True}, session_id=1, workspace_root=".",
+            )
+            assert len(results) == 1
+            assert results[0].message == "sync message"
+        finally:
+            await self._drain()
