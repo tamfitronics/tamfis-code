@@ -685,6 +685,44 @@ def save_session_state(
     put_session_state(state)
 
 
+_PATH_BEARING_TOOLS = {"read_file", "edit_file", "write_file", "apply_patch"}
+
+
+def _extract_touched_paths(messages: list[dict[str, Any]]) -> set[str]:
+    """Collect every file path a tool call in this turn read or wrote.
+
+    Scans the same tool_calls[].function.{name,arguments} shape the runner
+    itself uses (see runner_local.py's token-estimate/render helpers) -- a
+    best-effort scrape, not a schema validation, so a malformed or unknown
+    tool call is simply skipped rather than raised.
+    """
+    paths: set[str] = set()
+    for message in messages:
+        for tool_call in message.get("tool_calls") or []:
+            function = tool_call.get("function") or {}
+            if str(function.get("name") or "") not in _PATH_BEARING_TOOLS:
+                continue
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except (TypeError, ValueError):
+                continue
+            path = str(arguments.get("path") or arguments.get("file_path") or "").strip()
+            if path:
+                paths.add(path)
+    return paths
+
+
+def _fingerprint_path(workspace_root: str, path: str) -> Optional[dict[str, float]]:
+    resolved = Path(path)
+    if not resolved.is_absolute() and workspace_root:
+        resolved = Path(workspace_root) / path
+    try:
+        file_stat = resolved.stat()
+    except OSError:
+        return None
+    return {"mtime": file_stat.st_mtime, "size": file_stat.st_size}
+
+
 def save_turn_checkpoint(
     session_id: int, *, objective: str, mode: str,
     messages: list[dict[str, Any]], partial_assistant: str = "",
@@ -696,8 +734,19 @@ def save_turn_checkpoint(
     request.  Keeping only the newest bounded message window here prevents a
     long-running REPL from growing state.json forever while retaining native
     tool_call/tool-result pairs needed for protocol-correct continuation.
+
+    Also fingerprints (mtime, size) every file this turn's tool calls
+    touched, so a resumed run can tell whether another process or session
+    modified one of them while this task was interrupted -- see
+    diff_checkpoint_file_fingerprint, consumed by runner_local.py's
+    resumed_from_checkpoint path.
     """
     state = get_session_state(session_id)
+    touched = _extract_touched_paths(messages)
+    fingerprint = {
+        path: fp for path in sorted(touched)
+        if (fp := _fingerprint_path(state.workspace_root, path)) is not None
+    }
     state.turn_checkpoint = {
         "objective": objective,
         "mode": mode,
@@ -706,8 +755,36 @@ def save_turn_checkpoint(
         "partial_assistant": partial_assistant,
         "last_error": last_error,
         "updated_at": _now(),
+        "file_fingerprint": fingerprint,
     }
     put_session_state(state)
+
+
+def diff_checkpoint_file_fingerprint(
+    checkpoint: dict[str, Any], workspace_root: str,
+) -> dict[str, list[str]]:
+    """Compare a checkpoint's recorded (mtime, size) per touched file against
+    the file's current state. Never raises: an unreadable path is reported
+    as "missing" rather than aborting the comparison.
+
+    Returns {"changed": [...], "missing": [...]} (both possibly empty).
+    "changed" means content likely differs since the checkpoint was saved --
+    another coder's edit, a deploy, or this task's own retry after a crash.
+    "missing" means the path no longer exists at all.
+    """
+    fingerprint = checkpoint.get("file_fingerprint") or {}
+    changed: list[str] = []
+    missing: list[str] = []
+    for path, recorded in fingerprint.items():
+        current = _fingerprint_path(workspace_root, path)
+        if current is None:
+            missing.append(path)
+        elif (
+            current["mtime"] != recorded.get("mtime")
+            or current["size"] != recorded.get("size")
+        ):
+            changed.append(path)
+    return {"changed": sorted(changed), "missing": sorted(missing)}
 
 
 def mark_turn_checkpoint_interrupted(session_id: int, *, error: str) -> None:

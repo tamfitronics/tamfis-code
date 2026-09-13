@@ -1807,6 +1807,44 @@ def _close_interrupted_tool_calls(messages: list[dict[str, Any]]) -> list[dict[s
     return repaired
 
 
+def _resume_file_status_note(
+    prior_checkpoint: dict[str, Any], workspace_root: str,
+) -> Optional[dict[str, str]]:
+    """Ground a resumed run in what actually changed on disk while it was
+    interrupted, instead of leaving the model to guess between two bad
+    defaults: blindly trusting stale tool results (wrong if another
+    coder/session edited a touched file in the meantime) or reflexively
+    re-reading everything from scratch (indistinguishable from a restart
+    when nothing actually changed). Confirmed live: a resumed session
+    re-ran a full "reading N files, listing directories" discovery pass
+    with no signal either way.
+
+    Returns None when the checkpoint recorded no touched files at all
+    (nothing to compare, so no note is added).
+    """
+    file_status = local_state.diff_checkpoint_file_fingerprint(prior_checkpoint, workspace_root)
+    if file_status["changed"] or file_status["missing"]:
+        note_lines = [
+            "Since this task was interrupted, the following files it had "
+            "already read or edited were modified outside this session "
+            "(likely another coder or process) -- re-read each one before "
+            "relying on it or editing it further:",
+        ]
+        note_lines.extend(f"- {path} (modified)" for path in file_status["changed"])
+        note_lines.extend(f"- {path} (no longer exists)" for path in file_status["missing"])
+        return {"role": "system", "content": "\n".join(note_lines)}
+    if prior_checkpoint.get("file_fingerprint"):
+        return {
+            "role": "system",
+            "content": (
+                "None of the files this task had already read or edited have "
+                "changed since it was interrupted -- continue directly from "
+                "where it left off without re-reading or re-listing them."
+            ),
+        }
+    return None
+
+
 def _workspace_roots_related(candidate_root: str, current_root: str) -> bool:
     """True for the same workspace, or when `current_root` is a
     subdirectory of `candidate_root` (restarting from deeper inside a
@@ -4695,6 +4733,9 @@ async def _run_local_agent_turn_impl(
         partial = str(prior_checkpoint.get("partial_assistant") or "")
         if partial:
             resumed_messages.append({"role": "assistant", "content": partial})
+        note = _resume_file_status_note(prior_checkpoint, workspace_root)
+        if note:
+            resumed_messages.append(note)
         # Keep the user's new continuation directive explicit.  It may name
         # selected steps ("proceed with 1, 2, and 3"), so it must not be
         # replaced by a generic resume instruction.
