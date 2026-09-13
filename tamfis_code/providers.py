@@ -381,7 +381,7 @@ class ProviderManager:
     MODEL_CONTEXT_WINDOWS: dict[str, int] = {
         "moonshotai/kimi-k3": 1_048_576,
         "deepseek-ai/deepseek-v4-pro": 1_000_000,
-        "deepseek-ai/deepseek-v4-flash": 1_000_000,
+        "deepseek-ai/deepseek-v4.1-flash": 1_000_000,
         "nvidia/nemotron-3-ultra-550b-a55b": 1_000_000,
     }
 
@@ -437,14 +437,12 @@ class ProviderManager:
                 # above. Not the default -- explicit-select route for
                 # long-context coding work.
                 "minimax-m3:cloud",
-                # DeepSeek-V4-Flash-0731 (2026-08-04): Ollama's announced
-                # agentic-capability refresh of the DeepSeek V4 Flash line --
-                # reliable tool calling at long contexts, three selectable
-                # reasoning_effort tiers (low/high/max), hosted US+EU with
-                # zero data retention. Explicit-select route like glm-5.3 and
-                # minimax-m3 above, not the default, since it hasn't been
-                # live-verified against this CLI's own tool-calling loop yet.
-                "deepseek-v4-flash:0731-cloud",
+                # DeepSeek-V4.1-Flash (2026-09-10): Ollama's rolling tag for the
+                # DeepSeek V4.1 Flash line -- 1M context, tools, thinking,
+                # reasoning_effort 1-100, hosted US+EU with zero data retention.
+                # Live-verified 2026-09-13: chat, tool calling, and vision all
+                # confirmed against this CLI's tool-calling loop.
+                "deepseek-v4.1-flash:cloud",
             ],
             # priority=3 (2026-08-08, was 0/first): Ollama Cloud's weekly
             # usage limit is a real multi-day-reset 429, not a transient
@@ -679,6 +677,7 @@ class ProviderManager:
                 # NVIDIA NIM end-of-life 2026-08-07 (HTTP 410 confirmed live
                 # in tamgpt6's intent classifier), no longer callable.
                 "deepseek-ai/deepseek-v4-pro",
+                "deepseek-ai/deepseek-v4.1-flash",
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
                 "moonshotai/kimi-k2.6",
@@ -724,7 +723,7 @@ class ProviderManager:
                 "Qwen/Qwen3.6-27B",
                 "Qwen/Qwen3-Coder-480B-A35B-Instruct",
                 "deepseek-ai/DeepSeek-V4-Pro",
-                "deepseek-ai/DeepSeek-V4-Flash",
+                "deepseek-ai/DeepSeek-V4.1-Flash",
                 "meta-llama/Llama-3.2-3B-Instruct",
                 "mistralai/Mistral-7B-Instruct-v0.3",
                 "microsoft/Phi-3.5-vision-instruct",

@@ -116,8 +116,8 @@ MODELS: dict[str, ModelRecord] = {
         ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
         "frontier", "high",
     ),
-    "deepseek-ai/deepseek-v4-flash": ModelRecord(
-        "deepseek-ai/deepseek-v4-flash", "nvidia",
+    "deepseek-ai/deepseek-v4.1-flash": ModelRecord(
+        "deepseek-ai/deepseek-v4.1-flash", "nvidia",
         ModelCapabilities(parallel_tool_calls=True, long_context=True), 1000000,
         ("repository_search", "multi_file_edit", "debugging", "tool_heavy_execution"),
         "frontier", "medium",
@@ -146,9 +146,9 @@ MODELS: dict[str, ModelRecord] = {
         ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
         "frontier", "high",
     ),
-    "deepseek-ai/DeepSeek-V4-Flash": ModelRecord(
-        "deepseek-ai/DeepSeek-V4-Flash", "hf",
-        ModelCapabilities(parallel_tool_calls=True, long_context=True), 262144,
+    "deepseek-ai/DeepSeek-V4.1-Flash": ModelRecord(
+        "deepseek-ai/DeepSeek-V4.1-Flash", "hf",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True, vision=True), 1048576,
         ("repository_search", "multi_file_edit", "debugging", "tool_heavy_execution"),
         "frontier", "medium",
     ),

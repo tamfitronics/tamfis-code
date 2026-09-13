@@ -664,6 +664,70 @@ class OrchestratorTests(unittest.TestCase):
         self.assertEqual(report.severity, "error")
         self.assertTrue(any("no successful file mutation" in item for item in report.unresolved))
 
+    def test_plain_git_diff_and_status_satisfy_mutation_recorded(self):
+        """A checkpoint-resumed turn that re-verifies with plain `git status`
+        and `git diff <path>` (no --stat/--name-only) must not be told no
+        mutation was recorded.
+
+        Live-reproduced: a turn resumed from a saved checkpoint after the
+        real edits (and their `git diff`/`compileall` verification) had
+        already happened in an earlier, now-discarded turn. This turn ran
+        only `git status`, `git diff <path>` (full unified diff, not
+        --stat), and `compileall` -- all read-only, all green, all showing
+        the same real changes -- yet validate_completion still failed with
+        "no successful file mutation was recorded" on every retry, because
+        neither command matched the --stat/--name-only-only carve-out. The
+        turn looped: fail, resume, re-verify the same already-correct code,
+        fail again, indefinitely.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("fix the broken router"),
+            tool_records=[
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git status"},
+                    "stdout": (
+                        "On branch main\n"
+                        "Changes not staged for commit:\n"
+                        "  modified:   tamfis_code/model_registry.py\n"
+                        "  modified:   tamfis_code/providers.py\n"
+                    ),
+                },
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "git diff tamfis_code/model_registry.py"},
+                    "stdout": (
+                        "diff --git a/tamfis_code/model_registry.py b/tamfis_code/model_registry.py\n"
+                        "index a42a822..367a0a9 100644\n"
+                        "--- a/tamfis_code/model_registry.py\n"
+                        "+++ b/tamfis_code/model_registry.py\n"
+                        "@@ -116,8 +116,8 @@\n"
+                        '-    "deepseek-ai/deepseek-v4-flash": ModelRecord(\n'
+                        '+    "deepseek-ai/deepseek-v4.1-flash": ModelRecord(\n'
+                    ),
+                },
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "python3 -m compileall -q ."},
+                    "stdout": "",
+                },
+            ],
+            any_mutation=False,
+            final_text=(
+                "Both projects compile successfully. model_registry.py and "
+                "providers.py were updated to deepseek-v4.1-flash."
+            ),
+            workspace_root="/home/tamfiscode",
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        mutation_check = next(item for item in report.checks if item["name"] == "mutation_recorded")
+        self.assertTrue(mutation_check["accepted_git_diffstat_evidence"])
+
     def test_guard_tool_call_auto_extends_the_tool_call_budget(self):
         # Regression: a "round" can contain several tool calls, so the raw
         # tool-call ceiling was reachable before the round budget's own

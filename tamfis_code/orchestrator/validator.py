@@ -143,11 +143,29 @@ _MUTATING_TOOLS = {
 # from the model's own claims -- so it closes this gap without weakening the
 # claim-vs-evidence bar the other checks enforce.
 _GIT_DIFFSTAT_COMMAND_RE = re.compile(
-    r"\bgit\s+(?:diff|show|log)\b[^|;&\n]*--stat\b|\bgit\s+diff\b[^|;&\n]*--name-only\b",
+    r"\bgit\s+(?:diff|show|log)\b[^|;&\n]*--stat\b|\bgit\s+diff\b[^|;&\n]*--name-only\b|"
+    # Confirmed live: a turn re-verifying already-made changes across a
+    # checkpoint resume ran plain `git diff <path>` (a full unified diff, no
+    # --stat/--name-only) and `git status` -- neither matched above, so this
+    # gate failed the same already-correct turn the --stat carve-out exists
+    # to protect, forcing the identical pointless retry loop.
+    r"\bgit\s+diff\b|\bgit\s+status\b",
     re.IGNORECASE,
 )
 _GIT_DIFFSTAT_LINE_RE = re.compile(
     r"^\s*([^\s|][^|]*?)\s*\|\s*\d+\s*[+\-]*\s*$", re.MULTILINE,
+)
+# A plain `git diff` has no diffstat summary line at all -- its evidence is
+# the unified-diff header, which appears exactly once per changed file and
+# cannot occur in any other command's output.
+_GIT_UNIFIED_DIFF_HEADER_RE = re.compile(
+    r"^diff --git a/.+ b/(.+)$", re.MULTILINE,
+)
+# `git status` (plain or --short) evidence of a real modification -- distinct
+# from the diffstat/unified-diff formats above, so it needs its own line
+# pattern.
+_GIT_STATUS_LINE_RE = re.compile(
+    r"^\s*(?:modified:\s+|[MARCU?]{1,2}\s+)(\S.*?)\s*$", re.MULTILINE,
 )
 
 # Confirmed live: a turn that fixes the requested bug, verifies it cleanly
@@ -249,8 +267,12 @@ def _successful_changed_paths(tool_records: list[dict[str, Any]], workspace_root
             if not _GIT_DIFFSTAT_COMMAND_RE.search(command):
                 continue
             stdout = str(item.get("stdout") or "")
-            for match in _GIT_DIFFSTAT_LINE_RE.finditer(stdout):
-                raw_path = match.group(1).strip()
+            raw_paths = [
+                match.group(1).strip()
+                for pattern in (_GIT_DIFFSTAT_LINE_RE, _GIT_UNIFIED_DIFF_HEADER_RE, _GIT_STATUS_LINE_RE)
+                for match in pattern.finditer(stdout)
+            ]
+            for raw_path in raw_paths:
                 if not raw_path or not _looks_like_file_path(Path(raw_path)):
                     continue
                 candidate = Path(raw_path).expanduser()
