@@ -10,6 +10,7 @@ the same convention Codex/Claude Code use for naming a conversation.
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tamfis_code import state as state_module
 
@@ -143,4 +144,98 @@ class RememberConversationTurnSetsTitleOnceTests(_StateDirFixture, unittest.Test
     def test_blank_objective_leaves_the_title_unset(self):
         state_module.save_session_state(1, workspace_root="/a")
         state_module.remember_conversation_turn(1, objective="   ", answer="Done.")
+        self.assertEqual(state_module.get_session_state(1).session_title, "")
+
+
+class EnsureSessionTitleTests(_StateDirFixture, unittest.TestCase):
+    """Confirmed live: three of the four call sites that clear active_task on
+    task completion (Remote Workspace reattach, `status` polling a completed
+    remote task, and runner.py's remote task-stream completion) never went
+    through remember_conversation_turn, so those sessions kept showing as a
+    bare "Session N" forever. Each such site now calls ensure_session_title
+    directly before clearing active_task -- these tests stand in for those
+    three sites without needing to drive the full CLI/runner machinery."""
+
+    def test_sets_the_title_from_the_objective_when_unset(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky test")
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky test")
+
+    def test_never_overwrites_an_already_set_title(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky test")
+        state_module.ensure_session_title(1, "Something else entirely")
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky test")
+
+    def test_blank_objective_is_a_no_op(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "   ")
+        self.assertEqual(state_module.get_session_state(1).session_title, "")
+
+
+def _fake_async_client(post_side_effect):
+    """Mirrors test_mcp.py's own helper of the same name -- stands in for
+    ``async with httpx.AsyncClient(...) as client: await client.post(...)``."""
+    client = MagicMock()
+    client.post = AsyncMock(side_effect=post_side_effect)
+    cm = MagicMock()
+    cm.__aenter__ = AsyncMock(return_value=client)
+    cm.__aexit__ = AsyncMock(return_value=False)
+    return MagicMock(return_value=cm)
+
+
+class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
+    """The mechanical title (first ~60 chars of the objective) is upgraded,
+    best-effort, to a short AI-written one via TamfisGPT's local Tier IV
+    endpoint. This must never raise or block completion: an unreachable or
+    broken endpoint should simply leave the mechanical title in place."""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def test_replaces_the_mechanical_title_on_success(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": "Fix flaky auth test"}}],
+        }
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
+
+    def test_leaves_the_mechanical_title_when_endpoint_is_unreachable(self):
+        import httpx as httpx_module
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+
+        async def fake_post(*args, **kwargs):
+            raise httpx_module.ConnectError("boom")
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky auth test")
+
+    def test_leaves_the_mechanical_title_on_non_200(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+        response = MagicMock()
+        response.status_code = 500
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky auth test")
+
+    def test_blank_objective_is_a_no_op(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        self._run(state_module.upgrade_session_title_with_ai(1, "   "))
         self.assertEqual(state_module.get_session_state(1).session_title, "")

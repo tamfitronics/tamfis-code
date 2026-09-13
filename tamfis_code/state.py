@@ -747,6 +747,80 @@ def _derive_session_title(text: str) -> str:
     return seed[:60] + ("…" if len(seed) > 60 else "")
 
 
+def ensure_session_title(session_id: int, objective: str) -> None:
+    """Persist a session_title from `objective` if one isn't already set.
+
+    Confirmed live: `remember_conversation_turn` (the only place that used
+    to do this) is called from exactly one of at least four places a task
+    completes and clears `active_task` -- the local standalone runner's
+    success path. The other three (a Remote Workspace reattach finding a
+    task finished while disconnected, a `status` command polling a
+    completed remote task, and `runner.py`'s own remote task-stream
+    completion) all clear `active_task` -- the resume picker's *only*
+    other title source (see best_effort_session_label) -- without ever
+    persisting a title first, so any session finishing through one of those
+    three permanently shows as a bare "Session N" forever after, even
+    though the real objective was sitting right there in scope at the
+    clearing call site the whole time. Callers should call this (or
+    remember_conversation_turn, which now calls this too) at every such
+    site, not just the one that already had it.
+    """
+    if not objective or not objective.strip():
+        return
+    state = get_session_state(session_id)
+    if state.session_title:
+        return
+    state.session_title = _derive_session_title(objective)
+    put_session_state(state)
+
+
+async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None:
+    """Best-effort: replace the mechanical title (first ~60 chars of the
+    objective) with a short, AI-written one via TamfisGPT's local internal
+    endpoint, when reachable. Never raises and never blocks a task's
+    completion on this -- ensure_session_title's synchronous, dependency-
+    free title has already been persisted by the time any caller awaits
+    this, so a slow/unreachable/broken model call here only means the
+    session keeps its mechanical title, not that it loses its title.
+    """
+    if not objective or not objective.strip():
+        return
+    try:
+        import httpx
+        base = os.environ.get("TAMGPT_TIER_IV_URL", "http://127.0.0.1:9555").rstrip("/")
+        async with httpx.AsyncClient(timeout=6.0) as client:
+            response = await client.post(
+                f"{base}/v1/chat/completions",
+                json={
+                    "model": "auto",
+                    "temperature": 0.3,
+                    "max_tokens": 20,
+                    "messages": [
+                        {
+                            "role": "system",
+                            "content": (
+                                "Write a short session title (3-6 words, no punctuation at the "
+                                "end, no quotes) summarizing what this coding task is about. "
+                                "Respond with ONLY the title."
+                            ),
+                        },
+                        {"role": "user", "content": objective.strip()[:2000]},
+                    ],
+                },
+            )
+        if response.status_code != 200:
+            return
+        content = str((response.json() or {}).get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
+        title = _derive_session_title(content.strip("\"'"))
+    except Exception:
+        return
+    if not title:
+        return
+    state = get_session_state(session_id)
+    state.session_title = title
+    put_session_state(state)
+
+
 def best_effort_session_label(state: SessionState) -> str:
     """One-line summary of what a session was/is doing, straight from
     already-recorded activity (active_task objective, then
@@ -805,9 +879,8 @@ def remember_conversation_turn(
     session_id: int, *, objective: str, answer: str, clear_checkpoint: bool = False,
 ) -> None:
     """Append a completed local turn to durable, bounded session memory."""
+    ensure_session_title(session_id, objective)
     state = get_session_state(session_id)
-    if not state.session_title:
-        state.session_title = _derive_session_title(objective)
     history = [*state.conversation_history, {"role": "user", "content": objective}]
     if answer:
         history.append({"role": "assistant", "content": answer})

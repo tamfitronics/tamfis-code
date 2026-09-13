@@ -5455,6 +5455,7 @@ async def _run_local_agent_turn_impl(
         local_state.remember_conversation_turn(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
         )
+        await local_state.upgrade_session_title_with_ai(session_id, objective)
         return TaskOutcome(status="completed", summary=content)
 
     def _synthesize_stuck_recovery_summary(messages: list[dict]) -> str:

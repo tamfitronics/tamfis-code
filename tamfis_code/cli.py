@@ -284,7 +284,9 @@ async def _resume_interrupted_task_if_any(
         f"[dim]◆ While this session was disconnected, task {task_id} "
         f"({objective or 'no objective recorded'}) ended: {task_status}.[/dim]"
     )
+    local_state.ensure_session_title(workspace.session_id, objective)
     local_state.save_session_state(workspace.session_id, execution_status=task_status, active_task=None)
+    await local_state.upgrade_session_title_with_ai(workspace.session_id, objective)
 
 
 # -- login / logout ------------------------------------------------------
@@ -989,12 +991,14 @@ async def status(ctx: click.Context, remote: bool):
         and state.running_action
     ):
         terminal_status = str(task_detail.get("status"))
+        objective = str((state.active_task or {}).get("objective") or task_detail.get("objective") or "")
         local_state.finish_action(
             workspace.session_id,
             str(state.running_action.get("id")),
             status=terminal_status,
             summary=str(task_detail.get("final_answer") or task_detail.get("error") or ""),
         )
+        local_state.ensure_session_title(workspace.session_id, objective)
         local_state.save_session_state(
             workspace.session_id,
             active_task=None,
@@ -1002,6 +1006,7 @@ async def status(ctx: click.Context, remote: bool):
             execution_status="idle",
         )
         state = local_state.get_session_state(workspace.session_id)
+        await local_state.upgrade_session_title_with_ai(workspace.session_id, objective)
     console.print(f"session_id={workspace.session_id}  status={session_detail.get('status')}  phase={state.current_phase}")
     console.print(f"workspace_root={workspace.workspace_root}")
     console.print(f"repository_root={state.repository_root or '(not a Git repository)'}  branch={state.active_branch or '-'}")

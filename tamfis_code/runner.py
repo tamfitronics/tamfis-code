@@ -510,8 +510,10 @@ async def _run_ai_task_and_stream_impl(
             f"[green]Plan saved[/green] · {saved.id} · run `/execute-plan {saved.id}` "
             f"in the REPL or `tamfis-code execute-plan {saved.id}` from the shell"
         )
+    local_state.ensure_session_title(session_id, objective)
     local_state.save_session_state(session_id, active_task=None, current_phase="report", execution_status=outcome.status)
     local_state.checkpoint(session_id, reason=f"task_{outcome.status}", summary=outcome.summary or outcome.error or "")
+    await local_state.upgrade_session_title_with_ai(session_id, objective)
     return outcome
 
 
