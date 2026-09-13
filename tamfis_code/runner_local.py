@@ -89,7 +89,7 @@ from .safety import (
     redact_secrets,
 )
 from .sandbox import SandboxPolicy
-from .workspace import classify_root, detect_validation_commands, scratch_root
+from .workspace import classify_root, detect_validation_commands, load_instruction_text, scratch_root
 from .workspace_access import ensure_workspace_access
 from .runtime.workspace_authority import (
     WorkspaceAuthorityError,
@@ -7081,6 +7081,10 @@ async def _run_local_agent_turn_impl(
                 item.to_dict()
                 for item in (orchestrator.run.tool_records if orchestrator.run else [])
             ]
+            try:
+                preflight_instructions = load_instruction_text(Path(workspace_root))
+            except Exception:
+                preflight_instructions = ""
             preflight = validate_completion(
                 profile=task_profile,
                 tool_records=tool_records,
@@ -7088,6 +7092,7 @@ async def _run_local_agent_turn_impl(
                 final_text=content,
                 objective=objective,
                 workspace_root=workspace_root,
+                project_instructions=preflight_instructions,
             )
             if (
                 tools

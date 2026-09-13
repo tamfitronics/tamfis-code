@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from pathlib import PurePath
+from pathlib import Path, PurePath
 import re
 from typing import Any, Callable
 
@@ -12,6 +12,7 @@ from .context import ContextBundle, build_context_bundle
 from .planner import ExecutionPlan, create_plan
 from .protocols import AgentPhase, ToolEnvelope, classify_failure
 from .validator import ValidationReport, validate_completion
+from ..workspace import load_instruction_text
 from ..runtime import ExecutionController, GuardDecision, ObservationDecision
 from ..runtime.budgets import RuntimeBudgets
 
@@ -549,11 +550,20 @@ class AgentOrchestrator:
         assert self.run is not None
         self.run.runtime.begin_validation()
         self.transition(AgentPhase.VALIDATE, action="Validate evidence and completion claims")
+        try:
+            project_instructions = load_instruction_text(Path(self.workspace_root))
+        except Exception:
+            # Best-effort only -- a workspace with no instructions, an
+            # unreadable file, or a non-git directory must never block
+            # validation itself; it just means the deploy-recorded check
+            # below has nothing to enforce this turn.
+            project_instructions = ""
         report = validate_completion(
             profile=self.run.profile,
             tool_records=[item.to_dict() for item in self.run.tool_records],
             any_mutation=any_mutation, final_text=final_text,
             objective=self.run.objective, workspace_root=self.workspace_root,
+            project_instructions=project_instructions,
         )
         if (
             self.run.reasoning_plan

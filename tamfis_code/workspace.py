@@ -118,6 +118,33 @@ def _instruction_chain(repository_root: Path, working_directory: Path) -> list[P
             deduplicated.append(resolved)
     return deduplicated
 
+
+def load_instruction_text(workspace_root: Path, *, max_chars: int = 32 * 1024) -> str:
+    """Read this workspace's AGENTS.md/CLAUDE.md-style instruction files.
+
+    Used by completion validation (orchestrator/validator.py) to check
+    whether the project's own instructions require a specific post-edit
+    action -- most commonly a service restart -- before a change counts as
+    deployed, independent of whatever subset of this text also ended up in
+    the model's own prompt.
+    """
+    root_text = _git(workspace_root, "rev-parse", "--show-toplevel")
+    root = Path(root_text).resolve() if root_text else Path(workspace_root).resolve()
+    remaining = max_chars
+    blocks: list[str] = []
+    for path in _instruction_chain(root, Path(workspace_root)):
+        if remaining <= 0:
+            break
+        try:
+            content = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        snippet = content[:remaining]
+        remaining -= len(snippet)
+        blocks.append(snippet)
+    return "\n\n".join(blocks)
+
+
 MANIFEST_LANGUAGE_MAP = {
     "package.json": ("JavaScript/TypeScript", "npm"),
     "pyproject.toml": ("Python", "pip"),

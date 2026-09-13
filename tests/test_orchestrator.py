@@ -728,6 +728,119 @@ class OrchestratorTests(unittest.TestCase):
         mutation_check = next(item for item in report.checks if item["name"] == "mutation_recorded")
         self.assertTrue(mutation_check["accepted_git_diffstat_evidence"])
 
+    def test_deploy_instruction_without_matching_command_fails(self):
+        """A project whose own CLAUDE.md says a change is inert without a
+        specific restart, edited but never restarted, must not pass.
+
+        Live-reproduced: tamgpt6's CLAUDE.md says "the change is inert until
+        `sudo systemctl restart tamfis-gpt.service` runs -- don't report a
+        fix as done or deployed before that restart". A turn edited
+        orchestration.yaml, verified it compiled, and reported the task
+        complete without ever running that restart.
+        """
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("add the new model to the registry"),
+            tool_records=[
+                {"tool_name": "edit_file", "success": True, "arguments": {"path": "tier_iv_orchestration/config/orchestration.yaml"}},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "python3 -m compileall -q ."},
+                },
+            ],
+            any_mutation=True,
+            final_text="Added the new model to orchestration.yaml. Validation complete.",
+            project_instructions=(
+                "After any change to a .py file or tier_iv_orchestration/config/orchestration.yaml, "
+                "remember the change is inert until `sudo systemctl restart tamfis-gpt.service` runs -- "
+                'don\'t report a fix as "done" or "deployed" before that restart and a clean health check.'
+            ),
+        )
+
+        self.assertFalse(report.passed)
+        self.assertEqual(report.severity, "error")
+        deploy_check = next(item for item in report.checks if item["name"] == "deploy_recorded")
+        self.assertFalse(deploy_check["passed"])
+        self.assertTrue(any("sudo systemctl restart tamfis-gpt.service" in item for item in report.unresolved))
+
+    def test_deploy_instruction_satisfied_by_matching_restart_command(self):
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("add the new model to the registry"),
+            tool_records=[
+                {"tool_name": "edit_file", "success": True, "arguments": {"path": "tier_iv_orchestration/config/orchestration.yaml"}},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "sudo systemctl restart tamfis-gpt.service"},
+                },
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "curl -s http://127.0.0.1:9555/health"},
+                    "stdout": '{"status": "ok"}',
+                },
+            ],
+            any_mutation=True,
+            final_text="Added the new model, restarted the service, and confirmed the health check.",
+            project_instructions=(
+                "The change is inert until `sudo systemctl restart tamfis-gpt.service` runs."
+            ),
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        deploy_check = next(item for item in report.checks if item["name"] == "deploy_recorded")
+        self.assertTrue(deploy_check["passed"])
+
+    def test_deploy_instruction_satisfied_by_same_systemd_unit_different_phrasing(self):
+        """The exact wording (sudo, extra flags) can differ from the
+        instruction's text -- restarting the same systemd unit still
+        counts, the same way reported_restart_supported treats phrasing
+        loosely elsewhere in this file."""
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        report = validate_completion(
+            profile=classify_task("add the new model to the registry"),
+            tool_records=[
+                {"tool_name": "edit_file", "success": True, "arguments": {"path": "orchestration.yaml"}},
+                {
+                    "tool_name": "execute_command", "success": True, "exit_code": 0,
+                    "arguments": {"command": "systemctl restart tamfis-gpt.service"},
+                },
+            ],
+            any_mutation=True,
+            final_text="Added the new model and restarted the service.",
+            project_instructions=(
+                "The change is inert until `sudo systemctl restart tamfis-gpt.service` runs."
+            ),
+        )
+
+        self.assertTrue(report.passed)
+
+    def test_extract_deploy_commands_ignores_backtick_file_references(self):
+        """Live-caught bug: the real instruction sentence this feature was
+        built for backtick-quotes bare file references alongside the real
+        command -- "a change to a `.py` file or
+        `tier_iv_orchestration/config/orchestration.yaml` ... is inert until
+        `sudo systemctl restart tamfis-gpt.service` runs" -- and the first
+        version of the extractor grabbed all three as if they were required
+        commands. Only the one that actually looks like a command (contains
+        whitespace) may be extracted."""
+        from tamfis_code.orchestrator.validator import _extract_deploy_commands
+
+        commands = _extract_deploy_commands(
+            "After any change to a `.py` file or "
+            "`tier_iv_orchestration/config/orchestration.yaml`, remember the "
+            "change is inert until `sudo systemctl restart tamfis-gpt.service` "
+            "runs -- don't report a fix as done before that restart."
+        )
+
+        self.assertEqual(commands, ["sudo systemctl restart tamfis-gpt.service"])
+
     def test_guard_tool_call_auto_extends_the_tool_call_budget(self):
         # Regression: a "round" can contain several tool calls, so the raw
         # tool-call ceiling was reachable before the round budget's own

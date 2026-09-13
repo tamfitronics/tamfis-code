@@ -300,9 +300,80 @@ def _successful_commands(tool_records: list[dict[str, Any]]) -> list[str]:
     ]
 
 
+# Confirmed live: a project's own CLAUDE.md said, in these exact words, that
+# editing certain files is inert until a specific backtick-quoted command
+# runs ("the change is inert until `sudo systemctl restart tamfis-gpt.service`
+# runs"). A turn edited those files, never ran that command, and still
+# reported the task complete -- the existing _SERVICE_RESTART_CLAIM_RE gate
+# below only fires when the model's own text *claims* a restart happened, so
+# a turn that mutates real files and simply says nothing about deployment
+# sails through it untouched. This closes that gap: the project's own stated
+# requirement becomes something the model must satisfy, not just something it
+# must not lie about having done.
+_DEPLOY_TRIGGER_WORDS_RE = re.compile(
+    r"\b(?:inert|won'?t\s+take\s+effect|has\s+no\s+effect|not\s+(?:live|deployed|applied)|"
+    r"requires?\s+(?:a\s+)?restart(?:ing)?|must\s+(?:be\s+)?restart(?:ed)?|"
+    r"before\s+(?:it'?s|they'?re)\s+(?:live|deployed))\b",
+    re.IGNORECASE,
+)
+_BACKTICK_COMMAND_RE = re.compile(r"`([^`\n]{3,200})`")
+_SYSTEMCTL_UNIT_RE = re.compile(
+    r"\bsystemctl\s+(?:restart|reload(?:-or-restart)?)\s+([\w@.\-]+)", re.IGNORECASE,
+)
+
+
+def _extract_deploy_commands(instructions: str) -> list[str]:
+    """Pull backtick-quoted commands out of sentences that say a change is
+    inert/ineffective without them. Order-independent: the trigger phrase and
+    the command can appear in either order within the same sentence.
+
+    Live-checked against tamgpt6's actual CLAUDE.md: the same sentence also
+    backtick-quotes bare file references ("a `.py` file or
+    `tier_iv_orchestration/config/orchestration.yaml`") alongside the real
+    command. A shell command is reliably distinguishable from either of
+    those by containing whitespace (a subcommand/argument split); a bare
+    path or extension never does.
+    """
+    commands: list[str] = []
+    for sentence in re.split(r"(?<=[.\n])\s+", instructions or ""):
+        if not _DEPLOY_TRIGGER_WORDS_RE.search(sentence):
+            continue
+        for match in _BACKTICK_COMMAND_RE.finditer(sentence):
+            command = match.group(1).strip()
+            if command and " " in command and command not in commands:
+                commands.append(command)
+    return commands
+
+
+def _normalize_command(command: str) -> str:
+    text = " ".join(command.split())
+    return text[5:].strip() if text.lower().startswith("sudo ") else text
+
+
+def _deploy_command_satisfied(required_commands: list[str], successful_commands: list[str]) -> str | None:
+    """Return the required command a successful one satisfies, or None."""
+    normalized_ran = [_normalize_command(c) for c in successful_commands]
+    for required in required_commands:
+        normalized_required = _normalize_command(required)
+        if normalized_required in normalized_ran:
+            return required
+        # A restart of the *same systemd unit* counts even if the exact
+        # phrasing (sudo, extra flags) differs from the instruction's text.
+        required_unit_match = _SYSTEMCTL_UNIT_RE.search(required)
+        if not required_unit_match:
+            continue
+        required_unit = required_unit_match.group(1)
+        for ran in successful_commands:
+            ran_match = _SYSTEMCTL_UNIT_RE.search(ran)
+            if ran_match and ran_match.group(1) == required_unit:
+                return required
+    return None
+
+
 def validate_completion(
     *, profile: TaskProfile, tool_records: list[dict[str, Any]],
     any_mutation: bool, final_text: str, objective: str = "", workspace_root: str = "",
+    project_instructions: str = "",
 ) -> ValidationReport:
     checks: list[dict[str, Any]] = []
     unresolved: list[str] = []
@@ -457,6 +528,28 @@ def validate_completion(
         if not mutation_requirement_met:
             unresolved.append("The request required a code change, but no successful file mutation was recorded.")
 
+        # A real edit to a project whose own instructions name a specific
+        # post-edit command (see _extract_deploy_commands) isn't done until
+        # that command has actually run -- a verified no-op edit needs no
+        # deployment, since nothing changed to deploy.
+        if mutation_requirement_met and not verified_no_change:
+            deploy_commands = _extract_deploy_commands(project_instructions)
+            if deploy_commands:
+                matched_command = _deploy_command_satisfied(deploy_commands, successful_commands)
+                checks.append({
+                    "name": "deploy_recorded",
+                    "passed": matched_command is not None,
+                    "required_commands": deploy_commands,
+                    "matched_command": matched_command,
+                })
+                if matched_command is None:
+                    unresolved.append(
+                        "This project's own instructions say this kind of change has no effect until "
+                        + " (or ".join(f"`{cmd}`" for cmd in deploy_commands)
+                        + (")" if len(deploy_commands) > 1 else "")
+                        + " runs, but no successful execute_command matching that was recorded."
+                    )
+
         # A successful transport response is not enough for a project build:
         # every explicitly requested output path must exist and be non-empty.
         # This catches the common long-generation failure where a model builds
@@ -565,6 +658,11 @@ def validate_completion(
         if mutation_claimed or _SERVICE_RESTART_CLAIM_RE.search(final_text or "") or _LIVE_VERIFICATION_CLAIM_RE.search(final_text or ""):
             severity = "error"
         if any(check["name"] == "commit_authorship_disclosed" and not check["passed"] for check in checks):
+            severity = "error"
+        if any(check["name"] == "deploy_recorded" and not check["passed"] for check in checks):
+            # Same bar as mutation_recorded: a project's own stated
+            # deployment requirement is not optional guidance, and a warning
+            # here would let the CLI report success over an inert change.
             severity = "error"
 
     return ValidationReport(passed, checks, unresolved, severity=severity)
