@@ -246,17 +246,17 @@ plugin configs on this box also use `PostToolUseFailure` and
 | UserPromptSubmit (block a turn or add context before it reaches a provider) | `hooks.py`'s new `user_prompt_submit` + `run_user_prompt_submit_hooks()` | COVERED (added 2026-09-13) — fires once per turn in `runner_local.py` right after the resumed/fresh objective is finalized; exit code 2 blocks the turn before any provider call, other output is folded into the objective as added context. Confirmed live end-to-end in `tests/test_claude_parity_hooks.py`: a blocking hook stops the turn with zero provider calls, and a context-adding hook's text is proven to reach the actual provider request payload |
 | Stop (can force the agent to keep working via `{"decision": "block"}`, re-injecting into the same round loop) | none | GAP (feature) — the block-and-continue half of Stop has no analog; would require resuming a turn `runner_local.py` already believes is finished, a substantially larger change than this pass's scope. Not built |
 | Stop (observe-only half: fires on successful completion) | `hooks.py`'s new `session_completed` + `run_session_completed_hooks()` | COVERED (added 2026-09-13) — deliberately only the observe-only half of Stop's contract; fires from `_finalize_completed_answer`, the one real successful-completion return path in `_run_local_agent_turn_impl`. Confirmed live in `tests/test_claude_parity_hooks.py` that a real on-disk hook fires with the correct summary |
-| SubagentStop | none | GAP (feature) — no equivalent fires when a delegated swarm sub-task finishes; `swarm.py`'s delegation has no hook point at all today |
-| SessionStart (load context, persist env vars via `$CLAUDE_ENV_FILE`) | none | GAP (feature) — no hook fires when a tamfis-code session/process starts |
-| SessionEnd | none | GAP (feature) — no hook fires when a session ends (as distinct from a single turn completing, which `session_completed` now covers) |
-| PreCompact (add critical info to preserve before context compaction) | none | GAP (feature) — `state.py`'s conversation compaction (see `test_thread_compression.py`) has no hook point before it runs |
-| Notification (react when Claude sends a notification) | none | GAP (feature) — no equivalent; tamfis-code has no generalized notification-event concept for hooks to observe |
+| SubagentStop | `hooks.py`'s new `subagent_stop` + `run_subagent_stop_hooks()` | COVERED (added 2026-09-13) — fires from `agents.py`'s `execute_tasks`'s `run_one` closure, the single choke point every delegated swarm sub-task's success/failure already converges on. Observe-only, like `session_completed`. Confirmed live end-to-end in `tests/test_swarm.py`: fires once per sub-task with the correct status/error for both a succeeding and a failing sub-task |
+| SessionStart (load context, persist env vars via `$CLAUDE_ENV_FILE`) | `hooks.py`'s new `session_start` + `run_session_start_hooks()` | COVERED (added 2026-09-13) — fires once when the interactive REPL begins (`interactive.py`'s `run_interactive` wrapper); output shown as a dim diagnostic. No `$CLAUDE_ENV_FILE` equivalent (tamfis-code has no matching env-injection point), so this only covers "load context," not "set environment" |
+| SessionEnd | `hooks.py`'s new `session_end` + `run_session_end_hooks()` | COVERED (added 2026-09-13) — `run_interactive` wraps the whole REPL loop in try/finally so this fires exactly once regardless of which exit path (Ctrl+C, Ctrl+D, /exit, an uncaught exception) was taken, rather than instrumenting every exit point individually. Confirmed live end-to-end in `tests/test_tamfis_code_repl_exit.py` across two different real exit paths |
+| PreCompact (add critical info to preserve before context compaction) | `hooks.py`'s new `pre_compact` + `run_pre_compact_hooks()` | COVERED (added 2026-09-13) — fires from `interactive.py`'s `/compact` handler (tamfis-code's only compaction trigger — no size-triggered auto-compact exists), and its output is folded into `state.py`'s `compact_session_thread` via a new `preserve_note` parameter so critical info actually survives the fold, not just logged. Confirmed live end-to-end in `test_tamfis_code_repl_exit.py` via a real `/compact` command |
+| Notification (react when Claude sends a notification) | `hooks.py`'s new `notification` + `run_notification_hooks()` | COVERED (added 2026-09-13) — wired at `background.py`'s `update_job_status`, the single real notification tamfis-code already sends (a background job/goal finishing). Narrower than Claude Code's broader notion (permission-request/idle nudges have no equivalent choke point yet), documented as a scoping choice. Confirmed live end-to-end in `test_background_lifecycle.py` with a real on-disk hook |
 | PostToolUseFailure, UserPromptExpansion | none | GAP (feature), lower priority — narrower/newer events seen in real plugin configs but not central to the documented spec |
 | Prompt-based hooks (`{"type": "prompt", "prompt": "..."}` — an LLM call decides the outcome instead of a shell command) | none | GAP (feature) — every tamfis-code hook is a `command`-type shell subprocess only |
-| Parallel hook execution (all matching hooks for an event run concurrently) | sequential (`for hook in hooks: ...`, awaited one at a time) | GAP (feature) — a design choice difference (this session's implementations lean toward deterministic ordering, e.g. `session_interrupted`'s "first blocking hook stops evaluation" semantics), not obviously a defect, but worth the user knowing it's not matched |
-| `if`-conditional matching (gate a hook on the actual command being run, e.g. `"if": "Bash(git commit:*)"`, not just the tool name) | tamfis-code's `matcher` is a regex against `tool_name` only | GAP (feature) — no equivalent of matching against the command/argument content itself |
+| Parallel hook execution (all matching hooks for an event run concurrently) | `hooks.py`'s `_run_hooks_concurrently()` (via `asyncio.gather`), used by every `run_*_hooks` function | COVERED (added 2026-09-13) — hook order is preserved in the returned list regardless of completion order; for a blocking-capable event, a later hook's subprocess still runs to completion even after an earlier one blocks (only its reported result is dropped), matching Claude Code's own "hooks don't see each other's output" independence contract. Confirmed live: two 0.5s hooks complete in ~0.5s total, not ~1.0s (`test_hooks.py`'s `TestParallelHookExecution`) |
+| `if`-conditional matching (gate a hook on the actual command being run, e.g. `"if": "Bash(git commit:*)"`, not just the tool name) | `HookDefinition.if_command`, matched via `fnmatch` against `tool_input["command"]` | COVERED (added 2026-09-13) — a deliberately simplified, glob-style equivalent rather than porting Claude Code's exact mini-language verbatim; only meaningful for tools with a `command` argument (`execute_command`), ignored for others |
 | `asyncRewake` (a hook runs in the background and later "wakes" the agent back up with its findings, mid-or-after an already-answered turn) | none | GAP (feature), largest of this list — no background/suspend-resume mechanism exists in tamfis-code's synchronous per-turn hook firing at all; would need genuinely new runtime infrastructure, not a small addition |
-| PreToolUse's `updatedInput` (a hook can rewrite the tool call's arguments before it runs, not just approve/deny it) | none | GAP (feature) — tamfis-code's pre_tool_use can only block, never mutate, the pending tool call |
+| PreToolUse's `updatedInput` (a hook can rewrite the tool call's arguments before it runs, not just approve/deny it) | `HookResult.updated_input`, parsed from a pre_tool_use hook's stdout (`{"updated_input": {...}}`) | COVERED (added 2026-09-13) — a flatter, simpler shape than Claude Code's real nested `hookSpecificOutput.updatedInput` (no `systemMessage`/`permissionDecision` concept to nest alongside). Applied in place to the pending call's arguments at both `runner_local.py` dispatch sites. Confirmed live end-to-end in `test_claude_parity_hooks.py`: a hook rewrites `write_file`'s content, and the actual file written to disk contains the rewritten text, not the model's original request |
 | Hooks loaded once at session start, require a restart to pick up changes | tamfis-code reads hooks.toml fresh every turn | Not a gap — tamfis-code's behavior here is arguably better (edit hooks.toml and the very next turn uses it, no restart), noted for completeness rather than tabulated as COVERED/GAP |
 
 ### Broader feature areas (lighter-touch, verified against source but not test-audited to the same depth as hooks)
@@ -280,12 +280,32 @@ functions.
 
 Deliberately not attempted this pass (each is a genuine, separate feature
 investment, not a fast/high-value fix): Stop's block-and-continue
-semantics, SubagentStop, SessionStart, SessionEnd, PreCompact,
-Notification, prompt-based (LLM-driven) hooks, parallel hook execution,
-`if`-conditional command matching, `asyncRewake`, and PreToolUse's
-`updatedInput` mutation. The skills auto-discovery/invocation gap
-(`plugins.py`'s unused `skill_roots` field) is likewise flagged but not
-built here.
+semantics. The skills auto-discovery/invocation gap (`plugins.py`'s
+unused `skill_roots` field) is likewise flagged but not built here.
+
+- 2026-09-13 (follow-up pass): the remaining hooks-table items the user
+  asked to build regardless of size were all closed: `session_start`,
+  `session_end`, `subagent_stop` (wired into `interactive.py`'s
+  `run_interactive`/`agents.py`'s `execute_tasks`), `pre_compact` (wired
+  into `interactive.py`'s `/compact`, folding a hook's output into
+  `state.py`'s `compact_session_thread` via a new `preserve_note`
+  parameter), `notification` (wired into `background.py`'s
+  `update_job_status`), `if_command` matching (`HookDefinition.if_command`,
+  fnmatch-glob against `tool_input["command"]`), `updated_input` mutation
+  (`HookResult.updated_input`, parsed from a pre_tool_use hook's stdout,
+  applied in place before tool dispatch at both `runner_local.py` sites),
+  and parallel hook execution (`hooks.py` refactored around a shared
+  `_run_hooks_concurrently`/`_execute_one_hook` pair using `asyncio.gather`,
+  cutting the file from 778 to 567 lines while adding every capability
+  above). Every new capability has both isolated unit tests and at least
+  one real end-to-end integration test proving the actual wiring (not
+  just the isolated hooks.py function) -- see `test_hooks.py`,
+  `test_tamfis_code_repl_exit.py`, `test_swarm.py`,
+  `test_background_lifecycle.py`, `test_claude_parity_hooks.py`, and
+  `test_round_budget_extension.py`. Only `asyncRewake` and prompt-based
+  (LLM-driven) hooks remain unbuilt, by explicit user agreement (see
+  AskUserQuestion in the session transcript) as the two items large enough
+  to warrant their own separate pass.
 
 ## Summary
 
