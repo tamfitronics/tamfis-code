@@ -615,7 +615,7 @@ class ProviderManager:
             # chat-completions calls with tools attached, real tool_calls
             # returned, not guessed from NVIDIA's public catalog page):
             # nemotron-3-ultra-550b-a55b (1.8s), nemotron-3-super-120b-a12b
-            # (6.1s), nemotron-3-nano-30b-a3b, llama-3.3-nemotron-super-49b-
+            # (6.1s), nemotron-3.5-lightning-30b-a3b, llama-3.3-nemotron-super-49b-
             # v1.5, llama-3.3-nemotron-super-49b-v1, minimaxai/minimax-m3
             # all returned genuine tool_calls. ultra-550b-a55b was NVIDIA's
             # largest/most capable model verified at the time and became
@@ -650,7 +650,10 @@ class ProviderManager:
                 "moonshotai/kimi-k3",
                 "nvidia/nemotron-3-ultra-550b-a55b",
                 "nvidia/nemotron-3-super-120b-a12b",
-                "nvidia/nemotron-3-nano-30b-a3b",
+                # Replaced retired nvidia/nemotron-3-nano-30b-a3b on
+                # 2026-09-13. Live re-verified against this account with
+                # HTTP 200 and a genuine get_weather tool_calls event.
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
                 # NVIDIA-hosted, live-verified real tool_calls on this
                 # account; high accuracy on reasoning/tool-calling per
                 # NVIDIA's own catalog, kept as mid-tier fallbacks below the

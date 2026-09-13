@@ -26,6 +26,7 @@ class ReasoningEffortCapabilityTests(unittest.TestCase):
     def test_nemotron_on_nvidia_is_capable(self):
         self.assertTrue(reasoning_effort_capable(ProviderType.NVIDIA, "nvidia/nemotron-3-super-120b-a12b"))
         self.assertTrue(reasoning_effort_capable(ProviderType.NVIDIA, "nvidia/nemotron-3-ultra-550b-a55b"))
+        self.assertTrue(reasoning_effort_capable(ProviderType.NVIDIA, "nvidia/nemotron-3.5-lightning-30b-a3b"))
 
     def test_llama_on_nvidia_is_not_capable(self):
         # This is the exact model+provider combination confirmed live to hang.

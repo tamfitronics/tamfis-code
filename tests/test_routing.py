@@ -1,4 +1,5 @@
 from tamfis_code.providers import ProviderManager, ProviderType
+from tamfis_code.model_registry import get_model
 from tamfis_code.routing import (
     ComplexityLevel,
     TaskType,
@@ -548,7 +549,12 @@ def test_nvidia_exposes_newly_added_coding_and_tool_calling_models():
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
     assert "nvidia/nemotron-3-ultra-550b-a55b" in config.models
     assert "nvidia/nemotron-3-super-120b-a12b" in config.models
-    assert "nvidia/nemotron-3-nano-30b-a3b" in config.models
+    assert "nvidia/nemotron-3.5-lightning-30b-a3b" in config.models
+    assert "nvidia/nemotron-3-nano-30b-a3b" not in config.models
+    lightning = get_model("nvidia/nemotron-3.5-lightning-30b-a3b")
+    assert lightning is not None
+    assert lightning.provider == "nvidia"
+    assert lightning.capabilities.tool_calling is True
     assert "nvidia/llama-3.3-nemotron-super-49b-v1.5" in config.models
     assert "nvidia/llama-3.3-nemotron-super-49b-v1" in config.models
     assert "minimaxai/minimax-m3" in config.models

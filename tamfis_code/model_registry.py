@@ -38,6 +38,14 @@ MODELS: dict[str, ModelRecord] = {
         ModelCapabilities(long_context=True), 128000,
         ("repository_audit", "architecture", "long_context_review"), "frontier", "high",
     ),
+    # Direct replacement for NVIDIA's retired nemotron-3-nano-30b-a3b.
+    # Live-verified 2026-09-13: HTTP 200 and a native function tool_calls
+    # response with valid JSON arguments through NVIDIA NIM.
+    "nvidia/nemotron-3.5-lightning-30b-a3b": ModelRecord(
+        "nvidia/nemotron-3.5-lightning-30b-a3b", "nvidia",
+        ModelCapabilities(), 128000,
+        ("multi_file_edit", "debugging", "tool_heavy_execution"), "high", "medium",
+    ),
     # Also confirmed live on openrouter (same "moonshotai/kimi-k2.6" id;
     # not a second dict entry since the id is identical) and on HF's
     # router (a distinct id -- "moonshotai/Kimi-K2.6", different casing,
