@@ -189,3 +189,31 @@ async def test_mixed_stdio_and_http_servers_both_become_available(tmp_path: Path
         tool_names = {t["name"] for t in await bridge.list_tools()}
         assert tool_names == {"mcp__local_server__echo", "mcp__remote_server__remote_echo"}
         await bridge.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_one_server_failing_at_startup_does_not_block_the_others(tmp_path: Path):
+    """Closes the Codex mcp_optional_startup_grace.rs/mcp_refresh_cleanup.rs
+    parity gap: initialize() runs every configured server's startup
+    concurrently via asyncio.gather, and _initialize_stdio_server/
+    _initialize_http_server each catch their own Exception internally
+    (terminating the process / dropping the http connection) rather than
+    letting it propagate -- so one server that can't start (a typo'd
+    command, an unreachable host) must not prevent a working server
+    alongside it from registering. Confirmed live before writing this."""
+    config = tmp_path / ".tamfis" / "mcp.json"
+    config.parent.mkdir(parents=True)
+    script = Path(__file__).parent / "fixtures" / "mcp_echo_server.py"
+    config.write_text(json.dumps({
+        "mcpServers": {
+            "broken-server": {"command": "/definitely/does/not/exist/binary", "args": []},
+            "working-server": {"command": sys.executable, "args": [str(script)]},
+        },
+    }))
+    bridge = StandaloneMCPBridge(workspace_root=str(tmp_path))
+    ok = await asyncio.wait_for(bridge.initialize(), timeout=10)
+    assert ok is True
+    assert bridge.available is True
+    tool_names = {t["name"] for t in await bridge.list_tools()}
+    assert tool_names == {"mcp__working_server__echo"}
+    await bridge.shutdown()

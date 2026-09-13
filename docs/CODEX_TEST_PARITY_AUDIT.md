@@ -46,9 +46,9 @@ Changelog at the bottom — do not just delete the history.
 | Codex category | tamfis-code feature | Verdict |
 |---|---|---|
 | External MCP config loading, `mcp_login.rs` | `mcp_client.py` `load_mcp_servers` | COVERED — `test_standalone_mcp_client.py` |
-| `mcp_tool_cache.rs` | none (rebuilt fresh per turn) | N/A |
-| OAuth refresh (`mcp_auth_refresh.rs`, `mcp_oauth_refresh_tests.rs`, `mcp_auth_elicitation.rs`) | none (static credentials only) | N/A |
-| Startup lifecycle/grace (`mcp_startup_refresh_http_proxy.rs`, `mcp_refresh_cleanup.rs`, `mcp_optional_startup_grace.rs`) | `mcp.py` `initialize(background=False)` | GAP — no test for a slow/unreachable external MCP server at startup specifically |
+| `mcp_tool_cache.rs` | none | N/A — confirmed by full-text search: zero hits for "cache" in `mcp_client.py`/`mcp.py` related to tool lists; `StandaloneMCPBridge._tools`/`_tool_map` are populated once per bridge instance and the bridge itself is rebuilt fresh per turn, so there is nothing to invalidate |
+| OAuth refresh (`mcp_auth_refresh.rs`, `mcp_oauth_refresh_tests.rs`, `mcp_auth_elicitation.rs`) | none | N/A — confirmed: zero hits for "oauth" or "elicit" in `mcp_client.py`/`mcp.py`; external MCP servers authenticate via static `config.headers`/`config.env` only |
+| Startup lifecycle/grace (`mcp_startup_refresh_http_proxy.rs`, `mcp_refresh_cleanup.rs`, `mcp_optional_startup_grace.rs`) | `StandaloneMCPBridge.initialize()` (`mcp_client.py`) | COVERED (fixed 2026-09-13) — confirmed live and now tested: `initialize()` runs every configured server's startup concurrently via `asyncio.gather`, and `_initialize_stdio_server`/`_initialize_http_server` each catch their own `Exception` internally (terminating the process / dropping the http connection) rather than propagating it, so one server that can't start never blocks a working server alongside it. New test: `test_standalone_mcp_client.py::test_one_server_failing_at_startup_does_not_block_the_others` |
 | `mcp_extension_protocol.rs`, `mcp_ema_config.rs`, elicitation (`mcp_tool_exposure.rs`, `mcp_turn_metadata.rs`, `mcp_user_verification.rs`) | none | N/A — no elicitation protocol |
 | `ext/mcp/tests` (hosted apps) | none | N/A — out of scope |
 
@@ -147,3 +147,8 @@ Changelog at the bottom — do not just delete the history.
   (`TestRealBwrapEnforcement`, skipped if bwrap isn't installed). execpolicy
   DSL and `extension_sandbox.rs` N/A verdicts confirmed by reading
   `tool_policy.py`/`safety.py`/`plugins.py` in full rather than by grep.
+- 2026-09-13: MCP protocol theme resolved. Startup lifecycle/grace closed
+  with a new test proving one broken server doesn't block a working one
+  alongside it (`test_standalone_mcp_client.py`). `mcp_tool_cache.rs` and
+  OAuth-refresh N/A verdicts tightened with concrete full-text-search
+  evidence instead of a prior grep pass's "not found."
