@@ -399,9 +399,13 @@ class AgentManager:
         fan-out over one bad name.
         """
         from .agent_definitions import load_agent_definitions
+        from .hooks import load_hooks, run_subagent_stop_hooks
         from .local_chat import resolve_provider_type
         from .workspace import resolve_swarm_subtask_workspace
 
+        subagent_stop_hooks = [
+            hook for hook in load_hooks(workspace_root) if hook.event == "subagent_stop"
+        ]
         definitions = load_agent_definitions(workspace_root) if agent_types else {}
         resolved_agent_types: List[Optional[str]] = (
             list(agent_types) if agent_types is not None else [None] * len(descriptions)
@@ -452,6 +456,17 @@ class AgentManager:
                     result = {"error": str(e)}
                     task.status = AgentStatus.FAILED
                     task.error = str(e)
+                if subagent_stop_hooks:
+                    # Claude-Code-parity addition, observe-only (see
+                    # run_subagent_stop_hooks' own docstring for why this
+                    # doesn't attempt the real SubagentStop's
+                    # block-and-continue semantics).
+                    await run_subagent_stop_hooks(
+                        subagent_stop_hooks,
+                        session_id=parent_session_id or 0, workspace_root=workspace_root,
+                        task_id=task.id, description=description,
+                        status=task.status.value, error=task.error or "",
+                    )
                 return {"task_id": task.id, "description": description, "status": task.status.value, "result": result}
 
         return list(await asyncio.gather(*(

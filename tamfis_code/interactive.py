@@ -844,6 +844,42 @@ async def run_interactive(
     client: Optional[RemoteAPIClient], config: Config, workspace: WorkspaceContext,
     *, provider: str = "auto", model: Optional[str] = None,
 ) -> None:
+    """Claude-Code-parity SessionStart/SessionEnd wrapper around the actual
+    REPL loop (_run_interactive_impl). The loop below has many distinct
+    exit paths (Ctrl+C, Ctrl+D, /exit, an uncaught exception) scattered
+    across ~1400 lines -- rather than hunting down and instrumenting each
+    one (fragile: a future new exit path would silently skip SessionEnd),
+    wrapping the single await in try/finally guarantees SessionEnd fires
+    exactly once no matter which path was taken, the same guarantee
+    Python's own finally semantics give for free. Session, here, means one
+    interactive REPL process lifetime -- one-shot `ask`/`chat`/`exec`
+    invocations are a different, much shorter-lived concept and are not
+    covered by these two events.
+    """
+    from .hooks import load_hooks, run_session_end_hooks, run_session_start_hooks
+
+    configured_hooks = load_hooks(workspace.workspace_root)
+    hook_console = Console(no_color=not config.colour)
+    start_hooks = [hook for hook in configured_hooks if hook.event == "session_start"]
+    if start_hooks:
+        for result in await run_session_start_hooks(
+            start_hooks, session_id=workspace.session_id, workspace_root=workspace.workspace_root,
+        ):
+            hook_console.print(f"[dim][hook:session_start] {result.message}[/dim]")
+    try:
+        await _run_interactive_impl(client, config, workspace, provider=provider, model=model)
+    finally:
+        end_hooks = [hook for hook in configured_hooks if hook.event == "session_end"]
+        if end_hooks:
+            await run_session_end_hooks(
+                end_hooks, session_id=workspace.session_id, workspace_root=workspace.workspace_root,
+            )
+
+
+async def _run_interactive_impl(
+    client: Optional[RemoteAPIClient], config: Config, workspace: WorkspaceContext,
+    *, provider: str = "auto", model: Optional[str] = None,
+) -> None:
     """Drives the interactive REPL. `client=None` means standalone mode: no
     TamfisGPT Remote Workspace backend, no login -- AI turns/shell commands
     run through runner_local.py's local agent loop calling `provider`

@@ -1,5 +1,8 @@
 import asyncio
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 from tamfis_code.agents import AgentManager, DelegatedCodingAgent
@@ -199,6 +202,66 @@ class ExecuteTasksRendererFactoryTests(unittest.TestCase):
 
         self.assertEqual(len(captured_agents), 1)
         self.assertIsNone(captured_agents[0]["renderer_factory"])
+
+
+class ExecuteTasksSubagentStopHookTests(unittest.TestCase):
+    """Claude-Code-parity addition: subagent_stop fires once per sub-task,
+    at the single choke point in execute_tasks's run_one closure where
+    every sub-task's success or failure already converges before
+    returning its result dict -- proven here with a real on-disk hook and
+    a real workspace_root (needed as the hook subprocess's cwd), not a
+    mock of run_subagent_stop_hooks itself."""
+
+    def test_fires_once_per_subtask_with_status_and_description(self):
+        with tempfile.TemporaryDirectory() as ws:
+            marker = Path(ws) / "subagent_stops.jsonl"
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                f'[[subagent_stop]]\ncommand = "cat >> {marker}; echo >> {marker}"\n'
+            )
+            fake_workspace = MagicMock(session_id=1, workspace_root=ws)
+
+            async def fake_execute(self, task):
+                if "fail" in task.description:
+                    return {"status": "failed", "error": "boom"}
+                return {"status": "completed", "summary": "done"}
+
+            with patch("tamfis_code.workspace.resolve_swarm_subtask_workspace", return_value=fake_workspace), \
+                    patch("tamfis_code.agents.DelegatedCodingAgent.execute", new=fake_execute):
+                manager = AgentManager()
+                results = asyncio.run(manager.execute_tasks(
+                    ["task a", "task fail"],
+                    manager=object(), provider=object(), model=None, console=object(),
+                    workspace_root=ws, parent_session_id=7,
+                ))
+
+            self.assertEqual(len(results), 2)
+            lines = marker.read_text().strip().splitlines()
+            self.assertEqual(len(lines), 2, "subagent_stop hook did not fire once per sub-task")
+            payloads = [json.loads(line) for line in lines]
+            by_description = {p["description"]: p for p in payloads}
+            self.assertEqual(by_description["task a"]["event"], "subagent_stop")
+            self.assertEqual(by_description["task a"]["session_id"], 7)
+            self.assertEqual(by_description["task a"]["status"], "completed")
+            self.assertEqual(by_description["task fail"]["status"], "failed")
+            self.assertIn("boom", by_description["task fail"]["error"])
+
+    def test_no_configured_hook_means_no_extra_work(self):
+        with tempfile.TemporaryDirectory() as ws:
+            fake_workspace = MagicMock(session_id=1, workspace_root=ws)
+
+            async def fake_execute(self, task):
+                return {"status": "completed", "summary": "done"}
+
+            with patch("tamfis_code.workspace.resolve_swarm_subtask_workspace", return_value=fake_workspace), \
+                    patch("tamfis_code.agents.DelegatedCodingAgent.execute", new=fake_execute):
+                manager = AgentManager()
+                results = asyncio.run(manager.execute_tasks(
+                    ["task a"], manager=object(), provider=object(), model=None, console=object(),
+                    workspace_root=ws,
+                ))
+            self.assertEqual(len(results), 1)
 
 
 class ExecuteTasksAgentTypesTests(unittest.TestCase):

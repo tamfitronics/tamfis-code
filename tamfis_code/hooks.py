@@ -91,6 +91,7 @@ HOOK_TIMEOUT_SECONDS = 30
 _HOOK_EVENTS = (
     "pre_tool_use", "post_tool_use", "session_interrupted",
     "user_prompt_submit", "session_completed",
+    "session_start", "session_end", "subagent_stop",
 )
 
 
@@ -377,6 +378,196 @@ async def run_session_completed_hooks(
     results: list[HookResult] = []
     for hook in hooks:
         if hook.event != "session_completed":
+            continue
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                hook.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace_root,
+            )
+        except OSError as exc:
+            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
+            continue
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            results.append(HookResult(
+                blocked=False,
+                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
+                hook=hook,
+            ))
+            continue
+        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
+        if text:
+            results.append(HookResult(blocked=False, message=text, hook=hook))
+    return results
+
+
+async def run_session_start_hooks(
+    hooks: list[HookDefinition],
+    *,
+    session_id: int,
+    workspace_root: str,
+) -> list[HookResult]:
+    """Claude-Code-parity addition: fires once when an interactive REPL
+    session begins (see interactive.py's run_interactive wrapper), with
+    {"event": "session_start", "session_id": ..., "workspace_root": ...}
+    on stdin. Observe-only -- Claude Code's real SessionStart also lets a
+    hook persist environment variables for the rest of the session via
+    $CLAUDE_ENV_FILE; tamfis-code has no equivalent env-injection point in
+    its process model, so this only covers "load context": a hook's
+    output is surfaced to the user as a dim diagnostic line by the
+    caller, the same way a SessionStart hook loading project context
+    would be shown.
+    """
+    if not hooks:
+        return []
+    payload = json.dumps({
+        "event": "session_start",
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+    }, default=str).encode("utf-8")
+
+    results: list[HookResult] = []
+    for hook in hooks:
+        if hook.event != "session_start":
+            continue
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                hook.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace_root,
+            )
+        except OSError as exc:
+            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
+            continue
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            results.append(HookResult(
+                blocked=False,
+                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
+                hook=hook,
+            ))
+            continue
+        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
+        if text:
+            results.append(HookResult(blocked=False, message=text, hook=hook))
+    return results
+
+
+async def run_session_end_hooks(
+    hooks: list[HookDefinition],
+    *,
+    session_id: int,
+    workspace_root: str,
+) -> list[HookResult]:
+    """Claude-Code-parity addition: fires once when an interactive REPL
+    session ends -- any exit path (Ctrl+C, Ctrl+D, /exit, an uncaught
+    exception) -- via interactive.py's run_interactive wrapping the whole
+    REPL loop in try/finally, so this always fires exactly once regardless
+    of which exit path was taken. Distinct from session_completed, which
+    fires per successful *turn*, not per process lifetime. Observe-only
+    (cleanup/logging), matching Claude Code's SessionEnd contract -- there
+    is nothing left to block once the session is already ending.
+    """
+    if not hooks:
+        return []
+    payload = json.dumps({
+        "event": "session_end",
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+    }, default=str).encode("utf-8")
+
+    results: list[HookResult] = []
+    for hook in hooks:
+        if hook.event != "session_end":
+            continue
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                hook.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace_root,
+            )
+        except OSError as exc:
+            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
+            continue
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            results.append(HookResult(
+                blocked=False,
+                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
+                hook=hook,
+            ))
+            continue
+        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
+        if text:
+            results.append(HookResult(blocked=False, message=text, hook=hook))
+    return results
+
+
+async def run_subagent_stop_hooks(
+    hooks: list[HookDefinition],
+    *,
+    session_id: int,
+    workspace_root: str,
+    task_id: str,
+    description: str,
+    status: str,
+    error: str = "",
+) -> list[HookResult]:
+    """Claude-Code-parity addition: fires once a delegated swarm sub-task
+    finishes (agents.py's AgentManager.execute_tasks -- the single choke
+    point every sub-task's success or failure already converges on before
+    returning its result dict), with {"event": "subagent_stop",
+    "session_id": ..., "workspace_root": ..., "task_id": ...,
+    "description": ..., "status": "completed"|"failed", "error": ...} on
+    stdin. session_id is the *parent* session that launched the swarm (0
+    when there is none, e.g. a one-shot `agent-cmd delegate` invocation),
+    not the sub-task's own isolated child session.
+
+    Like session_completed, this is deliberately NOT a port of Claude
+    Code's real SubagentStop, which (like Stop) can return
+    {"decision": "block"} to force the subagent to keep working --
+    observe-only here, for the same reason session_completed's own
+    docstring gives: tamfis-code's synchronous per-turn hook firing has no
+    analog for resuming a sub-task the caller already believes is
+    finished.
+    """
+    if not hooks:
+        return []
+    payload = json.dumps({
+        "event": "subagent_stop",
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+        "task_id": task_id,
+        "description": description,
+        "status": status,
+        "error": error,
+    }, default=str).encode("utf-8")
+
+    results: list[HookResult] = []
+    for hook in hooks:
+        if hook.event != "subagent_stop":
             continue
         try:
             proc = await asyncio.create_subprocess_shell(

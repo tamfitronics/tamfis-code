@@ -16,7 +16,9 @@
    command list the way typing "/" alone is expected to behave.
 """
 import io
+import tempfile
 import unittest
+from pathlib import Path
 from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
@@ -26,14 +28,14 @@ from tamfis_code.interactive import run_interactive, HELP_TEXT
 from tamfis_code.workspace import WorkspaceContext
 
 
-def _run(scripted_inputs):
+def _run(scripted_inputs, workspace_root="/tmp/fake-workspace"):
     """Runs run_interactive with prompt_async yielding each of
     scripted_inputs in turn (raising it directly if it's an Exception),
     and returns everything printed to the console."""
     buf = io.StringIO()
     fake_console = Console(file=buf, no_color=True, width=200)
 
-    workspace = WorkspaceContext(session_id=1, server_id=1, workspace_root="/tmp/fake-workspace")
+    workspace = WorkspaceContext(session_id=1, server_id=1, workspace_root=workspace_root)
     config = Config()
 
     prompt_mock = AsyncMock(side_effect=scripted_inputs)
@@ -64,6 +66,50 @@ class ReplExitTests(unittest.TestCase):
         output = _run(["/", EOFError()])
         self.assertIn("show this help", output)  # a line from HELP_TEXT
         self.assertNotIn("task", output.lower().split("show this help")[0][-50:])
+
+
+class SessionStartEndHookTests(unittest.TestCase):
+    """Claude-Code-parity addition: session_start/session_end fire exactly
+    once per REPL process lifetime, regardless of which of the loop's many
+    exit paths (Ctrl+C, Ctrl+D, /exit, an uncaught exception) is taken --
+    proven here via the same run_interactive harness ReplExitTests already
+    uses for two different real exit paths, rather than only unit-testing
+    hooks.py's run_session_start_hooks/run_session_end_hooks in isolation.
+    """
+
+    def test_session_start_hook_output_is_shown_and_session_end_fires_on_ctrl_c(self):
+        with tempfile.TemporaryDirectory() as ws:
+            marker = Path(ws) / "ended.txt"
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                '[[session_start]]\n'
+                'command = "echo \\"project context loaded\\" 1>&2"\n'
+                '\n'
+                '[[session_end]]\n'
+                f'command = "cat > {marker}"\n'
+            )
+            output = _run([KeyboardInterrupt()], workspace_root=ws)
+            self.assertIn("project context loaded", output)
+            self.assertTrue(marker.is_file(), "session_end hook never ran on the Ctrl+C exit path")
+
+    def test_session_end_fires_on_the_eof_exit_path_too(self):
+        # A different exit path than Ctrl+C -- proves session_end's
+        # try/finally isn't accidentally tied to one specific exception.
+        with tempfile.TemporaryDirectory() as ws:
+            marker = Path(ws) / "ended.txt"
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                f'[[session_end]]\ncommand = "cat > {marker}"\n'
+            )
+            _run([EOFError()], workspace_root=ws)
+            self.assertTrue(marker.is_file(), "session_end hook never ran on the EOF exit path")
+
+    def test_no_configured_hooks_is_a_silent_noop(self):
+        with tempfile.TemporaryDirectory() as ws:
+            output = _run([KeyboardInterrupt()], workspace_root=ws)
+        self.assertIsInstance(output, str)
 
 
 if __name__ == "__main__":

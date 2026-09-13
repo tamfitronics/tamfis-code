@@ -13,8 +13,9 @@ import pytest
 
 from tamfis_code import hooks as hooks_module
 from tamfis_code.hooks import (
-    HookDefinition, load_hooks, run_session_completed_hooks, run_session_hooks,
-    run_tool_hooks, run_user_prompt_submit_hooks,
+    HookDefinition, load_hooks, run_session_completed_hooks, run_session_end_hooks,
+    run_session_hooks, run_session_start_hooks, run_subagent_stop_hooks, run_tool_hooks,
+    run_user_prompt_submit_hooks,
 )
 
 
@@ -76,6 +77,21 @@ class TestLoadHooks:
         assert loaded[0] == HookDefinition(
             event="session_interrupted", matcher="", command="notify-send interrupted", source="user config",
         )
+
+    def test_loads_session_start_and_session_end_hooks(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text(
+            '[[session_start]]\ncommand = "echo start"\n\n'
+            '[[session_end]]\ncommand = "echo end"\n'
+        )
+        loaded = load_hooks()
+        assert [h.event for h in loaded] == ["session_start", "session_end"]
+
+    def test_loads_subagent_stop_hooks(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text('[[subagent_stop]]\ncommand = "echo done"\n')
+        loaded = load_hooks()
+        assert [h.event for h in loaded] == ["subagent_stop"]
 
 
 class TestRunToolHooks:
@@ -345,6 +361,148 @@ class TestRunSessionCompletedHooks:
         try:
             hooks = [HookDefinition(event="session_completed", matcher="", command="sleep 5", source="user config")]
             results = await run_session_completed_hooks(hooks, session_id=1, workspace_root=".")
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert "timed out" in results[0].message
+
+
+class TestRunSessionStartHooks:
+    """Claude-Code-parity addition: fires once when an interactive REPL
+    session begins. Observe-only -- there is no tool_name/matcher, and no
+    way to block a session from starting."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        assert await run_session_start_hooks([], session_id=1, workspace_root=".") == []
+
+    @pytest.mark.asyncio
+    async def test_every_configured_hook_runs_and_output_is_returned(self):
+        hooks = [
+            HookDefinition(event="session_start", matcher="", command='echo "one" 1>&2', source="user config"),
+            HookDefinition(event="session_start", matcher="", command='echo "two" 1>&2', source="project config"),
+        ]
+        results = await run_session_start_hooks(hooks, session_id=1, workspace_root=".")
+        assert [r.message for r in results] == ["one", "two"]
+        assert all(r.blocked is False for r in results)
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_has_no_special_meaning(self):
+        hooks = [HookDefinition(event="session_start", matcher="", command='echo "fyi" 1>&2; exit 2', source="user config")]
+        results = await run_session_start_hooks(hooks, session_id=1, workspace_root=".")
+        assert results[0].blocked is False
+        assert results[0].message == "fyi"
+
+    @pytest.mark.asyncio
+    async def test_receives_the_session_id_on_stdin(self):
+        hooks = [HookDefinition(
+            event="session_start", matcher="",
+            command="python3 -c \"import sys, json; d = json.load(sys.stdin); print(d['session_id'], file=sys.stderr)\"",
+            source="user config",
+        )]
+        results = await run_session_start_hooks(hooks, session_id=99, workspace_root=".")
+        assert results[0].message == "99"
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="session_start", matcher="", command="sleep 5", source="user config")]
+            results = await run_session_start_hooks(hooks, session_id=1, workspace_root=".")
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert "timed out" in results[0].message
+
+
+class TestRunSessionEndHooks:
+    """Claude-Code-parity addition: fires once when an interactive REPL
+    session ends, regardless of which exit path was taken (see
+    test_tamfis_code_repl_exit.py's SessionStartEndHookTests for the real
+    end-to-end proof across two different exit paths)."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        assert await run_session_end_hooks([], session_id=1, workspace_root=".") == []
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_has_no_special_meaning(self):
+        hooks = [HookDefinition(event="session_end", matcher="", command='echo "fyi" 1>&2; exit 2', source="user config")]
+        results = await run_session_end_hooks(hooks, session_id=1, workspace_root=".")
+        assert results[0].blocked is False
+        assert results[0].message == "fyi"
+
+    @pytest.mark.asyncio
+    async def test_receives_the_workspace_root_on_stdin(self):
+        with tempfile.TemporaryDirectory() as ws:
+            hooks = [HookDefinition(
+                event="session_end", matcher="",
+                command="python3 -c \"import sys, json; d = json.load(sys.stdin); print(d['workspace_root'], file=sys.stderr)\"",
+                source="user config",
+            )]
+            results = await run_session_end_hooks(hooks, session_id=1, workspace_root=ws)
+            assert results[0].message == ws
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="session_end", matcher="", command="sleep 5", source="user config")]
+            results = await run_session_end_hooks(hooks, session_id=1, workspace_root=".")
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert "timed out" in results[0].message
+
+
+class TestRunSubagentStopHooks:
+    """Claude-Code-parity addition: fires once per delegated swarm sub-task
+    when it finishes (see test_swarm.py's ExecuteTasksSubagentStopHookTests
+    for the real end-to-end proof against agents.py's execute_tasks).
+    Observe-only, like session_completed -- no way for a hook to force a
+    finished sub-task to keep working."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        result = await run_subagent_stop_hooks(
+            [], session_id=1, workspace_root=".", task_id="t1", description="x", status="completed",
+        )
+        assert result == []
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_has_no_special_meaning(self):
+        hooks = [HookDefinition(event="subagent_stop", matcher="", command='echo "fyi" 1>&2; exit 2', source="user config")]
+        results = await run_subagent_stop_hooks(
+            hooks, session_id=1, workspace_root=".", task_id="t1", description="x", status="completed",
+        )
+        assert results[0].blocked is False
+        assert results[0].message == "fyi"
+
+    @pytest.mark.asyncio
+    async def test_receives_the_task_id_description_status_and_error_on_stdin(self):
+        hooks = [HookDefinition(
+            event="subagent_stop", matcher="",
+            command=(
+                "python3 -c \"import sys, json; d = json.load(sys.stdin); "
+                "print(d['task_id'] + ':' + d['description'] + ':' + d['status'] + ':' + d['error'], "
+                "file=sys.stderr)\""
+            ),
+            source="user config",
+        )]
+        results = await run_subagent_stop_hooks(
+            hooks, session_id=1, workspace_root=".", task_id="delegated_abc",
+            description="fix the bug", status="failed", error="boom",
+        )
+        assert results[0].message == "delegated_abc:fix the bug:failed:boom"
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="subagent_stop", matcher="", command="sleep 5", source="user config")]
+            results = await run_subagent_stop_hooks(
+                hooks, session_id=1, workspace_root=".", task_id="t1", description="x", status="completed",
+            )
         finally:
             hooks_module.HOOK_TIMEOUT_SECONDS = original
         assert "timed out" in results[0].message
