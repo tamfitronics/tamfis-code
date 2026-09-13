@@ -21,9 +21,24 @@ files use the same shape:
     matcher = "execute_command"
     command = "notify-send 'tamfis-code ran a command'"
 
+    [[session_interrupted]]
+    command = "notify-send 'tamfis-code task was interrupted'"
+
 Each hook command is run with the event JSON on stdin:
     {"event": "pre_tool_use"|"post_tool_use", "tool_name": ..., "tool_input": {...},
      "tool_output": {...} (post_tool_use only), "session_id": ..., "workspace_root": ...}
+
+session_interrupted fires whenever the standalone local runner checkpoints
+a turn as interrupted -- a provider/tool failure it can't recover from
+mid-turn, a tool-call round budget exhausted, or a rejected/invalid final
+answer -- anywhere runner_local.py calls its internal
+`_persist_turn_checkpoint(status="interrupted", ...)`. It has no
+`tool_name`/`matcher` concept (nothing tool-specific triggered it), so
+every configured `session_interrupted` hook runs unconditionally; its
+payload is instead {"event": "session_interrupted", "session_id": ...,
+"workspace_root": ..., "reason": ...}. Like PostToolUse, this is
+observe-only -- the interruption already happened, so no exit code can
+undo it -- but see run_session_hooks for details.
 
 PreToolUse: exit code 2 blocks the tool call -- the tool is never actually
 executed, and the hook's stderr (falling back to stdout) becomes the denial
@@ -55,7 +70,7 @@ from .config import CONFIG_DIR
 HOOKS_PATH = CONFIG_DIR / "hooks.toml"
 PROJECT_HOOKS_RELATIVE = Path(".tamfis") / "hooks.toml"
 HOOK_TIMEOUT_SECONDS = 30
-_HOOK_EVENTS = ("pre_tool_use", "post_tool_use")
+_HOOK_EVENTS = ("pre_tool_use", "post_tool_use", "session_interrupted")
 
 
 @dataclass(frozen=True)
@@ -177,6 +192,67 @@ async def run_tool_hooks(
         if event == "pre_tool_use" and proc.returncode == 2:
             results.append(HookResult(blocked=True, message=text or f"Blocked by hook: {hook.command}", hook=hook))
             break
+        if text:
+            results.append(HookResult(blocked=False, message=text, hook=hook))
+    return results
+
+
+async def run_session_hooks(
+    hooks: list[HookDefinition],
+    event: str,
+    *,
+    session_id: int,
+    workspace_root: str,
+    reason: str = "",
+) -> list[HookResult]:
+    """Run every configured hook for a session-level `event` (currently only
+    "session_interrupted") -- unlike run_tool_hooks, there is no tool_name
+    to match against, so every hook configured for this event runs
+    unconditionally, in configured order. Always observe-only: the exit
+    code is never inspected, since a session-level event (a task already
+    checkpointed as interrupted) can't be blocked or undone after the
+    fact. A hook that fails to start, errors, or times out degrades to a
+    diagnostic in the result list, the same never-crash-the-turn contract
+    run_tool_hooks already established.
+    """
+    if not hooks:
+        return []
+    payload = json.dumps({
+        "event": event,
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+        "reason": reason,
+    }, default=str).encode("utf-8")
+
+    results: list[HookResult] = []
+    for hook in hooks:
+        if hook.event != event:
+            continue
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                hook.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace_root,
+            )
+        except OSError as exc:
+            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
+            continue
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            results.append(HookResult(
+                blocked=False,
+                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
+                hook=hook,
+            ))
+            continue
+        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
         if text:
             results.append(HookResult(blocked=False, message=text, hook=hook))
     return results

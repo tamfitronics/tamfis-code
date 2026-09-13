@@ -150,6 +150,42 @@ class RoundBudgetExtensionTests(_StatePatchMixin, unittest.TestCase):
             ]
             self.assertFalse(any("granting" in item.lower() for item in diagnostics))
 
+    def test_interruption_fires_the_configured_session_interrupted_hook(self):
+        # Codex-parity addition (interrupt_hooks.rs): closes out the exact
+        # scenario proven above -- a strict round-cap failure checkpoints
+        # the turn as interrupted -- by also proving a real, on-disk
+        # project hook actually fires for it, not just that hooks.py's own
+        # unit tests can invoke run_session_hooks directly.
+        with tempfile.TemporaryDirectory() as ws:
+            first = Path(ws) / "first.py"
+            first.write_text("# first\n")
+            marker = Path(ws) / "marker.txt"
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                f'[[session_interrupted]]\ncommand = "cat > {marker}"\n'
+            )
+            client = _FakeClient([
+                self._read_round(1, first),
+                [_chunk(_delta(content="This must not be reached."))],
+            ])
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                _FakeManager(client), ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "inspect the files"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto",
+                interactive=False, max_rounds=1, strict_max_rounds=True,
+            ))
+
+            self.assertEqual(outcome.status, "failed")
+            self.assertTrue(marker.is_file(), "session_interrupted hook never ran")
+            payload = json.loads(marker.read_text())
+            self.assertEqual(payload["event"], "session_interrupted")
+            self.assertEqual(payload["session_id"], 1)
+            self.assertIn("Stopped after 1 tool-call rounds", payload["reason"])
+
 
 if __name__ == "__main__":
     unittest.main()

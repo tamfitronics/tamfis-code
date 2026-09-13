@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from tamfis_code import hooks as hooks_module
-from tamfis_code.hooks import HookDefinition, load_hooks, run_tool_hooks
+from tamfis_code.hooks import HookDefinition, load_hooks, run_session_hooks, run_tool_hooks
 
 
 class TestLoadHooks:
@@ -59,6 +59,20 @@ class TestLoadHooks:
         hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
         hooks_module.HOOKS_PATH.write_text("this is not valid toml [[[")
         assert load_hooks() == []
+
+    def test_loads_session_interrupted_hooks(self):
+        # Codex-parity addition (interrupt_hooks.rs): a third hook-event
+        # category, alongside pre/post_tool_use, for a checkpointed
+        # interruption rather than a specific tool call.
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text(
+            '[[session_interrupted]]\ncommand = "notify-send interrupted"\n'
+        )
+        loaded = load_hooks()
+        assert len(loaded) == 1
+        assert loaded[0] == HookDefinition(
+            event="session_interrupted", matcher="", command="notify-send interrupted", source="user config",
+        )
 
 
 class TestRunToolHooks:
@@ -166,3 +180,70 @@ class TestRunToolHooks:
         assert results[0].blocked is False
         assert "timed out" in results[0].message
         assert "killed" in results[0].message
+
+
+class TestRunSessionHooks:
+    """session_interrupted hooks (Codex-parity: interrupt_hooks.rs) have no
+    tool_name/matcher to filter on -- every configured hook for the event
+    runs unconditionally, and, like PostToolUse, is always observe-only
+    since the interruption already happened by the time it fires."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        assert await run_session_hooks([], "session_interrupted", session_id=1, workspace_root=".") == []
+
+    @pytest.mark.asyncio
+    async def test_every_configured_hook_runs_unconditionally(self):
+        hooks = [
+            HookDefinition(event="session_interrupted", matcher="", command='echo "one" 1>&2', source="user config"),
+            HookDefinition(event="session_interrupted", matcher="", command='echo "two" 1>&2', source="project config"),
+        ]
+        results = await run_session_hooks(hooks, "session_interrupted", session_id=1, workspace_root=".")
+        assert [r.message for r in results] == ["one", "two"]
+        assert all(r.blocked is False for r in results)
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_has_no_special_meaning(self):
+        # Unlike pre_tool_use, there is nothing left to block -- the turn
+        # was already checkpointed as interrupted before this fires.
+        hooks = [HookDefinition(event="session_interrupted", matcher="", command='echo "fyi" 1>&2; exit 2', source="user config")]
+        results = await run_session_hooks(hooks, "session_interrupted", session_id=1, workspace_root=".")
+        assert results[0].blocked is False
+        assert results[0].message == "fyi"
+
+    @pytest.mark.asyncio
+    async def test_a_command_that_cannot_start_reports_a_diagnostic_not_a_crash(self):
+        hooks = [HookDefinition(
+            event="session_interrupted", matcher="", command="/definitely/not/a/real/executable",
+            source="user config",
+        )]
+        results = await run_session_hooks(hooks, "session_interrupted", session_id=1, workspace_root=".")
+        assert len(results) == 1
+        assert results[0].blocked is False
+        assert results[0].message
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="session_interrupted", matcher="", command="sleep 5", source="user config")]
+            results = await run_session_hooks(hooks, "session_interrupted", session_id=1, workspace_root=".")
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert len(results) == 1
+        assert "timed out" in results[0].message
+        assert "killed" in results[0].message
+
+    @pytest.mark.asyncio
+    async def test_receives_the_session_and_reason_on_stdin(self):
+        hooks = [HookDefinition(
+            event="session_interrupted", matcher="",
+            command="python3 -c \"import sys, json; d = json.load(sys.stdin); "
+                    "print(str(d['session_id']) + ':' + d['reason'], file=sys.stderr)\"",
+            source="user config",
+        )]
+        results = await run_session_hooks(
+            hooks, "session_interrupted", session_id=42, workspace_root=".", reason="provider streaming failed",
+        )
+        assert results[0].message == "42:provider streaming failed"

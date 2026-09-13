@@ -44,7 +44,7 @@ from rich.console import Console
 from . import evidence as evidence_store
 from . import state as local_state
 from .config import Config
-from .hooks import load_hooks, run_tool_hooks
+from .hooks import load_hooks, run_session_hooks, run_tool_hooks
 from .mcp import MCPServer
 from .providers import ProviderManager, ProviderType, reasoning_effort_capable
 from .render import (
@@ -4969,6 +4969,24 @@ async def _run_local_agent_turn_impl(
             last_error=last_error,
         )
 
+    async def _fire_session_interrupted_hooks(reason: str) -> None:
+        """Run every configured `session_interrupted` hook -- Codex-parity
+        addition: tamfis-code previously had no third hook-event category
+        beyond pre/post_tool_use, so nothing ever fired when a turn was
+        checkpointed as interrupted (a provider/tool failure, a tool-call
+        round budget exhausted, a rejected final answer, ...). Fire-and-
+        forget from the model's perspective -- observe-only, matching
+        run_session_hooks' contract; a hook failure here is logged into the
+        result but never raised into the turn.
+        """
+        interrupted_hooks = [hook for hook in configured_hooks if hook.event == "session_interrupted"]
+        if not interrupted_hooks:
+            return
+        await run_session_hooks(
+            interrupted_hooks, "session_interrupted",
+            session_id=session_id, workspace_root=workspace_root, reason=reason,
+        )
+
     def _remember_stream_delta(delta: str) -> None:
         """Persist streaming text often enough to survive interruption,
         without fsyncing state.json for every provider token."""
@@ -5409,6 +5427,7 @@ async def _run_local_agent_turn_impl(
                         "completed tool actions."
                     )
                     _persist_turn_checkpoint(partial_assistant=content, status="interrupted")
+                    await _fire_session_interrupted_hooks(message)
                     orchestrator.fail(message)
                     renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
                     return TaskOutcome(status="failed", error=message)
@@ -5461,6 +5480,7 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
             _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
+            await _fire_session_interrupted_hooks(message)
             return TaskOutcome(status="failed", error=message, summary=content)
         validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
         if validation.severity == "error":
@@ -5483,6 +5503,7 @@ async def _run_local_agent_turn_impl(
                 },
             })
             _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
+            await _fire_session_interrupted_hooks(message)
             return TaskOutcome(status="failed", error=message, summary=content)
         if not validation.passed:
             caveat = "\n\n⚠ Validation incomplete: " + "; ".join(validation.unresolved)
@@ -6389,6 +6410,7 @@ async def _run_local_agent_turn_impl(
                     status="interrupted",
                     last_error=message,
                 )
+                await _fire_session_interrupted_hooks(message)
                 orchestrator.fail(message)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
                 return TaskOutcome(status="failed", error=message)
@@ -6537,6 +6559,7 @@ async def _run_local_agent_turn_impl(
                 status="interrupted",
                 last_error=error,
             )
+            await _fire_session_interrupted_hooks(error)
             orchestrator.fail(error)
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
             return TaskOutcome(status="failed", error=error)
@@ -6710,6 +6733,7 @@ async def _run_local_agent_turn_impl(
                     "tool-capable provider, or select one explicitly."
                 )
                 _persist_turn_checkpoint(status="interrupted", last_error=error)
+                await _fire_session_interrupted_hooks(error)
                 orchestrator.fail(error)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
@@ -6787,6 +6811,7 @@ async def _run_local_agent_turn_impl(
                     "another tool-capable provider, or select one explicitly."
                 )
                 _persist_turn_checkpoint(status="interrupted", last_error=error)
+                await _fire_session_interrupted_hooks(error)
                 orchestrator.fail(error)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
@@ -6864,6 +6889,7 @@ async def _run_local_agent_turn_impl(
                     "another tool-capable provider, or select one explicitly."
                 )
                 _persist_turn_checkpoint(status="interrupted", last_error=error)
+                await _fire_session_interrupted_hooks(error)
                 orchestrator.fail(error)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
@@ -6950,6 +6976,7 @@ async def _run_local_agent_turn_impl(
                     "or name a specific file/error to fix."
                 )
                 _persist_turn_checkpoint(status="interrupted", last_error=error)
+                await _fire_session_interrupted_hooks(error)
                 orchestrator.fail(error)
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
@@ -8135,6 +8162,7 @@ async def _run_local_agent_turn_impl(
         "this usually means the task needs to be narrowed.)"
     )
     _persist_turn_checkpoint(status="interrupted", last_error=message)
+    await _fire_session_interrupted_hooks(message)
     orchestrator.fail(message)
     renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
     return TaskOutcome(status="failed", error=message)
