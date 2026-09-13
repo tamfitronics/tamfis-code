@@ -118,18 +118,22 @@ Changelog at the bottom — do not just delete the history.
 |---|---|---|
 | `fork_thread.rs` | session fork | COVERED — `test_session_fork.py` |
 | `multi_agent_resume.rs`, `multi_agent_mode.rs`, `codex_delegate.rs`, `spawn_agent_description.rs` | swarm delegation | COVERED — `test_swarm.py`, `test_agents_delegation.py` |
-| `subagent_notifications.rs`, `subagent_service_tier.rs` | "subagent" referenced across `swarm.py` etc. | GAP — notification/service-tier semantics specifically unconfirmed |
+| `subagent_notifications.rs` | `swarm.py`'s `BufferedSubagentRenderer` -- relays real-time status (model selected, tool call, file mutation, failure) from each concurrent sub-task back to the parent's aggregate status display via `on_update` | COVERED (confirmed 2026-09-13) — `test_swarm.py`'s `BufferedSubagentRendererTests` covers event-to-update translation, the no-`on_update` no-op case, and multiple independent renderer instances |
+| `subagent_service_tier.rs` | none | N/A — confirmed: no "tier" concept anywhere in `swarm.py`; every sub-task resolves its provider/model the same way as a top-level turn |
 
 ## CLI subcommands
 
 | Codex category | tamfis-code feature | Verdict |
 |---|---|---|
-| `login.rs`, `auth_refresh.rs` | `tamfis-code login`, `config.py`/`api_client.py` | GAP — refresh-on-401 behavior not confirmed tested |
+| `login.rs`, `auth_refresh.rs` | `RemoteAPIClient.login`/`_refresh` (`api_client.py`) | COVERED (confirmed 2026-09-13) — `test_tamfis_code_api_client.py` already covers: a 401 triggers refresh then retries successfully, the refresh token is sent as a cookie (not a JSON body -- a specific prior regression), a 401 with no refresh token raises `AuthRequiredError`, login's flat-token-response parsing, and login-failure error detail |
 | `device_code_login.rs`, `login_server_e2e.rs`, `logout.rs` | none (no OAuth/device-code flow) | N/A |
 | `doctor_path_safety.rs` | `check_path_safety()` | COVERED (added 2026-09-13) |
 | `doctor_enterprise_network.rs` | none | N/A — out of scope |
 | `mcp_add_remove.rs`, `mcp_list.rs`, `mcp_login.rs` | config-file-based MCP server config (not imperative CLI) | COVERED via config-loading tests; imperative-CLI surface itself N/A (doesn't exist) |
-| `features.rs`, `queue.rs`, `delete.rs`, `debug_models.rs`, `debug_clear_memories.rs` | unconfirmed | GAP — needs investigation before classifying |
+| `queue.rs` | `cli.py`'s `queue` command over `state.py`'s `enqueue_instruction` | COVERED — same underlying mechanism as `turn_input_submission.rs`/`pending_input.rs` above, tested across 7 files |
+| `delete.rs`, `debug_clear_memories.rs` | `cli.py`'s `clear-session` command | COVERED — tested across `test_cli_commands.py`, `test_session_lifecycle.py`, `test_state_caps_and_pruning.py` |
+| `debug_models.rs` | `cli.py`'s `providers` command | COVERED (loosely) — confirmed by reading it in full: a thin ~20-line display wrapper around `get_provider_status()` with no independent logic of its own to test beyond what the underlying provider-status/model-routing tests already exercise |
+| `features.rs` (feature-flag listing) | none | N/A — confirmed: no such command exists in `cli.py`'s command list |
 
 ## Telemetry
 
@@ -192,3 +196,28 @@ Changelog at the bottom — do not just delete the history.
   `personality.rs`, `collaboration_instructions.rs`, `git_enrichment.rs`)
   confirmed via a full-text search across all of `tamfis_code/*.py` --
   none exist under any name.
+- 2026-09-13: Multi-agent and CLI-subcommand themes resolved, no code
+  changes needed (all reclassified after reading the actual code/tests in
+  full). `subagent_notifications.rs` -> COVERED (`BufferedSubagentRenderer`,
+  tested in `test_swarm.py`); `subagent_service_tier.rs` -> N/A (no "tier"
+  concept exists). `login.rs`/`auth_refresh.rs` -> COVERED
+  (`test_tamfis_code_api_client.py` already covers the 401-retry, cookie-vs-
+  JSON-body, and no-refresh-token paths in detail). `queue.rs` -> COVERED
+  (same mechanism as `turn_input_submission.rs`). `delete.rs`/
+  `debug_clear_memories.rs` -> COVERED (`clear-session`, tested across 3
+  files). `debug_models.rs` -> COVERED loosely (`providers` command is a
+  thin display wrapper with no independent logic). `features.rs` -> N/A
+  (no such command exists).
+
+## Summary
+
+Every row in this document has now been resolved to a definitive verdict
+(no remaining "tentative"/"unconfirmed" rows) as of 2026-09-13. Fixed this
+pass: symlink-escape write/edit tests, hook-execution-timeout test,
+`doctor` PATH-safety check, real-bwrap sandbox enforcement tests, MCP
+startup-grace test, quota-classifier tests, token-budget tests,
+same-path-write dispatch-conflict test, `load_instruction_text` refresh
+test, and a full vision/image-attachment test file. One genuine future
+FEATURE gap was flagged for the user rather than silently built:
+`interrupt_hooks.rs` has no tamfis-code equivalent (no hook event fires on
+task interruption/cancellation).
