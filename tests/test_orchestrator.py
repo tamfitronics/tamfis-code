@@ -890,6 +890,50 @@ class OrchestratorTests(unittest.TestCase):
         research_check = next(item for item in report.checks if item["name"] == "research_evidence_recorded")
         self.assertTrue(research_check["passed"])
 
+    def test_research_task_with_knowledge_base_search_passes(self):
+        """knowledge_base_search (added 2026-09-13) queries TamfisGPT's real
+        Tier VI research corpus, not the model's own knowledge -- exactly as
+        legitimate research evidence as a live web search."""
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        profile = classify_task("what's the latest news on the ECB rate decision")
+
+        report = validate_completion(
+            profile=profile,
+            tool_records=[
+                {"tool_name": "knowledge_base_search", "success": True, "arguments": {"query": "ECB rate decision"}},
+            ],
+            any_mutation=False,
+            final_text="Per the research corpus, the ECB held rates steady at its latest meeting.",
+        )
+
+        self.assertTrue(report.passed)
+        research_check = next(item for item in report.checks if item["name"] == "research_evidence_recorded")
+        self.assertTrue(research_check["passed"])
+
+    def test_research_task_with_only_knowledge_base_index_fails(self):
+        """knowledge_base_index writes to the corpus, it doesn't search it --
+        indexing a source found some other way isn't evidence that this
+        turn's own claims came from a real search."""
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        profile = classify_task("what's the latest news on the ECB rate decision")
+
+        report = validate_completion(
+            profile=profile,
+            tool_records=[
+                {"tool_name": "knowledge_base_index", "success": True, "arguments": {"title": "x", "text": "y"}},
+            ],
+            any_mutation=False,
+            final_text="The ECB most recently held rates steady at its last meeting.",
+        )
+
+        self.assertFalse(report.passed)
+        research_check = next(item for item in report.checks if item["name"] == "research_evidence_recorded")
+        self.assertFalse(research_check["passed"])
+
     def test_guard_tool_call_auto_extends_the_tool_call_budget(self):
         # Regression: a "round" can contain several tool calls, so the raw
         # tool-call ceiling was reachable before the round budget's own

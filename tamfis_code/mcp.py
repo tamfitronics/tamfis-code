@@ -44,6 +44,11 @@ _load_project_env()
 # config/state paths (see config.resolve_config_dir).
 _TAVILY_SEARCH_ENDPOINT = "https://api.tavily.com/search"
 _DUCKDUCKGO_HTML_ENDPOINT = "https://html.duckduckgo.com/html/"
+# TamfisGPT's internal Tier IV service (tier_iv_orchestration/tamgpt_api.py),
+# 127.0.0.1-only, no auth needed -- only reachable/useful on a host that also
+# runs TamfisGPT. Overridable for anyone running that service on a different
+# port/host.
+_TAMGPT_TIER_IV_BASE = os.environ.get("TAMGPT_TIER_IV_URL", "http://127.0.0.1:9555").rstrip("/")
 _DUCKDUCKGO_HEADERS = {
     "User-Agent": (
         "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -711,6 +716,53 @@ class MCPServer:
                 "required": ["query"],
             },
             handler=self._web_search,
+        )
+
+        self.register_tool(
+            name="knowledge_base_search",
+            description=(
+                "Search TamfisGPT's shared research corpus (real papers/sources it has already "
+                "acquired and indexed from its own research feature) for passages relevant to a "
+                "query -- a second, complementary source of research evidence alongside web_search, "
+                "not a replacement for it. Only works on a host running TamfisGPT (calls its local "
+                "internal API); returns a clear error, not a crash, if that's unavailable -- fall "
+                "back to web_search in that case. Read-only, no side effects."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Search query"},
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 30,
+                        "description": "Maximum number of sources to return (default 10)",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=self._knowledge_base_search,
+        )
+
+        self.register_tool(
+            name="knowledge_base_index",
+            description=(
+                "Add a source you found (via web_search or elsewhere) into TamfisGPT's shared "
+                "research corpus, so future research (from this tool or TamfisGPT's own research "
+                "feature) can find it via knowledge_base_search too. Only index sources actually "
+                "relevant to the research at hand, not every page visited. Only works on a host "
+                "running TamfisGPT; returns a clear error, not a crash, if that's unavailable."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "title": {"type": "string", "description": "Source title"},
+                    "url": {"type": "string", "description": "Source URL"},
+                    "text": {"type": "string", "description": "The source's relevant text content to index"},
+                },
+                "required": ["title", "text"],
+            },
+            handler=self._knowledge_base_index,
         )
 
         self.register_tool(
@@ -1993,6 +2045,69 @@ class MCPServer:
         if not results:
             return {"query": query, "provider": None, "results": [], "message": "No results found."}
         return {"query": query, "provider": provider, "results": results}
+
+    async def _knowledge_base_search(self, query: str, limit: int = 10) -> Dict[str, Any]:
+        """Query TamfisGPT's shared research corpus via its internal Tier IV
+        endpoint (see tier_iv_orchestration/tamgpt_api.py's /v1/knowledge/search
+        on that project, 127.0.0.1-only, no auth -- same trust boundary as
+        this tool's own TamfisGPT-routed model calls). Unlike web_search,
+        this is inherently TamfisGPT-dependent -- there is no portable
+        fallback, so a connectivity failure is reported clearly rather than
+        raised, and the caller should fall back to web_search instead.
+        """
+        query = (query or "").strip()
+        if not query:
+            raise ValueError("knowledge_base_search requires a non-empty query")
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 10
+        limit = max(1, min(limit, 30))
+
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    f"{_TAMGPT_TIER_IV_BASE}/v1/knowledge/search",
+                    json={"query": query, "limit": limit},
+                )
+        except httpx.HTTPError as exc:
+            return {
+                "query": query, "results": [],
+                "error": f"TamfisGPT knowledge base unreachable ({exc}) -- fall back to web_search.",
+            }
+        if response.status_code != 200:
+            return {
+                "query": query, "results": [],
+                "error": f"TamfisGPT knowledge search failed (HTTP {response.status_code}) -- fall back to web_search.",
+            }
+        payload = response.json() or {}
+        return {"query": query, "results": payload.get("results") or []}
+
+    async def _knowledge_base_index(self, title: str, text: str, url: str = "") -> Dict[str, Any]:
+        """Write a source into TamfisGPT's shared research corpus -- see
+        _knowledge_base_search's docstring for the endpoint/trust model."""
+        title = (title or "").strip()
+        text = (text or "").strip()
+        if not title or not text:
+            raise ValueError("knowledge_base_index requires a non-empty title and text")
+
+        source = {
+            "title": title,
+            "url": (url or "").strip(),
+            "evidence_units": [{"text": text}],
+        }
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                response = await client.post(
+                    f"{_TAMGPT_TIER_IV_BASE}/v1/knowledge/index",
+                    json={"source": source},
+                )
+        except httpx.HTTPError as exc:
+            return {"indexed": False, "error": f"TamfisGPT knowledge base unreachable ({exc})."}
+        if response.status_code != 200:
+            return {"indexed": False, "error": f"TamfisGPT knowledge index failed (HTTP {response.status_code})."}
+        payload = response.json() or {}
+        return {"indexed": True, "chunks_indexed": payload.get("chunks_indexed", 0)}
 
 # Convenience function for CLI use
 async def call_tool(name: str, **kwargs):

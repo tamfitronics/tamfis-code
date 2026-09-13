@@ -136,8 +136,12 @@ _MUTATING_TOOLS = {
 # a research question ("what's the latest news on X") answered using only
 # those would still just be the model's training-data knowledge dressed up
 # as a live finding -- exactly what classify_task's RESEARCH branch exists to
-# route away from.
-_REAL_RESEARCH_TOOLS = {"web_search", "browser"}
+# route away from. knowledge_base_search (added 2026-09-13) queries a real,
+# externally-maintained corpus (TamfisGPT's Tier VI research corpus) rather
+# than the model's own knowledge, so it's exactly as legitimate evidence as a
+# live web search -- knowledge_base_index (writing to that corpus, not
+# reading it) is deliberately excluded here.
+_REAL_RESEARCH_TOOLS = {"web_search", "browser", "knowledge_base_search"}
 
 # Confirmed live: a turn that finds an objective already fully committed
 # (by a prior turn, or already sitting on disk before this one started) and

@@ -722,3 +722,103 @@ class TestWebSearchTool:
             outcome = await server.call_tool("web_search", {"query": "anything"})
         assert outcome["success"] is True
         assert outcome["result"]["provider"] == "duckduckgo"
+
+
+class TestKnowledgeBaseTools:
+    """knowledge_base_search/_index call TamfisGPT's internal Tier IV
+    endpoint (127.0.0.1:9555/v1/knowledge/*) -- unlike web_search, this is
+    inherently TamfisGPT-dependent, so a connectivity failure must be
+    reported clearly in the result, never raised (a standalone host with no
+    TamfisGPT must still be able to fall back to web_search)."""
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_search_rejects_empty_query(self):
+        server = MCPServer()
+        with pytest.raises(ValueError):
+            await server._knowledge_base_search(query="   ")
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_search_returns_results_on_success(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"results": [{"title": "A Paper", "url": "https://example.com/paper"}]}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._knowledge_base_search(query="model routing")
+        assert result["results"] == [{"title": "A Paper", "url": "https://example.com/paper"}]
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_search_reports_unreachable_instead_of_raising(self):
+        async def fake_post(*args, **kwargs):
+            raise httpx.ConnectError("boom")
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._knowledge_base_search(query="model routing")
+        assert result["results"] == []
+        assert "unreachable" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_search_reports_non_200_instead_of_raising(self):
+        response = MagicMock()
+        response.status_code = 500
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._knowledge_base_search(query="model routing")
+        assert result["results"] == []
+        assert "HTTP 500" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_index_rejects_missing_title_or_text(self):
+        server = MCPServer()
+        with pytest.raises(ValueError):
+            await server._knowledge_base_index(title="", text="something")
+        with pytest.raises(ValueError):
+            await server._knowledge_base_index(title="A Title", text="   ")
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_index_returns_chunks_indexed_on_success(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"chunks_indexed": 3}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._knowledge_base_index(title="A Title", text="Some content", url="https://x.example")
+        assert result == {"indexed": True, "chunks_indexed": 3}
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_index_reports_unreachable_instead_of_raising(self):
+        async def fake_post(*args, **kwargs):
+            raise httpx.ConnectError("boom")
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._knowledge_base_index(title="A Title", text="Some content")
+        assert result["indexed"] is False
+        assert "unreachable" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_knowledge_base_tools_are_registered_and_reachable_via_call_tool(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"results": []}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        server = MCPServer()
+        tool_names = {tool["name"] for tool in server.list_tools()}
+        assert "knowledge_base_search" in tool_names
+        assert "knowledge_base_index" in tool_names
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            outcome = await server.call_tool("knowledge_base_search", {"query": "anything"})
+        assert outcome["success"] is True
+        assert outcome["result"]["results"] == []

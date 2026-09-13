@@ -34,7 +34,10 @@ EDIT_TOOLS = [
 ]
 EXECUTE_TOOLS = [*READ_TOOLS, "execute_command"]
 GIT_TOOLS = ["get_git_info", "read_file", "search_code", "find_references", "execute_command", "ask_user_question"]
-RESEARCH_TOOLS = ["web_search", "browser", "read_file", "search_code", "find_references", "ask_user_question"]
+RESEARCH_TOOLS = [
+    "web_search", "browser", "knowledge_base_search", "knowledge_base_index",
+    "read_file", "search_code", "find_references", "ask_user_question",
+]
 
 
 def allowed_tools(profile: TaskProfile, *, read_only: bool) -> list[str]:
