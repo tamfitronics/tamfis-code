@@ -841,6 +841,55 @@ class OrchestratorTests(unittest.TestCase):
 
         self.assertEqual(commands, ["sudo systemctl restart tamfis-gpt.service"])
 
+    def test_research_task_without_web_search_or_browser_fails(self):
+        """RESEARCH previously had no completion gate of its own --
+        tool_evidence_recorded only requires *some* successful tool call, so
+        a turn that called read_file once (also in RESEARCH_TOOLS)
+        satisfied it without ever actually searching. A request classified
+        as needing current/external info (e.g. "what's the latest news on
+        X") answered that way is training-data knowledge presented as a
+        live finding."""
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        profile = classify_task("what's the latest news on the ECB rate decision")
+        self.assertEqual(profile.task_type.value, "research")
+
+        report = validate_completion(
+            profile=profile,
+            tool_records=[
+                {"tool_name": "read_file", "success": True, "arguments": {"path": "notes.md"}},
+            ],
+            any_mutation=False,
+            final_text="The ECB most recently held rates steady at its last meeting.",
+        )
+
+        self.assertFalse(report.passed)
+        self.assertEqual(report.severity, "error")
+        research_check = next(item for item in report.checks if item["name"] == "research_evidence_recorded")
+        self.assertFalse(research_check["passed"])
+        self.assertTrue(any("no successful web_search or browser tool call" in item for item in report.unresolved))
+
+    def test_research_task_with_web_search_passes(self):
+        from tamfis_code.orchestrator.validator import validate_completion
+        from tamfis_code.routing import classify_task
+
+        profile = classify_task("what's the latest news on the ECB rate decision")
+
+        report = validate_completion(
+            profile=profile,
+            tool_records=[
+                {"tool_name": "web_search", "success": True, "arguments": {"query": "ECB rate decision latest news"}},
+            ],
+            any_mutation=False,
+            final_text="Per a web search just now, the ECB held rates steady at its latest meeting.",
+        )
+
+        self.assertTrue(report.passed)
+        self.assertEqual(report.severity, "pass")
+        research_check = next(item for item in report.checks if item["name"] == "research_evidence_recorded")
+        self.assertTrue(research_check["passed"])
+
     def test_guard_tool_call_auto_extends_the_tool_call_budget(self):
         # Regression: a "round" can contain several tool calls, so the raw
         # tool-call ceiling was reachable before the round budget's own

@@ -130,6 +130,15 @@ _MUTATING_TOOLS = {
     "create_artifact",
 }
 
+# The subset of tool_policy.py's RESEARCH_TOOLS that actually reaches outside
+# the repository/conversation for current information. read_file/search_code/
+# find_references/ask_user_question are also offered on a research task, but
+# a research question ("what's the latest news on X") answered using only
+# those would still just be the model's training-data knowledge dressed up
+# as a live finding -- exactly what classify_task's RESEARCH branch exists to
+# route away from.
+_REAL_RESEARCH_TOOLS = {"web_search", "browser"}
+
 # Confirmed live: a turn that finds an objective already fully committed
 # (by a prior turn, or already sitting on disk before this one started) and
 # verifies it with `git diff --stat`/`git show --stat` never calls
@@ -516,6 +525,27 @@ def validate_completion(
                     "turn's own work."
                 )
 
+    if profile.task_type == TaskType.RESEARCH:
+        # Unlike EDIT/DEBUG/AUDIT, RESEARCH previously had no completion gate
+        # of its own at all -- tool_evidence_recorded only requires *some*
+        # successful tool call, so a turn that called read_file once (or any
+        # other RESEARCH_TOOLS entry) satisfied it without ever actually
+        # searching. classify_task only routes here on explicit web/current-
+        # info phrasing ("search the web", "latest news", "current price",
+        # ...), so an answer that never reached the web is answering from
+        # training-data knowledge presented as a live finding.
+        research_evidence = any(
+            item.get("tool_name") in _REAL_RESEARCH_TOOLS and item.get("success") is True
+            for item in tool_records
+        )
+        checks.append({"name": "research_evidence_recorded", "passed": research_evidence})
+        if not research_evidence:
+            unresolved.append(
+                "This request was classified as needing current/external information, but no "
+                "successful web_search or browser tool call was recorded -- an answer here must "
+                "come from an actual search, not general knowledge presented as a current finding."
+            )
+
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}:
         git_diffstat_evidence = bool(_successful_changed_paths(tool_records, workspace_root))
         mutation_requirement_met = any_mutation or verified_no_change or git_diffstat_evidence
@@ -663,6 +693,13 @@ def validate_completion(
             # Same bar as mutation_recorded: a project's own stated
             # deployment requirement is not optional guidance, and a warning
             # here would let the CLI report success over an inert change.
+            severity = "error"
+        if any(check["name"] == "research_evidence_recorded" and not check["passed"] for check in checks):
+            # Same bar as mutation_recorded: a research task that never
+            # actually searched is presenting stale/training-data knowledge
+            # as a current finding, which is worse than an honest "I
+            # couldn't verify this is current" -- a warning would still let
+            # the CLI report it as done.
             severity = "error"
 
     return ValidationReport(passed, checks, unresolved, severity=severity)
