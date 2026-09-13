@@ -2065,7 +2065,7 @@ class MCPServer:
         limit = max(1, min(limit, 30))
 
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
                     f"{_TAMGPT_TIER_IV_BASE}/v1/knowledge/search",
                     json={"query": query, "limit": limit},
@@ -2097,7 +2097,7 @@ class MCPServer:
             "evidence_units": [{"text": text}],
         }
         try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
+            async with httpx.AsyncClient(timeout=30.0) as client:
                 response = await client.post(
                     f"{_TAMGPT_TIER_IV_BASE}/v1/knowledge/index",
                     json={"source": source},
