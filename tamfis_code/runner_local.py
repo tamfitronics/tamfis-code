@@ -4652,14 +4652,23 @@ async def _run_pre_tool_use_hooks(
         session_id=session_id, workspace_root=workspace_root,
     )
     for hook_result in pre_hook_results:
-        renderer.handle_event({
-            "event_type": "diagnostics",
-            "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
-        })
+        if hook_result.message:
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
+            })
     blocking = next((r for r in pre_hook_results if r.blocked), None)
-    if blocking is None:
-        return None
-    return {"error": f"Blocked by hook: {blocking.message}", "success": False}
+    if blocking is not None:
+        return {"error": f"Blocked by hook: {blocking.message}", "success": False}
+    # Claude-Code-parity addition (updatedInput): apply every non-blocked
+    # hook's rewritten fields, in configured order, so a later hook can
+    # still see/override an earlier hook's rewrite -- mutates the caller's
+    # own `arguments` dict in place, which every call site already reads
+    # again immediately after this call for the actual tool dispatch.
+    for hook_result in pre_hook_results:
+        if hook_result.updated_input:
+            arguments.update(hook_result.updated_input)
+    return None
 
 
 async def _run_local_agent_turn_impl(
@@ -8071,15 +8080,23 @@ async def _run_local_agent_turn_impl(
                 )
                 blocking = next((r for r in pre_hook_results if r.blocked), None)
                 for hook_result in pre_hook_results:
-                    renderer.handle_event({
-                        "event_type": "diagnostics",
-                        "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
-                    })
+                    if hook_result.message:
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {"content": f"[hook:{hook_result.hook.event}] {hook_result.message}"},
+                        })
                 if blocking is not None:
                     result = {"error": f"Blocked by hook: {blocking.message}", "success": False}
                     working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
                     renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                     continue
+                # Claude-Code-parity addition (updatedInput): see
+                # _run_pre_tool_use_hooks' own comment -- mutates
+                # `arguments` in place before the ToolEnvelope below is
+                # built from it.
+                for hook_result in pre_hook_results:
+                    if hook_result.updated_input:
+                        arguments.update(hook_result.updated_input)
 
             envelope = ToolEnvelope(
                 tool_call_id=tc.call_id or f"call_round_{_round}", tool_name=tc.name, arguments=arguments,

@@ -13,8 +13,9 @@ import pytest
 
 from tamfis_code import hooks as hooks_module
 from tamfis_code.hooks import (
-    HookDefinition, load_hooks, run_session_completed_hooks, run_session_end_hooks,
-    run_session_hooks, run_session_start_hooks, run_subagent_stop_hooks, run_tool_hooks,
+    HookDefinition, load_hooks, run_notification_hooks, run_pre_compact_hooks,
+    run_session_completed_hooks, run_session_end_hooks, run_session_hooks,
+    run_session_start_hooks, run_subagent_stop_hooks, run_tool_hooks,
     run_user_prompt_submit_hooks,
 )
 
@@ -92,6 +93,198 @@ class TestLoadHooks:
         hooks_module.HOOKS_PATH.write_text('[[subagent_stop]]\ncommand = "echo done"\n')
         loaded = load_hooks()
         assert [h.event for h in loaded] == ["subagent_stop"]
+
+    def test_loads_pre_compact_hooks(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text('[[pre_compact]]\ncommand = "echo keep this"\n')
+        loaded = load_hooks()
+        assert [h.event for h in loaded] == ["pre_compact"]
+
+    def test_loads_notification_hooks(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text('[[notification]]\ncommand = "notify-send done"\n')
+        loaded = load_hooks()
+        assert [h.event for h in loaded] == ["notification"]
+
+    def test_loads_the_optional_if_command_field(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text(
+            '[[pre_tool_use]]\nmatcher = "execute_command"\nif_command = "git commit*"\ncommand = "echo hi"\n'
+        )
+        loaded = load_hooks()
+        assert loaded[0].if_command == "git commit*"
+
+    def test_if_command_defaults_to_empty_when_absent(self):
+        hooks_module.HOOKS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        hooks_module.HOOKS_PATH.write_text('[[pre_tool_use]]\ncommand = "echo hi"\n')
+        loaded = load_hooks()
+        assert loaded[0].if_command == ""
+
+
+class TestIfCommandMatching:
+    """Claude-Code-parity addition: a simplified, fnmatch-glob equivalent
+    of Claude Code's real `"if": "Bash(git commit:*)"` syntax -- gates a
+    pre_tool_use/post_tool_use hook on the actual command content, not
+    just the tool name."""
+
+    @pytest.mark.asyncio
+    async def test_matching_command_fires_the_hook(self):
+        hooks = [HookDefinition(
+            event="pre_tool_use", matcher="execute_command", if_command="git commit*",
+            command='echo "blocked commit" 1>&2; exit 2', source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "pre_tool_use", tool_name="execute_command",
+            tool_input={"command": "git commit -m fix"}, session_id=1, workspace_root=".",
+        )
+        assert results[0].blocked is True
+        assert results[0].message == "blocked commit"
+
+    @pytest.mark.asyncio
+    async def test_non_matching_command_does_not_fire_the_hook(self):
+        hooks = [HookDefinition(
+            event="pre_tool_use", matcher="execute_command", if_command="git commit*",
+            command='echo "should never run" 1>&2; exit 2', source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "pre_tool_use", tool_name="execute_command",
+            tool_input={"command": "ls -la"}, session_id=1, workspace_root=".",
+        )
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_a_tool_with_no_command_argument_never_matches_if_command(self):
+        hooks = [HookDefinition(
+            event="pre_tool_use", matcher="write_file", if_command="git commit*",
+            command='echo "should never run" 1>&2; exit 2', source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "pre_tool_use", tool_name="write_file",
+            tool_input={"path": "app.py"}, session_id=1, workspace_root=".",
+        )
+        assert results == []
+
+    @pytest.mark.asyncio
+    async def test_matcher_still_applies_alongside_if_command(self):
+        # A hook can require both the tool name AND the command content to
+        # match -- if_command alone is not a substitute for matcher.
+        hooks = [HookDefinition(
+            event="pre_tool_use", matcher="write_file", if_command="git commit*",
+            command='echo "should never run" 1>&2; exit 2', source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "pre_tool_use", tool_name="execute_command",
+            tool_input={"command": "git commit -m fix"}, session_id=1, workspace_root=".",
+        )
+        assert results == []
+
+
+class TestUpdatedInputMutation:
+    """Claude-Code-parity addition: a non-blocked pre_tool_use hook can
+    rewrite the pending call's arguments by printing
+    {"updated_input": {...}} as its whole stdout -- a flatter, simpler
+    shape than Claude Code's real nested hookSpecificOutput.updatedInput
+    (tamfis-code has no systemMessage/permissionDecision concept to nest
+    this alongside)."""
+
+    @pytest.mark.asyncio
+    async def test_updated_input_is_parsed_from_stdout(self):
+        hooks = [HookDefinition(
+            event="pre_tool_use", matcher="write_file",
+            command='echo \'{"updated_input": {"content": "sanitized"}}\'',
+            source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "pre_tool_use", tool_name="write_file",
+            tool_input={"path": "x.py", "content": "raw"}, session_id=1, workspace_root=".",
+        )
+        assert results[0].blocked is False
+        assert results[0].updated_input == {"content": "sanitized"}
+        # The raw JSON blob is not also dumped as a diagnostic message.
+        assert results[0].message == ""
+
+    @pytest.mark.asyncio
+    async def test_plain_non_json_stdout_is_not_mistaken_for_updated_input(self):
+        hooks = [HookDefinition(
+            event="pre_tool_use", matcher="write_file", command='echo "just some text"', source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "pre_tool_use", tool_name="write_file", tool_input={"path": "x.py"},
+            session_id=1, workspace_root=".",
+        )
+        assert results[0].updated_input is None
+        assert results[0].message == "just some text"
+
+    @pytest.mark.asyncio
+    async def test_json_without_an_updated_input_key_is_not_mistaken_for_a_mutation(self):
+        hooks = [HookDefinition(
+            event="pre_tool_use", matcher="write_file", command='echo \'{"other": "field"}\'', source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "pre_tool_use", tool_name="write_file", tool_input={"path": "x.py"},
+            session_id=1, workspace_root=".",
+        )
+        assert results[0].updated_input is None
+
+    @pytest.mark.asyncio
+    async def test_updated_input_is_never_parsed_for_post_tool_use(self):
+        # Mutating a call after it already ran makes no sense -- post_tool_use
+        # never attempts updated_input parsing at all.
+        hooks = [HookDefinition(
+            event="post_tool_use", matcher="write_file",
+            command='echo \'{"updated_input": {"content": "sanitized"}}\'',
+            source="user config",
+        )]
+        results = await run_tool_hooks(
+            hooks, "post_tool_use", tool_name="write_file", tool_input={"path": "x.py"},
+            tool_output={"success": True}, session_id=1, workspace_root=".",
+        )
+        assert results[0].updated_input is None
+        assert "updated_input" in results[0].message  # surfaced as plain text instead
+
+
+class TestParallelHookExecution:
+    """Claude-Code-parity addition: every matching hook for one event runs
+    concurrently (asyncio.gather), matching Claude Code's own documented
+    "all matching hooks run in parallel" contract, rather than one at a
+    time."""
+
+    @pytest.mark.asyncio
+    async def test_two_slow_hooks_run_concurrently_not_sequentially(self):
+        import time
+        hooks = [
+            HookDefinition(event="post_tool_use", matcher="", command="sleep 0.5", source="user config"),
+            HookDefinition(event="post_tool_use", matcher="", command="sleep 0.5", source="project config"),
+        ]
+        start = time.monotonic()
+        await run_tool_hooks(
+            hooks, "post_tool_use", tool_name="write_file", tool_input={}, session_id=1, workspace_root=".",
+        )
+        elapsed = time.monotonic() - start
+        # Sequential execution would take ~1.0s; concurrent takes ~0.5s.
+        # A generous ceiling avoids flaking under real subprocess/CI jitter.
+        assert elapsed < 0.9, f"hooks did not run concurrently (took {elapsed:.2f}s)"
+
+    @pytest.mark.asyncio
+    async def test_a_hook_after_a_blocking_one_still_actually_runs_but_its_result_is_dropped(self):
+        # Documents the real trade-off: under true parallel execution, a
+        # later hook's subprocess still runs to completion even though an
+        # earlier hook already blocked the call -- there is no way to
+        # cancel an already-launched hook without breaking Claude Code's
+        # own "hooks don't see each other's output" independence contract.
+        # Only its reported RESULT is dropped from the returned list.
+        with tempfile.TemporaryDirectory() as tmp:
+            marker = Path(tmp) / "ran.txt"
+            hooks = [
+                HookDefinition(event="pre_tool_use", matcher="", command='echo "blocked" 1>&2; exit 2', source="user config"),
+                HookDefinition(event="pre_tool_use", matcher="", command=f"touch {marker}", source="project config"),
+            ]
+            results = await run_tool_hooks(
+                hooks, "pre_tool_use", tool_name="execute_command", tool_input={}, session_id=1, workspace_root=".",
+            )
+            assert len(results) == 1
+            assert results[0].blocked is True
+            assert marker.is_file(), "the later hook's subprocess should still have run"
 
 
 class TestRunToolHooks:
@@ -503,6 +696,88 @@ class TestRunSubagentStopHooks:
             results = await run_subagent_stop_hooks(
                 hooks, session_id=1, workspace_root=".", task_id="t1", description="x", status="completed",
             )
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert "timed out" in results[0].message
+
+
+class TestRunPreCompactHooks:
+    """Claude-Code-parity addition: fires immediately before /compact folds
+    older turns into the conversation summary -- tamfis-code's only
+    compaction trigger. A hook's output is folded into the preserved
+    summary by the caller (see test_thread_compression.py's
+    test_preserve_note_from_a_pre_compact_hook_survives_the_fold), not
+    just logged."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        assert await run_pre_compact_hooks([], session_id=1, workspace_root=".") == []
+
+    @pytest.mark.asyncio
+    async def test_every_configured_hook_runs_and_output_is_returned(self):
+        hooks = [
+            HookDefinition(event="pre_compact", matcher="", command='echo "keep this" 1>&2', source="user config"),
+        ]
+        results = await run_pre_compact_hooks(hooks, session_id=1, workspace_root=".")
+        assert results[0].message == "keep this"
+        assert results[0].blocked is False
+
+    @pytest.mark.asyncio
+    async def test_receives_the_session_id_on_stdin(self):
+        hooks = [HookDefinition(
+            event="pre_compact", matcher="",
+            command="python3 -c \"import sys, json; d = json.load(sys.stdin); print(d['session_id'], file=sys.stderr)\"",
+            source="user config",
+        )]
+        results = await run_pre_compact_hooks(hooks, session_id=42, workspace_root=".")
+        assert results[0].message == "42"
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="pre_compact", matcher="", command="sleep 5", source="user config")]
+            results = await run_pre_compact_hooks(hooks, session_id=1, workspace_root=".")
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert "timed out" in results[0].message
+
+
+class TestRunNotificationHooks:
+    """Claude-Code-parity addition: fires whenever tamfis-code delivers a
+    notification-style message into a session (see
+    test_background_lifecycle.py's real end-to-end proof against
+    background.py's update_job_status). Observe-only."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        assert await run_notification_hooks([], session_id=1, workspace_root=".", message="x") == []
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_has_no_special_meaning(self):
+        hooks = [HookDefinition(event="notification", matcher="", command='echo "fyi" 1>&2; exit 2', source="user config")]
+        results = await run_notification_hooks(hooks, session_id=1, workspace_root=".", message="job done")
+        assert results[0].blocked is False
+        assert results[0].message == "fyi"
+
+    @pytest.mark.asyncio
+    async def test_receives_the_message_on_stdin(self):
+        hooks = [HookDefinition(
+            event="notification", matcher="",
+            command="python3 -c \"import sys, json; d = json.load(sys.stdin); print(d['message'], file=sys.stderr)\"",
+            source="user config",
+        )]
+        results = await run_notification_hooks(hooks, session_id=1, workspace_root=".", message="background job finished")
+        assert results[0].message == "background job finished"
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="notification", matcher="", command="sleep 5", source="user config")]
+            results = await run_notification_hooks(hooks, session_id=1, workspace_root=".", message="x")
         finally:
             hooks_module.HOOK_TIMEOUT_SECONDS = original
         assert "timed out" in results[0].message

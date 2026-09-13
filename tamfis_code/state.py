@@ -1459,7 +1459,9 @@ def summarize_thread(session_id: int, *, keep_recent: int = COMPACT_KEEP_RECENT_
     return summary
 
 
-def compact_session_thread(session_id: int, *, keep_recent: int = COMPACT_KEEP_RECENT_TURNS) -> str:
+def compact_session_thread(
+    session_id: int, *, keep_recent: int = COMPACT_KEEP_RECENT_TURNS, preserve_note: str = "",
+) -> str:
     """Compress the durable thread in place: fold older turns into
     conversation_summary and keep only the recent `keep_recent` turns in
     conversation_history. Returns the structured recap (same as
@@ -1469,6 +1471,11 @@ def compact_session_thread(session_id: int, *, keep_recent: int = COMPACT_KEEP_R
     seeded from the bounded summary + recent turns, not the full raw
     transcript -- matching how Claude Code/Codex keep a long REPL usable
     without the terminal UI/UX growing heavy.
+
+    `preserve_note`, when given (interactive.py's PreCompact hook output --
+    Claude-Code-parity addition), is folded into the digest as its own
+    leading line so critical information a hook flagged survives the fold,
+    matching Claude Code's PreCompact "preserve context" contract.
     """
     state = get_session_state(session_id)
     turns = _extract_turns(state.conversation_history)
@@ -1479,6 +1486,8 @@ def compact_session_thread(session_id: int, *, keep_recent: int = COMPACT_KEEP_R
 
     older = turns[:-keep_recent] if keep_recent > 0 else turns
     digest_parts: list[str] = []
+    if preserve_note:
+        digest_parts.append(f"- [Preserved by pre_compact hook] {preserve_note}")
     for turn in older:
         objective = turn["objective"]
         answer = turn["answer"]

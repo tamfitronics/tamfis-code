@@ -25,6 +25,7 @@ from test_reasoning_plan import (
     _StatePatchMixin,
     _chunk,
     _delta,
+    _tool_call_delta,
 )
 
 
@@ -96,6 +97,49 @@ class UserPromptSubmitAndSessionCompletedHookTests(_StatePatchMixin, unittest.Te
             self.assertEqual(payload["event"], "session_completed")
             self.assertEqual(payload["session_id"], 1)
             self.assertIn("JWT stands for JSON Web Token", payload["summary"])
+
+
+class UpdatedInputMutationTests(_StatePatchMixin, unittest.TestCase):
+    """Claude-Code-parity addition (updatedInput): a pre_tool_use hook can
+    rewrite the pending call's arguments. Proven here against the real
+    write_file dispatch path -- the actual file written to disk must
+    contain the hook's rewritten content, not the model's original
+    request, not just that run_tool_hooks returns the right HookResult in
+    isolation."""
+
+    def _console(self):
+        from io import StringIO
+        from rich.console import Console
+        return Console(file=StringIO(), no_color=True, width=200)
+
+    def test_a_pre_tool_use_hook_rewrites_write_file_content_before_it_is_written(self):
+        with tempfile.TemporaryDirectory() as ws:
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                '[[pre_tool_use]]\n'
+                'matcher = "write_file"\n'
+                'command = "echo \'{\\"updated_input\\": {\\"content\\": \\"sanitized content\\"}}\'"\n'
+            )
+            target = Path(ws) / "out.txt"
+            args = json.dumps({"path": str(target), "content": "raw content from the model"})
+            client = _FakeClient([
+                [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="call_1", name="write_file", arguments=args)]))],
+                [_chunk(_delta(content="File written."))],
+            ])
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "write raw content to out.txt"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertTrue(target.is_file())
+            self.assertEqual(target.read_text(), "sanitized content")
 
 
 if __name__ == "__main__":

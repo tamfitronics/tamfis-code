@@ -141,20 +141,46 @@ def update_job_status(job_id: str, status: str, *, exit_code: Optional[int] = No
         from . import state as local_state
 
         tail = str(record.get("result_tail") or "").strip()
+        message = (
+            f"[Background {'goal' if record.get('goal') else 'task'} {job_id} finished "
+            f"with status={status} and exit_code={exit_code}.] "
+            "Use this completion as new evidence. Summarize the outcome, identify any "
+            "remaining work, and continue only if the original objective is not complete."
+            + (f"\n\nOutput tail:\n{tail}" if tail else "")
+        )
         local_state.enqueue_instruction(
-            int(record["session_id"]),
-            (
-                f"[Background {'goal' if record.get('goal') else 'task'} {job_id} finished "
-                f"with status={status} and exit_code={exit_code}.] "
-                "Use this completion as new evidence. Summarize the outcome, identify any "
-                "remaining work, and continue only if the original objective is not complete."
-                + (f"\n\nOutput tail:\n{tail}" if tail else "")
-            ),
-            classification="follow_up",
-            priority=20,
+            int(record["session_id"]), message, classification="follow_up", priority=20,
         )
         record["notification_delivered"] = True
+        _fire_notification_hooks(
+            session_id=int(record["session_id"]),
+            workspace_root=str(record.get("workspace_root") or "."),
+            message=message,
+        )
     _write_job(BackgroundJob(**record))
+
+
+def _fire_notification_hooks(*, session_id: int, workspace_root: str, message: str) -> None:
+    """Claude-Code-parity addition: update_job_status runs synchronously in
+    a detached background child process right before it exits (see this
+    function's own docstring above), with no already-running asyncio event
+    loop to conflict with -- asyncio.run is safe here, unlike everywhere
+    else in this codebase's request-serving paths. Never lets a broken
+    hook prevent the job record from being written.
+    """
+    import asyncio
+
+    from .hooks import load_hooks, run_notification_hooks
+
+    hooks = [hook for hook in load_hooks(workspace_root) if hook.event == "notification"]
+    if not hooks:
+        return
+    try:
+        asyncio.run(run_notification_hooks(
+            hooks, session_id=session_id, workspace_root=workspace_root, message=message,
+        ))
+    except Exception:
+        pass
 
 
 def stop_job(job_id: str) -> bool:

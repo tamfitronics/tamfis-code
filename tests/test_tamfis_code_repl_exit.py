@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
 
+from tamfis_code import state as state_module
 from tamfis_code.config import Config
 from tamfis_code.interactive import run_interactive, HELP_TEXT
 from tamfis_code.workspace import WorkspaceContext
@@ -110,6 +111,46 @@ class SessionStartEndHookTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as ws:
             output = _run([KeyboardInterrupt()], workspace_root=ws)
         self.assertIsInstance(output, str)
+
+
+class PreCompactHookTests(unittest.TestCase):
+    """Claude-Code-parity addition: a pre_compact hook fires when /compact
+    runs, and its output survives the fold into conversation_summary --
+    proven here via a real /compact command through the actual REPL, not
+    a direct call to compact_session_thread."""
+
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        state_module._STATE_CACHE = None
+        state_module._STATE_CACHE_KEY = None
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        state_module._STATE_CACHE = None
+        state_module._STATE_CACHE_KEY = None
+        self._tmp.cleanup()
+
+    def test_pre_compact_hook_output_survives_the_fold(self):
+        with tempfile.TemporaryDirectory() as ws:
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                '[[pre_compact]]\ncommand = "echo \\"remember the auth refactor\\" 1>&2"\n'
+            )
+            history = []
+            for i in range(8):
+                history.append({"role": "user", "content": f"obj {i}"})
+                history.append({"role": "assistant", "content": f"ans {i}"})
+            state_module.save_session_state(1, conversation_history=history)
+
+            _run(["/compact", EOFError()], workspace_root=ws)
+
+            state = state_module.get_session_state(1)
+            self.assertIn("remember the auth refactor", state.conversation_summary)
 
 
 if __name__ == "__main__":

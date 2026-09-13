@@ -120,6 +120,17 @@ class CompactSessionThreadTests(_StateDirFixture, unittest.TestCase):
         self.assertIn("obj 7", recap)
         self.assertIn("Recent 3 turn", recap)
 
+    def test_preserve_note_from_a_pre_compact_hook_survives_the_fold(self):
+        # Claude-Code-parity addition: a pre_compact hook's output is
+        # folded into the summary as its own leading line, not discarded --
+        # matching Claude Code's "preserve critical info" contract for
+        # this event.
+        turns = [(f"obj {i}", f"ans {i}") for i in range(8)]
+        self._seed_history(5, turns)
+        state_module.compact_session_thread(5, keep_recent=3, preserve_note="Remember: use RFC 7519 for JWT.")
+        state = state_module.get_session_state(5)
+        self.assertIn("Remember: use RFC 7519 for JWT.", state.conversation_summary)
+
     def test_compact_short_thread_is_a_noop_on_history(self):
         self._seed_history(6, [("one", "1"), ("two", "2")])
         recap = state_module.compact_session_thread(6, keep_recent=4)

@@ -21,6 +21,11 @@ files use the same shape:
     matcher = "execute_command"
     command = "notify-send 'tamfis-code ran a command'"
 
+    [[pre_tool_use]]
+    matcher = "execute_command"
+    if_command = "git commit*"   # fnmatch glob against tool_input["command"]; Claude-Code-parity addition
+    command = "python3 my_commit_guard.py"
+
     [[session_interrupted]]
     command = "notify-send 'tamfis-code task was interrupted'"
 
@@ -71,11 +76,24 @@ A hook that fails to start, errors, or times out never crashes the turn --
 it degrades to a visible diagnostic, the same "never let an optional
 integration point take down a real turn" contract already established by
 mcp.py's `_import_monorepo_attr` for browser/the shared MCP bridge.
+
+Claude-Code-parity addition: every matching hook for one event runs
+CONCURRENTLY (asyncio.gather), matching Claude Code's own documented "all
+matching hooks run in parallel" contract, rather than one at a time.
+Hook order is still preserved in the returned list regardless of
+completion order. For a blocking-capable event (pre_tool_use,
+user_prompt_submit), once the first hook in *configured* order blocks,
+later hooks' results are dropped from the returned list the same way
+sequential short-circuiting used to behave -- but their subprocesses
+still actually run to completion (or timeout) concurrently, since there
+is no way to cancel an already-launched hook without breaking Claude
+Code's own "hooks don't see each other's output" independence contract.
 """
 
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import re
 import tomllib
@@ -91,7 +109,7 @@ HOOK_TIMEOUT_SECONDS = 30
 _HOOK_EVENTS = (
     "pre_tool_use", "post_tool_use", "session_interrupted",
     "user_prompt_submit", "session_completed",
-    "session_start", "session_end", "subagent_stop",
+    "session_start", "session_end", "subagent_stop", "pre_compact", "notification",
 )
 
 
@@ -101,6 +119,7 @@ class HookDefinition:
     matcher: str
     command: str
     source: str
+    if_command: str = ""
 
 
 @dataclass(frozen=True)
@@ -108,6 +127,7 @@ class HookResult:
     blocked: bool
     message: str
     hook: HookDefinition
+    updated_input: Optional[dict[str, Any]] = None
 
 
 def _load_hooks_file(path: Path, source: str) -> list[HookDefinition]:
@@ -131,6 +151,7 @@ def _load_hooks_file(path: Path, source: str) -> list[HookDefinition]:
                 continue
             hooks.append(HookDefinition(
                 event=event, matcher=str(entry.get("matcher") or ""), command=command, source=source,
+                if_command=str(entry.get("if_command") or ""),
             ))
     return hooks
 
@@ -146,13 +167,121 @@ def load_hooks(project_root: Optional[str] = None) -> list[HookDefinition]:
     return hooks
 
 
-def _matches(hook: HookDefinition, tool_name: str) -> bool:
-    if not hook.matcher:
-        return True
+def _matches(hook: HookDefinition, tool_name: str, tool_input: Optional[dict[str, Any]] = None) -> bool:
+    """`matcher` (a regex against the tool name) must pass first; if the
+    hook also sets `if_command` (Claude-Code-parity addition -- a
+    simplified, glob-style equivalent of Claude Code's real
+    `"if": "Bash(git commit:*)"` syntax, deliberately not porting that
+    exact mini-language verbatim), it is additionally matched with
+    fnmatch against tool_input["command"]. Only meaningful for tools that
+    actually take a `command` argument (execute_command); for any other
+    tool, an `if_command` clause simply never matches rather than
+    crashing -- there is nothing sensible to compare it against.
+    """
+    if hook.matcher:
+        try:
+            if re.search(hook.matcher, tool_name) is None:
+                return False
+        except re.error:
+            return False
+    if hook.if_command:
+        command = str((tool_input or {}).get("command") or "")
+        if not command:
+            return False
+        if not fnmatch.fnmatch(command, hook.if_command):
+            return False
+    return True
+
+
+
+
+async def _execute_one_hook(
+    hook: HookDefinition, payload: bytes, *, workspace_root: str,
+    blocking_capable: bool = False, want_updated_input: bool = False,
+) -> Optional[HookResult]:
+    """Run a single hook subprocess and interpret its outcome. Returns
+    None when the hook produced nothing worth reporting (no message, not
+    blocked, no updated_input) -- callers filter these out. Every public
+    run_*_hooks function below launches all of its matching hooks
+    concurrently via _run_hooks_concurrently and calls this once per hook.
+    """
     try:
-        return re.search(hook.matcher, tool_name) is not None
-    except re.error:
-        return False
+        proc = await asyncio.create_subprocess_shell(
+            hook.command,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=workspace_root,
+        )
+    except OSError as exc:
+        return HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook)
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        return HookResult(
+            blocked=False,
+            message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
+            hook=hook,
+        )
+    stderr_text = stderr.decode("utf-8", errors="ignore").strip()
+    stdout_text = stdout.decode("utf-8", errors="ignore").strip()
+    text = stderr_text or stdout_text
+    if blocking_capable and proc.returncode == 2:
+        return HookResult(blocked=True, message=text or f"Blocked by hook: {hook.command}", hook=hook)
+    # Claude-Code-parity addition (updatedInput): a pre_tool_use hook that
+    # didn't block can instead rewrite the pending call's arguments by
+    # printing {"updated_input": {...}} as its entire stdout. Deliberately
+    # a flatter, simpler shape than Claude Code's real nested
+    # hookSpecificOutput.updatedInput -- tamfis-code has no separate
+    # systemMessage/permissionDecision concept to nest this alongside. If
+    # stdout parses as that shape, it is not also surfaced as a raw JSON
+    # diagnostic message.
+    updated_input: Optional[dict[str, Any]] = None
+    if want_updated_input:
+        try:
+            parsed = json.loads(stdout_text)
+        except (ValueError, TypeError):
+            parsed = None
+        if isinstance(parsed, dict) and isinstance(parsed.get("updated_input"), dict):
+            updated_input = parsed["updated_input"]
+            text = stderr_text
+    if text or updated_input is not None:
+        return HookResult(blocked=False, message=text, hook=hook, updated_input=updated_input)
+    return None
+
+
+async def _run_hooks_concurrently(
+    matching: list[HookDefinition], payload: bytes, *, workspace_root: str,
+    blocking_capable: bool = False, want_updated_input: bool = False,
+) -> list[HookResult]:
+    """Launch every matching hook concurrently (Claude-Code-parity: "all
+    matching hooks run in parallel"), then resolve to a deterministic
+    result list in configured order regardless of completion order. For a
+    blocking-capable event, once the first hook in configured order
+    blocked, later hooks' results are dropped from the returned list --
+    their subprocesses still ran to completion (or timeout) concurrently;
+    only their reported outcome is discarded, matching how a
+    sequential-with-early-break design used to behave for the caller.
+    """
+    if not matching:
+        return []
+    raw = await asyncio.gather(*(
+        _execute_one_hook(
+            hook, payload, workspace_root=workspace_root,
+            blocking_capable=blocking_capable, want_updated_input=want_updated_input,
+        )
+        for hook in matching
+    ))
+    results = [result for result in raw if result is not None]
+    if blocking_capable:
+        blocking_index = next((i for i, result in enumerate(results) if result.blocked), None)
+        if blocking_index is not None:
+            results = results[: blocking_index + 1]
+    return results
 
 
 async def run_tool_hooks(
@@ -165,13 +294,15 @@ async def run_tool_hooks(
     session_id: int,
     workspace_root: str,
 ) -> list[HookResult]:
-    """Run every configured hook for `event` whose matcher matches
-    `tool_name`, in configured order, and return what each one reported.
-    Callers stop at the first `blocked` result for pre_tool_use (a later
-    hook's opinion on a call that was already refused doesn't matter);
-    every hook still runs for post_tool_use since none of them can block.
+    """Run every configured hook for `event` whose matcher (and, for
+    pre_tool_use/post_tool_use, if_command) matches, concurrently. For
+    pre_tool_use, exit code 2 blocks the tool call, and a non-blocked
+    hook may rewrite tool_input via updated_input (see _execute_one_hook).
+    post_tool_use is always observe-only -- the tool already ran, so no
+    exit code can undo it.
     """
-    if not hooks:
+    matching = [hook for hook in hooks if hook.event == event and _matches(hook, tool_name, tool_input)]
+    if not matching:
         return []
     payload = json.dumps({
         "event": event,
@@ -181,42 +312,11 @@ async def run_tool_hooks(
         "session_id": session_id,
         "workspace_root": workspace_root,
     }, default=str).encode("utf-8")
-
-    results: list[HookResult] = []
-    for hook in hooks:
-        if hook.event != event or not _matches(hook, tool_name):
-            continue
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_root,
-            )
-        except OSError as exc:
-            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
-            continue
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            results.append(HookResult(
-                blocked=False,
-                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
-                hook=hook,
-            ))
-            continue
-        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
-        if event == "pre_tool_use" and proc.returncode == 2:
-            results.append(HookResult(blocked=True, message=text or f"Blocked by hook: {hook.command}", hook=hook))
-            break
-        if text:
-            results.append(HookResult(blocked=False, message=text, hook=hook))
-    return results
+    return await _run_hooks_concurrently(
+        matching, payload, workspace_root=workspace_root,
+        blocking_capable=(event == "pre_tool_use"),
+        want_updated_input=(event == "pre_tool_use"),
+    )
 
 
 async def run_session_hooks(
@@ -228,16 +328,14 @@ async def run_session_hooks(
     reason: str = "",
 ) -> list[HookResult]:
     """Run every configured hook for a session-level `event` (currently only
-    "session_interrupted") -- unlike run_tool_hooks, there is no tool_name
-    to match against, so every hook configured for this event runs
-    unconditionally, in configured order. Always observe-only: the exit
-    code is never inspected, since a session-level event (a task already
-    checkpointed as interrupted) can't be blocked or undone after the
-    fact. A hook that fails to start, errors, or times out degrades to a
-    diagnostic in the result list, the same never-crash-the-turn contract
-    run_tool_hooks already established.
+    "session_interrupted") concurrently -- unlike run_tool_hooks, there is
+    no tool_name to match against, so every hook configured for this event
+    runs unconditionally. Always observe-only: the exit code is never
+    inspected, since a session-level event (a task already checkpointed as
+    interrupted) can't be blocked or undone after the fact.
     """
-    if not hooks:
+    matching = [hook for hook in hooks if hook.event == event]
+    if not matching:
         return []
     payload = json.dumps({
         "event": event,
@@ -245,39 +343,7 @@ async def run_session_hooks(
         "workspace_root": workspace_root,
         "reason": reason,
     }, default=str).encode("utf-8")
-
-    results: list[HookResult] = []
-    for hook in hooks:
-        if hook.event != event:
-            continue
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_root,
-            )
-        except OSError as exc:
-            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
-            continue
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            results.append(HookResult(
-                blocked=False,
-                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
-                hook=hook,
-            ))
-            continue
-        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
-        if text:
-            results.append(HookResult(blocked=False, message=text, hook=hook))
-    return results
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root)
 
 
 async def run_user_prompt_submit_hooks(
@@ -291,15 +357,16 @@ async def run_user_prompt_submit_hooks(
     objective is classified/sent to a provider, with
     {"event": "user_prompt_submit", "session_id": ..., "workspace_root": ...,
     "objective": ...} on stdin. Every configured hook for the event runs
-    unconditionally (there is no tool_name to match against). Exit code 2
-    blocks the turn from proceeding at all -- the caller is expected to
-    fail the turn with the hook's stderr/stdout as the reason, the same
-    convention pre_tool_use already uses for a blocked tool call. Any
-    other hook output is returned as additional context for the caller to
-    fold into the objective (Claude Code's "add context" capability for
-    this event) rather than discarded.
+    unconditionally and concurrently (there is no tool_name to match
+    against). Exit code 2 blocks the turn from proceeding at all -- the
+    caller is expected to fail the turn with the hook's stderr/stdout as
+    the reason, the same convention pre_tool_use already uses for a
+    blocked tool call. Any other hook output is returned as additional
+    context for the caller to fold into the objective (Claude Code's "add
+    context" capability for this event) rather than discarded.
     """
-    if not hooks:
+    matching = [hook for hook in hooks if hook.event == "user_prompt_submit"]
+    if not matching:
         return []
     payload = json.dumps({
         "event": "user_prompt_submit",
@@ -307,42 +374,7 @@ async def run_user_prompt_submit_hooks(
         "workspace_root": workspace_root,
         "objective": objective,
     }, default=str).encode("utf-8")
-
-    results: list[HookResult] = []
-    for hook in hooks:
-        if hook.event != "user_prompt_submit":
-            continue
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_root,
-            )
-        except OSError as exc:
-            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
-            continue
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            results.append(HookResult(
-                blocked=False,
-                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
-                hook=hook,
-            ))
-            continue
-        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
-        if proc.returncode == 2:
-            results.append(HookResult(blocked=True, message=text or f"Blocked by hook: {hook.command}", hook=hook))
-            break
-        if text:
-            results.append(HookResult(blocked=False, message=text, hook=hook))
-    return results
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root, blocking_capable=True)
 
 
 async def run_session_completed_hooks(
@@ -366,7 +398,8 @@ async def run_session_completed_hooks(
     turn the caller already believes is finished). This only covers the
     observe-only notification half of Stop's contract.
     """
-    if not hooks:
+    matching = [hook for hook in hooks if hook.event == "session_completed"]
+    if not matching:
         return []
     payload = json.dumps({
         "event": "session_completed",
@@ -374,39 +407,7 @@ async def run_session_completed_hooks(
         "workspace_root": workspace_root,
         "summary": summary,
     }, default=str).encode("utf-8")
-
-    results: list[HookResult] = []
-    for hook in hooks:
-        if hook.event != "session_completed":
-            continue
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_root,
-            )
-        except OSError as exc:
-            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
-            continue
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            results.append(HookResult(
-                blocked=False,
-                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
-                hook=hook,
-            ))
-            continue
-        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
-        if text:
-            results.append(HookResult(blocked=False, message=text, hook=hook))
-    return results
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root)
 
 
 async def run_session_start_hooks(
@@ -426,46 +427,15 @@ async def run_session_start_hooks(
     caller, the same way a SessionStart hook loading project context
     would be shown.
     """
-    if not hooks:
+    matching = [hook for hook in hooks if hook.event == "session_start"]
+    if not matching:
         return []
     payload = json.dumps({
         "event": "session_start",
         "session_id": session_id,
         "workspace_root": workspace_root,
     }, default=str).encode("utf-8")
-
-    results: list[HookResult] = []
-    for hook in hooks:
-        if hook.event != "session_start":
-            continue
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_root,
-            )
-        except OSError as exc:
-            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
-            continue
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            results.append(HookResult(
-                blocked=False,
-                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
-                hook=hook,
-            ))
-            continue
-        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
-        if text:
-            results.append(HookResult(blocked=False, message=text, hook=hook))
-    return results
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root)
 
 
 async def run_session_end_hooks(
@@ -483,46 +453,15 @@ async def run_session_end_hooks(
     (cleanup/logging), matching Claude Code's SessionEnd contract -- there
     is nothing left to block once the session is already ending.
     """
-    if not hooks:
+    matching = [hook for hook in hooks if hook.event == "session_end"]
+    if not matching:
         return []
     payload = json.dumps({
         "event": "session_end",
         "session_id": session_id,
         "workspace_root": workspace_root,
     }, default=str).encode("utf-8")
-
-    results: list[HookResult] = []
-    for hook in hooks:
-        if hook.event != "session_end":
-            continue
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_root,
-            )
-        except OSError as exc:
-            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
-            continue
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            results.append(HookResult(
-                blocked=False,
-                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
-                hook=hook,
-            ))
-            continue
-        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
-        if text:
-            results.append(HookResult(blocked=False, message=text, hook=hook))
-    return results
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root)
 
 
 async def run_subagent_stop_hooks(
@@ -553,7 +492,8 @@ async def run_subagent_stop_hooks(
     analog for resuming a sub-task the caller already believes is
     finished.
     """
-    if not hooks:
+    matching = [hook for hook in hooks if hook.event == "subagent_stop"]
+    if not matching:
         return []
     payload = json.dumps({
         "event": "subagent_stop",
@@ -564,36 +504,64 @@ async def run_subagent_stop_hooks(
         "status": status,
         "error": error,
     }, default=str).encode("utf-8")
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root)
 
-    results: list[HookResult] = []
-    for hook in hooks:
-        if hook.event != "subagent_stop":
-            continue
-        try:
-            proc = await asyncio.create_subprocess_shell(
-                hook.command,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE,
-                cwd=workspace_root,
-            )
-        except OSError as exc:
-            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
-            continue
-        try:
-            stdout, stderr = await asyncio.wait_for(
-                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
-            )
-        except asyncio.TimeoutError:
-            proc.kill()
-            await proc.wait()
-            results.append(HookResult(
-                blocked=False,
-                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
-                hook=hook,
-            ))
-            continue
-        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
-        if text:
-            results.append(HookResult(blocked=False, message=text, hook=hook))
-    return results
+
+async def run_pre_compact_hooks(
+    hooks: list[HookDefinition],
+    *,
+    session_id: int,
+    workspace_root: str,
+) -> list[HookResult]:
+    """Claude-Code-parity addition: fires immediately before
+    state.py's compact_session_thread folds older turns into the
+    conversation summary (tamfis-code's only compaction trigger --
+    unlike Claude Code, there is no size-triggered auto-compact, only the
+    explicit `/compact` command), with {"event": "pre_compact",
+    "session_id": ..., "workspace_root": ...} on stdin. A hook's output
+    is folded into the preserved summary by the caller (see
+    compact_session_thread's preserve_note parameter) rather than just
+    logged, matching Claude Code's "preserve critical info" intent for
+    this event. Observe/contribute-only: there is no way to block a
+    compaction the user explicitly requested.
+    """
+    matching = [hook for hook in hooks if hook.event == "pre_compact"]
+    if not matching:
+        return []
+    payload = json.dumps({
+        "event": "pre_compact",
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+    }, default=str).encode("utf-8")
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root)
+
+
+async def run_notification_hooks(
+    hooks: list[HookDefinition],
+    *,
+    session_id: int,
+    workspace_root: str,
+    message: str,
+) -> list[HookResult]:
+    """Claude-Code-parity addition: fires whenever tamfis-code delivers a
+    notification-style message into a session, with {"event":
+    "notification", "session_id": ..., "workspace_root": ...,
+    "message": ...} on stdin. Currently wired at background.py's
+    update_job_status -- the single real notification tamfis-code already
+    sends today (a background job/goal finishing, enqueued as a follow-up
+    instruction for the parent session) -- rather than Claude Code's
+    broader notion covering permission-request/idle nudges, which have no
+    single equivalent choke point in tamfis-code's architecture yet.
+    Observe-only: a background job has already finished by the time this
+    fires, so there is nothing left to block.
+    """
+    matching = [hook for hook in hooks if hook.event == "notification"]
+    if not matching:
+        return []
+    payload = json.dumps({
+        "event": "notification",
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+        "message": message,
+    }, default=str).encode("utf-8")
+    return await _run_hooks_concurrently(matching, payload, workspace_root=workspace_root)

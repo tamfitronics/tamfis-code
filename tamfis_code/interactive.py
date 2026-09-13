@@ -2078,7 +2078,18 @@ async def _run_interactive_impl(
             # turns in conversation_history, so a long REPL thread stops
             # dominating the terminal and the next turn's context. The
             # durable checkpoint is still saved too, so resume is unaffected.
-            recap = local_state.compact_session_thread(workspace.session_id)
+            from .hooks import load_hooks as _load_hooks_for_compact, run_pre_compact_hooks
+            pre_compact_hooks = [
+                hook for hook in _load_hooks_for_compact(workspace.workspace_root)
+                if hook.event == "pre_compact"
+            ]
+            preserve_note = ""
+            if pre_compact_hooks:
+                hook_results = await run_pre_compact_hooks(
+                    pre_compact_hooks, session_id=workspace.session_id, workspace_root=workspace.workspace_root,
+                )
+                preserve_note = "\n".join(r.message for r in hook_results if r.message)
+            recap = local_state.compact_session_thread(workspace.session_id, preserve_note=preserve_note)
             # Read the freshly-compacted state directly rather than reusing a
             # `state` local that is only assigned inside the /status and
             # /context blocks (both of which `continue`). Before this fix,

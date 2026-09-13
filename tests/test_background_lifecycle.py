@@ -62,3 +62,45 @@ def test_background_completion_is_reinjected_once_into_originating_session():
         finally:
             background.JOBS_DIR = original_jobs
             state.CONFIG_DIR, state.STATE_PATH = original_state
+
+
+def test_a_configured_notification_hook_fires_on_background_job_completion():
+    """Claude-Code-parity addition: update_job_status runs in a detached
+    background child process with no already-running asyncio event loop,
+    so it can safely asyncio.run the hook itself -- proven here with a
+    real on-disk .tamfis/hooks.toml and a real subprocess, not a mock of
+    run_notification_hooks."""
+    original_jobs = background.JOBS_DIR
+    original_state = (state.CONFIG_DIR, state.STATE_PATH)
+    with tempfile.TemporaryDirectory() as tmp:
+        root = Path(tmp)
+        background.JOBS_DIR = root / "jobs"
+        state.CONFIG_DIR = root / "state"
+        state.STATE_PATH = root / "state" / "state.json"
+        try:
+            marker = root / "notified.txt"
+            hooks_dir = root / ".tamfis"
+            hooks_dir.mkdir()
+            (hooks_dir / "hooks.toml").write_text(
+                f'[[notification]]\ncommand = "cat > {marker}"\n'
+            )
+            log = root / "job.log"
+            log.write_text("done\n")
+            job = background.BackgroundJob(
+                id="bg-notify", pid=999998, session_id=88, workspace_root=str(root),
+                mode="coding", objective_preview="run a task", log_path=str(log),
+                prompt_path=str(root / "prompt"), started_at=1.0,
+            )
+            background._write_job(job)
+
+            background.update_job_status("bg-notify", "completed", exit_code=0)
+
+            assert marker.is_file(), "notification hook never ran"
+            import json
+            payload = json.loads(marker.read_text())
+            assert payload["event"] == "notification"
+            assert payload["session_id"] == 88
+            assert "bg-notify" in payload["message"]
+        finally:
+            background.JOBS_DIR = original_jobs
+            state.CONFIG_DIR, state.STATE_PATH = original_state
