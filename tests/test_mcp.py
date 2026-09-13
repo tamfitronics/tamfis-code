@@ -459,6 +459,56 @@ class TestMCPServerWorkspaceScoped:
         assert target.read_text() == "x = 1\nx = 1\n"  # unchanged
 
     @pytest.mark.asyncio
+    async def test_write_file_through_a_symlinked_leaf_outside_workspace_is_blocked(self):
+        # Mirrors OpenAI Codex's apply-patch no_follow suite (a symlink whose
+        # final component points outside the sandbox must never be a way to
+        # write outside it). Confirmed live: _resolve_in_workspace already
+        # calls Path.resolve() (which follows symlinks) before checking the
+        # *resolved* target is within an allowed root, so this already
+        # works -- this test only pins the behavior with a regression.
+        outside = Path(tempfile.mkdtemp())
+        victim = outside / "victim.txt"
+        victim.write_text("original\n")
+        link = Path(self.temp_dir) / "link.txt"
+        link.symlink_to(victim)
+
+        result = await self.server.call_tool('write_file', {'path': str(link), 'content': 'PWNED'})
+
+        assert result['success'] is False
+        assert 'outside the workspace' in result['error']
+        assert victim.read_text() == "original\n"
+
+    @pytest.mark.asyncio
+    async def test_write_file_through_a_symlinked_ancestor_directory_is_blocked(self):
+        outside = Path(tempfile.mkdtemp())
+        linked_dir = Path(self.temp_dir) / "linked"
+        linked_dir.symlink_to(outside)
+
+        result = await self.server.call_tool(
+            'write_file', {'path': str(linked_dir / "new.txt"), 'content': 'PWNED'},
+        )
+
+        assert result['success'] is False
+        assert 'outside the workspace' in result['error']
+        assert not (outside / "new.txt").exists()
+
+    @pytest.mark.asyncio
+    async def test_edit_file_through_a_symlinked_leaf_outside_workspace_is_blocked(self):
+        outside = Path(tempfile.mkdtemp())
+        victim = outside / "victim.txt"
+        victim.write_text("original\n")
+        link = Path(self.temp_dir) / "link.txt"
+        link.symlink_to(victim)
+
+        result = await self.server.call_tool('edit_file', {
+            'path': str(link), 'old_string': 'original', 'new_string': 'PWNED',
+        })
+
+        assert result['success'] is False
+        assert 'outside the workspace' in result['error']
+        assert victim.read_text() == "original\n"
+
+    @pytest.mark.asyncio
     async def test_execute_command_cwd_actually_changes_directory(self):
         """A model repeatedly tried to invent a 'directory'/other bogus
         argument on execute_command to target a subdirectory, since the tool

@@ -142,3 +142,27 @@ class TestRunToolHooks:
             session_id=42, workspace_root=".",
         )
         assert results[0].message == "write_file:app.py"
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        # HOOK_TIMEOUT_SECONDS defaults to 30s, which would make this test
+        # itself hang for 30s on every run -- patch it down so the timeout
+        # path is actually exercised instead of the hook simply finishing
+        # first. Mirrors Codex's own hooks_executor test intent: a hook that
+        # never returns must never be able to stall the whole turn.
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(
+                event="pre_tool_use", matcher="", command="sleep 5", source="user config",
+            )]
+            results = await run_tool_hooks(
+                hooks, "pre_tool_use", tool_name="execute_command", tool_input={},
+                session_id=1, workspace_root=".",
+            )
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert len(results) == 1
+        assert results[0].blocked is False
+        assert "timed out" in results[0].message
+        assert "killed" in results[0].message
