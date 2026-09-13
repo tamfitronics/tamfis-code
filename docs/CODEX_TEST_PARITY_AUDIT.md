@@ -322,6 +322,21 @@ unused `skill_roots` field) is likewise flagged but not built here.
   See `test_hooks.py`'s `TestPromptBasedHooks`/`TestAsyncRewake` and
   `test_claude_parity_hooks.py`'s `PromptBasedHookTests`/`AsyncRewakeTests`.
 
+## Agent Client Protocol (ACP)
+
+Separate from the Codex and Claude Code comparisons above, `tamfis_code/acp.py`
+was checked directly against ACP v1's authoritative schema and session-lifecycle
+documentation from `zed-industries/agent-client-protocol` at commit
+`ada6b108389a` (2026-09-12 snapshot).
+
+| ACP area | tamfis-code implementation | Verdict |
+|---|---|---|
+| Initialization version negotiation | `ACPAgent.handle("initialize")` | COVERED (fixed 2026-09-13) — returns the agent's supported protocol version when the client's offered version is unsupported, leaving compatibility enforcement to the client as required by `InitializeResponse.protocolVersion` |
+| Durable-session history replay | `ACPAgent._load_session()` | COVERED (fixed 2026-09-13) — replays stored user and assistant turns in order as `session/update` notifications; the spec states that `session/load` MUST replay the entire conversation |
+| Embedded prompt resources | `ACPAgent._prompt_text()` | COVERED (fixed 2026-09-13) — reads `EmbeddedResource` payloads from the schema-defined nested `resource` object, using text when present and the URI for binary resources; direct `ResourceLink` URIs remain supported |
+| JSON-RPC framing, prompt cancellation, workspace validation, and prompt error paths | `ACPAgent._dispatch()`, `_prompt()`, `_allowed_cwd()` | COVERED — `tests/test_acp.py` now has 26 tests, including wire-level request/notification behavior and a real in-flight cancellation task that resolves the prompt with `stopReason: "cancelled"` |
+| Per-session MCP servers | `session/new` and `session/load` request handling | GAP (feature) — ACP requires `mcpServers` in these requests, but the adapter does not yet connect them to `mcp_client.py`'s `StandaloneMCPBridge`; implementing session-scoped MCP registration is a separate feature investment |
+
 ## Summary
 
 Every row in this document has now been resolved to a definitive verdict
