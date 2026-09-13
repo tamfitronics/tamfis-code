@@ -788,7 +788,14 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     try:
         import httpx
         base = os.environ.get("TAMGPT_TIER_IV_URL", "http://127.0.0.1:9555").rstrip("/")
-        async with httpx.AsyncClient(timeout=6.0) as client:
+        # Confirmed live against the real Tier IV endpoint: "auto" routing
+        # latency for a real completion varies widely (4.5s, 20.3s, and one
+        # run that exceeded 30s) -- 6.0s failed on nearly every call. This
+        # is still a best-effort upgrade (ensure_session_title's mechanical
+        # title already stands and is never lost), so a generous timeout
+        # here trades a slightly slower completion path for the AI title
+        # actually landing instead of silently no-op'ing almost every time.
+        async with httpx.AsyncClient(timeout=25.0) as client:
             response = await client.post(
                 f"{base}/v1/chat/completions",
                 json={
