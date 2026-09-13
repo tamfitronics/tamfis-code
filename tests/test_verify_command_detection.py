@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
@@ -36,14 +37,50 @@ class DetectVerifyCommandTests(unittest.TestCase):
         self.assertIn("git diff --check", commands.values())
 
     def test_detects_python_checks(self):
+        # Regression: this used to hardcode "python -m compileall -q ." --
+        # wrong on this box and most modern Linux distros, which have no
+        # bare `python` on PATH, only `python3`. Match the same
+        # interpreter-detection the implementation uses instead of assuming
+        # either name, so this test is correct on both kinds of machine.
+        python_bin = "python3" if shutil.which("python3") else "python"
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             (root / "pyproject.toml").write_text("[tool.ruff]\n")
             (root / "tests").mkdir()
             commands = dict(detect_validation_commands(root))
-        self.assertIn("python -m compileall -q .", commands.values())
+        self.assertIn(f"{python_bin} -m compileall -q .", commands.values())
         self.assertIn("ruff check .", commands.values())
         self.assertIn("pytest -q", commands.values())
+
+    def test_python_syntax_check_uses_python3_when_bare_python_is_absent(self):
+        """Live-reproduced: a model correctly ran `python -m compileall -q .`
+        (fails: "bash: python: command not found" on this box), self-
+        corrected to `python3 -m compileall -q .` (succeeds), but the
+        harness's own confirmation check does a plain substring match of the
+        *detected* command against the executed one -- "python -m
+        compileall -q ." is not a substring of "python3 -m compileall -q ."
+        (the "3" breaks it right after "python"). The real, successful,
+        self-corrected run was never recognized, and the task hard-failed
+        after exhausting its retry budget. Pin both PATH states explicitly
+        so this doesn't depend on what happens to be installed wherever the
+        test suite runs.
+        """
+        from unittest.mock import patch
+        from tamfis_code.workspace import detect_validation_commands
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "requirements.txt").write_text("")
+            (root / "tests").mkdir()
+
+            with patch("tamfis_code.workspace.shutil.which", side_effect=lambda name: name == "python3" and "/usr/bin/python3" or None):
+                commands = dict(detect_validation_commands(root))
+            self.assertIn("python3 -m compileall -q .", commands.values())
+            self.assertNotIn("python -m compileall -q .", commands.values())
+
+            with patch("tamfis_code.workspace.shutil.which", side_effect=lambda name: name == "python" and "/usr/bin/python" or None):
+                commands = dict(detect_validation_commands(root))
+            self.assertIn("python -m compileall -q .", commands.values())
 
     def test_detects_cmake_build(self):
         with tempfile.TemporaryDirectory() as tmp:

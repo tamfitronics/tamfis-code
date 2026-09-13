@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import shutil
 import subprocess
 import tempfile
 from dataclasses import dataclass
@@ -1238,7 +1239,21 @@ def detect_validation_commands(workspace_root: Path) -> list[tuple[str, str]]:
                 add("npm test", "npm test")
 
     elif language == "Python":
-        add("Python syntax check", "python -m compileall -q .")
+        # Confirmed live: this box (and most modern Linux distros, Debian/
+        # Ubuntu included) has no bare `python` on PATH, only `python3`. The
+        # model correctly ran `python -m compileall -q .` (fails: command not
+        # found), self-corrected to `python3 -m compileall -q .` (succeeds),
+        # but runner_local.py's confirmation check does a plain substring
+        # match of this exact string against the executed command --
+        # "python -m compileall -q ." is not a substring of "python3 -m
+        # compileall -q ." (the "3" breaks it right after "python"), so the
+        # real, successful, self-corrected run was never recognized. That
+        # looped the task to a hard failure after the retry budget ran out.
+        # Detecting the interpreter that's actually callable here, instead
+        # of assuming "python", makes the suggested and matched command the
+        # one that will actually work on this system.
+        python_bin = "python3" if shutil.which("python3") else "python"
+        add("Python syntax check", f"{python_bin} -m compileall -q .")
         manifest_text = ""
         for manifest in (root / "pyproject.toml", root / "setup.cfg"):
             if manifest.is_file():
