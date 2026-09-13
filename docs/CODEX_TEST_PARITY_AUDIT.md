@@ -252,10 +252,10 @@ plugin configs on this box also use `PostToolUseFailure` and
 | PreCompact (add critical info to preserve before context compaction) | `hooks.py`'s new `pre_compact` + `run_pre_compact_hooks()` | COVERED (added 2026-09-13) — fires from `interactive.py`'s `/compact` handler (tamfis-code's only compaction trigger — no size-triggered auto-compact exists), and its output is folded into `state.py`'s `compact_session_thread` via a new `preserve_note` parameter so critical info actually survives the fold, not just logged. Confirmed live end-to-end in `test_tamfis_code_repl_exit.py` via a real `/compact` command |
 | Notification (react when Claude sends a notification) | `hooks.py`'s new `notification` + `run_notification_hooks()` | COVERED (added 2026-09-13) — wired at `background.py`'s `update_job_status`, the single real notification tamfis-code already sends (a background job/goal finishing). Narrower than Claude Code's broader notion (permission-request/idle nudges have no equivalent choke point yet), documented as a scoping choice. Confirmed live end-to-end in `test_background_lifecycle.py` with a real on-disk hook |
 | PostToolUseFailure, UserPromptExpansion | none | GAP (feature), lower priority — narrower/newer events seen in real plugin configs but not central to the documented spec |
-| Prompt-based hooks (`{"type": "prompt", "prompt": "..."}` — an LLM call decides the outcome instead of a shell command) | none | GAP (feature) — every tamfis-code hook is a `command`-type shell subprocess only |
+| Prompt-based hooks (`{"type": "prompt", "prompt": "..."}` — an LLM call decides the outcome instead of a shell command) | `HookDefinition.hook_type`/`.prompt`, `_execute_prompt_hook()` | COVERED (added 2026-09-13) — calls the same internal Tier IV endpoint `upgrade_session_title_with_ai` uses, with `$TOOL_INPUT`/`$TOOL_RESULT`/`$USER_PROMPT`/`$REASON`/`$SUMMARY` template substitution; fails open (never blocks) on any connectivity/parse failure, surfaced as a diagnostic. Confirmed live end-to-end against the REAL endpoint (not mocked) in `test_claude_parity_hooks.py`: a prompt hook denying a shell command proves the command never actually ran |
 | Parallel hook execution (all matching hooks for an event run concurrently) | `hooks.py`'s `_run_hooks_concurrently()` (via `asyncio.gather`), used by every `run_*_hooks` function | COVERED (added 2026-09-13) — hook order is preserved in the returned list regardless of completion order; for a blocking-capable event, a later hook's subprocess still runs to completion even after an earlier one blocks (only its reported result is dropped), matching Claude Code's own "hooks don't see each other's output" independence contract. Confirmed live: two 0.5s hooks complete in ~0.5s total, not ~1.0s (`test_hooks.py`'s `TestParallelHookExecution`) |
 | `if`-conditional matching (gate a hook on the actual command being run, e.g. `"if": "Bash(git commit:*)"`, not just the tool name) | `HookDefinition.if_command`, matched via `fnmatch` against `tool_input["command"]` | COVERED (added 2026-09-13) — a deliberately simplified, glob-style equivalent rather than porting Claude Code's exact mini-language verbatim; only meaningful for tools with a `command` argument (`execute_command`), ignored for others |
-| `asyncRewake` (a hook runs in the background and later "wakes" the agent back up with its findings, mid-or-after an already-answered turn) | none | GAP (feature), largest of this list — no background/suspend-resume mechanism exists in tamfis-code's synchronous per-turn hook firing at all; would need genuinely new runtime infrastructure, not a small addition |
+| `asyncRewake` (a hook runs in the background and later "wakes" the agent back up with its findings, mid-or-after an already-answered turn) | `HookDefinition.async_rewake`/`.rewake_message`, `_execute_and_rewake()`, `drain_pending_rewake_tasks()` | COVERED (added 2026-09-13) — a detached `asyncio.create_task` runs the hook; on completion its findings are queued via `state.py`'s `enqueue_instruction` (the same mechanism `background.py`'s completed-job notifications already use), reaching a *later* turn even though the triggering one is already done. Real bug found and fixed during live verification: `asyncio.run()`'s own automatic shutdown-time task cancellation does not reliably interrupt a task blocked on a subprocess pipe read in this environment (confirmed against a bare minimal repro) -- would have hung the whole process on exit if a rewake hook were still running. Fixed by explicitly tracking and draining pending rewake tasks before the event loop shuts down (wired into `interactive.py`'s `run_interactive` and `cli.py`'s shared `_run_async`). Documented real limitation: only reliably reaches a long-lived process (the interactive REPL); a one-shot CLI invocation whose process exits immediately can still lose an in-flight rewake task, an inherent fire-and-forget trade-off, not papered over. Confirmed live end-to-end in `test_claude_parity_hooks.py`: a rewake hook's finding reaches a persisted `queued_user_instructions` entry after the triggering turn has already completed |
 | PreToolUse's `updatedInput` (a hook can rewrite the tool call's arguments before it runs, not just approve/deny it) | `HookResult.updated_input`, parsed from a pre_tool_use hook's stdout (`{"updated_input": {...}}`) | COVERED (added 2026-09-13) — a flatter, simpler shape than Claude Code's real nested `hookSpecificOutput.updatedInput` (no `systemMessage`/`permissionDecision` concept to nest alongside). Applied in place to the pending call's arguments at both `runner_local.py` dispatch sites. Confirmed live end-to-end in `test_claude_parity_hooks.py`: a hook rewrites `write_file`'s content, and the actual file written to disk contains the rewritten text, not the model's original request |
 | Hooks loaded once at session start, require a restart to pick up changes | tamfis-code reads hooks.toml fresh every turn | Not a gap — tamfis-code's behavior here is arguably better (edit hooks.toml and the very next turn uses it, no restart), noted for completeness rather than tabulated as COVERED/GAP |
 
@@ -307,20 +307,32 @@ unused `skill_roots` field) is likewise flagged but not built here.
   AskUserQuestion in the session transcript) as the two items large enough
   to warrant their own separate pass.
 
+- 2026-09-13 (final pass): `asyncRewake` and prompt-based hooks -- the two
+  items deliberately deferred as large enough to warrant their own pass --
+  are both closed. Prompt-based hooks call the real internal Tier IV LLM
+  endpoint; asyncRewake runs a hook fully detached via `asyncio.create_task`
+  and queues its findings as a follow-up instruction once it finishes. A
+  real bug was found and fixed during live verification of asyncRewake
+  (not just designed around): `asyncio.run()`'s own automatic shutdown-time
+  task cancellation does not reliably interrupt a task blocked on a
+  subprocess pipe read in this environment, which would have hung the
+  whole process on exit if a rewake hook were still running -- fixed with
+  an explicit pending-task registry and drain step wired into both
+  `interactive.py`'s `run_interactive` and `cli.py`'s shared `_run_async`.
+  See `test_hooks.py`'s `TestPromptBasedHooks`/`TestAsyncRewake` and
+  `test_claude_parity_hooks.py`'s `PromptBasedHookTests`/`AsyncRewakeTests`.
+
 ## Summary
 
 Every row in this document has now been resolved to a definitive verdict
-(no remaining "tentative"/"unconfirmed" rows) as of 2026-09-13. Fixed this
-pass: symlink-escape write/edit tests, hook-execution-timeout test,
-`doctor` PATH-safety check, real-bwrap sandbox enforcement tests, MCP
-startup-grace test, quota-classifier tests, token-budget tests,
-same-path-write dispatch-conflict test, the `session_interrupted`,
-`user_prompt_submit`, and `session_completed` hook events (Codex's
-`interrupt_hooks.rs` and two Claude-Code-parity additions), `load_instruction_text` refresh
-test, and a full vision/image-attachment test file. Several genuine future
-FEATURE gaps remain flagged for the user rather than silently built --
-see the Claude Code comparison section above for the full list (Stop's
-block-and-continue semantics, SubagentStop, SessionStart, SessionEnd,
-PreCompact, Notification, prompt-based hooks, parallel hook execution,
-`if`-conditional matching, `asyncRewake`, PreToolUse input mutation, and
-skills auto-discovery).
+(no remaining "tentative"/"unconfirmed" rows), and every hooks-table GAP
+has now been closed except Stop's block-and-continue semantics
+(deliberately not attempted -- would require resuming a turn the caller
+already believes is finished, a substantially larger change) and skills
+auto-discovery (`plugins.py`'s unused `skill_roots` field -- flagged, not
+built). Every other Claude Code hook capability compared in this document
+-- all 9 documented events, prompt-based hooks, parallel execution,
+if-conditional matching, PreToolUse input mutation, and asyncRewake -- is
+now implemented in tamfis-code, each with both unit tests and a real
+end-to-end integration test proving the actual wiring, not just the
+isolated function.
