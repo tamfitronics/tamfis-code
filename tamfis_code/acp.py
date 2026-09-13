@@ -129,8 +129,23 @@ class ACPAgent:
                 parts.append(block)
             elif isinstance(block, dict) and block.get("type") == "text":
                 parts.append(str(block.get("text") or ""))
-            elif isinstance(block, dict) and block.get("type") in {"resource", "resource_link"}:
-                parts.append(str(block.get("text") or block.get("uri") or ""))
+            elif isinstance(block, dict) and block.get("type") == "resource_link":
+                # ResourceLink (real ACP schema): uri is a direct top-level
+                # field.
+                parts.append(str(block.get("uri") or ""))
+            elif isinstance(block, dict) and block.get("type") == "resource":
+                # EmbeddedResource (real ACP schema): unlike ResourceLink,
+                # the actual payload is nested one level down under
+                # "resource" (either TextResourceContents' text/uri or
+                # BlobResourceContents' uri/mimeType for binary data) --
+                # confirmed live against the real ACP v1 JSON schema that
+                # reading block.get("text")/block.get("uri") directly (the
+                # previous code) always returned nothing for this block
+                # type, silently dropping every embedded-context resource a
+                # client sent even though `embeddedContext: true` is
+                # advertised in this agent's own initialize capabilities.
+                resource = block.get("resource") if isinstance(block.get("resource"), dict) else {}
+                parts.append(str(resource.get("text") or resource.get("uri") or ""))
         text = "\n".join(part for part in parts if part).strip()
         if not text:
             raise ACPError(-32602, "prompt contains no supported text content")
@@ -143,6 +158,16 @@ class ACPAgent:
         workspace = resolve_local_workspace(cwd)
         session_id = str(workspace.session_id)
         self.sessions[session_id] = ACPSession(session_id, workspace.session_id, cwd)
+        # KNOWN GAP, not fixed here: the real ACP schema makes `mcpServers`
+        # a required NewSessionRequest field -- a client (e.g. Zed) may
+        # configure session-specific MCP servers here expecting the agent
+        # to actually connect to them for this session's tool calls. This
+        # agent has no wiring from params["mcpServers"] into
+        # mcp_client.py's StandaloneMCPBridge at all; any servers a client
+        # sends are silently ignored. Bridging this is a real, separate
+        # feature investment (dynamically registering session-scoped MCP
+        # tools into run_local_agent_turn), not a quick correctness fix,
+        # so it's flagged here rather than attempted.
         return {"sessionId": session_id}
 
     async def _load_session(self, params: JsonObject) -> JsonObject:
@@ -151,14 +176,34 @@ class ACPAgent:
         session_id = str(params.get("sessionId") or "")
         if not session_id:
             raise ACPError(-32602, "sessionId is required")
+        try:
+            runtime_id = int(session_id)
+        except ValueError as exc:
+            raise ACPError(-32602, f"invalid Tamfis session id: {session_id}") from exc
+        state = local_state.get_session_state(runtime_id)
         if session_id not in self.sessions:
-            try:
-                runtime_id = int(session_id)
-            except ValueError as exc:
-                raise ACPError(-32602, f"invalid Tamfis session id: {session_id}") from exc
-            state = local_state.get_session_state(runtime_id)
             cwd = self._allowed_cwd(params.get("cwd") or state.workspace_root or state.primary_workspace)
             self.sessions[session_id] = ACPSession(session_id, runtime_id, cwd)
+        # Real ACP spec requirement (session-setup docs: "The Agent MUST
+        # replay the entire conversation to the Client in the form of
+        # session/update notifications"). Confirmed live this was
+        # previously skipped entirely: a resumed session's client-side UI
+        # showed no history at all, even though the underlying turn
+        # continuity already worked correctly (runner_local.py rehydrates
+        # conversation_history on its own once a fresh prompt arrives with
+        # no prior assistant messages in the passed-in list).
+        for turn in state.conversation_history:
+            role = turn.get("role")
+            content = str(turn.get("content") or "")
+            if not content or role not in ("user", "assistant"):
+                continue
+            await self.notify("session/update", {
+                "sessionId": session_id,
+                "update": {
+                    "sessionUpdate": "user_message_chunk" if role == "user" else "agent_message_chunk",
+                    "content": {"type": "text", "text": content},
+                },
+            })
         return {"sessionId": session_id}
 
     async def _run_prompt(self, session: ACPSession, text: str, renderer: _ACPRenderer):
@@ -218,9 +263,15 @@ class ACPAgent:
     async def handle(self, method: str, params: JsonObject | None = None) -> JsonObject:
         values = params or {}
         if method == "initialize":
-            offered = values.get("protocolVersion", 1)
-            if offered != 1:
-                raise ACPError(-32602, f"unsupported ACP protocol version: {offered}")
+            # Per the real ACP spec (schema/v1's InitializeResponse.protocolVersion
+            # doc): "the protocol version the client specified if supported by the
+            # agent, or the latest protocol version supported by the agent." The
+            # agent must always negotiate by returning ITS OWN supported version,
+            # never reject the handshake outright -- it's the CLIENT's job to
+            # inspect the returned version and disconnect if it can't work with
+            # it. Confirmed live: erroring here on any offered version other than
+            # 1 broke the handshake for a well-behaved client that offers a newer
+            # version expecting graceful negotiation instead of a hard failure.
             return {
                 "protocolVersion": 1,
                 "agentCapabilities": {
