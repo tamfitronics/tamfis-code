@@ -131,3 +131,47 @@ async def test_all_nim_keys_exhaust_once_then_record_one_route_failure(monkeypat
     assert telemetry.provider_requests[ProviderType.NVIDIA.value] == 2
     assert telemetry.provider_failures[ProviderType.NVIDIA.value] == 1
     ProviderManager.reset_runtime_routing_state()
+
+
+class TestIsQuotaOrRateLimitError:
+    """Closes the Codex quota_exceeded.rs parity gap: fallback_candidates()
+    passes allow_premium_primary=is_quota_or_rate_limit_error(exc) so a real
+    weekly-quota 429 unlocks otherwise-reserved premium routes, but a plain
+    connection/timeout failure (the daemon is just down) must not -- this
+    classifier had no direct test anywhere; only a hand-rolled fake
+    reimplementing simplified logic existed (see _FallbackCapableManager in
+    test_reasoning_plan.py), never the real classmethod itself."""
+
+    def test_http_429_status_code_is_quota(self):
+        class RateLimited(RuntimeError):
+            status_code = 429
+        assert ProviderManager.is_quota_or_rate_limit_error(RateLimited("slow down")) is True
+
+    def test_http_402_status_code_is_quota(self):
+        class PaymentRequired(RuntimeError):
+            status_code = 402
+        assert ProviderManager.is_quota_or_rate_limit_error(PaymentRequired("pay up")) is True
+
+    def test_http_404_status_code_is_not_quota(self):
+        class NotFound(RuntimeError):
+            status_code = 404
+        assert ProviderManager.is_quota_or_rate_limit_error(NotFound("model missing")) is False
+
+    def test_message_marker_without_a_status_code_still_matches(self):
+        assert ProviderManager.is_quota_or_rate_limit_error(
+            RuntimeError("Error: insufficient credits remaining on this account"),
+        ) is True
+        assert ProviderManager.is_quota_or_rate_limit_error(
+            RuntimeError("weekly usage limit reached, try again next week"),
+        ) is True
+
+    def test_a_plain_transport_failure_is_not_quota(self):
+        assert ProviderManager.is_quota_or_rate_limit_error(TimeoutError("connect timed out")) is False
+        assert ProviderManager.is_quota_or_rate_limit_error(ConnectionError("connection refused")) is False
+
+    def test_status_code_on_a_response_attribute_is_also_read(self):
+        class ResponseLike:
+            status_code = 429
+        class WrappedError(RuntimeError):
+            response = ResponseLike()
+        assert ProviderManager.is_quota_or_rate_limit_error(WrappedError("rate limited")) is True

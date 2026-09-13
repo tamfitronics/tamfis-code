@@ -68,8 +68,8 @@ Changelog at the bottom — do not just delete the history.
 | Codex category | tamfis-code feature | Verdict |
 |---|---|---|
 | `hooks.rs`, `hooks_executor.rs` | `hooks.py`, `HOOK_TIMEOUT_SECONDS` | COVERED (timeout-kill path fixed 2026-09-13) |
-| `hooks_mcp.rs` (hooks calling MCP tools) | unconfirmed | GAP — needs confirmation hooks can invoke MCP tools at all |
-| `interrupt_hooks.rs` (hooks on task interruption) | unconfirmed | GAP — needs confirmation |
+| `hooks_mcp.rs` (hooks calling MCP tools) | none | N/A — confirmed by reading `hooks.py` in full (182 lines, the whole module): a hook is an arbitrary shell command run via `asyncio.create_subprocess_shell` in its own OS process, receiving only a JSON event on stdin; there is no API surface for a hook to call back into tamfis-code's in-process MCP tool registry at all |
+| `interrupt_hooks.rs` (hooks on task interruption) | none | N/A, but flagged as a genuine FEATURE gap, not a test gap — confirmed `_HOOK_EVENTS = ("pre_tool_use", "post_tool_use")` is the complete event set; there is no third event category firing on task cancellation/interruption. Worth a deliberate future addition if the user wants it (e.g. a `session_interrupted` hook event), but not built here since this pass is scoped to closing test gaps for existing features |
 
 ## Resume / compaction / rollout
 
@@ -84,11 +84,11 @@ Changelog at the bottom — do not just delete the history.
 | Codex category | tamfis-code feature | Verdict |
 |---|---|---|
 | `retry_after.rs` | none (immediate failover instead of backoff) | N/A — architectural difference |
-| `quota_exceeded.rs` | `quota` handling in `providers.py`/`local_chat.py`/`runner_local.py` | GAP — no dedicated test found |
+| `quota_exceeded.rs` | `ProviderManager.is_quota_or_rate_limit_error` (`providers.py`) | COVERED (fixed 2026-09-13) — the real classmethod had zero direct tests (only a hand-rolled fake reimplementing simplified logic existed in `test_reasoning_plan.py`'s `_FallbackCapableManager`); `test_provider_key_rotation.py`'s new `TestIsQuotaOrRateLimitError` covers HTTP 429/402/404 status codes, message-marker fallback, a plain transport failure NOT being classified as quota, and a `.response.status_code` attribute also being read |
 | `model_switching.rs`, `model_overrides.rs`, `model_runtime_selectors.rs`, `model_provider_requirements_tests.rs` | `model_registry.py`, `model_group_fallback` | COVERED (fallback path); override/selector edge cases unconfirmed |
 | `stream_error_allows_next_turn.rs`, `stream_no_completed.rs` | stream-error handling | COVERED — `test_stream_reconnect.py` |
 | `prompt_caching.rs`, `prompt_cache_key.rs` | none (no `cache_control` breakpoints implemented) | N/A — real feature gap, not a test gap |
-| `token_budget.rs`, `token_usage_rollout.rs` | token-budget concept in `runner_local.py` | GAP — unclear if token-level (vs. round-level) accounting is covered by `test_round_budget_extension.py` |
+| `token_budget.rs`, `token_usage_rollout.rs` | `_estimate_tokens`/`_trim_tool_outputs` (`runner_local.py`) -- real context-window budget accounting (`token_budget = context_window * safety_margin - MAX_TOKENS_PER_REQUEST`), distinct from `test_round_budget_extension.py`'s round-COUNT safety valve | COVERED (fixed 2026-09-13) — confirmed `test_round_budget_extension.py` is unrelated (round count, not tokens) and neither token function had any test at all; new `tests/test_token_budget_trimming.py` covers estimate correctness (content + tool_calls arguments), a no-op when already under budget, shrinking an oversized history below target, and the leading system / latest user messages always being preserved |
 
 ## Tool execution mechanics
 
@@ -159,3 +159,15 @@ Changelog at the bottom — do not just delete the history.
   Confirmed `decide_permission` (persisted allow/ask/deny rules) and the
   interactive approval-prompt flow are two genuinely distinct mechanisms,
   each separately tested.
+- 2026-09-13: Hooks theme resolved. `hooks_mcp.rs` and `interrupt_hooks.rs`
+  both N/A, confirmed by reading `hooks.py` in full (182 lines): hooks are
+  plain shell subprocesses with no MCP-calling API, and there is no
+  third hook-event category for task interruption at all --
+  `interrupt_hooks.rs` flagged as a genuine future FEATURE gap, not a test
+  gap, and not built here.
+- 2026-09-13: Resilience theme's `quota_exceeded.rs` and `token_budget.rs`
+  closed. `ProviderManager.is_quota_or_rate_limit_error` never had a direct
+  test (`test_provider_key_rotation.py`'s new `TestIsQuotaOrRateLimitError`,
+  6 tests). `_estimate_tokens`/`_trim_tool_outputs` never had any test at
+  all (`tests/test_token_budget_trimming.py`, 9 new tests) -- confirmed
+  distinct from the existing round-count budget tests.
