@@ -12,7 +12,10 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pytest
 
 from tamfis_code import hooks as hooks_module
-from tamfis_code.hooks import HookDefinition, load_hooks, run_session_hooks, run_tool_hooks
+from tamfis_code.hooks import (
+    HookDefinition, load_hooks, run_session_completed_hooks, run_session_hooks,
+    run_tool_hooks, run_user_prompt_submit_hooks,
+)
 
 
 class TestLoadHooks:
@@ -247,3 +250,101 @@ class TestRunSessionHooks:
             hooks, "session_interrupted", session_id=42, workspace_root=".", reason="provider streaming failed",
         )
         assert results[0].message == "42:provider streaming failed"
+
+
+class TestRunUserPromptSubmitHooks:
+    """Claude-Code-parity addition: fires once per turn before the objective
+    is classified/sent to a provider. Unlike pre_tool_use, there is no
+    tool_name/matcher -- every configured hook runs. Exit code 2 blocks the
+    whole turn (mirrors pre_tool_use's own block contract); any other
+    output is folded in by the caller as additional context, Claude Code's
+    "add context" capability for this event."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        assert await run_user_prompt_submit_hooks([], session_id=1, workspace_root=".", objective="x") == []
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_blocks_the_turn(self):
+        hooks = [HookDefinition(event="user_prompt_submit", matcher="", command='echo "not allowed" 1>&2; exit 2', source="user config")]
+        results = await run_user_prompt_submit_hooks(hooks, session_id=1, workspace_root=".", objective="do something risky")
+        assert results[0].blocked is True
+        assert results[0].message == "not allowed"
+
+    @pytest.mark.asyncio
+    async def test_non_blocking_output_is_returned_as_added_context(self):
+        hooks = [HookDefinition(event="user_prompt_submit", matcher="", command='echo "reminder: use JWT" 1>&2', source="user config")]
+        results = await run_user_prompt_submit_hooks(hooks, session_id=1, workspace_root=".", objective="add auth")
+        assert results[0].blocked is False
+        assert results[0].message == "reminder: use JWT"
+
+    @pytest.mark.asyncio
+    async def test_first_blocking_hook_stops_evaluation_of_later_hooks(self):
+        hooks = [
+            HookDefinition(event="user_prompt_submit", matcher="", command='echo "blocked" 1>&2; exit 2', source="user config"),
+            HookDefinition(event="user_prompt_submit", matcher="", command='echo "should never run" 1>&2', source="project config"),
+        ]
+        results = await run_user_prompt_submit_hooks(hooks, session_id=1, workspace_root=".", objective="x")
+        assert len(results) == 1
+        assert results[0].blocked is True
+
+    @pytest.mark.asyncio
+    async def test_receives_the_objective_on_stdin(self):
+        hooks = [HookDefinition(
+            event="user_prompt_submit", matcher="",
+            command="python3 -c \"import sys, json; d = json.load(sys.stdin); print(d['objective'], file=sys.stderr)\"",
+            source="user config",
+        )]
+        results = await run_user_prompt_submit_hooks(hooks, session_id=1, workspace_root=".", objective="fix the flaky test")
+        assert results[0].message == "fix the flaky test"
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="user_prompt_submit", matcher="", command="sleep 5", source="user config")]
+            results = await run_user_prompt_submit_hooks(hooks, session_id=1, workspace_root=".", objective="x")
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert results[0].blocked is False
+        assert "timed out" in results[0].message
+
+
+class TestRunSessionCompletedHooks:
+    """Observe-only completion notification, symmetric to
+    TestRunSessionHooks (session_interrupted) for the success case. Never
+    blocks -- there is nothing left to block by the time a turn has
+    already completed successfully."""
+
+    @pytest.mark.asyncio
+    async def test_no_hooks_configured_is_a_cheap_noop(self):
+        assert await run_session_completed_hooks([], session_id=1, workspace_root=".") == []
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_has_no_special_meaning(self):
+        hooks = [HookDefinition(event="session_completed", matcher="", command='echo "fyi" 1>&2; exit 2', source="user config")]
+        results = await run_session_completed_hooks(hooks, session_id=1, workspace_root=".")
+        assert results[0].blocked is False
+        assert results[0].message == "fyi"
+
+    @pytest.mark.asyncio
+    async def test_receives_the_summary_on_stdin(self):
+        hooks = [HookDefinition(
+            event="session_completed", matcher="",
+            command="python3 -c \"import sys, json; d = json.load(sys.stdin); print(d['summary'], file=sys.stderr)\"",
+            source="user config",
+        )]
+        results = await run_session_completed_hooks(hooks, session_id=1, workspace_root=".", summary="fixed the bug")
+        assert results[0].message == "fixed the bug"
+
+    @pytest.mark.asyncio
+    async def test_a_hanging_hook_is_killed_and_reported_as_non_blocking(self):
+        original = hooks_module.HOOK_TIMEOUT_SECONDS
+        hooks_module.HOOK_TIMEOUT_SECONDS = 0.2
+        try:
+            hooks = [HookDefinition(event="session_completed", matcher="", command="sleep 5", source="user config")]
+            results = await run_session_completed_hooks(hooks, session_id=1, workspace_root=".")
+        finally:
+            hooks_module.HOOK_TIMEOUT_SECONDS = original
+        assert "timed out" in results[0].message

@@ -44,7 +44,10 @@ from rich.console import Console
 from . import evidence as evidence_store
 from . import state as local_state
 from .config import Config
-from .hooks import load_hooks, run_session_hooks, run_tool_hooks
+from .hooks import (
+    load_hooks, run_session_completed_hooks, run_session_hooks,
+    run_tool_hooks, run_user_prompt_submit_hooks,
+)
 from .mcp import MCPServer
 from .providers import ProviderManager, ProviderType, reasoning_effort_capable
 from .render import (
@@ -4818,6 +4821,26 @@ async def _run_local_agent_turn_impl(
             if recovered_objective else incoming_objective
         )
     )
+    # Claude-Code-parity addition: user_prompt_submit fires once per turn,
+    # before classification/planning ever sees the objective -- exit code 2
+    # blocks the turn outright (mirrors pre_tool_use's own block contract);
+    # any other hook output is folded in as additional context, the same
+    # "add context" capability Claude Code's real UserPromptSubmit has.
+    user_prompt_hooks = [hook for hook in configured_hooks if hook.event == "user_prompt_submit"]
+    if user_prompt_hooks:
+        prompt_hook_results = await run_user_prompt_submit_hooks(
+            user_prompt_hooks, session_id=session_id, workspace_root=workspace_root, objective=objective,
+        )
+        blocking_prompt_result = next((r for r in prompt_hook_results if r.blocked), None)
+        if blocking_prompt_result is not None:
+            renderer.handle_event({
+                "event_type": "ai_task_failed",
+                "payload": {"error": blocking_prompt_result.message},
+            })
+            return TaskOutcome(status="failed", error=blocking_prompt_result.message)
+        added_context = "\n".join(r.message for r in prompt_hook_results if r.message)
+        if added_context:
+            objective = f"{objective}\n\nAdditional context from hook: {added_context}"
     _turn_budget_config = effective_config
     orchestrator = AgentOrchestrator(
         session_id=session_id, workspace_root=workspace_root, emit=renderer.handle_event,
@@ -4985,6 +5008,20 @@ async def _run_local_agent_turn_impl(
         await run_session_hooks(
             interrupted_hooks, "session_interrupted",
             session_id=session_id, workspace_root=workspace_root, reason=reason,
+        )
+
+    async def _fire_session_completed_hooks(summary: str) -> None:
+        """Run every configured `session_completed` hook -- Claude-Code-
+        parity addition, symmetric to _fire_session_interrupted_hooks for
+        the success case. Observe-only: see run_session_completed_hooks'
+        own docstring for why this deliberately doesn't attempt Claude
+        Code's real Stop hook's block-and-continue semantics.
+        """
+        completed_hooks = [hook for hook in configured_hooks if hook.event == "session_completed"]
+        if not completed_hooks:
+            return
+        await run_session_completed_hooks(
+            completed_hooks, session_id=session_id, workspace_root=workspace_root, summary=summary,
         )
 
     def _remember_stream_delta(delta: str) -> None:
@@ -5518,6 +5555,7 @@ async def _run_local_agent_turn_impl(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
         )
         await local_state.upgrade_session_title_with_ai(session_id, objective)
+        await _fire_session_completed_hooks(content)
         return TaskOutcome(status="completed", summary=content)
 
     def _synthesize_stuck_recovery_summary(messages: list[dict]) -> str:

@@ -24,6 +24,12 @@ files use the same shape:
     [[session_interrupted]]
     command = "notify-send 'tamfis-code task was interrupted'"
 
+    [[user_prompt_submit]]
+    command = "python3 my_prompt_guard.py"
+
+    [[session_completed]]
+    command = "notify-send 'tamfis-code task finished'"
+
 Each hook command is run with the event JSON on stdin:
     {"event": "pre_tool_use"|"post_tool_use", "tool_name": ..., "tool_input": {...},
      "tool_output": {...} (post_tool_use only), "session_id": ..., "workspace_root": ...}
@@ -39,6 +45,18 @@ payload is instead {"event": "session_interrupted", "session_id": ...,
 "workspace_root": ..., "reason": ...}. Like PostToolUse, this is
 observe-only -- the interruption already happened, so no exit code can
 undo it -- but see run_session_hooks for details.
+
+user_prompt_submit fires once per turn, before the objective is
+classified/sent to a provider. Like pre_tool_use, exit code 2 blocks --
+here, the whole turn, not just one tool call. Any other hook output is
+folded into the objective as additional context, mirroring Claude Code's
+"add context" capability for this event. See run_user_prompt_submit_hooks.
+
+session_completed fires once a turn completes successfully -- an
+observe-only notification, deliberately NOT a port of Claude Code's real
+Stop hook (which can force the agent to keep working by returning
+{"decision": "block"}; that has no analog in tamfis-code's synchronous
+per-turn hook firing). See run_session_completed_hooks.
 
 PreToolUse: exit code 2 blocks the tool call -- the tool is never actually
 executed, and the hook's stderr (falling back to stdout) becomes the denial
@@ -70,7 +88,10 @@ from .config import CONFIG_DIR
 HOOKS_PATH = CONFIG_DIR / "hooks.toml"
 PROJECT_HOOKS_RELATIVE = Path(".tamfis") / "hooks.toml"
 HOOK_TIMEOUT_SECONDS = 30
-_HOOK_EVENTS = ("pre_tool_use", "post_tool_use", "session_interrupted")
+_HOOK_EVENTS = (
+    "pre_tool_use", "post_tool_use", "session_interrupted",
+    "user_prompt_submit", "session_completed",
+)
 
 
 @dataclass(frozen=True)
@@ -227,6 +248,135 @@ async def run_session_hooks(
     results: list[HookResult] = []
     for hook in hooks:
         if hook.event != event:
+            continue
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                hook.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace_root,
+            )
+        except OSError as exc:
+            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
+            continue
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            results.append(HookResult(
+                blocked=False,
+                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
+                hook=hook,
+            ))
+            continue
+        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
+        if text:
+            results.append(HookResult(blocked=False, message=text, hook=hook))
+    return results
+
+
+async def run_user_prompt_submit_hooks(
+    hooks: list[HookDefinition],
+    *,
+    session_id: int,
+    workspace_root: str,
+    objective: str,
+) -> list[HookResult]:
+    """Claude-Code-parity addition: fires once per turn, before the
+    objective is classified/sent to a provider, with
+    {"event": "user_prompt_submit", "session_id": ..., "workspace_root": ...,
+    "objective": ...} on stdin. Every configured hook for the event runs
+    unconditionally (there is no tool_name to match against). Exit code 2
+    blocks the turn from proceeding at all -- the caller is expected to
+    fail the turn with the hook's stderr/stdout as the reason, the same
+    convention pre_tool_use already uses for a blocked tool call. Any
+    other hook output is returned as additional context for the caller to
+    fold into the objective (Claude Code's "add context" capability for
+    this event) rather than discarded.
+    """
+    if not hooks:
+        return []
+    payload = json.dumps({
+        "event": "user_prompt_submit",
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+        "objective": objective,
+    }, default=str).encode("utf-8")
+
+    results: list[HookResult] = []
+    for hook in hooks:
+        if hook.event != "user_prompt_submit":
+            continue
+        try:
+            proc = await asyncio.create_subprocess_shell(
+                hook.command,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=workspace_root,
+            )
+        except OSError as exc:
+            results.append(HookResult(blocked=False, message=f"Hook failed to start ({exc}): {hook.command}", hook=hook))
+            continue
+        try:
+            stdout, stderr = await asyncio.wait_for(
+                proc.communicate(payload), timeout=HOOK_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+            results.append(HookResult(
+                blocked=False,
+                message=f"Hook timed out after {HOOK_TIMEOUT_SECONDS}s and was killed: {hook.command}",
+                hook=hook,
+            ))
+            continue
+        text = (stderr or stdout or b"").decode("utf-8", errors="ignore").strip()
+        if proc.returncode == 2:
+            results.append(HookResult(blocked=True, message=text or f"Blocked by hook: {hook.command}", hook=hook))
+            break
+        if text:
+            results.append(HookResult(blocked=False, message=text, hook=hook))
+    return results
+
+
+async def run_session_completed_hooks(
+    hooks: list[HookDefinition],
+    *,
+    session_id: int,
+    workspace_root: str,
+    summary: str = "",
+) -> list[HookResult]:
+    """Claude-Code-parity addition: an observe-only completion notification,
+    symmetric to run_session_hooks' "session_interrupted" for the failure
+    case -- fires once a turn completes successfully, with
+    {"event": "session_completed", "session_id": ..., "workspace_root": ...,
+    "summary": ...} on stdin.
+
+    This is deliberately NOT a port of Claude Code's real Stop hook: Stop
+    can return {"decision": "block"} to force the agent to keep working
+    (re-injecting into the same round loop), which has no analog in
+    tamfis-code's synchronous per-turn hook firing and would require
+    substantial runner_local.py changes to support safely (resuming a
+    turn the caller already believes is finished). This only covers the
+    observe-only notification half of Stop's contract.
+    """
+    if not hooks:
+        return []
+    payload = json.dumps({
+        "event": "session_completed",
+        "session_id": session_id,
+        "workspace_root": workspace_root,
+        "summary": summary,
+    }, default=str).encode("utf-8")
+
+    results: list[HookResult] = []
+    for hook in hooks:
+        if hook.event != "session_completed":
             continue
         try:
             proc = await asyncio.create_subprocess_shell(
