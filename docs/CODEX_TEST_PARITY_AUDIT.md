@@ -69,7 +69,7 @@ Changelog at the bottom — do not just delete the history.
 |---|---|---|
 | `hooks.rs`, `hooks_executor.rs` | `hooks.py`, `HOOK_TIMEOUT_SECONDS` | COVERED (timeout-kill path fixed 2026-09-13) |
 | `hooks_mcp.rs` (hooks calling MCP tools) | none | N/A — confirmed by reading `hooks.py` in full (182 lines, the whole module): a hook is an arbitrary shell command run via `asyncio.create_subprocess_shell` in its own OS process, receiving only a JSON event on stdin; there is no API surface for a hook to call back into tamfis-code's in-process MCP tool registry at all |
-| `interrupt_hooks.rs` (hooks on task interruption) | none | N/A, but flagged as a genuine FEATURE gap, not a test gap — confirmed `_HOOK_EVENTS = ("pre_tool_use", "post_tool_use")` is the complete event set; there is no third event category firing on task cancellation/interruption. Worth a deliberate future addition if the user wants it (e.g. a `session_interrupted` hook event), but not built here since this pass is scoped to closing test gaps for existing features |
+| `interrupt_hooks.rs` (hooks on task interruption) | `hooks.py`'s new `session_interrupted` event + `run_session_hooks()`; fired from `runner_local.py`'s `_fire_session_interrupted_hooks()` at all 10 call sites where a turn is checkpointed interrupted | COVERED (added 2026-09-13) — 6 unit tests in `test_hooks.py` plus a real end-to-end integration test in `test_round_budget_extension.py` proving an on-disk `.tamfis/hooks.toml` hook actually fires on a real strict-round-cap interruption |
 
 ## Resume / compaction / rollout
 
@@ -209,6 +209,13 @@ Changelog at the bottom — do not just delete the history.
   thin display wrapper with no independent logic). `features.rs` -> N/A
   (no such command exists).
 
+- 2026-09-13: `interrupt_hooks.rs` closed. The genuine feature gap flagged
+  in the prior pass was built: a new `session_interrupted` hook event
+  fires from all 10 sites in `runner_local.py` where a turn is
+  checkpointed interrupted. See `tests/test_hooks.py`'s
+  `TestRunSessionHooks` and `test_round_budget_extension.py`'s new
+  end-to-end integration test.
+
 ## Summary
 
 Every row in this document has now been resolved to a definitive verdict
@@ -216,7 +223,8 @@ Every row in this document has now been resolved to a definitive verdict
 pass: symlink-escape write/edit tests, hook-execution-timeout test,
 `doctor` PATH-safety check, real-bwrap sandbox enforcement tests, MCP
 startup-grace test, quota-classifier tests, token-budget tests,
-same-path-write dispatch-conflict test, `load_instruction_text` refresh
+same-path-write dispatch-conflict test, the `session_interrupted` hook
+event (closing the one flagged feature gap), `load_instruction_text` refresh
 test, and a full vision/image-attachment test file. One genuine future
 FEATURE gap was flagged for the user rather than silently built:
 `interrupt_hooks.rs` has no tamfis-code equivalent (no hook event fires on
