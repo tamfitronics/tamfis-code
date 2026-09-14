@@ -536,21 +536,29 @@ class TestRunUserPromptSubmitHooks:
 
 
 class TestRunSessionCompletedHooks:
-    """Observe-only completion notification, symmetric to
-    TestRunSessionHooks (session_interrupted) for the success case. Never
-    blocks -- there is nothing left to block by the time a turn has
-    already completed successfully."""
+    """Completion notification with Claude-Code Stop-hook semantics."""
 
     @pytest.mark.asyncio
     async def test_no_hooks_configured_is_a_cheap_noop(self):
         assert await run_session_completed_hooks([], session_id=1, workspace_root=".") == []
 
     @pytest.mark.asyncio
-    async def test_exit_code_2_has_no_special_meaning(self):
+    async def test_exit_code_2_blocks_for_stop_hooks(self):
         hooks = [HookDefinition(event="session_completed", matcher="", command='echo "fyi" 1>&2; exit 2', source="user config")]
         results = await run_session_completed_hooks(hooks, session_id=1, workspace_root=".")
-        assert results[0].blocked is False
+        assert results[0].blocked is True
         assert results[0].message == "fyi"
+
+    @pytest.mark.asyncio
+    async def test_structured_block_decision_is_returned(self):
+        hooks = [HookDefinition(
+            event="session_completed", matcher="",
+            command="python3 -c \"import json; print(json.dumps({'decision': 'block', 'reason': 'run tests'}))\"",
+            source="user config",
+        )]
+        results = await run_session_completed_hooks(hooks, session_id=1, workspace_root=".")
+        assert results[0].blocked is True
+        assert results[0].message == "run tests"
 
     @pytest.mark.asyncio
     async def test_receives_the_summary_on_stdin(self):

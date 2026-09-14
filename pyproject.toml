@@ -1,6 +1,6 @@
 [project]
 name = "tamfis-code"
-version = "1.6.43"
+version = "1.6.44"
 description = "TamfisGPT Code -- portable subscription-backed terminal coding agent with local tools, PTY, plans, queues, and approvals"
 readme = "README.md"
 license = "LicenseRef-Proprietary"

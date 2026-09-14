@@ -5021,17 +5021,16 @@ async def _run_local_agent_turn_impl(
             session_id=session_id, workspace_root=workspace_root, reason=reason,
         )
 
-    async def _fire_session_completed_hooks(summary: str) -> None:
+    async def _fire_session_completed_hooks(summary: str) -> list[Any]:
         """Run every configured `session_completed` hook -- Claude-Code-
         parity addition, symmetric to _fire_session_interrupted_hooks for
-        the success case. Observe-only: see run_session_completed_hooks'
-        own docstring for why this deliberately doesn't attempt Claude
-        Code's real Stop hook's block-and-continue semantics.
+        the success case. Results are returned so a Stop hook can request
+        more work before completion is persisted.
         """
         completed_hooks = [hook for hook in configured_hooks if hook.event == "session_completed"]
         if not completed_hooks:
-            return
-        await run_session_completed_hooks(
+            return []
+        return await run_session_completed_hooks(
             completed_hooks, session_id=session_id, workspace_root=workspace_root, summary=summary,
         )
 
@@ -5391,6 +5390,8 @@ async def _run_local_agent_turn_impl(
     # kill/start loop. Keep this turn-local evidence so a later destructive
     # command can be refused even when its PID/arguments differ each round.
     port_conflict_seen = False
+    stop_hook_blocks = 0
+    max_stop_hook_blocks = 3
 
     async def _finalize_completed_answer(
         content: str, finish_reason: Optional[str], *, synthesized: bool = False,
@@ -5410,7 +5411,7 @@ async def _run_local_agent_turn_impl(
         reporting real, already-executed calls), so that check must not
         run against them -- otherwise a summary of genuinely completed
         work gets a false "nothing happened" caveat slapped on it."""
-        nonlocal resolved_provider, config, client, resolved_model
+        nonlocal resolved_provider, config, client, resolved_model, stop_hook_blocks
         truncation_rounds = 0
         while finish_reason == "length" and truncation_rounds < MAX_TRUNCATION_CONTINUATIONS:
             truncation_rounds += 1
@@ -5530,7 +5531,7 @@ async def _run_local_agent_turn_impl(
             _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
             await _fire_session_interrupted_hooks(message)
             return TaskOutcome(status="failed", error=message, summary=content)
-        validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
+        validation = orchestrator.validate(final_text=content, any_mutation=any_mutation)
         if validation.severity == "error":
             # Do not throw away a completed response behind an opaque
             # "internal validation" message. A real evidence mismatch is
@@ -5561,6 +5562,45 @@ async def _run_local_agent_turn_impl(
             note = "\n\nℹ " + " ".join(dict.fromkeys(soft_validation_notes))
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": note}})
             content += note
+
+        stop_results = await _fire_session_completed_hooks(content)
+        stop_block = next((result for result in stop_results if result.blocked), None)
+        if stop_block is not None:
+            stop_hook_blocks += 1
+            reason = stop_block.message or "Stop hook requested more work."
+            if stop_hook_blocks > max_stop_hook_blocks:
+                message = (
+                    f"Stop hook blocked completion {stop_hook_blocks} times; "
+                    "stopping to avoid an infinite continuation loop."
+                )
+                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+                _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
+                await _fire_session_interrupted_hooks(message)
+                orchestrator.fail(message)
+                return TaskOutcome(status="failed", error=message, summary=content)
+            working_messages.append({"role": "assistant", "content": content})
+            working_messages.append({
+                "role": "user",
+                "content": (
+                    "A Stop hook blocked completion and requires more work. "
+                    f"Hook reason: {reason}\n"
+                    "Continue the task, inspect/modify/verify as needed, and do not give a final answer "
+                    "until the Stop hook condition is satisfied."
+                ),
+            })
+            orchestrator.mark_repair(f"Stop hook requested more work: {reason}")
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"Stop hook requested more work ({stop_hook_blocks}/{max_stop_hook_blocks}): {reason}"
+                    )
+                },
+            })
+            _persist_turn_checkpoint(status="running", last_error=reason)
+            return TaskOutcome(status="continue", summary="")
+
+        validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
         renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed", "validation": validation.to_dict()}})
         local_state.remember_conversation_turn(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
@@ -5853,7 +5893,8 @@ async def _run_local_agent_turn_impl(
                         )
                     },
                 })
-                return await _finalize_completed_answer(fallback_summary, None, synthesized=True)
+                outcome = await _finalize_completed_answer(fallback_summary, None, synthesized=True)
+                return outcome
             reason = (
                 "wrote an unexecuted tool call instead of real text"
                 if recovery_is_fake_tool_call else "was empty too"
@@ -5865,7 +5906,8 @@ async def _run_local_agent_turn_impl(
             orchestrator.fail(message)
             renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
             return TaskOutcome(status="failed", error=message)
-        return await _finalize_completed_answer(recovery_content, recovery_finish_reason)
+        outcome = await _finalize_completed_answer(recovery_content, recovery_finish_reason)
+        return outcome
 
     # Computed here, after every working_messages.insert() above (the scope
     # rule and, when should_plan() fired, the grounded plan message) -- both
@@ -5905,6 +5947,8 @@ async def _run_local_agent_turn_impl(
                     max_rounds += 1
                 outcome = await _handle_stuck_loop(stalled_reason, [])
                 if outcome is not None:
+                    if outcome.status == "continue":
+                        continue
                     return outcome
                 continue
             if _round_extensions_used >= MAX_AGENT_ROUND_EXTENSIONS:
@@ -7240,7 +7284,10 @@ async def _run_local_agent_turn_impl(
                 _persist_turn_checkpoint()
                 continue
 
-            return await _finalize_completed_answer(content, finish_reason)
+            outcome = await _finalize_completed_answer(content, finish_reason)
+            if outcome.status == "continue":
+                continue
+            return outcome
 
         signature = _tool_calls_signature(tool_calls)
         if signature == previous_tool_calls_signature:
@@ -7290,6 +7337,8 @@ async def _run_local_agent_turn_impl(
         if stuck_reason is not None:
             outcome = await _handle_stuck_loop(stuck_reason, tool_calls)
             if outcome is not None:
+                if outcome.status == "continue":
+                    continue
                 return outcome
             continue  # nudged -- give the model one more round to self-correct
 

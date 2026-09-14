@@ -68,11 +68,10 @@ here, the whole turn, not just one tool call. Any other hook output is
 folded into the objective as additional context, mirroring Claude Code's
 "add context" capability for this event. See run_user_prompt_submit_hooks.
 
-session_completed fires once a turn completes successfully -- an
-observe-only notification, deliberately NOT a port of Claude Code's real
-Stop hook (which can force the agent to keep working by returning
-{"decision": "block"}; that has no analog in tamfis-code's synchronous
-per-turn hook firing). See run_session_completed_hooks.
+session_completed fires at the completion boundary. Like Claude Code's Stop
+hook, a command hook may return JSON {"decision": "block", "reason": "..."}
+to keep the same model loop running; a non-blocking result is an observe-only
+notification. See run_session_completed_hooks.
 
 PreToolUse: exit code 2 blocks the tool call -- the tool is never actually
 executed, and the hook's stderr (falling back to stdout) becomes the denial
@@ -339,8 +338,18 @@ async def _execute_command_hook(
     stderr_text = stderr.decode("utf-8", errors="ignore").strip()
     stdout_text = stdout.decode("utf-8", errors="ignore").strip()
     text = stderr_text or stdout_text
-    if blocking_capable and proc.returncode == 2:
-        return HookResult(blocked=True, message=text or f"Blocked by hook: {hook.command}", hook=hook)
+    if blocking_capable:
+        # Stop hooks use a structured decision; PreToolUse also supports the
+        # historical exit-code-2 blocking contract.
+        try:
+            decision_payload = json.loads(stdout_text)
+        except (TypeError, ValueError):
+            decision_payload = None
+        if isinstance(decision_payload, dict) and str(decision_payload.get("decision") or "").lower() == "block":
+            reason = str(decision_payload.get("reason") or text or "Blocked by Stop hook").strip()
+            return HookResult(blocked=True, message=reason, hook=hook)
+        if proc.returncode == 2:
+            return HookResult(blocked=True, message=text or f"Blocked by hook: {hook.command}", hook=hook)
     # Claude-Code-parity addition (updatedInput): a pre_tool_use hook that
     # didn't block can instead rewrite the pending call's arguments by
     # printing {"updated_input": {...}} as its entire stdout. Deliberately
@@ -641,19 +650,16 @@ async def run_session_completed_hooks(
     workspace_root: str,
     summary: str = "",
 ) -> list[HookResult]:
-    """Claude-Code-parity addition: an observe-only completion notification,
+    """Claude-Code-parity addition: a completion notification with Stop-hook
+    block-and-continue semantics,
     symmetric to run_session_hooks' "session_interrupted" for the failure
     case -- fires once a turn completes successfully, with
     {"event": "session_completed", "session_id": ..., "workspace_root": ...,
     "summary": ...} on stdin.
 
-    This is deliberately NOT a port of Claude Code's real Stop hook: Stop
-    can return {"decision": "block"} to force the agent to keep working
-    (re-injecting into the same round loop), which has no analog in
-    tamfis-code's synchronous per-turn hook firing and would require
-    substantial runner_local.py changes to support safely (resuming a
-    turn the caller already believes is finished). This only covers the
-    observe-only notification half of Stop's contract.
+    A command hook can return {"decision": "block", "reason": "..."}; the
+    local runner consumes that result before persisting completion and
+    re-enters the same model loop with the reason as a repair instruction.
     """
     matching = [hook for hook in hooks if hook.event == "session_completed"]
     if not matching:
@@ -666,6 +672,7 @@ async def run_session_completed_hooks(
     }
     return await _run_hooks_concurrently(
         matching, payload, workspace_root=workspace_root, session_id=session_id, event="session_completed",
+        blocking_capable=True,
     )
 
 

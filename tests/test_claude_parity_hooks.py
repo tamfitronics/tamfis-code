@@ -2,8 +2,8 @@
 alongside the Codex `interrupt_hooks.rs`/`session_interrupted` work:
 `user_prompt_submit` (fires before the objective is classified/sent to a
 provider; can block the whole turn or add context) and `session_completed`
-(an observe-only notification fired on a successful completion, symmetric
-to `session_interrupted` for the failure case). Confirmed live via
+(a Stop-hook completion boundary that can block and re-enter the same model
+loop, symmetric to `session_interrupted` for the failure case). Confirmed live via
 hooks.py's own unit tests first (test_hooks.py); these prove the actual
 runner_local.py wiring, not just that the hooks.py functions work in
 isolation -- the same pattern test_round_budget_extension.py already
@@ -97,6 +97,41 @@ class UserPromptSubmitAndSessionCompletedHookTests(_StatePatchMixin, unittest.Te
             self.assertEqual(payload["event"], "session_completed")
             self.assertEqual(payload["session_id"], 1)
             self.assertIn("JWT stands for JSON Web Token", payload["summary"])
+
+    def test_stop_hook_block_reenters_same_model_loop_before_persisting_completion(self):
+        with tempfile.TemporaryDirectory() as ws:
+            hooks_dir = Path(ws) / ".tamfis"
+            hooks_dir.mkdir()
+            marker = Path(ws) / "stop_once.marker"
+            guard = Path(ws) / "stop_guard.py"
+            guard.write_text(
+                "import json, pathlib\n"
+                f"marker = pathlib.Path({str(marker)!r})\n"
+                "if not marker.exists():\n"
+                "    marker.touch()\n"
+                "    print(json.dumps({'decision': 'block', 'reason': 'run the required verification'}))\n"
+            )
+            (hooks_dir / "hooks.toml").write_text(
+                f'[[session_completed]]\ncommand = "python3 {guard}"\n'
+            )
+            client = _FakeClient([
+                [_chunk(_delta(content="Draft answer."))],
+                [_chunk(_delta(content="Verified final answer."))],
+            ])
+            manager = _FakeManager(client)
+            renderer = _RecordingRenderer()
+
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "what is JWT authentication"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+            ))
+
+            self.assertEqual(outcome.status, "completed")
+            self.assertEqual(len(client.calls), 2)
+            self.assertIn("A Stop hook blocked completion", json.dumps(client.calls[1]["messages"]))
+            self.assertEqual(outcome.summary, "Verified final answer.")
 
 
 class UpdatedInputMutationTests(_StatePatchMixin, unittest.TestCase):
