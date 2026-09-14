@@ -767,6 +767,57 @@ class MCPServer:
         )
 
         self.register_tool(
+            name="list_external_agent_sessions",
+            description=(
+                "List coding sessions recorded on this machine by OTHER AI coding agents -- "
+                "Claude Code, Codex CLI, GitHub Copilot CLI, OpenCode, Kimi Code -- read-only, "
+                "newest first. Use this when the user asks to continue, pick up, or finish work "
+                "they started in one of those tools (e.g. \"continue what Codex was doing\", "
+                "\"pick up where Claude Code left off\") instead of asking them to re-explain the "
+                "task. Defaults to sessions recorded for this same workspace; pass all_workspaces "
+                "to search every directory on this machine. Follow up with "
+                "read_external_agent_session on whichever session id looks right before acting on "
+                "it -- this only returns titles/metadata, not the conversation content."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tool": {
+                        "type": "string",
+                        "description": "Restrict to one tool (claude-code, codex, copilot, opencode, kimi-code). Omit to search all of them.",
+                    },
+                    "all_workspaces": {
+                        "type": "boolean",
+                        "description": "Search every workspace on this machine instead of just the current one. Default false.",
+                    },
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 50, "description": "Maximum sessions to return (default 20)."},
+                },
+            },
+            handler=self._list_external_agent_sessions,
+        )
+
+        self.register_tool(
+            name="read_external_agent_session",
+            description=(
+                "Read one session's recovered transcript from another AI coding agent (see "
+                "list_external_agent_sessions for how to find the tool/session_id pair). Returns "
+                "the recent turns of that conversation so you can understand what was being "
+                "worked on and continue it -- but nothing it claims was already done should be "
+                "trusted without re-verifying against the actual repository state; the transcript "
+                "may be stale, partial, or from a different branch/checkout."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "tool": {"type": "string", "description": "The tool name from list_external_agent_sessions, e.g. \"codex\""},
+                    "session_id": {"type": "string", "description": "The session id from list_external_agent_sessions"},
+                },
+                "required": ["tool", "session_id"],
+            },
+            handler=self._read_external_agent_session,
+        )
+
+        self.register_tool(
             name="ask_user_question",
             description=(
                 "Pause and ask the human at the terminal a direct clarifying question when you "
@@ -819,6 +870,41 @@ class MCPServer:
             return self._console.input("Your answer: ").strip() or "(no answer given)"
         finally:
             resume_live_if_active(self._renderer)
+
+    async def _list_external_agent_sessions(
+        self, tool: Optional[str] = None, all_workspaces: bool = False, limit: int = 20,
+    ) -> List[Dict[str, Any]]:
+        from . import external_agents
+        if tool and tool not in external_agents.known_tools():
+            return [{
+                "error": f"Unknown tool '{tool}'. Known tools: {', '.join(external_agents.known_tools())}.",
+            }]
+        sessions = external_agents.discover_external_sessions(
+            workspace_root=None if all_workspaces else self.workspace_root,
+            tools=[tool] if tool else None, limit=max(1, min(limit, 50)),
+        )
+        if not sessions:
+            return []
+        return [
+            {
+                "tool": s.tool, "session_id": s.session_id, "title": s.title,
+                "cwd": s.cwd, "updated_at": s.updated_at,
+            }
+            for s in sessions
+        ]
+
+    async def _read_external_agent_session(self, tool: str, session_id: str) -> Dict[str, Any]:
+        from . import external_agents
+        if tool not in external_agents.known_tools():
+            return {"error": f"Unknown tool '{tool}'. Known tools: {', '.join(external_agents.known_tools())}."}
+        record = external_agents.read_external_session(tool, session_id)
+        if record is None:
+            return {"error": f"No '{tool}' session '{session_id}' found -- call list_external_agent_sessions again, the id may be stale."}
+        return {
+            "tool": record["tool"], "session_id": record["session_id"], "title": record["title"],
+            "cwd": record["cwd"], "updated_at": record["updated_at"],
+            "brief": external_agents.continuation_brief(record),
+        }
 
     def register_tool(self, name: str, description: str,
                       parameters: Dict[str, Any], handler: Callable):

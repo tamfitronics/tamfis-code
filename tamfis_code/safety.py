@@ -27,7 +27,11 @@ RISK_READ_ONLY = "read_only"
 RISK_MEDIUM = "medium"
 RISK_DANGEROUS = "dangerous"
 
-READ_ONLY_TOOLS = {"read_file", "list_directory", "search_code", "find_references", "get_git_info", "ask_user_question", "inspect_artifact"}
+READ_ONLY_TOOLS = {
+    "read_file", "list_directory", "search_code", "find_references", "get_git_info",
+    "ask_user_question", "inspect_artifact",
+    "list_external_agent_sessions", "read_external_agent_session",
+}
 MUTATING_FILE_TOOLS = {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"}
 
 MAX_MUTATION_HISTORY = 200

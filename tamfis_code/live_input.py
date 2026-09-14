@@ -18,7 +18,7 @@ from typing import Any, Awaitable, Callable, Optional
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text import HTML
+from prompt_toolkit.formatted_text import FormattedText, HTML, to_formatted_text
 from prompt_toolkit.styles import Style
 
 from . import state as local_state
@@ -177,7 +177,9 @@ def idle_bottom_toolbar(
     model: Optional[str] = None,
     has_suggestion: bool = False,
     active_agents: Optional[int] = None,
-) -> HTML:
+    update_version: Optional[str] = None,
+    update_handler: Optional[Callable[..., Any]] = None,
+) -> HTML | FormattedText:
     """Bottom-toolbar content for the plain REPL prompt (no task running) --
     same mode/agents banner as the live in-task footer below, so the bar
     doesn't disappear the moment a turn finishes."""
@@ -196,8 +198,23 @@ def idle_bottom_toolbar(
         f"{_mode_and_agents_html(cli_config, session_id, active_agents=resolved_agents)}"
         f"{suggestion_hint}"
     )
-    chip = _right_chip(session_id, resolved_agents)
-    return HTML(_right_align(left, chip + " "))
+    chip = (
+        f"<update-action>↑ Install v{update_version} · click or Ctrl+U</update-action>"
+        if update_version else _right_chip(session_id, resolved_agents)
+    )
+    rendered = HTML(_right_align(left, chip + " "))
+    if not update_version or update_handler is None:
+        return rendered
+    # prompt_toolkit supports a mouse handler as the optional third item in
+    # a formatted-text fragment. HTML gives us the layout and escaping; tag
+    # only the update chip's fragments as clickable after conversion.
+    fragments = []
+    for style, text in to_formatted_text(rendered):
+        if "class:update-action" in style:
+            fragments.append((style, text, update_handler))
+        else:
+            fragments.append((style, text))
+    return FormattedText(fragments)
 
 
 @contextlib.contextmanager
@@ -225,6 +242,7 @@ def composer_style() -> Style:
     return Style.from_dict({
         "bottom-toolbar": "noreverse",
         "bottom-toolbar.text": "noreverse",
+        "update-action": "ansiyellow bold underline",
         # Do not rely on prompt-toolkit's palette-dependent #888 default:
         # several SSH themes render it indistinguishably from the composer
         # background. Bright-black is the portable ANSI "ghost text" color.

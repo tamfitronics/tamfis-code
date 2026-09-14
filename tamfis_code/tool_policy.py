@@ -19,9 +19,15 @@ from .routing import TaskProfile, TaskType
 # no side effects on the workspace (it writes to CONFIG_DIR/memory, not any
 # project file), so a read-only audit/inspect/plan turn should still be able
 # to record something worth remembering next session.
+# list_external_agent_sessions/read_external_agent_session are the same
+# shape again: read-only local-disk lookups (another AI coding tool's own
+# session files, never this project's), so a plain/inspect/audit turn can
+# still act on "continue what Codex was doing" without needing edit-level
+# tool access just to look that up.
 READ_TOOLS = [
     "list_directory", "search_code", "find_references", "read_file",
     "get_git_info", "ask_user_question", "inspect_artifact", "save_memory",
+    "list_external_agent_sessions", "read_external_agent_session",
 ]
 EDIT_TOOLS = [
     *READ_TOOLS,

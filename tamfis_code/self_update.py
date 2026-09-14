@@ -17,6 +17,7 @@ import os
 import re
 import subprocess
 import sys
+import sysconfig
 import hashlib
 import json
 import tempfile
@@ -80,6 +81,22 @@ def _parse_version(value: str) -> Tuple[int, ...]:
     return tuple(parts)
 
 
+def _pip_install_command(*arguments: str) -> list[str]:
+    """Build the updater's pip command for this interpreter.
+
+    Debian/Ubuntu mark their system interpreter as externally managed. An
+    already-installed system-wide Tamfis Code still has to be able to update
+    itself when the user explicitly clicks Install; pip otherwise rejects the
+    operation before looking at the wheel. Virtual environments never receive
+    the override.
+    """
+    command = [sys.executable, "-m", "pip", "install"]
+    marker = Path(sysconfig.get_path("stdlib")) / "EXTERNALLY-MANAGED"
+    if sys.prefix == sys.base_prefix and marker.exists():
+        command.append("--break-system-packages")
+    return [*command, *arguments]
+
+
 def check_update_available(repo_path: Optional[Path] = None) -> Optional[str]:
     """Return the newest available release; explicit paths only check locally."""
     repo_version = _repo_version(repo_path or DEFAULT_REPO_PATH)
@@ -108,7 +125,7 @@ def apply_update(repo_path: Optional[Path] = None) -> Tuple[bool, str]:
                 if len(data) > 64 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != remote["sha256"]:
                     return False, "Update failed: release checksum mismatch or oversized download"
                 wheel.write_bytes(data)
-                result = subprocess.run([sys.executable, "-m", "pip", "install", "--upgrade", str(wheel)], capture_output=True, text=True, timeout=180)
+                result = subprocess.run(_pip_install_command("--upgrade", str(wheel)), capture_output=True, text=True, timeout=180)
                 if result.returncode:
                     return False, "Update failed: " + (result.stderr or result.stdout)[-2000:]
                 return True, f"Updated to {remote['version']}."
@@ -116,7 +133,7 @@ def apply_update(repo_path: Optional[Path] = None) -> Tuple[bool, str]:
             return False, f"Update failed: {exc}"
     try:
         result = subprocess.run(
-            [sys.executable, "-m", "pip", "install", "--no-deps", "-e", str(checkout)],
+            _pip_install_command("--no-deps", "-e", str(checkout)),
             capture_output=True, text=True, timeout=180,
         )
     except (OSError, subprocess.TimeoutExpired) as exc:

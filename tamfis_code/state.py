@@ -235,6 +235,14 @@ class SessionState:
     # first turn completes; session_display_title() below supplies the
     # fallback for that window.
     session_title: str = ""
+    # True once upgrade_session_title_with_ai has attempted (successfully or
+    # not) to replace the mechanical title with an AI-written one. Set
+    # *before* the network call, not after, so exactly one attempt is ever
+    # made per session -- without this, every completed turn re-ran the
+    # upgrade on that turn's own objective, silently overwriting an already
+    # good title with one describing whatever the user typed most recently
+    # instead of what the session as a whole was about.
+    ai_title_attempted: bool = False
     # Set exactly once, the first time this session is ever persisted (see
     # put_session_state) -- distinct from updated_at, which changes on every
     # write. Backs the resume picker's "Sort: Created" option.
@@ -859,9 +867,22 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     free title has already been persisted by the time any caller awaits
     this, so a slow/unreachable/broken model call here only means the
     session keeps its mechanical title, not that it loses its title.
+
+    Every call site awaits this after each completed turn, not just the
+    session's first -- so this makes (and records, via ai_title_attempted)
+    exactly one attempt per session, from that first turn's objective, and
+    is a fast no-op on every later turn. Without that guard this ran on
+    every turn using *that turn's* objective, so a session's title kept
+    getting silently replaced by a one-off later message instead of staying
+    a stable, accurate label for the session as a whole.
     """
     if not objective or not objective.strip():
         return
+    state = get_session_state(session_id)
+    if state.ai_title_attempted:
+        return
+    state.ai_title_attempted = True
+    put_session_state(state)
     try:
         import httpx
         base = os.environ.get("TAMGPT_TIER_IV_URL", "http://127.0.0.1:9555").rstrip("/")
@@ -1387,6 +1408,66 @@ def _extract_turns(messages: list[dict[str, Any]]) -> list[dict[str, str]]:
     if current["objective"] or current["answer"]:
         turns.append(current)
     return turns
+
+
+@dataclass
+class RecapTurn:
+    objective: str
+    answer: str = ""
+
+
+@dataclass
+class ThreadRecap:
+    """Structured form of a session recap -- the same data summarize_thread
+    folds into one plain-text blob, kept as typed fields instead so
+    render.render_thread_recap can lay each kind of fact out as its own
+    section (a bordered multi-section card) rather than one undifferentiated
+    paragraph. summarize_thread's plain-text form still exists unchanged
+    for /compact's char-count bookkeeping; this is purely the display path.
+    """
+    empty_reason: str = ""
+    older_count: int = 0
+    older_turns: list[RecapTurn] = field(default_factory=list)
+    modified_files: list[str] = field(default_factory=list)
+    unresolved_count: int = 0
+    active_plan_id: str = ""
+    active_plan_objective: str = ""
+    active_plan_steps: list[dict[str, Any]] = field(default_factory=list)
+    recent_turns: list[RecapTurn] = field(default_factory=list)
+
+
+def build_thread_recap(session_id: int, *, keep_recent: int = COMPACT_KEEP_RECENT_TURNS) -> ThreadRecap:
+    """Structured counterpart to summarize_thread, for a polished card-style
+    recap display (see render.render_thread_recap) instead of a single
+    plain-text panel. Draws from the exact same durable SessionState fields
+    summarize_thread does -- this is a presentation-layer split, not a
+    different data source."""
+    state = get_session_state(session_id)
+    turns = _extract_turns(state.conversation_history)
+    if not turns:
+        prior_summary = (state.conversation_summary or "").strip()
+        if prior_summary:
+            return ThreadRecap(empty_reason=_bounded_text(prior_summary, head=MAX_COMPACT_SUMMARY_CHARS, tail=0, label="summary"))
+        return ThreadRecap(empty_reason="No conversation recorded in this session yet.")
+
+    recent = turns[-keep_recent:] if keep_recent > 0 else []
+    older = turns[:-keep_recent] if keep_recent > 0 else turns
+
+    recap = ThreadRecap(
+        older_count=len(older),
+        older_turns=[RecapTurn(objective=t["objective"], answer=t["answer"]) for t in older],
+        recent_turns=[RecapTurn(objective=t["objective"], answer=t["answer"]) for t in recent],
+    )
+    if state.modified_files:
+        recap.modified_files = [str(m.get("path") or "") for m in state.modified_files[-10:] if m.get("path")]
+    recap.unresolved_count = len(state.unresolved_issues)
+    if state.saved_plans:
+        active = next((p for p in reversed(state.saved_plans) if p.get("id") == state.active_plan_id), None)
+        if active:
+            recap.active_plan_id = str(active.get("id") or "")
+            recap.active_plan_objective = str(active.get("objective") or "")
+            recap.active_plan_steps = list(active.get("steps") or [])
+    return recap
 
 
 def summarize_thread(session_id: int, *, keep_recent: int = COMPACT_KEEP_RECENT_TURNS) -> str:

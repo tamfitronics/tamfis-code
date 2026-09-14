@@ -239,3 +239,55 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         state_module.save_session_state(1, workspace_root="/a")
         self._run(state_module.upgrade_session_title_with_ai(1, "   "))
         self.assertEqual(state_module.get_session_state(1).session_title, "")
+
+    def test_a_later_turn_never_re_upgrades_an_already_ai_titled_session(self):
+        """Every call site awaits this after each completed turn, not just
+        the session's first. Before ai_title_attempted existed, that meant a
+        second/third/... turn's own objective silently replaced an already
+        good AI title -- a session about "fix the flaky auth test" would
+        retitle itself after an unrelated later message in the same thread.
+        """
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": "Fix flaky auth test"}}],
+        }
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
+
+        async def fake_post_later_turn(*args, **kwargs):
+            later = MagicMock()
+            later.status_code = 200
+            later.json.return_value = {"choices": [{"message": {"content": "Unrelated later message"}}]}
+            return later
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post_later_turn)) as client_cls:
+            self._run(state_module.upgrade_session_title_with_ai(1, "what's the weather like"))
+            client_cls.assert_not_called()
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
+
+    def test_an_unreachable_endpoint_on_the_first_turn_still_marks_one_attempt(self):
+        """A failed first attempt still burns the one-attempt budget instead
+        of retrying (and re-blocking turn completion on a 25s timeout) on
+        every subsequent turn for the rest of the session."""
+        import httpx as httpx_module
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+
+        async def fake_post(*args, **kwargs):
+            raise httpx_module.ConnectError("boom")
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertTrue(state_module.get_session_state(1).ai_title_attempted)
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)) as client_cls:
+            self._run(state_module.upgrade_session_title_with_ai(1, "another turn"))
+            client_cls.assert_not_called()

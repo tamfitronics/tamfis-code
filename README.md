@@ -19,6 +19,10 @@ that is selected only with `--remote` or `default_backend = "remote"`.
 Login also applies a newer version already present in the configured Tamfis
 Code source checkout after credentials are saved; set
 `TAMFIS_CODE_AUTO_UPDATE=0` for centrally managed installations.
+When a newer release is available during an interactive session, an update
+card and persistent footer action appear. Click the footer action, press
+Ctrl+U, or type `/update` to install and restart directly back into the same
+session.
 
 The standalone runtime uses TamfisGPT models. `standalone` is the default
 runtime boundary; model origins and routing topology are private deployment
@@ -43,6 +47,8 @@ tamfis-code update                                  # install a newer configured
 tamfis-code ask "explain what this repo does"
 tamfis-code agent "add a health-check endpoint"     # full read/write/execute loop
 tamfis-code recap                                   # structured recap of the last session in this workspace
+tamfis-code external-sessions list                  # discover work from Claude Code, Codex, Copilot, etc.
+tamfis-code continue-from codex <session-prefix>    # verify and continue another agent's session
 tamfis-code                                         # interactive REPL
 ```
 
@@ -71,6 +77,32 @@ Use `tamfis-code recap` (`/summary` or `/recap` in the REPL) at any time for
 a structured, bounded recap of a session -- recent turns, files touched,
 active plan progress, and unresolved issues -- computed from durable local
 state with no provider call and no network latency.
+
+### Continue work from another coding agent
+
+Tamfis Code can read local conversation history from Claude Code, Codex CLI,
+GitHub Copilot CLI, OpenCode, and Kimi Code without modifying those tools'
+state. `external-sessions list` shows the sessions relevant to the current
+workspace in a compact picker; add `--all` to search the machine. The displayed
+session prefix is accepted anywhere a session ID is requested:
+
+```bash
+tamfis-code external-sessions list --all
+tamfis-code external-sessions show claude-code dd1f76ec-20f
+tamfis-code continue-from claude-code dd1f76ec-20f
+```
+
+`continue-from` starts a new Tamfis Code task with a bounded transcript brief
+and explicitly requires the agent to verify prior claims against the current
+checkout. Use `--show-only` to inspect that brief without starting work. In the
+interactive REPL, `/external-sessions [tool]` lists candidates, and a natural
+request such as “continue what Codex was doing” can use the same read-only
+discovery tools directly.
+
+For another JSON/JSONL-based client, set
+`TAMFIS_CODE_EXTERNAL_AGENT_DIRS=name=/path/to/session/store` (comma-separate
+multiple entries). Generic stores are best-effort; credential-shaped filenames
+are skipped and all external-session access remains read-only.
 
 ### TamfisGPT subscription access
 

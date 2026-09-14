@@ -40,7 +40,7 @@ from .config import APPROVAL_MODES, CONFIG_DIR, Config, Credentials, load_config
 from .doctor import run_doctor
 from .runtime.memory import MemoryRecord, MemoryType, get_memory_store
 from .runtime.worktree import WorktreeError, create_worktree, list_worktrees, remove_worktree
-from .render import StructuredRenderer, StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
+from .render import StructuredRenderer, StreamRenderer, print_banner, print_error, print_external_agent_error, print_recent_thread, print_resume_plan_status, print_unified_diff, render_external_agent_session, render_external_sessions, render_thread_recap
 from .runner import (
     ACTIVE_TASK_STATUSES,
     attach_and_stream, follow_session_logs, retry_task_and_stream,
@@ -1114,8 +1114,126 @@ def recap_command(ctx: click.Context, session_id_opt: Optional[int]):
             console.print("[dim]No local session recorded for this workspace yet.[/dim]")
             return
         session_id = matching[-1]
-    recap = local_state.summarize_thread(session_id)
-    console.print(Panel(recap, title=f"Recap · session {session_id}", border_style="cyan", expand=False))
+    recap = local_state.build_thread_recap(session_id)
+    render_thread_recap(console, recap, title=f"Recap · session {session_id}")
+
+
+@cli.group(name="external-sessions")
+def external_sessions_group():
+    """Discover and inspect sessions recorded by other AI coding agents on
+    this machine (Claude Code, Codex, Copilot, OpenCode, Kimi Code, ...) --
+    read-only, never mutates another tool's own state. See `continue-from`
+    to actually pick up one of these sessions as a new tamfis-code task."""
+
+
+@external_sessions_group.command(name="list")
+@click.option("--tool", type=str, default=None, help="Only show sessions from this tool (see the error message for the known list).")
+@click.option("--all", "show_all", is_flag=True, default=False, help="Show sessions from every workspace on this machine, not just the current one.")
+@click.option("--limit", type=int, default=20, show_default=True, help="Maximum sessions to show.")
+@click.pass_context
+def external_sessions_list_command(ctx: click.Context, tool: Optional[str], show_all: bool, limit: int):
+    """List other agents' sessions, most recently updated first."""
+    config: Config = ctx.obj["config"]
+    workspace_root: Path = ctx.obj["workspace_root"]
+    console = Console(no_color=not config.colour)
+    from . import external_agents
+
+    if tool and tool not in external_agents.known_tools():
+        print_external_agent_error(console, f"Unknown tool '{tool}'. Known tools: {', '.join(external_agents.known_tools())}.")
+        raise SystemExit(EXIT_INVALID_ARGS)
+    sessions = external_agents.discover_external_sessions(
+        workspace_root=None if show_all else str(workspace_root),
+        tools=[tool] if tool else None, limit=limit,
+    )
+    if not sessions:
+        scope = "this machine" if show_all else "this workspace"
+        console.print(f"[dim]No external-agent sessions found for {scope}. Pass --all to widen the search.[/dim]")
+        return
+    scope = "all workspaces" if show_all else "current workspace"
+    render_external_sessions(console, sessions, title=f"External sessions · {scope}")
+
+
+@external_sessions_group.command(name="show")
+@click.argument("tool")
+@click.argument("session_id")
+@click.pass_context
+def external_sessions_show_command(ctx: click.Context, tool: str, session_id: str):
+    """Print one other-agent session's recovered transcript."""
+    config: Config = ctx.obj["config"]
+    console = Console(no_color=not config.colour)
+    from . import external_agents
+
+    record = external_agents.read_external_session(tool, session_id)
+    if record is None:
+        print_external_agent_error(console, f"No '{tool}' session '{session_id}' found. Run `tamfis-code external-sessions list --tool {tool} --all` to see what's available.")
+        raise SystemExit(EXIT_INVALID_ARGS)
+    render_external_agent_session(console, record)
+
+
+@cli.command(name="continue-from")
+@click.argument("tool", required=False)
+@click.argument("session_id", required=False)
+@click.option("--model", default="auto", show_default=True, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima.")
+@click.option("--show-only", is_flag=True, default=False, help="Only print the imported brief; don't start a new agent task with it.")
+@click.pass_context
+def continue_from_command(ctx: click.Context, tool: Optional[str], session_id: Optional[str], model: str, show_only: bool):
+    """Pick up work left in another AI coding agent on this machine. With no
+    arguments, imports the most recently updated session recorded for this
+    workspace by any known tool. Pass TOOL to restrict to one (e.g.
+    `codex`), and SESSION_ID (see `external-sessions list`) for a specific
+    session rather than the latest."""
+    config: Config = ctx.obj["config"]
+    workspace_root: Path = ctx.obj["workspace_root"]
+    console = Console(no_color=not config.colour)
+    from . import external_agents
+
+    if tool and tool not in external_agents.known_tools():
+        print_external_agent_error(console, f"Unknown tool '{tool}'. Known tools: {', '.join(external_agents.known_tools())}.")
+        raise SystemExit(EXIT_INVALID_ARGS)
+    if session_id and not tool:
+        print_external_agent_error(console, "A session id requires TOOL too, e.g. `tamfis-code continue-from codex <id>`.")
+        raise SystemExit(EXIT_INVALID_ARGS)
+
+    if session_id:
+        record = external_agents.read_external_session(tool, session_id)
+        if record is None:
+            print_external_agent_error(console, f"No '{tool}' session '{session_id}' found.")
+            raise SystemExit(EXIT_INVALID_ARGS)
+    else:
+        candidates = external_agents.discover_external_sessions(
+            workspace_root=str(workspace_root), tools=[tool] if tool else None, limit=1,
+        )
+        if not candidates:
+            scope = f"'{tool}' " if tool else ""
+            print_external_agent_error(
+                console,
+                f"No {scope}sessions found for this workspace. Run "
+                "`tamfis-code external-sessions list --all` to see everything on this machine.",
+            )
+            raise SystemExit(EXIT_INVALID_ARGS)
+        chosen = candidates[0]
+        record = external_agents.read_external_session(chosen.tool, chosen.session_id)
+        if record is None:
+            print_external_agent_error(console, "Found the session but couldn't read its transcript.")
+            raise SystemExit(EXIT_INVALID_ARGS)
+
+    brief = external_agents.continuation_brief(record)
+    console.print(Panel(
+        f"{record['title'] or '(untitled)'}\n{len(record['turns'])} turn(s) recovered · cwd {record['cwd'] or 'unknown'}",
+        title=f"Continuing from {record['tool']} · {record['session_id']}", border_style="cyan", expand=False,
+    ))
+    if show_only:
+        # The brief intentionally uses literal [user]/[assistant] markers;
+        # Rich would otherwise consume those as markup tags and hide them.
+        console.print(brief, markup=False)
+        return
+    objective = (
+        f"{brief}\n\n---\nPick up this task in the current workspace. Re-verify anything the "
+        "transcript above claims was already done before building on it -- it may be stale or incomplete."
+    )
+    exit_code = _run_async(_run_local_ai_command(config, workspace_root, objective, "agent", model, None, ()))
+    if exit_code != EXIT_OK:
+        raise SystemExit(exit_code)
 
 
 @cli.command(name="plans")

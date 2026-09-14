@@ -2,13 +2,36 @@
 from pathlib import Path
 import pytest
 
-from tamfis_code.self_update import _parse_version, check_update_available
+from tamfis_code.self_update import _parse_version, _pip_install_command, check_update_available
 
 
 def test_parse_version_numeric_not_lexical():
     assert _parse_version("1.10.0") > _parse_version("1.9.9")
     assert _parse_version("1.4.0") > _parse_version("1.3.9")
     assert not (_parse_version("1.3.9") > _parse_version("1.4.0"))
+
+
+def test_pip_command_allows_explicit_update_on_externally_managed_system_python(monkeypatch, tmp_path):
+    from tamfis_code import self_update
+    marker = tmp_path / "EXTERNALLY-MANAGED"
+    marker.write_text("")
+    monkeypatch.setattr(self_update.sysconfig, "get_path", lambda _name: str(tmp_path))
+    monkeypatch.setattr(self_update.sys, "prefix", "/usr")
+    monkeypatch.setattr(self_update.sys, "base_prefix", "/usr")
+
+    command = _pip_install_command("--upgrade", "/tmp/release.whl")
+    assert "--break-system-packages" in command
+    assert command[-2:] == ["--upgrade", "/tmp/release.whl"]
+
+
+def test_pip_command_never_uses_system_override_inside_a_venv(monkeypatch, tmp_path):
+    from tamfis_code import self_update
+    (tmp_path / "EXTERNALLY-MANAGED").write_text("")
+    monkeypatch.setattr(self_update.sysconfig, "get_path", lambda _name: str(tmp_path))
+    monkeypatch.setattr(self_update.sys, "prefix", "/venv")
+    monkeypatch.setattr(self_update.sys, "base_prefix", "/usr")
+
+    assert "--break-system-packages" not in _pip_install_command("--upgrade", "/tmp/release.whl")
 
 
 def test_check_update_available_newer(tmp_path: Path):

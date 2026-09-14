@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.application.current import get_app
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.completion import Completer, Completion
 from prompt_toolkit.document import Document
@@ -22,6 +23,7 @@ from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory, InMemoryHistory
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.keys import Keys
+from prompt_toolkit.mouse_events import MouseEventType
 from rich.console import Console
 from rich.markup import escape
 from rich.markdown import Markdown
@@ -56,7 +58,7 @@ from .live_input import (
     force_bottom_toolbar_visible,
     idle_bottom_toolbar,
 )
-from .render import StreamRenderer, print_banner, print_error, print_recent_thread, print_resume_plan_status, print_unified_diff
+from .render import StreamRenderer, print_banner, print_error, print_external_agent_error, print_recent_thread, print_resume_plan_status, print_unified_diff, render_external_sessions, render_thread_recap, render_update_notice
 from .runner import (
     TaskOutcome,
     resolve_approval_decision_async,
@@ -309,6 +311,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/tools", "show the tools exposed to tamfis-code tasks"),
     ("/commands", "list user-defined custom slash commands loaded from .md files"),
     ("/agent-types", "list declarative subagent types available to /delegate and /swarm"),
+    ("/external-sessions", "list sessions recorded by other AI coding agents (Claude Code, Codex, Copilot, ...) on this machine"),
     ("/pty", "manage a persistent background terminal"),
     ("/exit", "quit"),
     ("/quit", "quit"),
@@ -385,6 +388,7 @@ class Intent:
 
 
 _SIDEBAR_ACTION = "\x00tamfis-sidebar"
+_UPDATE_ACTION = "\x00tamfis-update"
 _SIDEBAR_PAGE_SIZE = 8
 
 
@@ -953,14 +957,10 @@ async def _run_interactive_impl(
         "Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
 
-    from .self_update import check_update_available, update_instructions
+    from .self_update import check_update_available
     _available_update = check_update_available()
     if _available_update:
-        console.print(
-            f"[yellow]◆ Update available: {__version__} -> {_available_update}.[/yellow] "
-            "[dim]Type /update to apply and restart into this same session.[/dim]\n"
-        )
-        console.print(Panel(update_instructions(), title="Tamfis Code update"))
+        render_update_notice(console, current=__version__, available=_available_update)
 
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
@@ -1005,6 +1005,16 @@ async def _run_interactive_impl(
         # prompt_toolkit re-evaluates a callable `message=` on invalidate.
         config.approval_policy = next_mode_in_cycle(config.approval_policy)
         event.app.invalidate()
+
+    if _available_update:
+        @bindings.add("c-u")
+        def _install_available_update(event) -> None:
+            event.app.exit(result=_UPDATE_ACTION)
+
+    def _click_available_update(mouse_event):
+        if mouse_event.event_type == MouseEventType.MOUSE_UP:
+            get_app().exit(result=_UPDATE_ACTION)
+        return None
 
     @bindings.add("c-b")
     def _toggle_sidebar(event) -> None:
@@ -1131,6 +1141,8 @@ async def _run_interactive_impl(
                 state=suggestion_state,
             )),
             active_agents=idle_active_agents,
+            update_version=_available_update,
+            update_handler=_click_available_update if _available_update else None,
         ),
         auto_suggest=_NextMessageAutoSuggest(
             lambda: last_response_text,
@@ -1144,6 +1156,10 @@ async def _run_interactive_impl(
         # change failed to provide; the status/mode toolbar remains directly
         # below the frame, matching Codex/Claude Code's visual hierarchy.
         show_frame=True,
+        # Mouse mode is enabled only while there is an actionable update
+        # chip. This keeps normal terminal selection behavior unchanged for
+        # the overwhelmingly common up-to-date case.
+        mouse_support=bool(_available_update),
     )
     force_bottom_toolbar_visible(session)
 
@@ -1368,6 +1384,8 @@ async def _run_interactive_impl(
                 )
 
         text = text.strip()
+        if text == _UPDATE_ACTION:
+            text = "/update"
         if text == _SIDEBAR_ACTION:
             if sidebar.visible:
                 render_sidebar(console, workspace.session_id, sidebar)
@@ -1860,6 +1878,8 @@ async def _run_interactive_impl(
             table.add_row("find_references", "Find where a symbol is defined and referenced", "Read-only")
             table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
             table.add_row("read_background_job", "Check on a Ctrl+B-backgrounded command", "Read-only")
+            table.add_row("list_external_agent_sessions", "List sessions from Claude Code/Codex/Copilot/etc on this machine", "Read-only")
+            table.add_row("read_external_agent_session", "Read one of those sessions to continue its work", "Read-only")
             table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Local risk classifier + approval + mutation ledger")
             table.add_row("write_file", "Create or fully replace a file", "Workspace-boundary check + approval + mutation ledger")
             table.add_row("extract_archive / repackage_archive", "Inspect and rebuild archives", "Workspace-boundary check + approval for writes")
@@ -1871,6 +1891,22 @@ async def _run_interactive_impl(
                 "[dim]This is the real local tool set (mcp.py) every turn uses -- see safety.py for how "
                 "risk is classified and see /diffs for the mutation ledger.[/dim]"
             )
+            continue
+        if _ci_equals(text, "/external-sessions") or _ci_startswith(text, "/external-sessions "):
+            from . import external_agents
+
+            requested_tool = text[len("/external-sessions"):].strip() or None
+            if requested_tool and requested_tool not in external_agents.known_tools():
+                print_external_agent_error(console, f"Unknown tool '{requested_tool}'. Known tools: {', '.join(external_agents.known_tools())}.")
+                continue
+            sessions = external_agents.discover_external_sessions(
+                workspace_root=workspace.workspace_root,
+                tools=[requested_tool] if requested_tool else None, limit=20,
+            )
+            if not sessions:
+                console.print("[dim]No external-agent sessions found for this workspace.[/dim]")
+                continue
+            render_external_sessions(console, sessions, title="External sessions · current workspace")
             continue
         if _ci_equals(text, "/commands"):
             if not custom_commands:
@@ -2110,8 +2146,8 @@ async def _run_interactive_impl(
             console.print(f"[dim]~{len(recap)} char recap saved. Next turn starts from the compressed context.[/dim]")
             continue
         if _ci_equals(text, "/summary") or _ci_equals(text, "/recap"):
-            recap = local_state.summarize_thread(workspace.session_id)
-            console.print(Panel(recap, title="Thread summary", border_style="cyan", expand=False))
+            recap = local_state.build_thread_recap(workspace.session_id)
+            render_thread_recap(console, recap, title="Thread summary")
             continue
         if _ci_equals(text, "/doctor") or _ci_equals(text, "/doctor --heal"):
             # Full self-health-check in both modes (Claude Code/Codex parity):

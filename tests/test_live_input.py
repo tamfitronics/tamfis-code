@@ -140,6 +140,19 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         # Right-aligned: the chip is the last thing on the line, after padding.
         self.assertTrue(rendered.rstrip().endswith(plain_tip))
 
+    def test_available_update_replaces_tip_with_clickable_install_action(self):
+        handler = Mock()
+        fragments = idle_bottom_toolbar(
+            _config("ask"), 1, model="auto",
+            update_version="9.9.9", update_handler=handler,
+        ).__pt_formatted_text__()
+        rendered = "".join(fragment[1] for fragment in fragments)
+
+        self.assertIn("↑ Install v9.9.9 · click or Ctrl+U", rendered)
+        clickable = [fragment for fragment in fragments if len(fragment) == 3]
+        self.assertTrue(clickable)
+        self.assertTrue(all(fragment[2] is handler for fragment in clickable))
+
     def test_right_align_pads_to_terminal_width(self):
         import shutil
         from unittest.mock import patch as mock_patch

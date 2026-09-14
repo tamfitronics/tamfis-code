@@ -260,6 +260,8 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
         "web_search": ("Searching the web", "Searched the web"),
         "list_directory": ("Inspecting directory", "Inspected directory"),
         "create_directory": ("Creating directory", "Created directory"),
+        "list_external_agent_sessions": ("Checking other coding-agent sessions", "Checked other coding-agent sessions"),
+        "read_external_agent_session": ("Reading another agent's session", "Read another agent's session"),
     }
     active, done = verbs.get(normalized, (normalized.replace("_", " ").strip().capitalize(), normalized.replace("_", " ").strip().capitalize()))
     label = done if completed else active
@@ -1839,6 +1841,122 @@ def print_error(console: Console, message: str) -> None:
     console.print(f"[bold red]Error:[/bold red] {escape(redact_routing_text(message))}")
 
 
+def print_external_agent_error(console: Console, message: str) -> None:
+    """Like print_error, but skips redact_routing_text. These messages
+    legitimately name real third-party tools (Claude Code, Kimi Code, ...)
+    installed on the user's machine -- exactly the "user's actual subject
+    matter" exception public_identity.redact_routing_text's own docstring
+    carves out for itself, not TamfisGPT's own backend routing. Confirmed
+    live: piping a literal tool name through print_error mangled
+    "claude-code"/"kimi-code" into "TamfisGPT-Ultra" (_MODEL_HINT_RE matches
+    "claude" and "kimi" as backend-identity hints) -- the same class of bug
+    that function's own docstring already documents fixing once before, for
+    OpenRouter error URLs."""
+    console.print(f"[bold red]Error:[/bold red] {escape(message)}")
+
+
+def render_update_notice(console: Console, *, current: str, available: str) -> None:
+    """Show an actionable, low-noise update card at an idle prompt."""
+    no_color = bool(getattr(console, "no_color", False))
+    version_line = Text()
+    version_line.append(f"v{current}", style=None if no_color else "dim")
+    version_line.append("  →  ", style=None if no_color else "cyan")
+    version_line.append(f"v{available}", style=None if no_color else "bold green")
+    detail = Text(
+        "Install while idle, restart in place, and return to this same session.",
+        style=None if no_color else "dim",
+    )
+    action = Text("  Install & restart  ", style=None if no_color else "bold black on yellow")
+    console.print(Panel(
+        Group(version_line, Text(""), detail, Text(""), action),
+        title=Text("Update available"),
+        subtitle=Text("Click the footer action, press Ctrl+U, or type /update"),
+        border_style="yellow",
+        expand=False,
+        padding=(0, 1),
+    ))
+
+
+_EXTERNAL_TOOL_LABELS = {
+    "claude-code": "Claude Code",
+    "codex": "Codex",
+    "copilot": "GitHub Copilot",
+    "opencode": "OpenCode",
+    "kimi-code": "Kimi Code",
+}
+
+
+def _external_tool_label(tool: str) -> str:
+    return _EXTERNAL_TOOL_LABELS.get(tool, tool.replace("-", " ").title())
+
+
+def render_external_sessions(console: Console, sessions: list[Any], *, title: str) -> None:
+    """Render a compact, responsive session picker for normal terminals.
+
+    Each session uses a two-line row so its title gets the width instead of
+    fighting a cwd and full UUID for five narrow table columns. The displayed
+    id is an accepted unique prefix (external_agents.read_external_session),
+    which keeps the follow-up command copyable even at 80 columns.
+    """
+    from .resume_picker import relative_time
+
+    no_color = bool(getattr(console, "no_color", False))
+    rows: list[Any] = []
+    for index, session in enumerate(sessions):
+        source = _external_tool_label(str(session.tool))
+        session_prefix = str(session.session_id)[:12]
+        cwd = str(session.cwd or "")
+        if len(cwd) > 28:
+            cwd = "…" + cwd[-27:]
+        heading = Text()
+        heading.append("● ", style=None if no_color else "cyan")
+        heading.append(source, style=None if no_color else "bold")
+        heading.append(f"  {relative_time(session.updated_at)}", style=None if no_color else "dim")
+        heading.append(f"  {session_prefix}", style=None if no_color else "cyan")
+        if cwd:
+            heading.append(f"  {cwd}", style=None if no_color else "dim")
+        detail = Text("  " + _preview(session.title or "(untitled session)", 68))
+        rows.extend((heading, detail))
+        if index != len(sessions) - 1:
+            rows.append(Text(""))
+
+    body = Group(*rows)
+    console.print(Panel(
+        body,
+        title=Text(title),
+        subtitle=Text("Session prefix works with continue-from and show"),
+        border_style="cyan",
+        expand=False,
+    ))
+
+
+def render_external_agent_session(console: Console, record: dict[str, Any]) -> None:
+    """Render one imported transcript with readable speaker hierarchy."""
+    no_color = bool(getattr(console, "no_color", False))
+    source = _external_tool_label(str(record.get("tool") or "external agent"))
+    metadata = Text()
+    metadata.append(record.get("title") or "(untitled session)", style=None if no_color else "bold")
+    metadata.append(f"\n{record.get('cwd') or 'unknown workspace'}", style=None if no_color else "dim")
+    if record.get("updated_at"):
+        from .resume_picker import relative_time
+        metadata.append(f"  ·  {relative_time(str(record['updated_at']))}", style=None if no_color else "dim")
+    console.print(Panel(
+        metadata,
+        title=Text(f"{source} · {record.get('session_id') or 'unknown'}"),
+        border_style="cyan",
+        expand=False,
+    ))
+    turns = record.get("turns") or []
+    if not turns:
+        console.print(Text("No transcript content recovered.", style=None if no_color else "dim"))
+        return
+    for turn in turns:
+        is_user = turn.get("role") == "user"
+        console.print(Text("You" if is_user else "Assistant", style=None if no_color else ("bold cyan" if is_user else "bold green")))
+        console.print(Markdown(str(turn.get("text") or "")))
+        console.print()
+
+
 def print_recent_thread(console: Console, messages: list[dict[str, Any]], limit: int = 6) -> None:
     """Prints the tail of GET /thread's message list -- used by `/resume`
     and `tamfis-code resume` so switching sessions doesn't drop the user
@@ -1952,3 +2070,86 @@ def print_resume_plan_status(console: Console, state: Any) -> None:
         color = colors.get(status)
         marker = glyph if no_color or color is None else f"[{color}]{glyph}[/{color}]"
         console.print(f"  {marker} {escape(str(step.get('step') or ''))}")
+
+
+_PLAN_STEP_MARKERS = {"completed": "✓", "in_progress": "◉", "failed": "✗"}
+_PLAN_STEP_COLORS = {"completed": "green", "in_progress": "yellow", "failed": "red"}
+
+
+def _preview(text: str, limit: int) -> str:
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def render_thread_recap(console: Console, recap: Any, *, title: str) -> None:
+    """Card-style recap for `/summary`/`/recap` and `tamfis-code recap` --
+    one bordered panel with a clearly separated section per kind of fact
+    (older-turn digest, files touched, plan progress, unresolved issues,
+    recent turns verbatim), instead of summarize_thread's single
+    undifferentiated text blob in a plain Panel. `recap` is a
+    state.ThreadRecap. Mirrors the marker/colour language
+    print_resume_plan_status and print_unified_diff already use elsewhere
+    in this renderer, so it reads as part of the same product rather than a
+    bolted-on view -- the Claude Code/Codex-style "one glance tells you
+    everything" recap card.
+    """
+    no_color = bool(getattr(console, "no_color", False))
+
+    def styled(text: str, style: str) -> str:
+        return text if no_color else f"[{style}]{text}[/{style}]"
+
+    if recap.empty_reason and not recap.older_turns and not recap.recent_turns:
+        console.print(Panel(Text(recap.empty_reason, style=None if no_color else "dim"), title=Text(title), border_style="cyan", expand=False))
+        return
+
+    blocks: list[Any] = []
+
+    if recap.older_turns:
+        header = Text.from_markup(styled(f"Summary of {recap.older_count} earlier turn(s)", "bold"))
+        rows: list[Text] = []
+        for index, turn in enumerate(recap.older_turns, start=1):
+            rows.append(Text.from_markup(f"  {index}. " + styled("You", "cyan") + f" › {escape(_preview(turn.objective, 200))}"))
+            if turn.answer:
+                rows.append(Text.from_markup("     " + styled("Assistant", "green") + f" › {escape(_preview(turn.answer, 200))}"))
+            else:
+                rows.append(Text("     (no recorded answer)", style=None if no_color else "dim"))
+        blocks.append(Group(header, *rows))
+
+    facts: list[Text] = []
+    if recap.modified_files:
+        facts.append(Text.from_markup(styled("Files touched", "bold") + "  " + escape(", ".join(recap.modified_files))))
+    if recap.active_plan_id:
+        steps = recap.active_plan_steps
+        done = sum(1 for s in steps if s.get("status") == "completed")
+        facts.append(Text.from_markup(styled("Plan", "bold") + f"  {escape(recap.active_plan_id)} ({done}/{len(steps)} steps)"))
+        if recap.active_plan_objective:
+            facts.append(Text.from_markup("    " + styled("Objective", "dim") + f"  {escape(_preview(recap.active_plan_objective, 240))}"))
+        for step in steps:
+            status = step.get("status", "pending")
+            glyph = _PLAN_STEP_MARKERS.get(status, "○")
+            color = _PLAN_STEP_COLORS.get(status)
+            marker = glyph if no_color or color is None else f"[{color}]{glyph}[/{color}]"
+            facts.append(Text.from_markup(f"    {marker} {escape(str(step.get('step') or ''))}"))
+    if recap.unresolved_count:
+        facts.append(Text.from_markup(styled("Unresolved issues", "bold yellow") + f"  {recap.unresolved_count} (run /doctor for detail)"))
+    if facts:
+        blocks.append(Group(*facts))
+
+    if recap.recent_turns:
+        header = Text.from_markup(styled(f"Recent {len(recap.recent_turns)} turn(s)", "bold"))
+        rows = []
+        for turn in recap.recent_turns:
+            rows.append(Text.from_markup(styled("You", "bold cyan") + f" › {escape(turn.objective)}"))
+            if turn.answer:
+                answer = turn.answer
+                if len(answer) > 1200:
+                    answer = answer[:600] + "\n  …\n  " + answer[-400:]
+                rows.append(Text.from_markup(styled("Assistant", "bold green") + f" › {escape(answer)}"))
+            rows.append(Text(""))
+        blocks.append(Group(header, *rows))
+
+    # A single blank-line-separated Group keeps every section inside one
+    # bordered card rather than one Panel per section, which read as several
+    # disconnected boxes instead of one coherent recap.
+    body = Group(*[item for block in blocks for item in (block, Text(""))][:-1])
+    console.print(Panel(body, title=Text(title), border_style="cyan", expand=False))
