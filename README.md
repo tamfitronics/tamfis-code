@@ -83,6 +83,11 @@ tamfis-code doctor
 tamfis-code agent "inspect this repository and fix the failing tests"
 ```
 
+When launched through an ACP-compatible IDE, `session/new` and `session/load`
+also accept the IDE's session-scoped `mcpServers` list. Those servers are
+connected for that session only and are never written into the repository's
+`.mcp.json`.
+
 The normal interactive and one-shot commands keep the local-agent connection
 alive for their lifetime. To make the repository available for work started
 from TamfisGPT Web without keeping an interactive chat open, run:

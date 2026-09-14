@@ -281,6 +281,33 @@ class TestNewSession:
         assert result["sessionId"] in agent.sessions
         assert agent.sessions[result["sessionId"]].cwd == self.workspace.resolve()
 
+    @pytest.mark.asyncio
+    async def test_new_session_registers_session_scoped_mcp_servers(self):
+        agent = ACPAgent(self.workspace, Config())
+        result = await agent.handle("session/new", {
+            "cwd": str(self.workspace),
+            "mcpServers": [{
+                "name": "review-tools",
+                "command": "python3",
+                "args": ["server.py"],
+                "env": [{"name": "MODE", "value": "review"}],
+            }],
+        })
+        session = agent.sessions[result["sessionId"]]
+        config = session.mcp_servers["review-tools"]
+        assert config.command == "python3"
+        assert config.args == ("server.py",)
+        assert config.env == {"MODE": "review"}
+
+    @pytest.mark.asyncio
+    async def test_new_session_rejects_malformed_mcp_server(self):
+        agent = ACPAgent(self.workspace, Config())
+        with pytest.raises(ACPError, match="needs command or url"):
+            await agent.handle("session/new", {
+                "cwd": str(self.workspace),
+                "mcpServers": [{"name": "broken"}],
+            })
+
 
 class TestDispatchProtocol:
     """Wire-level JSON-RPC framing tests: unknown method, malformed request,

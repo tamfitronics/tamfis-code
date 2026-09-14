@@ -9,7 +9,7 @@ import pytest
 
 from tamfis_code import mcp_client
 from tamfis_code.mcp import MCPServer
-from tamfis_code.mcp_client import StandaloneMCPBridge, load_mcp_servers
+from tamfis_code.mcp_client import StandaloneMCPBridge, load_mcp_servers, mcp_servers_from_protocol
 
 
 @pytest.fixture(autouse=True)
@@ -33,6 +33,18 @@ def test_loads_project_owned_mcp_configuration(tmp_path: Path):
     _configure(tmp_path)
     servers = load_mcp_servers(tmp_path)
     assert servers["demo-server"].command == sys.executable
+
+
+def test_parses_acp_session_scoped_mcp_servers_without_persisting_them():
+    servers = mcp_servers_from_protocol([{
+        "name": "acp-tools",
+        "url": "https://mcp.example.com/mcp",
+        "headers": {"Authorization": "Bearer ${ACP_TOKEN}"},
+        "env": [{"name": "MODE", "value": "review"}],
+    }])
+    assert servers["acp-tools"].url == "https://mcp.example.com/mcp"
+    assert servers["acp-tools"].env == {"MODE": "review"}
+    assert load_mcp_servers() == {}
 
 
 @pytest.mark.asyncio

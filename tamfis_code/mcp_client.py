@@ -162,10 +162,77 @@ def _parse_streamable_http_body(body: str, content_type: str) -> list[dict[str, 
     return messages
 
 
+def mcp_servers_from_protocol(value: Any) -> dict[str, MCPServerConfig]:
+    """Parse ACP ``mcpServers`` into the bridge's transport-neutral config.
+
+    ACP clients send a list of named server descriptors, while Claude-style
+    config files use a mapping.  Accept both shapes for interoperability, but
+    reject malformed entries instead of silently dropping a requested server.
+    """
+    if value in (None, []):
+        return {}
+    entries: list[tuple[str, Any]] = []
+    if isinstance(value, dict):
+        entries = [(str(name), spec) for name, spec in value.items()]
+    elif isinstance(value, list):
+        for index, spec in enumerate(value):
+            if not isinstance(spec, dict):
+                raise ValueError(f"mcpServers[{index}] must be an object")
+            name = str(spec.get("name") or f"server-{index + 1}").strip()
+            entries.append((name, spec))
+    else:
+        raise ValueError("mcpServers must be an array or object")
+
+    result: dict[str, MCPServerConfig] = {}
+    for name, raw in entries:
+        if not name or not isinstance(raw, dict):
+            raise ValueError(f"MCP server {name or '<unnamed>'} must be an object")
+        command = raw.get("command")
+        url = raw.get("url")
+        if not command and not url:
+            raise ValueError(f"MCP server {name} needs command or url")
+        if command and url:
+            raise ValueError(f"MCP server {name} cannot specify both command and url")
+        env = raw.get("env")
+        headers = raw.get("headers")
+        if env is not None and not isinstance(env, (dict, list)):
+            raise ValueError(f"MCP server {name}.env must be an object or array")
+        if headers is not None and not isinstance(headers, dict):
+            raise ValueError(f"MCP server {name}.headers must be an object")
+        if isinstance(env, list):
+            normalized_env: dict[str, str] = {}
+            for item in env:
+                if not isinstance(item, dict) or not item.get("name"):
+                    raise ValueError(f"MCP server {name}.env entries need name and value")
+                normalized_env[str(item["name"])] = _expand_env(str(item.get("value") or ""))
+        else:
+            normalized_env = {
+                str(k): _expand_env(str(v)) for k, v in env.items()
+            } if isinstance(env, dict) else {}
+        result[name] = MCPServerConfig(
+            name=name,
+            command=str(command) if command else None,
+            args=tuple(str(arg) for arg in (raw.get("args") or [])),
+            env=normalized_env or None,
+            cwd=str(raw.get("cwd")) if raw.get("cwd") else None,
+            url=str(url) if url else None,
+            headers={str(k): _expand_env(str(v)) for k, v in headers.items()} if isinstance(headers, dict) else None,
+        )
+    return result
+
+
 class StandaloneMCPBridge:
-    def __init__(self, workspace_root: str | Path | None = None):
+    def __init__(
+        self,
+        workspace_root: str | Path | None = None,
+        *,
+        servers: dict[str, MCPServerConfig] | None = None,
+    ):
         self.workspace_root = str(Path(workspace_root or Path.cwd()).resolve())
-        self.servers = load_mcp_servers(self.workspace_root)
+        # ACP session-scoped servers are supplied by the IDE and must not be
+        # written into the user's persistent .mcp.json.  Normal CLI turns use
+        # the layered on-disk configuration; ACP passes an explicit snapshot.
+        self.servers = dict(servers) if servers is not None else load_mcp_servers(self.workspace_root)
         self._processes: dict[str, asyncio.subprocess.Process] = {}
         self._http: dict[str, _HTTPConnection] = {}
         self._request_id = 0

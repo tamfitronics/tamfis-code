@@ -4690,6 +4690,7 @@ async def _run_local_agent_turn_impl(
     allow_swarm_tool: bool = False,
     attachment_paths: tuple[str, ...] = (),
     image_content_blocks: Optional[list[dict[str, Any]]] = None,
+    external_mcp_servers: Optional[dict[str, Any]] = None,
 ) -> TaskOutcome:
     """Run one user turn to completion against a directly-called provider,
     executing tool calls locally (full tool set, approval-gated) instead of
@@ -4801,6 +4802,7 @@ async def _run_local_agent_turn_impl(
             writable_roots=tuple(effective_config.sandbox_writable_roots),
             fail_if_unavailable=effective_config.sandbox_fail_if_unavailable,
         ),
+        external_mcp_servers=external_mcp_servers,
     )
     # Read fresh once per turn (not cached across turns/process lifetime) so
     # editing hooks.toml takes effect on the next turn without a restart.
@@ -8287,6 +8289,7 @@ async def run_local_agent_turn(
     allow_swarm_tool: bool = False,
     attachment_paths: tuple[str, ...] = (),
     image_content_blocks: Optional[list[dict[str, Any]]] = None,
+    external_mcp_servers: Optional[dict[str, Any]] = None,
 ) -> TaskOutcome:
     """Public local adapter routed through the unified Phase 2 runtime."""
     from .runtime.unified import get_unified_runtime
@@ -8298,4 +8301,5 @@ async def run_local_agent_turn(
         strict_max_rounds=strict_max_rounds, read_only=read_only,
         cli_config=cli_config, allow_swarm_tool=allow_swarm_tool,
         attachment_paths=attachment_paths, image_content_blocks=image_content_blocks,
+        external_mcp_servers=external_mcp_servers,
     )

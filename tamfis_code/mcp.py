@@ -137,10 +137,10 @@ def _import_monorepo_attr(module_path: str, attr: str):
     return None
 
 
-def _get_shared_mcp_bridge(workspace_root: str | None = None):
+def _get_shared_mcp_bridge(workspace_root: str | None = None, servers=None):
     """Return Tamfis Code's standalone MCP client bridge."""
     from .mcp_client import StandaloneMCPBridge
-    return StandaloneMCPBridge(workspace_root)
+    return StandaloneMCPBridge(workspace_root, servers=servers)
 
 
 def get_browser_tool_class():
@@ -281,6 +281,7 @@ class MCPServer:
         attachment_paths: Optional[List[str]] = None,
         allowed_workspace_roots: Optional[List[str]] = None,
         sandbox_policy: Optional[SandboxPolicy] = None,
+        external_mcp_servers: Optional[Dict[str, Any]] = None,
     ):
         # workspace_root/session_id are optional so existing callers that
         # construct MCPServer() with no arguments (tests, the `tools`/
@@ -334,7 +335,7 @@ class MCPServer:
         # first failure still gets the full explanation; later ones in the
         # same turn get a one-line reminder instead.
         self._sandbox_unavailable_warned = False
-        self._external_mcp = _get_shared_mcp_bridge(workspace_root)
+        self._external_mcp = _get_shared_mcp_bridge(workspace_root, external_mcp_servers)
         # Per-server, per-root temporary indexes keep find_references
         # incremental across repeated calls without writing cache files into
         # either the user's repository or home directory. TemporaryDirectory

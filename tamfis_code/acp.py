@@ -28,6 +28,7 @@ class ACPSession:
     runtime_session_id: int
     cwd: Path
     messages: list[JsonObject] = field(default_factory=list)
+    mcp_servers: dict[str, Any] = field(default_factory=dict)
 
 
 class ACPError(Exception):
@@ -153,25 +154,21 @@ class ACPAgent:
 
     async def _new_session(self, params: JsonObject) -> JsonObject:
         from .workspace import resolve_local_workspace
+        from .mcp_client import mcp_servers_from_protocol
 
         cwd = self._allowed_cwd(params.get("cwd"))
         workspace = resolve_local_workspace(cwd)
         session_id = str(workspace.session_id)
-        self.sessions[session_id] = ACPSession(session_id, workspace.session_id, cwd)
-        # KNOWN GAP, not fixed here: the real ACP schema makes `mcpServers`
-        # a required NewSessionRequest field -- a client (e.g. Zed) may
-        # configure session-specific MCP servers here expecting the agent
-        # to actually connect to them for this session's tool calls. This
-        # agent has no wiring from params["mcpServers"] into
-        # mcp_client.py's StandaloneMCPBridge at all; any servers a client
-        # sends are silently ignored. Bridging this is a real, separate
-        # feature investment (dynamically registering session-scoped MCP
-        # tools into run_local_agent_turn), not a quick correctness fix,
-        # so it's flagged here rather than attempted.
+        try:
+            mcp_servers = mcp_servers_from_protocol(params.get("mcpServers"))
+        except ValueError as exc:
+            raise ACPError(-32602, str(exc)) from exc
+        self.sessions[session_id] = ACPSession(session_id, workspace.session_id, cwd, mcp_servers=mcp_servers)
         return {"sessionId": session_id}
 
     async def _load_session(self, params: JsonObject) -> JsonObject:
         from . import state as local_state
+        from .mcp_client import mcp_servers_from_protocol
 
         session_id = str(params.get("sessionId") or "")
         if not session_id:
@@ -183,7 +180,11 @@ class ACPAgent:
         state = local_state.get_session_state(runtime_id)
         if session_id not in self.sessions:
             cwd = self._allowed_cwd(params.get("cwd") or state.workspace_root or state.primary_workspace)
-            self.sessions[session_id] = ACPSession(session_id, runtime_id, cwd)
+            try:
+                mcp_servers = mcp_servers_from_protocol(params.get("mcpServers"))
+            except ValueError as exc:
+                raise ACPError(-32602, str(exc)) from exc
+            self.sessions[session_id] = ACPSession(session_id, runtime_id, cwd, mcp_servers=mcp_servers)
         # Real ACP spec requirement (session-setup docs: "The Agent MUST
         # replay the entire conversation to the Client in the form of
         # session/update notifications"). Confirmed live this was
@@ -225,6 +226,7 @@ class ACPAgent:
             interactive=False,
             cli_config=self.config,
             allow_swarm_tool=True,
+            external_mcp_servers=session.mcp_servers,
         )
 
     async def _prompt(self, params: JsonObject) -> JsonObject:
@@ -281,7 +283,7 @@ class ACPAgent:
                         "audio": False,
                         "embeddedContext": True,
                     },
-                    "mcpCapabilities": {"http": False, "sse": False},
+                    "mcpCapabilities": {"http": True, "sse": False},
                 },
                 "agentInfo": {"name": "Tamfis Code", "version": __version__},
                 "authMethods": [],

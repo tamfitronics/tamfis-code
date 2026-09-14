@@ -335,7 +335,7 @@ documentation from `zed-industries/agent-client-protocol` at commit
 | Durable-session history replay | `ACPAgent._load_session()` | COVERED (fixed 2026-09-13) — replays stored user and assistant turns in order as `session/update` notifications; the spec states that `session/load` MUST replay the entire conversation |
 | Embedded prompt resources | `ACPAgent._prompt_text()` | COVERED (fixed 2026-09-13) — reads `EmbeddedResource` payloads from the schema-defined nested `resource` object, using text when present and the URI for binary resources; direct `ResourceLink` URIs remain supported |
 | JSON-RPC framing, prompt cancellation, workspace validation, and prompt error paths | `ACPAgent._dispatch()`, `_prompt()`, `_allowed_cwd()` | COVERED — `tests/test_acp.py` now has 26 tests, including wire-level request/notification behavior and a real in-flight cancellation task that resolves the prompt with `stopReason: "cancelled"` |
-| Per-session MCP servers | `session/new` and `session/load` request handling | GAP (feature) — ACP requires `mcpServers` in these requests, but the adapter does not yet connect them to `mcp_client.py`'s `StandaloneMCPBridge`; implementing session-scoped MCP registration is a separate feature investment |
+| Per-session MCP servers | `session/new` and `session/load` request handling | COVERED (added 2026-09-14) — ACP `mcpServers` descriptors are validated, converted to transport-neutral configs, and passed into the real `StandaloneMCPBridge` used by the local tool loop; they remain session-scoped and are never persisted to `.mcp.json` |
 
 ## Summary
 
