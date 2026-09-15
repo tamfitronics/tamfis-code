@@ -1,8 +1,7 @@
 """Tests for the multi-phase formal-planning extension: is_formal_planning_
 objective's gate, extract_phase_outline's parsing, merge_phase_plans'
-combination logic, ExecutionPlan's phase-aware step queries, and
-AgentOrchestrator._scale_budgets_for_plan_size's round-budget scaling for
-an oversized plan.
+combination logic, ExecutionPlan's phase-aware step queries, and the
+round-extension budget's "effectively unlimited" default.
 
 Covers the pure/deterministic pieces of that pipeline; the LLM-calling
 passes themselves (_attempt_phase_plans, _verify_and_critique_plan) are
@@ -11,10 +10,8 @@ re-mocked here.
 """
 import dataclasses
 import json
-import types
 import unittest
 
-from tamfis_code.orchestrator.engine import AgentOrchestrator
 from tamfis_code.orchestrator.planner import (
     MAX_PLAN_PHASES,
     ExecutionPlan,
@@ -191,56 +188,36 @@ class ExecutionPlanPhaseQueryTests(unittest.TestCase):
         self.assertEqual(plan_phase_count(flat), 1)
 
 
-class ScaleBudgetsForPlanSizeTests(unittest.TestCase):
-    def _fake_orchestrator(self, budgets: RuntimeBudgets, *, step_count: int):
-        events: list[dict] = []
-        fake_self = types.SimpleNamespace(
-            run=types.SimpleNamespace(runtime=types.SimpleNamespace(budgets=budgets)),
-            emit=events.append,
-        )
-        plan = ExecutionPlan(
-            objective="obj", assumptions=[], components=[],
-            steps=[PlanStep(i, f"step {i}") for i in range(step_count)],
-            validation_criteria=[], risks=[],
-        )
-        return fake_self, plan, events
+class RuntimeBudgetsAreEffectivelyUnlimitedTests(unittest.TestCase):
+    """max_round_extensions used to default to 2 (RuntimeBudgets) with
+    Config's own copy also at 2 -- the one actually threaded into every
+    real turn's RuntimeBudgets(...) construction (run_local_agent_turn).
+    AgentOrchestrator used to compensate with a step-count-based scaling
+    method (_scale_budgets_for_plan_size) capped at 10 extensions, which
+    could still be exhausted by a large, genuinely-progressing task, and
+    at one point crashed outright by assigning to a frozen dataclass
+    field. Both defaults are now 1000 ("effectively unlimited," matching
+    every sibling extension budget already at that value) instead, so
+    real protection comes from the round loop's own stall detection
+    (_insufficient_novel_evidence), not a small, easily-exhausted count --
+    the scaling method is gone; these tests just pin the defaults and the
+    still-relevant frozen-dataclass invariant.
+    """
 
-    def test_a_small_plan_leaves_the_default_budget_untouched(self):
-        fake_self, plan, events = self._fake_orchestrator(RuntimeBudgets(), step_count=10)
-        AgentOrchestrator._scale_budgets_for_plan_size(fake_self, plan)
-        self.assertEqual(fake_self.run.runtime.budgets.max_round_extensions, 2)
-        self.assertEqual(events, [])
+    def test_runtime_budgets_default_is_effectively_unlimited(self):
+        self.assertEqual(RuntimeBudgets().max_round_extensions, 1000)
 
-    def test_a_plan_just_over_80_steps_widens_the_budget_and_reports_the_true_before_value(self):
-        fake_self, plan, events = self._fake_orchestrator(RuntimeBudgets(), step_count=81)
-        AgentOrchestrator._scale_budgets_for_plan_size(fake_self, plan)
-        self.assertEqual(fake_self.run.runtime.budgets.max_round_extensions, 3)
-        self.assertEqual(len(events), 1)
-        message = events[0]["payload"]["content"]
-        # Regression test: this diagnostic used to read the budget field
-        # AFTER already overwriting it, so "from X" always printed the new
-        # value instead of the real previous one (e.g. "from 3 to 3").
-        self.assertIn("from 2", message)
-        self.assertIn("to 3", message)
+    def test_config_default_matches_and_actually_reaches_a_real_turn(self):
+        from tamfis_code.config import Config
+        self.assertEqual(Config().max_round_extensions, 1000)
+        self.assertEqual(Config().max_repair_extensions, 1000)
 
-    def test_widening_is_capped_at_10_extensions_for_a_very_large_plan(self):
-        fake_self, plan, events = self._fake_orchestrator(RuntimeBudgets(), step_count=1000)
-        AgentOrchestrator._scale_budgets_for_plan_size(fake_self, plan)
-        self.assertEqual(fake_self.run.runtime.budgets.max_round_extensions, 10)
-
-    def test_never_narrows_an_already_wider_budget(self):
-        budgets = dataclasses.replace(RuntimeBudgets(), max_round_extensions=8)
-        fake_self, plan, events = self._fake_orchestrator(budgets, step_count=90)
-        AgentOrchestrator._scale_budgets_for_plan_size(fake_self, plan)
-        self.assertEqual(fake_self.run.runtime.budgets.max_round_extensions, 8)
-        self.assertEqual(events, [])
-
-    def test_the_budgets_object_itself_is_frozen_so_replacement_must_be_used(self):
+    def test_the_budgets_object_itself_is_frozen(self):
         """RuntimeBudgets is deliberately immutable (runtime/budgets.py) --
-        this pins that invariant so a future refactor that tries direct
-        field assignment again (the bug _scale_budgets_for_plan_size itself
-        used to have) fails loudly here instead of only at run time on a
-        real oversized plan."""
+        pins that invariant so a future refactor that widens a budget by
+        direct field assignment (the bug _scale_budgets_for_plan_size used
+        to have) fails loudly in a unit test instead of only at run time on
+        a real oversized plan."""
         with self.assertRaises(dataclasses.FrozenInstanceError):
             RuntimeBudgets().max_round_extensions = 9
 

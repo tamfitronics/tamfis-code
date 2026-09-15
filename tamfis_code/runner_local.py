@@ -128,12 +128,14 @@ MAX_AGENT_ROUNDS = 40
 # loop below, not the orchestrator's internal budget.
 #
 # The real, live ceiling is RuntimeBudgets.max_round_extensions
-# (runtime/budgets.py), read via orchestrator.run.runtime.budgets below --
-# AgentOrchestrator.replace_plan's _scale_budgets_for_plan_size widens it
-# for a plan sized across more than one round window's worth of steps.
+# (runtime/budgets.py) and Config.max_round_extensions (config.py, which
+# actually reaches every real turn -- see run_local_agent_turn's
+# RuntimeBudgets(...) construction), both 1000 ("effectively unlimited",
+# the same reasoning already applied to every sibling extension budget)
+# for the same reason this comment's live-reported incident describes.
 # This module constant now only matters as a fallback default for the
 # (never expected in practice) case where orchestrator.run is None.
-MAX_AGENT_ROUND_EXTENSIONS = 2
+MAX_AGENT_ROUND_EXTENSIONS = 1000
 
 # Match reasoning depth to task complexity by default: routine work remains
 # responsive while architecture, debugging, and multi-component tasks get the

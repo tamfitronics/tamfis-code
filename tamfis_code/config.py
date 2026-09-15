@@ -161,13 +161,25 @@ class Config:
     # max_repair_rounds -- covers provider fallback, empty-continuation
     # recovery, and genuine fix-the-actual-failure repairs alike) may renew
     # instead of failing the task the moment it runs out.
-    max_repair_extensions: int = 2
+    # Confirmed live: this Config default -- not RuntimeBudgets' own field
+    # default (1000, "effectively unlimited", the same reasoning
+    # max_runtime_extensions above already documents) -- is what actually
+    # reaches every real turn (run_local_agent_turn always constructs
+    # RuntimeBudgets(max_repair_extensions=this value), overriding its
+    # generous default). Left at 2, a task that hit three unrelated infra
+    # hiccups (provider fallback, an empty continuation, a genuine repair)
+    # anywhere in its run hard-failed on the third, discarding real
+    # completed work, exactly the failure class max_runtime_extensions'
+    # own history above already fixed once for wall-clock exhaustion.
+    max_repair_extensions: int = 1000
     # How many times runner_local.py's plain tool-call-round loop may grant
-    # itself a fresh round window before hard-failing the turn. Matches the
-    # previously-hardcoded MAX_AGENT_ROUND_EXTENSIONS constant exactly --
-    # AgentOrchestrator.replace_plan widens the live runtime budget above
-    # this default for a plan sized across more than one round window.
-    max_round_extensions: int = 2
+    # itself a fresh round window before hard-failing the turn. Same
+    # Config-overrides-RuntimeBudgets'-real-default situation as
+    # max_repair_extensions just above: the round loop's own stall
+    # detection (_insufficient_novel_evidence) is what actually protects
+    # against a genuinely stuck task, not a small extension count, so this
+    # is bounded the same "effectively unlimited" way its siblings are.
+    max_round_extensions: int = 1000
     # A backgrounded (`--bg`) task that stops with more of its own saved
     # plan left incomplete (see state.plan_progress) may self-respawn via
     # the same detached-process mechanism its first launch already used,

@@ -70,12 +70,20 @@ class RuntimeBudgets:
     # own field, not folded into max_runtime_extensions: rounds (observe/act
     # cycles) are a coarser, separate dimension from wall-clock epoch
     # renewal -- a task can be well within its time budget and still run out
-    # of rounds. Default (2) matches the previously-hardcoded
-    # MAX_AGENT_ROUND_EXTENSIONS constant exactly, so this is a pure
-    # rename/relocation until something actually widens it (see
-    # AgentOrchestrator._scale_budgets_for_plan_size, orchestrator/engine.py)
-    # for a plan sized across more than one round window's worth of steps.
-    max_round_extensions: int = 2
+    # of rounds. Confirmed live (the same class of report that motivated
+    # max_tool_call_extensions/max_repair_extensions/max_plan_revision_
+    # extensions/max_runtime_extensions above, all also 1000): a large task
+    # kept making real, varied tool calls -- never tripping
+    # MAX_CONSECUTIVE_IDENTICAL_ROUNDS or any other stall guard -- and still
+    # hard-failed once the old default (2) ran out, discarding completed
+    # work exactly like those four used to before they were widened. The
+    # real protection against a genuinely stuck task is the round loop's own
+    # stall detection (_insufficient_novel_evidence, checked before this
+    # budget is ever consulted), not a small extension count, so this is
+    # bounded the same "effectively unlimited, not literally infinite" way
+    # its four siblings already are.
+    # Set to a very large value to effectively make round budget unlimited
+    max_round_extensions: int = 1000
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():
