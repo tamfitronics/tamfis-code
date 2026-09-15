@@ -1,7 +1,7 @@
 """Persistent Claude Code/Codex-style orchestration state machine."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as _dataclass_replace
 from pathlib import Path, PurePath
 import re
 from typing import Any, Callable
@@ -151,6 +151,53 @@ class AgentOrchestrator:
         )
         self.run.plan = plan
         self.run.plan_id = saved.id
+        # Widen round-extension budget for large plans that span multiple
+        # round windows (each extension = 40 more rounds).
+        self._scale_budgets_for_plan_size(plan)
+
+    def _scale_budgets_for_plan_size(self, plan: ExecutionPlan) -> None:
+        """Widen the round-extension budget for a plan that spans more than
+        one round window's worth of steps.
+
+        A round window is 40 rounds (runner_local.py's MAX_AGENT_ROUNDS).
+        Each extension grants another full window. A plan with N steps
+        typically needs ~N/2 rounds (one observe/act cycle per step on
+        average), so a plan with >80 steps would need >2 extensions.
+        This scales max_round_extensions proportionally to the plan's
+        step count, bounded by a reasonable ceiling so a genuinely stuck
+        task still hits the cap.
+        """
+        assert self.run is not None
+        step_count = len(plan.steps)
+        if step_count <= 80:
+            return  # default max_round_extensions=2 covers up to ~80 steps
+        # Each 40 steps ≈ 1 round window ≈ 1 extension needed
+        needed_extensions = max(2, (step_count + 39) // 40)
+        # Cap at 10 extensions (400 rounds) so a genuinely stuck task
+        # still fails instead of running indefinitely
+        new_limit = min(needed_extensions, 10)
+        previous_limit = self.run.runtime.budgets.max_round_extensions
+        if new_limit > previous_limit:
+            # RuntimeBudgets is a frozen dataclass (runtime/budgets.py) --
+            # every other budget field is read-only by design once a run
+            # starts. Assigning the field directly raised
+            # dataclasses.FrozenInstanceError the moment a plan actually
+            # exceeded 80 steps, crashing the exact large-plan case this
+            # method exists to widen the budget for. Replace the whole
+            # immutable instance instead of mutating a field on it.
+            self.run.runtime.budgets = _dataclass_replace(
+                self.run.runtime.budgets, max_round_extensions=new_limit,
+            )
+            self.emit({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"Plan has {step_count} steps -- widening round-extension "
+                        f"budget from {previous_limit} "
+                        f"to {new_limit} (each extension = 40 more rounds)."
+                    ),
+                },
+            })
 
     def _sync_plan_progress(self) -> None:
         """Persist current step statuses and let the renderer live-update

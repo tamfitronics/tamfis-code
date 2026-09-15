@@ -64,6 +64,18 @@ class RuntimeBudgets:
     # first time the shared counter runs out.
     # Set to a very large value to effectively make repair budget unlimited
     max_repair_extensions: int = 1000
+    # How many times runner_local.py's plain tool-call-round loop may grant
+    # itself a fresh round window (see _round_window_size) instead of
+    # hard-failing the turn once its round budget is spent. Deliberately its
+    # own field, not folded into max_runtime_extensions: rounds (observe/act
+    # cycles) are a coarser, separate dimension from wall-clock epoch
+    # renewal -- a task can be well within its time budget and still run out
+    # of rounds. Default (2) matches the previously-hardcoded
+    # MAX_AGENT_ROUND_EXTENSIONS constant exactly, so this is a pure
+    # rename/relocation until something actually widens it (see
+    # AgentOrchestrator._scale_budgets_for_plan_size, orchestrator/engine.py)
+    # for a plan sized across more than one round window's worth of steps.
+    max_round_extensions: int = 2
 
     def __post_init__(self) -> None:
         for name, value in self.__dict__.items():

@@ -962,6 +962,46 @@ async def _run_interactive_impl(
     if _available_update:
         render_update_notice(console, current=__version__, available=_available_update)
 
+    async def _poll_for_live_updates() -> None:
+        """Keep _available_update current for the rest of this REPL's
+        process lifetime, not just the one check made above before the
+        prompt was ever drawn. Before this, a release published hours into
+        a long-running session stayed completely invisible -- the footer
+        chip and Ctrl+U/click install path only ever reflected whatever was
+        true at startup -- so a long-lived session could sit on a stale
+        build indefinitely even though the exact same machinery already
+        existed to surface and install a newer one.
+
+        Sleeps first, deliberately: `session` (the PromptSession, used for
+        the live invalidate() below) isn't constructed until after this
+        task is created, further down in this same function, so the first
+        check must not run before that assignment has had a chance to
+        execute. Never prints into the console directly -- the terminal is
+        an active prompt_toolkit render surface by the time this could
+        fire, and a bare console.print here would corrupt it the same way
+        _wait_for_background_reinjection's own docstring warns about for a
+        raw KeyboardInterrupt; the footer chip, refreshed via
+        app.invalidate(), is the live notification surface instead. Relies
+        on asyncio.run()'s own automatic shutdown-time task cancellation
+        (see cli.py's _run_async) rather than an explicit cancel at every
+        one of this REPL's many distinct exit paths -- this task holds no
+        resource that needs an orderly close, unlike local_pty.
+        """
+        nonlocal _available_update
+        while True:
+            await asyncio.sleep(1800)  # 30 minutes -- a live release notice, not a poll storm
+            try:
+                found = await asyncio.to_thread(check_update_available)
+            except Exception:
+                continue
+            if found and found != _available_update:
+                _available_update = found
+                app = getattr(session, "app", None)
+                if app is not None and getattr(app, "is_running", False):
+                    app.invalidate()
+
+    asyncio.create_task(_poll_for_live_updates())
+
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     history_path = CONFIG_DIR / "history"
     bindings = KeyBindings()
@@ -1006,9 +1046,15 @@ async def _run_interactive_impl(
         config.approval_policy = next_mode_in_cycle(config.approval_policy)
         event.app.invalidate()
 
-    if _available_update:
-        @bindings.add("c-u")
-        def _install_available_update(event) -> None:
+    @bindings.add("c-u")
+    def _install_available_update(event) -> None:
+        # Registered unconditionally (not gated on _available_update at
+        # REPL-startup time) so a release published mid-session -- found by
+        # _poll_for_live_updates below, long after this binding was set up
+        # -- is still installable by the same shortcut, not just one
+        # discovered before the prompt was ever drawn. A no-op keypress
+        # when nothing is actually pending.
+        if _available_update:
             event.app.exit(result=_UPDATE_ACTION)
 
     def _click_available_update(mouse_event):
@@ -1158,7 +1204,16 @@ async def _run_interactive_impl(
         show_frame=True,
         # Mouse mode is enabled only while there is an actionable update
         # chip. This keeps normal terminal selection behavior unchanged for
-        # the overwhelmingly common up-to-date case.
+        # the overwhelmingly common up-to-date case. Fixed at construction
+        # time, unlike update_version/update_handler just above (both
+        # re-evaluated on every toolbar render): a release _poll_for_live_
+        # updates discovers mid-session, after this PromptSession already
+        # exists, still lights up the chip text and stays installable via
+        # Ctrl+U, but is not clickable in that one session -- toggling
+        # terminal mouse-tracking mode on an already-running prompt is not
+        # something prompt_toolkit exposes, and unconditionally enabling it
+        # from the start would cost every ordinary, already-up-to-date
+        # session its normal mouse text selection for no benefit.
         mouse_support=bool(_available_update),
     )
     force_bottom_toolbar_visible(session)

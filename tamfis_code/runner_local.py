@@ -70,11 +70,13 @@ from .orchestrator import (
     ToolEnvelope,
     build_reasoning_plan_prompt,
     describe_batch,
+    is_formal_planning_objective,
     parse_reasoning_plan,
+    reasoning_plan_system_prompt,
     should_plan,
 )
 from .orchestrator.validator import validate_completion, verified_no_change_completion
-from .orchestrator.planner import create_plan
+from .orchestrator.planner import create_plan, extract_phase_outline, merge_phase_plans, MAX_PLAN_PHASES
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import normalize_stream_chunk, system_messages_first
@@ -124,6 +126,13 @@ MAX_AGENT_ROUNDS = 40
 # extension (that one is scoped to time-only exhaustion) since this guards
 # a different, coarser dimension (rounds, not raw tool calls) in the plain
 # loop below, not the orchestrator's internal budget.
+#
+# The real, live ceiling is RuntimeBudgets.max_round_extensions
+# (runtime/budgets.py), read via orchestrator.run.runtime.budgets below --
+# AgentOrchestrator.replace_plan's _scale_budgets_for_plan_size widens it
+# for a plan sized across more than one round window's worth of steps.
+# This module constant now only matters as a fallback default for the
+# (never expected in practice) case where orchestrator.run is None.
 MAX_AGENT_ROUND_EXTENSIONS = 2
 
 # Match reasoning depth to task complexity by default: routine work remains
@@ -4434,6 +4443,8 @@ async def _attempt_reasoning_plan(
     scope_roots: Optional[list[Path]] = None,
     manager: Optional[ProviderManager] = None,
     provider: Optional[ProviderType] = None,
+    phase_scope: Optional[dict[str, Any]] = None,
+    capture_raw: Optional[dict[str, str]] = None,
 ) -> Optional[Any]:
     """Ask the resolved provider for a plan grounded in the real objective
     and real workspace facts (and, for a revision, real evidence gathered
@@ -4466,6 +4477,7 @@ async def _attempt_reasoning_plan(
         reconnaissance_summary=reconnaissance_summary,
         evidence_summary=evidence_summary,
         scope_roots=scope_roots,
+        phase_scope=phase_scope,
     )
     attempt_client, attempt_model = client, model
     tried_providers: set[ProviderType] = set()
@@ -4525,6 +4537,8 @@ async def _attempt_reasoning_plan(
             },
         })
         return None
+    if capture_raw is not None:
+        capture_raw["content"] = content
     rejection_log: list[str] = []
     plan = parse_reasoning_plan(
         content,
@@ -4556,6 +4570,198 @@ async def _attempt_reasoning_plan(
         })
         return None
     return plan
+
+
+def _reconnaissance_suggests_large_scope(planning_reconnaissance: Optional[str]) -> bool:
+    """Deterministic corroboration for a model's self-reported
+    multi_phase=true (planner.extract_phase_outline) -- an eager model
+    declaring a trivial `/plan` call "multi-phase" is not trusted on its
+    own. Re-reads the SAME deterministic reconnaissance string already
+    built for this turn (_build_planning_reconnaissance) for actual size
+    evidence: more than one real root, or a large objective-matching path
+    count. No new I/O.
+    """
+    if not planning_reconnaissance:
+        return False
+    root_count = sum(
+        1 for line in planning_reconnaissance.splitlines() if line.startswith("ROOT: ")
+    )
+    if root_count > 1:
+        return True
+    matched_path_count = 0
+    for line in planning_reconnaissance.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("objective_matching_paths:"):
+            continue
+        value = stripped.split(":", 1)[1].strip()
+        if value.lower().startswith("none found"):
+            continue
+        matched_path_count += len([item for item in value.split(",") if item.strip()])
+    return matched_path_count > 15
+
+
+async def _attempt_phase_plans(
+    client, *, model: str, objective: str, task_profile: Any, session_id: int,
+    renderer: StreamRenderer, reconnaissance_summary: str,
+    phase_outline: list[dict[str, str]],
+    reasoning_effort: Optional[str] = None,
+    scope_roots: Optional[list[Path]] = None,
+    manager: Optional[ProviderManager] = None,
+    provider: Optional[ProviderType] = None,
+) -> Optional[Any]:
+    """Draft one ExecutionPlan per phase (already bounded to MAX_PLAN_PHASES
+    by extract_phase_outline) via the existing, unmodified
+    _attempt_reasoning_plan -- one call per phase, each still capped at
+    MAX_REASONING_PLAN_STEPS, the same per-call reliability property a
+    single giant draft call would lose. Later phases reuse the "REVISION:
+    ... do not repeat completed work" evidence_summary plumbing
+    build_reasoning_plan_prompt already has, fed with earlier phases'
+    accepted steps, so phase 2 doesn't re-propose phase 1's work.
+
+    A phase whose own draft comes back empty/None is skipped -- merge_
+    phase_plans tolerates fewer real phases than outlined. Returns None
+    only when every phase failed, so the caller falls back to the
+    already-known-good single-shot draft.
+    """
+    phase_plans: list[tuple[str, Any]] = []
+    accepted_summaries: list[str] = []
+    for phase in phase_outline:
+        other_phases = [p["name"] for p in phase_outline if p is not phase]
+        phase_scope = {
+            "name": phase["name"], "description": phase["description"], "other_phases": other_phases,
+        }
+        plan = await _attempt_reasoning_plan(
+            client, model=model, objective=objective, task_profile=task_profile,
+            session_id=session_id, renderer=renderer,
+            reconnaissance_summary=reconnaissance_summary,
+            evidence_summary="\n".join(accepted_summaries) if accepted_summaries else None,
+            reasoning_effort=reasoning_effort, scope_roots=scope_roots,
+            manager=manager, provider=provider, phase_scope=phase_scope,
+        )
+        if plan is None or not plan.steps:
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": f"Phase '{phase['name']}' produced no usable steps; skipping."},
+            })
+            continue
+        phase_plans.append((phase["name"], plan))
+        accepted_summaries.append(
+            f"Phase '{phase['name']}' already planned: " + "; ".join(s.name for s in plan.steps)
+        )
+    if not phase_plans:
+        return None
+    return merge_phase_plans(objective, phase_plans)
+
+
+async def _verify_and_critique_plan(
+    plan, *, client, model: str, objective: str,
+    renderer: StreamRenderer, reconnaissance_summary: Optional[str],
+    workspace_summary: dict[str, Any], scope_roots: Optional[list[Path]],
+    reasoning_effort: Optional[str] = None,
+) -> Any:
+    """One bounded critique pass over an already-drafted plan (single-shot
+    or phase-merged): re-read up to 5 distinct `path:`-cited files the plan
+    already treats as evidence (validate_plan_step only ever accepts a
+    citation that passed evidence.path_is_authorised at draft time, so this
+    is plain Python file I/O inside an already-trusted boundary -- no new
+    security surface, no tool call, nothing to gate for read-only mode),
+    show the model its own draft next to what those files actually
+    contain, and let it revise only where contradicted -- the "read a file
+    to verify one detail, then tighten the plan" step a single-shot draft
+    never gets.
+
+    Fails open: any read error, provider error, or unparseable response
+    returns `plan` completely unchanged, matching the fail-open posture the
+    rest of the planning pipeline already relies on (a failed extra pass
+    must never leave the turn with no plan at all).
+    """
+    cited_paths: list[str] = []
+    seen: set[str] = set()
+    for step in plan.steps:
+        if len(cited_paths) >= 5:
+            break
+        for item in step.evidence:
+            if not item.startswith("path:"):
+                continue
+            candidate = item[len("path:"):]
+            if candidate in seen:
+                continue
+            seen.add(candidate)
+            cited_paths.append(candidate)
+            if len(cited_paths) >= 5:
+                break
+    if not cited_paths:
+        return plan
+
+    resolved_roots = [root.resolve() for root in (scope_roots or [])]
+
+    def _authorised(raw_path: str) -> Optional[Path]:
+        try:
+            resolved = Path(raw_path).resolve()
+        except OSError:
+            return None
+        if resolved_roots and not any(
+            resolved == root or root in resolved.parents for root in resolved_roots
+        ):
+            return None
+        return resolved
+
+    digest_sections: list[str] = []
+    for raw_path in cited_paths:
+        resolved = _authorised(raw_path)
+        if resolved is None or not resolved.is_file():
+            continue
+        try:
+            text = resolved.read_text(encoding="utf-8", errors="replace")[:4000]
+        except OSError:
+            continue
+        digest_sections.append(f"--- {raw_path} ---\n{text}")
+    if not digest_sections:
+        return plan
+
+    draft_summary = "\n".join(f"{s.index}. {s.name}" for s in plan.steps)
+    user_content = (
+        "DRAFT PLAN:\n" + draft_summary + "\n\n"
+        "ACTUAL CURRENT CONTENT of files this plan cites as evidence "
+        "(re-read just now, after the draft was written):\n\n"
+        + "\n\n".join(digest_sections) + "\n\n"
+        "Revise the plan only where this actual file content contradicts an assumption in a "
+        "step -- keep every step that is still accurate exactly as-is. If nothing is "
+        "contradicted, return the plan completely unchanged."
+    )
+    messages = [
+        {"role": "system", "content": reasoning_plan_system_prompt()},
+        {"role": "user", "content": user_content},
+    ]
+    try:
+        content, _tool_calls, finish_reason = await _stream_one_completion(
+            client, model=model, messages=messages, tools=[],
+            renderer=renderer, reasoning_effort=reasoning_effort, emit=False,
+        )
+    except Exception:
+        return plan
+    if finish_reason in {"degenerate_repetition", "conversation_echo", "repeated_content", "corrupted_output"}:
+        return plan
+    revised = parse_reasoning_plan(
+        content, objective=objective, reconnaissance_summary=reconnaissance_summary,
+        workspace_summary=workspace_summary, scope_roots=scope_roots,
+    )
+    if revised is None or not revised.steps:
+        return plan
+    # The critique pass never knows about phase grouping (its prompt/schema
+    # is the plain single-phase one) -- carry the original plan's phase
+    # tags/names forward onto the revised step list by position so a
+    # phase-merged plan stays phase-grouped after critique. A step count
+    # mismatch (model added/dropped steps) means positional carry-forward
+    # isn't safe, so fall back to the pre-critique plan entirely rather
+    # than risk mislabeling phases.
+    if plan.phase_names:
+        if len(revised.steps) != len(plan.steps):
+            return plan
+        for revised_step, original_step in zip(revised.steps, plan.steps):
+            revised_step.phase = original_step.phase
+        revised.phase_names = list(plan.phase_names)
+    return revised
 
 
 def _perform_context_rollover(
@@ -4860,6 +5066,7 @@ async def _run_local_agent_turn_impl(
             max_runtime_seconds=int(_turn_budget_config.turn_runtime_seconds),
             max_runtime_extensions=_turn_budget_config.max_runtime_extensions,
             max_repair_extensions=_turn_budget_config.max_repair_extensions,
+            max_round_extensions=_turn_budget_config.max_round_extensions,
         ),
     )
     # Snapshot BEFORE begin(): begin() itself immediately persists a fresh
@@ -5295,16 +5502,60 @@ async def _run_local_agent_turn_impl(
             workspace_summary=repository_context,
             scope_roots=scope_roots,
         )
+        _plan_reasoning_effort = _reasoning_effort(resolved_provider, resolved_model, task_profile)
+        _draft_raw: dict[str, str] = {}
         reasoning_plan = await _attempt_reasoning_plan(
             client, model=resolved_model, objective=objective, task_profile=task_profile,
             session_id=session_id, renderer=renderer,
             reconnaissance_summary=planning_reconnaissance,
             evidence_summary=resumed_evidence_summary,
-            reasoning_effort=_reasoning_effort(resolved_provider, resolved_model, task_profile),
+            reasoning_effort=_plan_reasoning_effort,
             scope_roots=scope_roots,
             manager=manager, provider=resolved_provider,
+            capture_raw=_draft_raw,
         )
         selected_plan = reasoning_plan or grounded_fallback
+
+        # Bounded multi-pass drafting for a genuinely large objective only
+        # (is_formal_planning_objective is the narrower gate -- excludes
+        # should_plan's cheap ">=2 file references" trigger, so the most
+        # common /plan call never pays for this). Phase-drafting only fires
+        # when the model's own self-reported multi_phase=true (captured
+        # from the same completion _attempt_reasoning_plan already made,
+        # via capture_raw) is corroborated by real deterministic
+        # reconnaissance evidence -- an eager model declaring a trivial
+        # request "multi-phase" on its own is not trusted.
+        if reasoning_plan is not None and is_formal_planning_objective(task_profile, objective):
+            phase_outline = extract_phase_outline(_draft_raw.get("content", ""))
+            if phase_outline and _reconnaissance_suggests_large_scope(planning_reconnaissance):
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Objective spans {len(phase_outline)} phases -- drafting each "
+                            f"separately: " + ", ".join(p["name"] for p in phase_outline)
+                        ),
+                    },
+                })
+                phased_plan = await _attempt_phase_plans(
+                    client, model=resolved_model, objective=objective, task_profile=task_profile,
+                    session_id=session_id, renderer=renderer,
+                    reconnaissance_summary=planning_reconnaissance or "",
+                    phase_outline=phase_outline,
+                    reasoning_effort=_plan_reasoning_effort,
+                    scope_roots=scope_roots, manager=manager, provider=resolved_provider,
+                )
+                if phased_plan is not None:
+                    selected_plan = phased_plan
+
+            if selected_plan is not None:
+                selected_plan = await _verify_and_critique_plan(
+                    selected_plan, client=client, model=resolved_model, objective=objective,
+                    renderer=renderer, reconnaissance_summary=planning_reconnaissance,
+                    workspace_summary=repository_context, scope_roots=scope_roots,
+                    reasoning_effort=_plan_reasoning_effort,
+                )
+
         if selected_plan is not None and orchestrator.run is not None:
             orchestrator.replace_plan(selected_plan)
             orchestrator.run.reasoning_plan = reasoning_plan is not None
@@ -5951,13 +6202,17 @@ async def _run_local_agent_turn_impl(
                         continue
                     return outcome
                 continue
-            if _round_extensions_used >= MAX_AGENT_ROUND_EXTENSIONS:
+            _max_round_extensions = (
+                orchestrator.run.runtime.budgets.max_round_extensions
+                if orchestrator.run is not None else MAX_AGENT_ROUND_EXTENSIONS
+            )
+            if _round_extensions_used >= _max_round_extensions:
                 break
             _round_extensions_used += 1
             max_rounds += _round_window_size
             orchestrator.mark_repair(
                 f"Extending the tool-call round budget (extension {_round_extensions_used}/"
-                f"{MAX_AGENT_ROUND_EXTENSIONS}) -- {_round} rounds of real tool work with no "
+                f"{_max_round_extensions}) -- {_round} rounds of real tool work with no "
                 "stall detected, task is larger than one round window rather than stuck"
             )
             renderer.handle_event({
@@ -5966,7 +6221,7 @@ async def _run_local_agent_turn_impl(
                     "content": (
                         f"Round budget reached after {_round} rounds of real, varied tool work "
                         f"(no stall detected) -- granting {_round_window_size} more rounds "
-                        f"(extension {_round_extensions_used}/{MAX_AGENT_ROUND_EXTENSIONS}) instead "
+                        f"(extension {_round_extensions_used}/{_max_round_extensions}) instead "
                         "of ending the task."
                     ),
                 },

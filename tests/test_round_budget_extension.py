@@ -22,6 +22,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from tamfis_code.config import Config
 from tamfis_code.providers import ProviderType
 from tamfis_code.runner_local import _insufficient_novel_evidence, run_local_agent_turn
 
@@ -99,7 +100,7 @@ class RoundBudgetExtensionTests(_StatePatchMixin, unittest.TestCase):
                 path.write_text(f"# file {i}\n")
                 files.append(path)
 
-            # max_rounds=1 with MAX_AGENT_ROUND_EXTENSIONS patched to 1 means
+            # max_rounds=1 with max_round_extensions=1 means
             # a hard ceiling of 2 total rounds -- 6 distinct tool-call rounds
             # (never producing a final answer) must still end in failure,
             # not an infinite/unbounded extension loop.
@@ -108,14 +109,17 @@ class RoundBudgetExtensionTests(_StatePatchMixin, unittest.TestCase):
             manager = _FakeManager(client)
             renderer = _RecordingRenderer()
 
-            with patch("tamfis_code.runner_local.MAX_AGENT_ROUND_EXTENSIONS", 1):
-                outcome = asyncio.run(run_local_agent_turn(
-                    manager, ProviderType.NVIDIA, None,
-                    [{"role": "user", "content": "read every file in this workspace"}],
-                    self._console(), renderer,
-                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
-                    max_rounds=1,
-                ))
+            # Use a config with max_round_extensions=1 instead of patching the constant
+            test_config = Config()
+            test_config.max_round_extensions = 1
+            outcome = asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "read every file in this workspace"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                max_rounds=1,
+                cli_config=test_config,
+            ))
 
             self.assertEqual(outcome.status, "failed")
             self.assertIn("tool-call rounds", outcome.error or "")

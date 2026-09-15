@@ -162,6 +162,20 @@ class Config:
     # recovery, and genuine fix-the-actual-failure repairs alike) may renew
     # instead of failing the task the moment it runs out.
     max_repair_extensions: int = 2
+    # How many times runner_local.py's plain tool-call-round loop may grant
+    # itself a fresh round window before hard-failing the turn. Matches the
+    # previously-hardcoded MAX_AGENT_ROUND_EXTENSIONS constant exactly --
+    # AgentOrchestrator.replace_plan widens the live runtime budget above
+    # this default for a plan sized across more than one round window.
+    max_round_extensions: int = 2
+    # A backgrounded (`--bg`) task that stops with more of its own saved
+    # plan left incomplete (see state.plan_progress) may self-respawn via
+    # the same detached-process mechanism its first launch already used,
+    # continuing with the literal resume prompt "continue", instead of
+    # sitting at a terminal status unattended forever. Bounded so a
+    # genuinely stuck task cannot chain indefinitely without anyone
+    # noticing.
+    max_background_continuations: int = 5
     debug: bool = False
     # Real (LLM-backed) subagent delegation is opt-in: concurrent sessions
     # against the Remote backend have open questions (rate limiting, approval
@@ -215,6 +229,8 @@ class Config:
             "max_tool_calls": self.max_tool_calls,
             "max_runtime_extensions": self.max_runtime_extensions,
             "max_repair_extensions": self.max_repair_extensions,
+            "max_round_extensions": self.max_round_extensions,
+            "max_background_continuations": self.max_background_continuations,
             "debug": self.debug,
             "enable_subagent_delegation": self.enable_subagent_delegation,
             "default_backend": self.default_backend,
@@ -268,6 +284,12 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "max_repair_extensions" in data:
             cfg.max_repair_extensions = int(data["max_repair_extensions"])
             cfg.sources["max_repair_extensions"] = source_name
+        if "max_round_extensions" in data:
+            cfg.max_round_extensions = int(data["max_round_extensions"])
+            cfg.sources["max_round_extensions"] = source_name
+        if "max_background_continuations" in data:
+            cfg.max_background_continuations = int(data["max_background_continuations"])
+            cfg.sources["max_background_continuations"] = source_name
         if "enable_subagent_delegation" in data:
             cfg.enable_subagent_delegation = bool(data["enable_subagent_delegation"])
             cfg.sources["enable_subagent_delegation"] = source_name
@@ -352,6 +374,21 @@ def load_config(project_root: Optional[Path] = None) -> Config:
     if env_repair_extensions:
         cfg.max_repair_extensions = int(env_repair_extensions)
         cfg.sources["max_repair_extensions"] = "env TAMFIS_CODE_MAX_REPAIR_EXTENSIONS"
+
+    env_round_extensions = os.environ.get("TAMFIS_CODE_MAX_ROUND_EXTENSIONS")
+    if env_round_extensions:
+        cfg.max_round_extensions = int(env_round_extensions)
+        cfg.sources["max_round_extensions"] = "env TAMFIS_CODE_MAX_ROUND_EXTENSIONS"
+
+    env_background_continuations = os.environ.get("TAMFIS_CODE_MAX_BACKGROUND_CONTINUATIONS")
+    if env_background_continuations:
+        cfg.max_background_continuations = int(env_background_continuations)
+        cfg.sources["max_background_continuations"] = "env TAMFIS_CODE_MAX_BACKGROUND_CONTINUATIONS"
+
+    env_debug = os.environ.get("TAMFIS_CODE_DEBUG")
+    if env_debug is not None:
+        cfg.debug = env_debug.lower() in {"1", "true", "yes"}
+        cfg.sources["debug"] = "env TAMFIS_CODE_DEBUG"
 
     env_roots = os.environ.get("TAMFIS_CODE_WORKSPACE_ROOTS")
     if env_roots:

@@ -27,6 +27,12 @@ MAX_REASONING_PLAN_STEPS = 8
 MAX_ASSUMPTIONS = 6
 MAX_RISKS = 8
 MAX_EVIDENCE_ITEMS = 12
+# A genuinely large objective (spanning many components/roots) drafts as
+# several per-phase plans instead of forcing MAX_REASONING_PLAN_STEPS steps
+# to cover work that doesn't fit in one reliable LLM draft. Bounded, not
+# unbounded, for the same reliability reason MAX_REASONING_PLAN_STEPS is
+# bounded: each phase is still one call, one 8-step cap.
+MAX_PLAN_PHASES = 6
 
 _CODE_FENCE_RE = re.compile(r"^```(?:json)?\s*|\s*```\s*$", re.IGNORECASE)
 _ABSOLUTE_PATH_RE = re.compile(
@@ -80,6 +86,10 @@ class PlanStep:
     name: str
     status: str = "pending"
     evidence: list[str] = field(default_factory=list)
+    # 0 = ungrouped (today's exact meaning for every existing/legacy plan).
+    # >0 = 1-based index into ExecutionPlan.phase_names, set only by
+    # merge_phase_plans for a genuinely large, multi-phase objective.
+    phase: int = 0
 
 
 @dataclass
@@ -90,6 +100,10 @@ class ExecutionPlan:
     steps: list[PlanStep]
     validation_criteria: list[str]
     risks: list[str]
+    # Empty = today's exact flat-plan shape. Non-empty only when
+    # merge_phase_plans built this plan from several per-phase drafts;
+    # phase_names[i-1] names PlanStep.phase == i.
+    phase_names: list[str] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
@@ -132,8 +146,85 @@ class ExecutionPlan:
         self._reindex()
         return removed
 
-    def next_pending(self) -> PlanStep | None:
-        return next((step for step in self.steps if step.status == "pending"), None)
+    def next_pending(self, *, phase: int | None = None) -> PlanStep | None:
+        """First step still pending, in plan order.
+
+        `phase=None` (default) scans the whole plan, in step order --
+        because merge_phase_plans lays out steps in phase order, this walks
+        phase 1's steps to completion before ever reaching phase 2's,
+        exactly the linear turn-by-turn advancement _advance_plan_step
+        already implements by hand. `phase=N` narrows to just that phase,
+        for a caller that already knows which phase it's driving.
+        """
+        return next(
+            (
+                step for step in self.steps
+                if step.status == "pending" and (phase is None or step.phase == phase)
+            ),
+            None,
+        )
+
+    def remaining_step_count(self, *, phase: int | None = None) -> int:
+        return sum(
+            1 for step in self.steps
+            if step.status != "completed" and (phase is None or step.phase == phase)
+        )
+
+
+def plan_phase_count(plan: ExecutionPlan) -> int:
+    """1 for an ordinary flat plan (today's exact shape); len(phase_names)
+    for a plan merge_phase_plans built from several per-phase drafts."""
+    return len(plan.phase_names) or 1
+
+
+def merge_phase_plans(objective: str, phase_plans: list[tuple[str, ExecutionPlan]]) -> ExecutionPlan:
+    """Combine one ExecutionPlan per phase (each independently drafted and
+    evidence-validated by _attempt_phase_plans, one call per phase) into a
+    single ExecutionPlan, the same shape every other consumer of
+    ExecutionPlan.steps already expects -- steps concatenated in phase
+    order and tagged with PlanStep.phase, not a nested structure, so
+    _advance_plan_step/edit_plan_step/the /plans renderer/state.py's
+    update_plan_steps all keep working unmodified across phases.
+
+    `phase_plans` is `[(phase_name, plan), ...]` in the order phases should
+    run. A phase whose drafting pass produced nothing usable is dropped
+    silently (same "fewer real phases than requested" tolerance
+    _generate_video_script_content's precedent uses) -- raises only if
+    every phase came back empty, since then there is nothing to merge.
+    """
+    steps: list[PlanStep] = []
+    phase_names: list[str] = []
+    assumptions: list[str] = []
+    risks: list[str] = []
+    validation_criteria: list[str] = []
+    components: list[str] = []
+
+    for phase_name, plan in phase_plans:
+        if not plan.steps:
+            continue
+        phase_index = len(phase_names) + 1
+        phase_names.append(phase_name)
+        for step in plan.steps:
+            steps.append(PlanStep(0, step.name, status=step.status, evidence=list(step.evidence), phase=phase_index))
+        assumptions.extend(plan.assumptions)
+        risks.extend(plan.risks)
+        validation_criteria.extend(plan.validation_criteria)
+        components.extend(plan.components)
+
+    if not steps:
+        raise ValueError("merge_phase_plans: no phase produced any usable steps")
+
+    merged = ExecutionPlan(
+        objective=objective,
+        assumptions=_dedupe_strings(assumptions),
+        components=_dedupe_strings(components),
+        steps=steps,
+        validation_criteria=_dedupe_strings(validation_criteria),
+        risks=_dedupe_strings(risks),
+        phase_names=phase_names,
+    )
+    merged._reindex()
+    return merged
 
 
 @dataclass
@@ -301,6 +392,24 @@ def should_plan(profile: TaskProfile, objective: str | None = None) -> bool:
     if _FORMAL_PLAN_RE.search(text) or len(text) >= 320:
         return True
     return len(set(_FILE_REFERENCE_RE.findall(text))) >= 2
+
+
+def is_formal_planning_objective(profile: TaskProfile, objective: str) -> bool:
+    """Narrower than should_plan(): true only for should_plan's PLAN/AUDIT/
+    MIXED and explicit-scale (_FORMAL_PLAN_RE / >=320 chars) branches --
+    deliberately excludes should_plan's narrowest trigger (>=2 distinct
+    file references for an EDIT/DEBUG/TEST objective), which is the
+    cheapest and most common way `/plan` fires today and must keep costing
+    exactly one LLM call. Gates the multi-pass drafting extension (outline,
+    per-phase calls, verify/critique pass) in runner_local.py so a plan
+    that already fits in one call never pays for passes it doesn't need.
+    """
+    text = objective.strip()
+    if profile.task_type in {TaskType.PLAN, TaskType.AUDIT, TaskType.MIXED}:
+        return True
+    if profile.task_type not in {TaskType.EDIT, TaskType.DEBUG, TaskType.TEST}:
+        return False
+    return bool(_FORMAL_PLAN_RE.search(text)) or len(text) >= 320
 
 
 def create_plan(
@@ -478,6 +587,39 @@ For a verified command, put the exact command in "command" and cite it as
 Do not return markdown fences or prose outside the JSON object.
 """.strip()
 
+# Appended only to the top-level (non-phase-scoped) draft call -- a
+# per-phase call already knows its own phase and must not recurse into
+# declaring further sub-phases of itself.
+_REASONING_PLAN_MULTI_PHASE_ADDENDUM = f"""
+
+11. If, and only if, this objective genuinely spans multiple independent
+    components/roots/subsystems too large for {MAX_REASONING_PLAN_STEPS} steps to
+    cover honestly, also set "multi_phase": true and "phase_outline" to an
+    ordered list of {{"name": "<short phase name>", "description": "<1-2 sentence
+    scope of this phase>"}} covering the whole objective, at most {MAX_PLAN_PHASES}
+    phases. Leave "multi_phase" false (or omit it) for anything that fits in one
+    normal plan -- this is the uncommon case, not the default.
+
+When "multi_phase" is true, "steps" may be empty or a short top-level summary --
+the real per-phase steps are drafted separately, one call per phase.
+""".strip()
+
+
+def _reasoning_plan_system_prompt(*, allow_multi_phase: bool) -> str:
+    if not allow_multi_phase:
+        return _REASONING_PLAN_SYSTEM
+    return _REASONING_PLAN_SYSTEM + "\n\n" + _REASONING_PLAN_MULTI_PHASE_ADDENDUM
+
+
+def reasoning_plan_system_prompt() -> str:
+    """Public accessor for the base (non-multi-phase) reasoning-plan system
+    prompt, for a caller building its own one-off tool-free completion in
+    the same style (e.g. runner_local.py's _verify_and_critique_plan) --
+    avoids either duplicating this prompt or reaching across the module
+    boundary for the private constant.
+    """
+    return _REASONING_PLAN_SYSTEM
+
 
 def build_reasoning_plan_prompt(
     objective: str,
@@ -487,8 +629,18 @@ def build_reasoning_plan_prompt(
     reconnaissance_summary: Optional[str] = None,
     evidence_summary: Optional[str] = None,
     scope_roots: Optional[Sequence[str | Path]] = None,
+    phase_scope: Optional[dict[str, Any]] = None,
 ) -> list[dict[str, str]]:
-    """Build a tool-free planning request from verified repository facts."""
+    """Build a tool-free planning request from verified repository facts.
+
+    `phase_scope`, when supplied, narrows this call to drafting just one
+    phase of a larger, already-outlined objective: `{"name": str,
+    "description": str, "other_phases": [str, ...]}`. The system prompt
+    drops the multi-phase self-reporting addendum in this case (a per-phase
+    call must not itself declare further phases) and the payload gains a
+    "phase_scope" key instructing the model to draft only this phase's
+    steps, using the other phases' names purely as non-duplication context.
+    """
     evidence = build_planner_evidence(
         reconnaissance_summary=reconnaissance_summary,
         workspace_summary=workspace_summary,
@@ -530,10 +682,47 @@ def build_reasoning_plan_prompt(
             "repeat completed work."
         )
 
+    if phase_scope:
+        payload["phase_scope"] = phase_scope
+        payload["phase_instruction"] = (
+            f"This objective was already broken into phases. Draft ONLY the "
+            f"{MAX_REASONING_PLAN_STEPS}-step-or-fewer plan for phase "
+            f"'{phase_scope.get('name', '')}' ({phase_scope.get('description', '')}). "
+            f"Do not draft steps for the other phases listed in phase_scope."
+            f"other_phases -- they are shown only so you don't duplicate their work."
+        )
+
     return [
-        {"role": "system", "content": _REASONING_PLAN_SYSTEM},
+        {"role": "system", "content": _reasoning_plan_system_prompt(allow_multi_phase=phase_scope is None)},
         {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
     ]
+
+
+def extract_phase_outline(raw_content: str) -> Optional[list[dict[str, str]]]:
+    """Pull just the top-level draft's self-reported phase_outline out of
+    the same raw completion parse_reasoning_plan already consumes, without
+    duplicating its step-validation logic. Returns None when the model
+    didn't set multi_phase=true or supplied no usable phase names -- the
+    caller (_is_formal_planning_objective's corroboration check in
+    runner_local.py) treats that as "not actually multi-phase" regardless
+    of what multi_phase itself said, so a bare, empty, or malformed
+    phase_outline is equivalent to not having declared one at all.
+    """
+    data = _load_json_object(raw_content)
+    if not isinstance(data, dict) or not data.get("multi_phase"):
+        return None
+    raw_outline = data.get("phase_outline")
+    if not isinstance(raw_outline, list):
+        return None
+    outline: list[dict[str, str]] = []
+    for item in raw_outline[:MAX_PLAN_PHASES]:
+        if not isinstance(item, dict):
+            continue
+        name = " ".join(str(item.get("name") or "").split())
+        if not name:
+            continue
+        outline.append({"name": name, "description": " ".join(str(item.get("description") or "").split())})
+    return outline or None
 
 
 def parse_reasoning_plan(
