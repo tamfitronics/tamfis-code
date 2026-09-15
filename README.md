@@ -421,6 +421,21 @@ ready, or `/plan` again to revise the objective first). This is the one
 explicit approval checkpoint between "here's the plan" and anything
 actually touching the workspace — Claude Code's Plan Mode equivalent.
 
+## Images
+
+One-shot `ask`/`chat`/`audit`/`agent`/`exec` accept `--attach <path>`
+(repeatable, up to 10 files, 10 MB each) for an image or document. In the
+interactive REPL, `/paste-image` reads an image straight off the system
+clipboard and attaches it to your very next message — no file path
+needed. It shells out to the platform's own clipboard tool (`pbpaste` on
+macOS, `wl-paste`/`xclip` on Linux depending on the compositor,
+PowerShell on Windows), the same approach every desktop AI coding tool
+uses; there is no portable escape-sequence trick a bare terminal program
+can use to read image bytes back from a plain headless SSH session with
+no attached GUI/X11/Wayland session, so `/paste-image` reports a clear
+reason instead of an attachment there rather than silently doing
+nothing.
+
 ## Safety model
 
 Every mutating tool call (`write_file`, `edit_file`, `execute_command`) is

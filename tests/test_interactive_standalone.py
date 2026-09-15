@@ -857,6 +857,54 @@ class StandaloneAiDispatchTests(_StatePatchMixin, unittest.TestCase):
         self.assertIn("standalone, local session", output)  # REPL kept running after the error
 
 
+class PasteImageTests(_StatePatchMixin, unittest.TestCase):
+    """/paste-image reads an image off the OS clipboard (clipboard.py's
+    read_clipboard_image, platform-dispatched to pbpaste/wl-paste/xclip/
+    PowerShell) and attaches it to the NEXT submitted objective only --
+    there was no image-attachment path in the interactive REPL at all
+    before this (run_local_agent_turn's own attachment_paths parameter
+    was only ever threaded through from the one-shot CLI's --attach
+    flag)."""
+
+    _FAKE_PNG = b"\x89PNG\r\n\x1a\nnot-a-real-png-but-real-bytes"
+
+    def test_a_pasted_image_is_attached_to_the_next_turn_only(self):
+        fake_outcome = TaskOutcome(status="completed", summary="Described the image.")
+        with patch("tamfis_code.interactive.read_clipboard_image", return_value=(self._FAKE_PNG, "")), \
+             patch("tamfis_code.interactive.run_local_agent_turn", new=AsyncMock(return_value=fake_outcome)) as mock_turn:
+            output = _run(["/paste-image", "what's in this image?", "and this follow-up?", EOFError()])
+
+        self.assertIn("Image attached", output)
+        self.assertEqual(mock_turn.await_count, 2)
+
+        first_attachments = mock_turn.call_args_list[0].kwargs["attachment_paths"]
+        self.assertEqual(len(first_attachments), 1)
+        self.assertEqual(Path(first_attachments[0]).read_bytes(), self._FAKE_PNG)
+
+        second_attachments = mock_turn.call_args_list[1].kwargs["attachment_paths"]
+        self.assertEqual(second_attachments, ())
+
+    def test_no_image_on_the_clipboard_reports_the_reason_and_attaches_nothing(self):
+        fake_outcome = TaskOutcome(status="completed", summary="ok")
+        with patch("tamfis_code.interactive.read_clipboard_image", return_value=(None, "no image on the clipboard")), \
+             patch("tamfis_code.interactive.run_local_agent_turn", new=AsyncMock(return_value=fake_outcome)) as mock_turn:
+            output = _run(["/paste-image", "hello", EOFError()])
+
+        self.assertIn("no image on the clipboard", output)
+        self.assertEqual(mock_turn.call_args.kwargs["attachment_paths"], ())
+
+    def test_an_oversized_clipboard_image_is_rejected_before_attaching(self):
+        from tamfis_code.clipboard import MAX_CLIPBOARD_IMAGE_BYTES
+        oversized = b"x" * (MAX_CLIPBOARD_IMAGE_BYTES + 1)
+        fake_outcome = TaskOutcome(status="completed", summary="ok")
+        with patch("tamfis_code.interactive.read_clipboard_image", return_value=(oversized, "")), \
+             patch("tamfis_code.interactive.run_local_agent_turn", new=AsyncMock(return_value=fake_outcome)) as mock_turn:
+            output = _run(["/paste-image", "hello", EOFError()])
+
+        self.assertIn("over the", output)
+        self.assertEqual(mock_turn.call_args.kwargs["attachment_paths"], ())
+
+
 class UnsupportedProviderTests(_StatePatchMixin, unittest.TestCase):
     def test_invalid_provider_reported_cleanly_not_a_traceback(self):
         buf = io.StringIO()

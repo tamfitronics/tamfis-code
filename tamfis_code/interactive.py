@@ -11,6 +11,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 import inspect
 import re
+import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -33,7 +34,7 @@ from rich.table import Table
 from . import __version__
 from . import state as local_state
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
-from .clipboard import copy_to_clipboard
+from .clipboard import MAX_CLIPBOARD_IMAGE_BYTES, copy_to_clipboard, read_clipboard_image
 from .config import (
     APPROVAL_MODES,
     CONFIG_DIR,
@@ -288,6 +289,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/cwd", "show the current workspace root"),
     ("/cd", "change the working directory for this session"),
     ("/copy", "copy the last assistant response to the clipboard"),
+    ("/paste-image", "attach an image from the system clipboard to your next message"),
     ("/doctor", "run connectivity/auth/self-health checks (add --heal to auto-repair fixable findings)"),
     ("/resume", "switch to another session"),
     ("/fork", "branch this conversation into a new independent session"),
@@ -1131,6 +1133,14 @@ async def _run_interactive_impl(
     # objective happens to echo one back.
     pending_pastes: dict[str, str] = {}
     paste_counter = 0
+    # Images queued via /paste-image, attached to the NEXT submitted
+    # objective. Deliberately NOT reset alongside pending_pastes at the
+    # top of the loop below (that runs right before every prompt,
+    # including the one immediately after /paste-image itself queues an
+    # image) -- it's cleared once, explicitly, right after being consumed
+    # by the turn it was attached to, so it survives exactly one prompt
+    # cycle and never leaks onto a second, unrelated turn.
+    pending_attachments: list[str] = []
 
     @bindings.add(Keys.BracketedPaste)
     def _collapse_large_paste(event) -> None:
@@ -1631,6 +1641,27 @@ async def _run_interactive_impl(
                 console.print(f"[dim]Copied {len(last_response_text):,} characters to clipboard.[/dim]")
             else:
                 console.print("[dim]Can't copy: output isn't attached to a terminal.[/dim]")
+            continue
+        if _ci_equals(text, "/paste-image"):
+            data, reason = await asyncio.to_thread(read_clipboard_image)
+            if data is None:
+                print_error(console, f"Couldn't read an image from the clipboard: {reason}")
+            elif len(data) > MAX_CLIPBOARD_IMAGE_BYTES:
+                print_error(
+                    console,
+                    f"Clipboard image is {len(data) / 1_048_576:.1f} MB, over the "
+                    f"{MAX_CLIPBOARD_IMAGE_BYTES // 1_048_576} MB limit for an attachment.",
+                )
+            else:
+                attachments_dir = CONFIG_DIR / "clipboard-attachments"
+                attachments_dir.mkdir(parents=True, exist_ok=True)
+                image_path = attachments_dir / f"paste-{uuid.uuid4().hex}.png"
+                image_path.write_bytes(data)
+                pending_attachments.append(str(image_path))
+                console.print(
+                    f"[green]Image attached[/green] ({len(data) / 1024:.0f} KB) -- "
+                    "included with your next message."
+                )
             continue
         if _ci_equals(text, "/status"):
             state = local_state.get_session_state(workspace.session_id)
@@ -2713,6 +2744,11 @@ async def _run_interactive_impl(
                     "payload": {"content": submitted_text},
                 })
                 if standalone:
+                    # Snapshot-and-clear: any image(s) queued via
+                    # /paste-image attach to exactly this turn, never a
+                    # later one submitted after this outcome resolves.
+                    turn_attachments = tuple(pending_attachments)
+                    pending_attachments.clear()
                     outcome = await _run_cancellable_local_turn(
                         session_id=workspace.session_id,
                         renderer=renderer,
@@ -2725,7 +2761,7 @@ async def _run_interactive_impl(
                             workspace_root=workspace.workspace_root, session_id=workspace.session_id,
                             approval_policy=config.approval_policy, interactive=True,
                             read_only=intent.mode in {"chat", "audit", "plan"}, cli_config=config,
-                            allow_swarm_tool=True,
+                            allow_swarm_tool=True, attachment_paths=turn_attachments,
                         ),
                     )
                     renderer.finish()
