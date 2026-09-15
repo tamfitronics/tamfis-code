@@ -263,7 +263,7 @@ plugin configs on this box also use `PostToolUseFailure` and
 | Area | Claude Code | tamfis-code | Verdict |
 |---|---|---|---|
 | Subagents | `.claude/agents/*.md`, `--agent`/`--agents` CLI flags | `agent_definitions.py`'s `load_agent_definitions` — user + project markdown files, read fresh (no restart needed), consumed by `swarm.py` delegation | COVERED — same convention, tamfis-code's fresher-reload behavior is again arguably ahead |
-| Skills (auto-discovered SKILL.md packages, triggered by description match) | `skills/<name>/SKILL.md` auto-discovery, per `plugin-structure/SKILL.md` | `plugins.py` declares a `skill_roots` field on plugin manifests, but confirmed by grep: nothing in `tamfis_code/*.py` actually reads a SKILL.md-like file from those roots or exposes anything to the model from them — `skill_roots` is only ever displayed in a status listing (`cli.py`'s plugin status output), never consumed | GAP (feature) — the plumbing for a skills concept was started (a config field exists) but the actual auto-discovery/invocation mechanism was never built |
+| Skills (auto-discovered SKILL.md packages, triggered by description match) | `skills/<name>/SKILL.md` auto-discovery, per `plugin-structure/SKILL.md` | `openhands/skills.py`'s `workspace_skill_registry` auto-discovers `SKILL.md`/`skill.toml`/`skill.json`/Kimi-flat-Markdown skills from Kimi/Claude/Codex/shared/project roots AND `plugins.py`'s `plugin_skill_roots()` (a plugin manifest's own `skill_roots` field) | COVERED (reclassified 2026-09-15) — this row's own prior verdict was stale: `plugin_skill_roots()` was already being consumed by `workspace_skill_registry` (`*plugin_skill_roots()` in its root list) by the time this was re-checked, just with no test proving a plugin-contributed SKILL.md is actually discovered end-to-end. New `tests/test_plugins.py::test_plugin_skill_roots_are_actually_discovered_by_the_skill_registry` closes that: a real SKILL.md under a plugin-declared root, loaded through the real registry, appears in a real `skill_prompt()` output |
 | Custom slash commands | `commands/*.md`, project + user, `$ARGUMENTS` substitution | `custom_commands.py` — explicitly modeled on this exact convention (its own docstring says "Claude Code/Codex-style"), same discovery paths, same `$ARGUMENTS` substitution, project overrides user by name | COVERED |
 | MCP integration | full external server config (stdio/HTTP), per `mcp-integration/SKILL.md` | `mcp_client.py`'s `StandaloneMCPBridge` — stdio and HTTP server support, config-file-based | COVERED for the core config/dispatch mechanism (OAuth/elicitation gaps already covered in the Codex section above, which apply equally here since Claude Code's MCP integration also documents those capabilities) |
 | Settings/permission model | `.claude/settings.json` (hooks, permissions.allow/deny, env, model), plugin `plugin-settings/SKILL.md` | `config.py` (`.tamfis/config.toml` layering) + `permissions.py` (`decide_permission` allow/ask/deny rules) | COVERED at a comparable depth for the core allow/ask/deny + config-layering mechanism |
@@ -321,6 +321,19 @@ unused `skill_roots` field) is likewise flagged but not built here.
   See `test_hooks.py`'s `TestPromptBasedHooks`/`TestAsyncRewake` and
   `test_claude_parity_hooks.py`'s `PromptBasedHookTests`/`AsyncRewakeTests`.
 
+- 2026-09-15: General gap sweep. Skills auto-discovery reclassified
+  GAP -> COVERED: this row's own prior verdict was stale, not a real gap
+  -- `plugin_skill_roots()` was already wired into `workspace_skill_
+  registry` (confirmed by reading `openhands/skills.py` in full), it just
+  had no test proving a plugin-contributed SKILL.md is actually
+  discovered. New `tests/test_plugins.py::test_plugin_skill_roots_are_
+  actually_discovered_by_the_skill_registry` closes that end-to-end.
+  Also fixed this document's own Summary section, which still listed
+  Stop's block-and-continue semantics as unbuilt a full day after
+  `9c8c529` ("Implement Stop hook block-and-continue") shipped it and
+  updated this row (247) but not the Summary further down -- a stale-doc
+  gap, not a code gap.
+
 ## Agent Client Protocol (ACP)
 
 Separate from the Codex and Claude Code comparisons above, `tamfis_code/acp.py`
@@ -340,12 +353,14 @@ documentation from `zed-industries/agent-client-protocol` at commit
 
 Every row in this document has now been resolved to a definitive verdict
 (no remaining "tentative"/"unconfirmed" rows), and every hooks-table GAP
-has now been closed except Stop's block-and-continue semantics
-(deliberately not attempted -- would require resuming a turn the caller
-already believes is finished, a substantially larger change) and skills
-auto-discovery (`plugins.py`'s unused `skill_roots` field -- flagged, not
-built). Every other Claude Code hook capability compared in this document
--- all 9 documented events, prompt-based hooks, parallel execution,
+has now been closed, including Stop's block-and-continue semantics
+(2026-09-14, `runner_local.py`'s completion boundary re-enters the same
+model loop on a structured block decision, bounded by a three-block
+guard) and skills auto-discovery (`openhands/skills.py`'s
+`workspace_skill_registry` plus `plugins.py`'s `plugin_skill_roots()`,
+end-to-end test added 2026-09-15). Every Claude Code hook capability
+compared in this document -- all 9 documented events, Stop's
+block-and-continue, prompt-based hooks, parallel execution,
 if-conditional matching, PreToolUse input mutation, and asyncRewake -- is
 now implemented in tamfis-code, each with both unit tests and a real
 end-to-end integration test proving the actual wiring, not just the
