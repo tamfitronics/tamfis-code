@@ -11,6 +11,7 @@ import tempfile
 import unittest
 from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from rich.console import Console
@@ -158,6 +159,42 @@ class DiagnoseLocalProvidersTests(unittest.TestCase):
         self.assertTrue(result)
         remote_client.assert_not_called()
         self.assertIn("not checked without --remote credentials", console.file.getvalue())
+
+    def test_check_remote_api_false_skips_the_remote_backend_even_with_saved_credentials(self):
+        """The actual gap this closes: `tamfis-code doctor` with no
+        --remote flag used to hand-reimplement only two of run_doctor's
+        many checks in cli.py instead of calling run_doctor at all, so
+        this parameter (and everything it protects) never had a code path
+        reaching it in practice. A user who previously ran `tamfis-code
+        login` (so load_credentials() returns real creds) but is now
+        running plain `doctor` must still never touch the Remote Workspace
+        backend -- check_remote_api=False must hold regardless of whether
+        credentials happen to exist on disk, not just when they don't
+        (that easier case is test_doctor_without_remote_credentials_makes_
+        no_remote_request above)."""
+        console = Console(file=StringIO(), no_color=True, width=200)
+        fake_creds = SimpleNamespace(email="user@example.com", user_id=None)
+        with patch("tamfis_code.doctor.load_credentials", return_value=fake_creds), \
+             patch("tamfis_code.doctor.get_provider_status", return_value=self._status(configured=True)), \
+             patch("tamfis_code.doctor.RemoteAPIClient") as remote_client:
+            result = _run(run_doctor(Config(), console, check_remote_api=False))
+
+        self.assertTrue(result)
+        remote_client.assert_not_called()
+        self.assertIn("not checked in standalone mode", console.file.getvalue())
+
+    def test_check_remote_api_false_still_runs_path_safety(self):
+        """Confirmed live: before this fix, `tamfis-code doctor` (no
+        --remote) never ran check_path_safety at all -- a real security
+        check (a world-writable, non-sticky PATH directory could let
+        another local user hijack a command tamfis-code shells out to)
+        that silently never executed for the default invocation every
+        ordinary user actually takes."""
+        console = Console(file=StringIO(), no_color=True, width=200)
+        with patch("tamfis_code.doctor.load_credentials", return_value=None), \
+             patch("tamfis_code.doctor.get_provider_status", return_value=self._status(configured=True)):
+            _run(run_doctor(Config(), console, check_remote_api=False))
+        self.assertIn("PATH safety", console.file.getvalue())
 
 
 class DiagnoseLocalSessionTests(unittest.TestCase):

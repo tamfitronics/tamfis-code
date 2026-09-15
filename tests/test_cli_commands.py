@@ -894,6 +894,22 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertIn("TamfisGPT model service", result.output)
         self.assertNotIn("nvidia", result.output.lower())
 
+    def test_doctor_without_remote_runs_the_full_check_set(self):
+        # Confirmed live: `tamfis-code doctor` (no --remote) used to
+        # hand-reimplement only two of run_doctor's checks in cli.py
+        # instead of calling run_doctor at all, so Config, PATH safety (a
+        # real security check), Workspace directory, and the agent-runtime
+        # note silently never ran for the default invocation every
+        # ordinary user actually takes -- only `/doctor` in the REPL got
+        # the full set. Pins every one of those missing rows now appearing.
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
+                result = self.runner.invoke(cli, ["--cwd", tmp, "doctor"])
+            fake_client.assert_not_called()
+        self.assertEqual(result.exit_code, 0, result.output)
+        for expected in ("Config", "PATH safety", "Workspace directory", "TamfisGPT agent runtime"):
+            self.assertIn(expected, result.output)
+
     def test_providers_table_has_one_status_column(self):
         status = {"available": [{"name": "private-route"}]}
         with patch("tamfis_code.providers.get_provider_status", return_value=status):

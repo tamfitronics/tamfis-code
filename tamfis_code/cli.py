@@ -778,54 +778,25 @@ async def doctor(ctx: click.Context, provider: str, remote: bool, heal: bool):
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
-        from .doctor import _STATUS_STYLE, _diagnose_local_session, _diagnose_self_health, _attempt_heal, _HEALABLE_CHECKS
         from .local_chat import resolve_provider_type
-        from .providers import get_provider_status
-        from .workspace import resolve_local_workspace
 
         try:
-            provider_type = resolve_provider_type(provider)
+            resolve_provider_type(provider)
         except ValueError as exc:
             raise click.UsageError(str(exc))
-        status = get_provider_status()
-        any_configured = any(
-            bool(info["api_key_set"]) or name == "tier_iv"
-            for name, info in status["config"].items()
-        )
-        console.print(
-            "[green]TamfisGPT model service ready[/green]"
-            if any_configured else "[yellow]TamfisGPT model service unavailable[/yellow]"
-        )
-        console.print(f"[dim]Currently selected: {public_model_name(model=None)}[/dim]")
-        workspace = resolve_local_workspace(workspace_root, discover=False)
-        console.print(f"[green]Local session ready[/green]  session_id={workspace.session_id}  workspace_root={workspace.workspace_root}")
-        # Session-local diagnostics from actual recorded local turns
-        # (context usage, tool-call success rate, plan progress,
-        # unresolved validation issues), plus the deep self-health-check of
-        # tamfis-code's own subsystems (state writability, runtime journal,
-        # evidence store, tool registry, background job registry) -- this
-        # default/local branch used to stop at provider connectivity and
-        # never report any of this, even though state.py/doctor.py already
-        # record/compute it all during real runs and `/doctor` in the REPL
-        # already showed it. `tamfis-code doctor` now has the same depth.
-        local_results = _diagnose_local_session(workspace_root) + _diagnose_self_health(workspace_root)
-        if heal:
-            for result in local_results:
-                if result.status == "FAIL" and result.name in _HEALABLE_CHECKS:
-                    outcome = _attempt_heal(result.name)
-                    if outcome:
-                        result.status = "HEALED"
-                        result.detail = f"{outcome} -- {result.detail}".strip(" -")
-        for result in local_results:
-            style = _STATUS_STYLE[result.status]
-            console.print(
-                f"[{style}]{result.status:8}[/{style}] {result.name}  "
-                f"[dim]{redact_routing_text(result.detail)}[/dim]"
-            )
-        if not any_configured:
-            print_error(console, "TamfisGPT model service is not configured on this installation. Contact the administrator.")
-            raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
-        if any(r.status == "FAIL" for r in local_results):
+        # check_remote_api=False: standalone `doctor` must never construct a
+        # RemoteAPIClient or otherwise touch the legacy Remote Workspace
+        # backend, even if --remote credentials happen to be saved on this
+        # machine (see run_doctor's own docstring) -- pass --remote to check
+        # that backend instead. Every other check still runs: this branch
+        # used to hand-reimplement only two of run_doctor's many checks
+        # (local session diagnostics, self-health), silently skipping
+        # Config, PATH safety (a real security check), workspace directory,
+        # and the agent-runtime note for every ordinary invocation, since
+        # this was the only branch an unauthenticated standalone user ever
+        # actually takes.
+        ok = await run_doctor(config, console, workspace_root, heal=heal, check_remote_api=False)
+        if not ok:
             raise SystemExit(EXIT_RUNTIME_UNAVAILABLE)
         return
 

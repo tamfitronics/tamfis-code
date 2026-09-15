@@ -127,7 +127,7 @@ Changelog at the bottom — do not just delete the history.
 |---|---|---|
 | `login.rs`, `auth_refresh.rs` | `RemoteAPIClient.login`/`_refresh` (`api_client.py`) | COVERED (confirmed 2026-09-13) — `test_tamfis_code_api_client.py` already covers: a 401 triggers refresh then retries successfully, the refresh token is sent as a cookie (not a JSON body -- a specific prior regression), a 401 with no refresh token raises `AuthRequiredError`, login's flat-token-response parsing, and login-failure error detail |
 | `device_code_login.rs`, `login_server_e2e.rs`, `logout.rs` | none (no OAuth/device-code flow) | N/A |
-| `doctor_path_safety.rs` | `check_path_safety()` | COVERED (added 2026-09-13) |
+| `doctor_path_safety.rs` | `check_path_safety()` | COVERED (added 2026-09-13; wiring gap found and fixed 2026-09-15) — the function and its unit tests were real, but `tamfis-code doctor` without `--remote` (what every unauthenticated standalone user actually runs) never called `run_doctor()` at all, so this check silently never ran in practice for that invocation; only `/doctor` in the REPL reached it. See the 2026-09-15 changelog entry |
 | `doctor_enterprise_network.rs` | none | N/A — out of scope |
 | `mcp_add_remove.rs`, `mcp_list.rs`, `mcp_login.rs` | config-file-based MCP server config (not imperative CLI) | COVERED via config-loading tests; imperative-CLI surface itself N/A (doesn't exist) |
 | `queue.rs` | `cli.py`'s `queue` command over `state.py`'s `enqueue_instruction` | COVERED — same underlying mechanism as `turn_input_submission.rs`/`pending_input.rs` above, tested across 7 files |
@@ -333,6 +333,30 @@ unused `skill_roots` field) is likewise flagged but not built here.
   `9c8c529` ("Implement Stop hook block-and-continue") shipped it and
   updated this row (247) but not the Summary further down -- a stale-doc
   gap, not a code gap.
+
+- 2026-09-15 (follow-up, user-requested `doctor` audit): found and fixed a
+  real wiring gap this document's `doctor_path_safety.rs` row missed by
+  stopping at "the function and its unit tests exist" instead of tracing
+  the actual call path to the CLI entry point. `tamfis-code doctor`
+  without `--remote` -- what every unauthenticated standalone user
+  actually runs -- hand-reimplemented only two of `run_doctor()`'s many
+  checks in `cli.py` (local session diagnostics, self-health) instead of
+  calling `run_doctor()` at all, so `check_path_safety()`, the `Config`
+  check, `Workspace directory`, and the `TamfisGPT agent runtime` note
+  silently never ran for that invocation; only `/doctor` in the REPL
+  reached the full set. Fixed by giving `run_doctor()` a
+  `check_remote_api` parameter (default `True`) that, when `False`, skips
+  constructing a `RemoteAPIClient`/calling the Remote Workspace backend
+  entirely -- even when `--remote` credentials happen to already be saved
+  on disk, preserving the tested "standalone doctor never touches that
+  backend" contract -- while every other check now runs unconditionally.
+  `cli.py`'s standalone branch now just calls `run_doctor(..., check_
+  remote_api=False)` instead of reimplementing a subset by hand. New
+  tests: `test_doctor_session_diagnostics.py`'s
+  `test_check_remote_api_false_skips_the_remote_backend_even_with_saved_
+  credentials` and `test_check_remote_api_false_still_runs_path_safety`,
+  plus `test_cli_commands.py`'s
+  `test_doctor_without_remote_runs_the_full_check_set`.
 
 ## Agent Client Protocol (ACP)
 

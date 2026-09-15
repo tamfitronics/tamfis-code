@@ -404,7 +404,24 @@ async def run_doctor(
     *,
     session_id: Optional[int] = None,
     heal: bool = False,
+    check_remote_api: bool = True,
 ) -> bool:
+    """`check_remote_api=False` (used by `tamfis-code doctor` without
+    `--remote`) skips constructing a RemoteAPIClient / calling the Remote
+    Workspace backend's `list_servers`/session-diagnostics entirely, even
+    when --remote credentials happen to be saved on this machine -- plain
+    standalone `doctor` must never make a network call to that backend
+    (confirmed by `test_doctor_reports_provider_status_without_remote_client`'s
+    `fake_client.assert_not_called()`), the same "standalone never touches
+    the legacy backend unless explicitly asked" contract every other
+    standalone command already honours. Every other check (Config, model
+    service, PATH safety, local session/self-health, workspace directory)
+    still runs regardless -- those were the actual gap: cli.py's standalone
+    doctor branch used to hand-reimplement only two of doctor.py's many
+    checks instead of calling this function at all, so PATH safety in
+    particular (a real security check) silently never ran for the default
+    invocation every ordinary user actually takes.
+    """
     results: list[CheckResult] = []
 
     results.append(CheckResult("Config", "PASS", f"api_base={config.api_base}"))
@@ -444,7 +461,12 @@ async def run_doctor(
     # the full API timeout. Local diagnostics remain complete below.
     client: Optional[RemoteAPIClient] = None
     servers: Optional[list[dict]] = None
-    if creds is None:
+    if not check_remote_api:
+        results.append(CheckResult(
+            "Remote API (Tier III, port 9500)", "WARNING",
+            "not checked in standalone mode; pass --remote to check the legacy Remote Workspace backend",
+        ))
+    elif creds is None:
         results.append(CheckResult(
             "Remote API (Tier III, port 9500)", "WARNING",
             "not checked without --remote credentials; the default local mode does not require it",
