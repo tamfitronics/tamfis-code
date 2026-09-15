@@ -875,6 +875,15 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     every turn using *that turn's* objective, so a session's title kept
     getting silently replaced by a one-off later message instead of staying
     a stable, accurate label for the session as a whole.
+
+    Confirmed live: the model does not reliably follow the "respond with
+    ONLY the title" system prompt below -- it can answer the objective's
+    actual content instead of describing it. The response is validated
+    (short, no terminal sentence punctuation) before being accepted; a
+    response that fails that check is discarded and the mechanical title
+    stands, rather than accepting a truncated sentence that would be
+    visually indistinguishable from the "first few words" mechanical
+    title this function exists to upgrade past.
     """
     if not objective or not objective.strip():
         return
@@ -916,7 +925,27 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
         if response.status_code != 200:
             return
         content = str((response.json() or {}).get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-        title = _derive_session_title(content.strip("\"'"))
+        stripped = content.strip("\"'")
+        # Confirmed live: the model behind this endpoint doesn't reliably
+        # follow the "respond with ONLY the title" instruction above --
+        # it sometimes starts answering the objective's actual content
+        # instead of describing it, producing a full sentence that then
+        # just got blindly 60-char-truncated by _derive_session_title's
+        # own safety cap. That result is indistinguishable from the
+        # mechanical "first few words" title this call exists to replace,
+        # even though a real model call did happen (this is exactly the
+        # live-reported "still not using LLM, just takes the first few
+        # words" symptom). A real title never needs
+        # _derive_session_title's truncation to kick in at all, and never
+        # ends in sentence-terminal punctuation despite being told not
+        # to. Reject anything that fails those checks and keep the
+        # mechanical fallback -- matches this function's existing
+        # fail-open contract (a rejected/failed upgrade never loses the
+        # mechanical title, it just doesn't improve on it this time).
+        word_count = len(stripped.split())
+        if not stripped or len(stripped) > 80 or word_count > 8 or stripped[-1:] in ".!?":
+            return
+        title = _derive_session_title(stripped)
     except Exception:
         return
     if not title:

@@ -210,6 +210,68 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
             self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
 
+    def test_rejects_a_response_that_answers_the_objective_instead_of_titling_it(self):
+        """Confirmed live (2026-09-15): the model behind this endpoint does
+        not reliably follow the "respond with ONLY the title" system
+        prompt -- it can start answering the objective's actual content
+        instead. Before this validation, that full-sentence response got
+        blindly 60-char-truncated by _derive_session_title, producing a
+        title visually indistinguishable from the mechanical "first few
+        words" title this call exists to upgrade past -- the exact
+        live-reported "still not using LLM" symptom, even though a real
+        model call did happen. A response like this (long, ends in
+        sentence-terminal punctuation) must be rejected and the
+        mechanical title left standing."""
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "What does a semicolon do in Python?")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {
+            "choices": [{"message": {"content": (
+                "In Python, a semicolon is used to separate multiple "
+                "statements written on a single line, though it is rarely "
+                "used because newlines already terminate statements."
+            )}}],
+        }
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "What does a semicolon do in Python?"))
+        self.assertEqual(
+            state_module.get_session_state(1).session_title,
+            "What does a semicolon do in Python?",
+        )
+
+    def test_rejects_a_response_ending_in_terminal_punctuation_even_if_short(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "It fixes the test."}}]}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky auth test")
+
+    def test_accepts_a_genuinely_short_compliant_title(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Investigate the timeout bug in the retry loop")
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"choices": [{"message": {"content": "Investigate retry loop timeout"}}]}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
+            self._run(state_module.upgrade_session_title_with_ai(1, "Investigate the timeout bug in the retry loop"))
+        self.assertEqual(state_module.get_session_state(1).session_title, "Investigate retry loop timeout")
+
     def test_leaves_the_mechanical_title_when_endpoint_is_unreachable(self):
         import httpx as httpx_module
         state_module.save_session_state(1, workspace_root="/a")
