@@ -129,6 +129,38 @@ class SessionDisplayTitleTests(_StateDirFixture, unittest.TestCase):
         self.assertEqual(state_module.session_display_title(3), "Refactor the auth middleware")
 
 
+class SessionHasRecordedActivityTests(_StateDirFixture, unittest.TestCase):
+    """Live-reported: "whenever you reinstall the sessions titles
+    disappear and only the session ID remains" -- traced to
+    resolve_local_workspace() being called by read-only, non-
+    conversational commands too (`doctor`, `sessions`), so a fresh
+    directory permanently registers an empty, title-less session id with
+    nothing to ever resume. session_has_recorded_activity is the building
+    block for surfacing a real prior session instead (see cli.py's
+    _print_resumable_session_hint) -- it must agree exactly with whatever
+    session_display_title would otherwise fall back to a bare "Session N"
+    for.
+    """
+
+    def test_false_for_a_session_with_nothing_recorded_at_all(self):
+        state_module.save_session_state(3, workspace_root="/a")
+        state = state_module.get_session_state(3)
+        self.assertFalse(state_module.session_has_recorded_activity(state))
+
+    def test_true_once_a_persisted_title_exists(self):
+        state_module.save_session_state(3, workspace_root="/a")
+        state_module.remember_conversation_turn(3, objective="Add dark mode", answer="Done.")
+        state = state_module.get_session_state(3)
+        self.assertTrue(state_module.session_has_recorded_activity(state))
+
+    def test_true_for_a_session_mid_task_with_no_title_yet(self):
+        state_module.save_session_state(
+            3, workspace_root="/a", active_task={"objective": "Fix intelligent routing pipeline"},
+        )
+        state = state_module.get_session_state(3)
+        self.assertTrue(state_module.session_has_recorded_activity(state))
+
+
 class RememberConversationTurnSetsTitleOnceTests(_StateDirFixture, unittest.TestCase):
     def test_first_completed_turn_sets_the_title(self):
         state_module.save_session_state(1, workspace_root="/a")

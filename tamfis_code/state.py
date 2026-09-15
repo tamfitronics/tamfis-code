@@ -998,6 +998,25 @@ def session_display_title(session_id: int) -> str:
     return state.session_title or best_effort_session_label(state) or f"Session {session_id}"
 
 
+def session_has_recorded_activity(state: SessionState) -> bool:
+    """True once a session has any real conversational activity -- exactly
+    the same condition that gives session_display_title something better
+    than a bare "Session N" to show.
+
+    Live-reported: session ids kept appearing in the resume picker/
+    `sessions` listing as permanently title-less "Session N" rows,
+    crowding out real conversations by recency. Cause: resolve_local_
+    workspace() (workspace.py) -- which mints/reuses a session id for a
+    directory -- is called by read-only, non-conversational commands too
+    (`doctor`, `sessions` itself), not just real turns, so simply running
+    `tamfis-code doctor` in a fresh directory permanently registers an
+    empty session with nothing to ever resume. Callers building a
+    resumable-sessions listing should filter on this rather than show
+    every known session id unconditionally.
+    """
+    return bool(state.session_title or best_effort_session_label(state))
+
+
 def set_session_archived(session_id: int, archived: bool) -> None:
     """Soft-hide (or restore) a session from the resume picker's default
     "Active" view -- Ctrl+A there. Reversible and non-destructive: every

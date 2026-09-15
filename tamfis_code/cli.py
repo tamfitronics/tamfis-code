@@ -218,6 +218,36 @@ def cli(
         _run_async(_interactive_entry(config, workspace_root, provider, model, remote))
 
 
+def _print_resumable_session_hint(console: Console, workspace_root: Path, *, exclude_session_id: int) -> None:
+    """Live-reported: "whenever you reinstall the sessions titles
+    disappear and only the session ID remains" -- traced to expected,
+    documented behavior a user could easily not know about: a bare
+    `tamfis-code` always opens a brand NEW session (force_new=True just
+    above), never resumes an old one, so relaunching after any restart
+    (a reinstall included) always lands in a title-less fresh session
+    while the real, titled prior conversation sits untouched but
+    unmentioned. Rather than changing that deliberate "never silently
+    reuse/clobber" behavior, surface the actual prior session right here
+    so it's a one-line hint instead of a silent surprise.
+    """
+    root = str(workspace_root.resolve())
+    candidates = [
+        sid for sid in local_state.all_known_session_ids()
+        if sid != exclude_session_id
+        and not (state := local_state.get_session_state(sid)).is_swarm_child
+        and (state.primary_workspace == root or state.workspace_root == root)
+        and local_state.session_has_recorded_activity(state)
+    ]
+    if not candidates:
+        return
+    latest = max(candidates, key=lambda sid: local_state.get_session_state(sid).updated_at or "")
+    title = local_state.session_display_title(latest)
+    console.print(
+        f"[dim]Starting a new session. Run `tamfis-code resume {latest}` to continue "
+        f'"{title}" instead.[/dim]'
+    )
+
+
 async def _interactive_entry(
     config: Config, workspace_root: Path, provider: str = "auto",
     model: Optional[str] = None, remote: bool = False,
@@ -232,6 +262,7 @@ async def _interactive_entry(
         # (or any other) workspace stay exactly as they were and remain
         # selectable via `tamfis-code resume` / `tamfis-code sessions`.
         workspace = resolve_local_workspace(workspace_root, force_new=True)
+        _print_resumable_session_hint(console, workspace_root, exclude_session_id=workspace.session_id)
         await run_interactive(None, config, workspace, provider=provider, model=model)
         return
 

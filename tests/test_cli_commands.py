@@ -14,6 +14,7 @@ from tamfis_code.cli import (
     _explicit_absolute_paths,
     _interactive_entry,
     _print_bg_hint,
+    _print_resumable_session_hint,
     _project_root_for_target,
     _session_for_primary,
     _use_remote,
@@ -170,6 +171,87 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
         _, kwargs = run_interactive.call_args
         started_workspace = run_interactive.call_args.args[2]
         self.assertEqual(started_workspace.session_id, 2)
+
+
+class PrintResumableSessionHintTests(unittest.TestCase):
+    """Live-reported: "whenever you reinstall the sessions titles
+    disappear and only the session ID remains" -- a bare `tamfis-code`
+    deliberately always starts a brand new session (see
+    BareLaunchAlwaysStartsANewSessionTests above), so relaunching after
+    any restart lands in a title-less fresh session while the real prior
+    conversation sits untouched but unmentioned. This hint surfaces that
+    prior session instead of leaving it a silent surprise, without
+    changing the deliberate never-silently-reuse behavior itself.
+    """
+
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        self.tmp.cleanup()
+
+    def _console(self):
+        from io import StringIO
+        buf = StringIO()
+        return Console(file=buf, no_color=True, width=200), buf
+
+    def test_no_hint_when_no_prior_session_exists_for_this_workspace(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj)
+            console, buf = self._console()
+            _print_resumable_session_hint(console, root, exclude_session_id=1)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_no_hint_when_the_only_prior_session_has_no_recorded_activity(self):
+        # Exactly the "doctor/sessions minted an empty session id" case --
+        # nothing meaningful to point the user back to.
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(1, workspace_root=str(root))
+            console, buf = self._console()
+            _print_resumable_session_hint(console, root, exclude_session_id=2)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_hints_at_a_prior_session_with_a_real_title(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(1, workspace_root=str(root))
+            state_module.remember_conversation_turn(1, objective="Fix the flaky auth test", answer="Done.")
+            console, buf = self._console()
+            _print_resumable_session_hint(console, root, exclude_session_id=2)
+        output = buf.getvalue()
+        self.assertIn("tamfis-code resume 1", output)
+        self.assertIn("Fix the flaky auth test", output)
+
+    def test_the_just_created_session_itself_is_never_the_hinted_one(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(2, workspace_root=str(root))
+            state_module.remember_conversation_turn(2, objective="Fix the flaky auth test", answer="Done.")
+            console, buf = self._console()
+            _print_resumable_session_hint(console, root, exclude_session_id=2)
+        self.assertEqual(buf.getvalue(), "")
+
+    def test_the_most_recently_updated_prior_session_wins(self):
+        import time
+
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(1, workspace_root=str(root))
+            state_module.remember_conversation_turn(1, objective="Older task", answer="Done.")
+            time.sleep(0.01)
+            state_module.save_session_state(3, workspace_root=str(root))
+            state_module.remember_conversation_turn(3, objective="Newer task", answer="Done.")
+            console, buf = self._console()
+            _print_resumable_session_hint(console, root, exclude_session_id=2)
+        output = buf.getvalue()
+        self.assertIn("tamfis-code resume 3", output)
+        self.assertIn("Newer task", output)
 
 
 class PrintBgHintTests(unittest.TestCase):
