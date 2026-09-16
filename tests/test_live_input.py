@@ -202,6 +202,33 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         )
         self.assertIn("kimi-k2.7-code:cloud", rendered)
 
+    def test_running_footer_puts_the_corner_chip_on_its_own_line(self):
+        # FIX (2026-09-16, operator request): status/mode text and the
+        # right-side chip used to be squeezed onto one right-aligned row,
+        # crowding both out on anything but a wide terminal. Each now gets
+        # its own row.
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
+
+        toolbar_lines = listener._bottom_toolbar().value.split("\n")
+
+        self.assertEqual(len(toolbar_lines), 2)
+        self.assertNotIn("Tip:", toolbar_lines[0])
+        self.assertIn("esc to interrupt", toolbar_lines[0])
+
+    def test_pending_update_replaces_the_corner_chip_mid_task(self):
+        # Informational only: self_update.py never installs/re-execs
+        # mid-task, so this chip has no click/Ctrl+U handler, unlike the
+        # idle toolbar's clickable install chip.
+        renderer = StreamRenderer(_console())
+        renderer.pending_update_version = "1.6.99"
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
+
+        rendered = listener._bottom_toolbar().value
+
+        self.assertIn("1.6.99", rendered)
+        self.assertIn("update when idle", rendered)
+
     def test_toolbar_is_not_suppressed_when_terminal_cpr_is_unknown(self):
         from prompt_toolkit import PromptSession
 

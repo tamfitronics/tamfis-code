@@ -602,14 +602,30 @@ class LiveInputListener:
             f"<ansigray>{status} · ↑ edit queued · esc to interrupt ·</ansigray> "
             f"{mode_and_agents_html}"
         )
-        chip = _right_chip(self.session_id, self._active_agents)
-        bottom_line = _right_align(left, chip + " ")
+        # FIX (2026-09-16, operator request): the status/mode line and the
+        # right-side chip used to be squeezed onto one `_right_align`ed row,
+        # which crowded out both the status text and the chip on anything
+        # but a wide terminal. Each now gets its own full-width row -- the
+        # chip is still right-aligned, just on a row of its own instead of
+        # sharing space with `left`.
+        pending_update = getattr(self.renderer, "pending_update_version", None)
+        chip = (
+            # Informational only: self_update.py's apply_update()/reexec()
+            # deliberately never run mid-task (re-exec would abandon the
+            # in-flight turn), so this chip has no click/Ctrl+U handler --
+            # that action stays on the idle toolbar (idle_bottom_toolbar).
+            f"<ansiyellow>↑ v{pending_update} available · update when idle</ansiyellow>"
+            if pending_update else _right_chip(self.session_id, self._active_agents)
+        )
+        chip_line = _right_align("", chip + " ")
         activity = self.renderer.live_input_activity_line()
-        if not activity:
-            return HTML(bottom_line)
-        from xml.sax.saxutils import escape as _xml_escape
-        activity_line = f" <ansigray>{_xml_escape(activity)}</ansigray>"
-        return HTML(f"{activity_line}\n{bottom_line}")
+        lines = []
+        if activity:
+            from xml.sax.saxutils import escape as _xml_escape
+            lines.append(f" <ansigray>{_xml_escape(activity)}</ansigray>")
+        lines.append(left)
+        lines.append(chip_line)
+        return HTML("\n".join(lines))
 
     async def _input_loop(self) -> None:
         from prompt_toolkit import PromptSession

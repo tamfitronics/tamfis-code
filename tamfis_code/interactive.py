@@ -1312,6 +1312,7 @@ async def _run_interactive_impl(
         plan_id = str(plan["id"])
         local_state.update_plan(workspace.session_id, plan_id, status="executing")
         renderer = StreamRenderer(console, mode_label=mode_label_for_policy(config.approval_policy))
+        renderer.pending_update_version = _available_update
         model_state = local_state.get_session_state(workspace.session_id)
         plan_objective = local_state.plan_execution_objective(plan)
         if standalone:
@@ -2544,6 +2545,7 @@ async def _run_interactive_impl(
                     print_error(console, "Existing uncommitted changes detected; retry is blocked to preserve user edits.")
                     continue
                 renderer = StreamRenderer(console, mode_label=mode_label_for_policy(config.approval_policy))
+                renderer.pending_update_version = _available_update
                 outcome = await _run_cancellable_local_turn(
                     session_id=workspace.session_id,
                     renderer=renderer,
@@ -2587,6 +2589,7 @@ async def _run_interactive_impl(
                         continue
                     task_id = failed["id"]
                 renderer = StreamRenderer(console)
+                renderer.pending_update_version = _available_update
                 outcome = await _run_remote_turn_with_live_ui(
                     session_id=workspace.session_id,
                     renderer=renderer,
@@ -2738,6 +2741,7 @@ async def _run_interactive_impl(
                         print_error(console, "Existing uncommitted changes detected; execute mode is blocked to preserve user edits. Use /audit or /plan, or clean the worktree yourself.")
                         continue
                 renderer = StreamRenderer(console, mode_label=mode_label_for_policy(config.approval_policy))
+                renderer.pending_update_version = _available_update
                 model_state = local_state.get_session_state(workspace.session_id)
                 renderer.handle_event({
                     "event_type": "user_message",

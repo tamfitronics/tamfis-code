@@ -537,6 +537,13 @@ class StreamRenderer:
         # Model displayed in the persistent PTY/TTY footer. It must be
         # initialised even before routing emits a model_selected event.
         self._model: Optional[str] = None
+        # Set by the REPL loop from its own idle-time update check
+        # (interactive.py's `_available_update`) so the live in-task footer
+        # (live_input.py's _bottom_toolbar) can surface a pending release
+        # without polling the network from the render hot path. Informational
+        # only -- see self_update.py's docstring for why installing/re-exec
+        # never happens mid-task, only from the idle prompt.
+        self.pending_update_version: Optional[str] = None
         self.streamed_final_text = False  # True once any assistant_delta content is shown
         self.debug = os.environ.get("TAMFIS_CODE_DEBUG", "").lower() in {"1", "true", "yes"}
 
