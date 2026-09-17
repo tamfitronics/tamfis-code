@@ -455,16 +455,39 @@ def create_plan(
             )
         )
 
+    # 2026-09-17 (plan dedup + de-padding, owner report: template plans
+    # listed four /tmp test dirs, two checkpoints and a generic validation
+    # command as if they were the work): the deterministic plan must not
+    # pad itself with boilerplate that merely repeats what later steps do.
+    # Key changes:
+    #   * manifests already covered by an inventory step are not re-read
+    #     by a separate "Read project metadata" step -- that step is only
+    #     added for manifests OUTSIDE inventoried roots;
+    #   * a validation step naming a command nobody agreed to run is
+    #     dropped when no verified command exists ("Validate using only
+    #     commands discovered during execution" is execution guidance,
+    #     not a plan step);
+    #   * the generic inventory step is skipped entirely when a connected
+    #     path step already makes the work concrete.
     if evidence.manifest_paths:
-        paths = sorted(evidence.manifest_paths, key=str)[:6]
-        rendered = ", ".join(str(path) for path in paths)
-        steps.append(
-            PlanStep(
-                len(steps) + 1,
-                f"Read project metadata: {rendered}.",
-                evidence=[f"path:{path}" for path in paths],
+        outside_roots = [
+            path for path in evidence.manifest_paths
+            if not any(
+                str(path).startswith(str(root).rstrip("/") + "/")
+                or Path(str(path)).parent == Path(str(root))
+                for root in evidence.roots
             )
-        )
+        ]
+        if outside_roots:
+            paths = sorted(outside_roots, key=str)[:6]
+            rendered = ", ".join(str(path) for path in paths)
+            steps.append(
+                PlanStep(
+                    len(steps) + 1,
+                    f"Read project metadata: {rendered}.",
+                    evidence=[f"path:{path}" for path in paths],
+                )
+            )
 
     if evidence.connected_paths:
         paths = sorted(evidence.connected_paths, key=str)[:6]
@@ -488,23 +511,15 @@ def create_plan(
             )
         )
 
-    if profile.requires_validation:
-        if evidence.verified_commands:
-            command = sorted(evidence.verified_commands)[0]
-            steps.append(
-                PlanStep(
-                    len(steps) + 1,
-                    f"Validate with `{command}`; investigate any failure.",
-                    evidence=[f"command:{command}"],
-                )
+    if profile.requires_validation and evidence.verified_commands:
+        command = sorted(evidence.verified_commands)[0]
+        steps.append(
+            PlanStep(
+                len(steps) + 1,
+                f"Validate with `{command}`; investigate any failure.",
+                evidence=[f"command:{command}"],
             )
-        else:
-            steps.append(
-                PlanStep(
-                    len(steps) + 1,
-                    "Validate using only commands discovered during execution.",
-                )
-            )
+        )
 
     steps.append(
         PlanStep(
@@ -557,6 +572,10 @@ NON-NEGOTIABLE RULES
    terse engineering checklist reads -- not a full sentence explaining itself.
    "purpose" is separate and is not shown next to the action, so do not repeat
    it inside "action".
+6b. Never pad the plan with recon bookskeeping that repeats earlier steps:
+   if a step already inventories a root, do not add another step to "read
+   metadata" for files inside that same root, and never spend a step on
+   "report findings" or "plan next steps" -- reporting is not plan work.
 7. When evidence is insufficient, plan a bounded read-only inventory of an
    authorised root or a verified path. Do not fill gaps with guesses.
 8. For multi-root work, keep each root explicit. Never collapse the common parent

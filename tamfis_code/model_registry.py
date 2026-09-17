@@ -57,6 +57,23 @@ MODELS: dict[str, ModelRecord] = {
         ModelCapabilities(parallel_tool_calls=True, long_context=True), 128000,
         ("multi_file_edit", "tool_heavy_execution", "planning"), "frontier", "medium",
     ),
+    # ADDED 2026-09-17 (owner directive: mirror TamfisGPT's model grouping,
+    # NIM free models -- kimi-k3, glm-5.3, other tool-calling-verified
+    # models): z-ai/glm-5.3 on NVIDIA NIM. Live-verified 2026-09-17 against
+    # integrate.api.nvidia.com with a real account key: (1) plain chat 200
+    # OK with real content; (2) a real get_weather function-calling probe
+    # returned a genuine tool_calls event with valid JSON arguments plus
+    # reasoning_content; (3) SSE streaming returned real incremental delta
+    # chunks. Mirrors tamgpt6's orchestration.yaml glm-5.3-nim entry
+    # (same free-frontier reasoning). Deliberately NOT claiming vision or
+    # parallel_tool_calls: the image-url probe timed out twice at 90s and
+    # no multi-tool-call probe was run -- untested capabilities stay
+    # unclaimed (same discipline as the kimi-k3 entry above).
+    "z-ai/glm-5.3": ModelRecord(
+        "z-ai/glm-5.3", "nvidia",
+        ModelCapabilities(long_context=True), 128000,
+        ("multi_file_edit", "planning", "tool_heavy_execution", "debugging"), "frontier", "medium",
+    ),
     # ADDED 2026-08-30: live-verified against integrate.api.nvidia.com with
     # a real account key -- plain chat (200 OK), a real function-calling
     # probe (returned a genuine tool_calls event, not narrated text), and
@@ -70,10 +87,15 @@ MODELS: dict[str, ModelRecord] = {
     # 128000 (matching kimi-k2.6) rather than the 1M this model is
     # documented at elsewhere (Ollama Cloud's kimi-k3:cloud comment in
     # providers.py) for the same reason.
+    # FIX 2026-09-17: tool_calling was implicitly True (dataclass default)
+    # but this entry only ever documented a chat + vision probe -- the same
+    # live session also returned a genuine tool_calls event, which is what
+    # made tamgpt6 adopt this model as its top free-frontier route. Now
+    # explicit so eligible_models(requires_tools=True) is honest about it.
     "moonshotai/kimi-k3": ModelRecord(
         "moonshotai/kimi-k3", "nvidia",
-        ModelCapabilities(vision=True, long_context=True), 1048576,
-        ("multi_file_edit", "planning", "vision_assisted_coding"), "frontier", "medium",
+        ModelCapabilities(tool_calling=True, vision=True, long_context=True), 1048576,
+        ("multi_file_edit", "planning", "tool_heavy_execution", "vision_assisted_coding"), "frontier", "medium",
     ),
     # Keep direct xAI and OpenRouter relay routes distinct. TamfisGPT's live
     # catalogue classifies direct Grok 4.6 as a Premium-accessible frontier

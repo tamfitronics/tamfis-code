@@ -458,6 +458,9 @@ class ProviderManager:
                 "kimi-k2.7-code:cloud",
                 "kimi-k3:cloud",
                 "glm-5.3-flash:cloud",
+                # glm-5.3 (non-flash) is NOT listed: no live vision evidence
+                # for it on this route (2026-09-17) -- untested claims stay
+                # out of the exact-model allowlist, matching model_registry.
             ],
             # NOTE: this budget is shared by the whole provider bucket
             # (gemma4:cloud, minimax-m3:cloud too, not just kimi-k3), and
@@ -648,6 +651,13 @@ class ProviderManager:
             default_model="moonshotai/kimi-k3",
             models=[
                 "moonshotai/kimi-k3",
+                # ADDED 2026-09-17 (owner directive: mirror TamfisGPT's free
+                # NIM frontier -- kimi-k3 + glm-5.3 + other tool-calling-
+                # verified models): live-verified this same day with a real
+                # account key -- plain chat 200, genuine get_weather
+                # tool_calls with reasoning_content, real SSE deltas. Not
+                # claiming vision (image probe timed out at 90s twice).
+                "z-ai/glm-5.3",
                 "nvidia/nemotron-3-ultra-550b-a55b",
                 "nvidia/nemotron-3-super-120b-a12b",
                 # Replaced retired nvidia/nemotron-3-nano-30b-a3b on
