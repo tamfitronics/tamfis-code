@@ -17,16 +17,25 @@ from tamfis_code import state as state_module
 
 class _StateDirFixture:
     def setUp(self):
-        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self._originals = (
+            state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH,
+        )
         self._tmp = tempfile.TemporaryDirectory()
         base = Path(self._tmp.name)
         state_module.CONFIG_DIR = base / ".config"
         state_module.STATE_PATH = base / ".config" / "state.json"
+        # _LOCK_PATH is bound from CONFIG_DIR at import time, so overriding
+        # CONFIG_DIR alone leaves the lock pointing at the real user config
+        # dir -- under a read-only sandbox every test then emits the
+        # "could not acquire the session-state lock" warning.
+        state_module._LOCK_PATH = base / ".config" / ".state.lock"
         state_module._STATE_CACHE = None
         state_module._STATE_CACHE_KEY = None
 
     def tearDown(self):
-        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        (
+            state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH,
+        ) = self._originals
         state_module._STATE_CACHE = None
         state_module._STATE_CACHE_KEY = None
         self._tmp.cleanup()
@@ -48,6 +57,32 @@ class DeriveSessionTitleTests(unittest.TestCase):
 
     def test_blank_text_yields_an_empty_title(self):
         self.assertEqual(state_module._derive_session_title("   \n  "), "")
+
+    def test_strips_leading_filler_words(self):
+        # The live-reported complaint: the title "just picks the first few
+        # words", so "please fix the login bug" showed as "please fix the
+        # login bug" instead of leading with the actual work.
+        self.assertEqual(
+            state_module._derive_session_title("please fix the login bug"),
+            "fix the login bug",
+        )
+
+    def test_prefers_the_first_sentence_over_later_detail(self):
+        # A multi-sentence objective's opening sentence is its intent;
+        # later sentences are detail or constraints and must not crowd out
+        # the intent in a 60-char title.
+        self.assertEqual(
+            state_module._derive_session_title(
+                "Fix the session leak in resume. Also update the docs. "
+                "Finally add tests."
+            ),
+            "Fix the session leak in resume",
+        )
+
+    def test_never_strips_to_an_empty_title(self):
+        # An objective made entirely of filler words still yields a
+        # non-empty title (the first word is always kept).
+        self.assertEqual(state_module._derive_session_title("please"), "please")
 
 
 class BestEffortSessionLabelTests(_StateDirFixture, unittest.TestCase):
@@ -94,7 +129,10 @@ class BestEffortSessionLabelTests(_StateDirFixture, unittest.TestCase):
         )
         label = state_module.best_effort_session_label(state_module.get_session_state(1))
         self.assertNotIn("\n", label)
-        self.assertEqual(label, "please finalise the work statred by codex: tip: run /review to get a code review of your current work"[:60] + "…")
+        # The smart title drops the leading filler word "please" and caps at
+        # 60 chars -- the same _derive_session_title the persisted
+        # session_title uses.
+        self.assertEqual(label, "finalise the work statred by codex: tip: run /review to get …")
 
 
 class SessionDisplayTitleTests(_StateDirFixture, unittest.TestCase):

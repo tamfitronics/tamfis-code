@@ -1665,6 +1665,12 @@ async def _run_local_ai_command(
     # "continue" destroys the last useful legacy resume pointer.
     if not _is_resume_request(objective):
         local_state.save_session_state(workspace.session_id, active_task={"objective": objective, "mode": mode})
+        # Title the session as soon as the turn starts, not only after it
+        # completes: a session interrupted mid-first-turn (Ctrl+C, crash,
+        # provider disconnect) otherwise stays a bare "Session N" in the
+        # resume picker even though its objective is right here in scope.
+        # ensure_session_title is a no-op once any title is already set.
+        local_state.ensure_session_title(workspace.session_id, objective)
     if config.output_mode == "text":
         from .public_identity import PUBLIC_PROVIDER_NAME
 

@@ -477,15 +477,17 @@ def resolve_local_workspace(
     workspace_root = str((cwd or Path.cwd()).resolve())
 
     if session_id is None and not force_new:
-        local_match = next((
-            sid for sid in reversed(local_state.all_known_session_ids())
-            if (candidate := local_state.get_session_state(sid)).primary_workspace == workspace_root
-            and not candidate.is_swarm_child
-            and not local_state.is_session_actively_running(candidate)
-        ), None)
-        session_id = local_match if local_match is not None else _next_local_session_id()
+        # Atomic mint-or-reuse under the cross-process state lock: two
+        # concurrent launches in this directory must never both decide
+        # "no idle session exists" and mint two different ids for the same
+        # workspace -- that is exactly how one logical conversation ended
+        # up listed several times in `tamfis-code resume` (see
+        # state.mint_or_reuse_session_id).
+        session_id, _reused = local_state.mint_or_reuse_session_id(workspace_root)
     elif session_id is None:
-        session_id = _next_local_session_id()
+        with local_state.state_lock():
+            known = local_state.all_known_session_ids()
+            session_id = (max(known) + 1) if known else 1
 
     # Reopening a crashed session used to refresh updated_at while preserving
     # execution_status="running", making a dead task look newly live forever.
@@ -614,10 +616,27 @@ def list_resumable_local_sessions(
     sessions too, not only the current directory's.
     """
     root = str(Path(workspace_root).resolve()) if workspace_root is not None else None
-    candidates = [
-        state for sid in local_state.all_known_session_ids()
-        if not (state := local_state.get_session_state(sid)).is_swarm_child
-    ]
+    # One row per session id, and only sessions with real recorded
+    # activity. Live-reported: `tamfis-code resume` listed one logical
+    # conversation several times -- every launch of a bare `tamfis-code`
+    # minted a fresh session row for the same directory (force_new=True),
+    # and read-only commands (doctor/sessions) registered empty rows too,
+    # so the picker filled up with blank, title-less "Session N" clones
+    # of the same workspace. session_has_recorded_activity is the exact
+    # condition that gives a row a real title; deduping by id guards the
+    # corrupted-state case where the same id appears twice.
+    seen_ids: set[int] = set()
+    candidates: list[local_state.SessionState] = []
+    for sid in local_state.all_known_session_ids():
+        if sid in seen_ids:
+            continue
+        seen_ids.add(sid)
+        state = local_state.get_session_state(sid)
+        if state.is_swarm_child:
+            continue
+        if not local_state.session_has_recorded_activity(state):
+            continue
+        candidates.append(state)
     candidates.sort(key=lambda state: state.updated_at or "", reverse=True)
     if root is not None:
         candidates.sort(

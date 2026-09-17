@@ -334,7 +334,7 @@ class ResumeCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         picker.assert_not_called()
 
     def test_picker_quit_cancels_without_starting_anything(self):
-        state_module.save_session_state(1, workspace_root=self.root)
+        state_module.save_session_state(1, workspace_root=self.root, active_task={"objective": "Fix the login bug"})
         run_interactive = AsyncMock()
         with patch("tamfis_code.cli._is_interactive_tty", return_value=True), \
              patch("tamfis_code.resume_picker.run_resume_picker", return_value=("quit", None)) as picker, \
@@ -348,7 +348,7 @@ class ResumeCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
     def test_picker_new_starts_a_brand_new_session_not_the_old_one(self):
         # Esc in the picker means "start a new session" (Codex/Claude Code's
         # own convention), not a plain cancel -- distinct from Ctrl+C.
-        state_module.save_session_state(1, workspace_root=self.root)
+        state_module.save_session_state(1, workspace_root=self.root, active_task={"objective": "Fix the login bug"})
         run_interactive = AsyncMock()
         with patch("tamfis_code.cli._is_interactive_tty", return_value=True), \
              patch("tamfis_code.resume_picker.run_resume_picker", return_value=("new", None)), \
@@ -364,8 +364,8 @@ class ResumeCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         )
 
     def test_picker_resume_jumps_to_the_chosen_session(self):
-        state_module.save_session_state(1, workspace_root=self.root)
-        state_module.save_session_state(2, workspace_root=self.root)
+        state_module.save_session_state(1, workspace_root=self.root, active_task={"objective": "Fix the login bug"})
+        state_module.save_session_state(2, workspace_root=self.root, active_task={"objective": "Fix the footer bug"})
         run_interactive = AsyncMock()
         with patch("tamfis_code.cli._is_interactive_tty", return_value=True), \
              patch("tamfis_code.resume_picker.run_resume_picker", return_value=("resume", 1)), \
@@ -376,8 +376,8 @@ class ResumeCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         self.assertEqual(started_workspace.session_id, 1)
 
     def test_non_interactive_invocation_skips_the_picker_and_uses_most_recent(self):
-        state_module.save_session_state(1, workspace_root=self.root)
-        state_module.save_session_state(2, workspace_root=self.root)
+        state_module.save_session_state(1, workspace_root=self.root, active_task={"objective": "Fix the login bug"})
+        state_module.save_session_state(2, workspace_root=self.root, active_task={"objective": "Fix the footer bug"})
         run_interactive = AsyncMock()
         with patch("tamfis_code.cli._is_interactive_tty", return_value=False), \
              patch("tamfis_code.resume_picker.run_resume_picker") as picker, \

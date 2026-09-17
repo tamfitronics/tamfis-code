@@ -23,16 +23,105 @@ import stat
 import sys
 import tempfile
 import uuid
+from contextlib import contextmanager
 from copy import deepcopy
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Iterator, Optional
 
 from .config import CONFIG_DIR
 
 STATE_PATH = CONFIG_DIR / "state.json"
 _VOLATILE_STATE: dict[tuple[str, int], "SessionState"] = {}
+
+# Cross-process advisory lock file. state.json is read-modify-written by
+# every CLI process, so concurrent launches in the same directory (or
+# even unrelated commands like `tamfis-code queue`/`sessions`) can race and
+# corrupt or duplicate session rows. A single per-user lock file protects
+# all state.json operations without changing the on-disk format.
+_LOCK_PATH = CONFIG_DIR / ".state.lock"
+# Re-entrancy guard: flock is per open-file-description, so a nested
+# state_lock() inside an already-held one would deadlock against itself.
+# A depth counter makes nesting a no-op instead.
+_LOCK_DEPTH = 0
+_LOCK_FD: Optional[int] = None
+
+
+def _release_state_lock() -> None:
+    global _LOCK_FD
+    if _LOCK_FD is None:
+        return
+    fd, _LOCK_FD = _LOCK_FD, None
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
+@contextmanager
+def state_lock() -> Iterator[None]:
+    """Advisory cross-process lock around state.json read-modify-write
+    cycles (see put_session_state/clear_session_state and workspace.py's
+    session-id selection).
+
+    Blocking on POSIX (flock LOCK_EX); on Windows msvcrt.LK_LOCK, which
+    retries for ~10s. The lock is released automatically if the holder
+    dies, so a crashed process can never leave a stale lock behind. If
+    locking is unavailable on the platform the body still runs (volatile
+    state keeps the current process usable) but a warning is emitted so
+    the degraded mode is diagnosable.
+    """
+    global _LOCK_DEPTH, _LOCK_FD
+    if _LOCK_DEPTH > 0:
+        # Already held by an outer state_lock() in this same process --
+        # flock would deadlock against our own open file description.
+        _LOCK_DEPTH += 1
+        try:
+            yield
+        finally:
+            _LOCK_DEPTH -= 1
+        return
+    acquired = False
+    try:
+        CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(_LOCK_PATH), os.O_CREAT | os.O_RDWR)
+        if sys.platform == "win32":
+            import msvcrt
+
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_LOCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(fd, fcntl.LOCK_EX)
+        _LOCK_FD = fd
+        acquired = True
+    except Exception as exc:
+        print(
+            f"\u26a0 Could not acquire the session-state lock ({exc}); concurrent "
+            "tamfis-code processes may race on session bookkeeping.",
+            file=sys.stderr,
+        )
+    _LOCK_DEPTH = 1
+    try:
+        yield
+    finally:
+        _LOCK_DEPTH = 0
+        if acquired:
+            _release_state_lock()
 
 
 def _volatile_key(session_id: int) -> tuple[str, int]:
@@ -602,6 +691,17 @@ def _prune_stale_sessions(data: dict[str, Any], *, keep_session_id: int) -> None
 
 
 def put_session_state(state: SessionState) -> None:
+    # The whole read-modify-write cycle holds the cross-process state lock
+    # (see state_lock): without it, two concurrent CLI processes -- e.g. a
+    # second terminal opened in the same directory, or `tamfis-code queue`
+    # racing a live turn -- could each load the same baseline and the
+    # later save would silently erase the earlier one's row, which is one
+    # way a session's recorded activity "leaked" into a blank duplicate.
+    with state_lock():
+        _put_session_state_locked(state)
+
+
+def _put_session_state_locked(state: SessionState) -> None:
     data = _load_raw()
     latest = data.get(str(state.session_id), {})
     # A second `tamfis-code queue ...` process may add an instruction while
@@ -822,14 +922,52 @@ def clear_turn_checkpoint(session_id: int) -> None:
 
 
 
+# Leading pleasantry/filler words that carry no meaning at the *start* of a
+# session title. Stripping them lets a short, information-dense title lead
+# with the actual work instead of the objective's first few words -- the
+# live-reported "just picks the first few words" symptom. Deliberately does
+# NOT include question words (what/how/why/which/who/where/when) or common
+# verbs (do/does/is/are/can/could/would/will): stripping "What does a
+# semicolon do in Python?" down to "semicolon do in Python?" destroys a
+# question objective's meaning, so only pure pleasantries are dropped.
+_TITLE_FILLER_WORDS = frozenset({
+    "a", "an", "and", "as", "at", "be", "but", "by", "for", "from",
+    "had", "has", "have", "he", "her", "here", "his", "i", "if", "in",
+    "into", "it", "its", "just", "me", "my", "need", "needs", "no",
+    "not", "of", "on", "or", "our", "please", "so", "some", "that",
+    "the", "their", "them", "then", "there", "these", "they", "this",
+    "to", "us", "very", "was", "we", "were", "with", "you", "your",
+})
+
+
 def _derive_session_title(text: str) -> str:
-    """`text` (usually a multi-line objective), whitespace-collapsed onto
-    one line and capped -- the same short-label convention Codex/Claude
-    Code use for naming a conversation after its opening message."""
+    """A short, information-dense label for a session from its objective.
+
+    Smarter than a blind "first 60 characters" cut, which is exactly the
+    live-reported complaint ("just picks the first few words"): the first
+    sentence (or first line) is taken, leading filler/pleasantry words are
+    dropped, and the result is capped at 60 chars. Multi-line objectives
+    are collapsed first so a title can never contain a raw newline.
+    """
     seed = " ".join((text or "").split()).strip()
     if not seed:
         return ""
-    return seed[:60] + ("…" if len(seed) > 60 else "")
+    # Prefer the first sentence -- an objective's opening sentence is its
+    # intent; later sentences are usually detail or constraints.
+    first_sentence = re.split(r"(?<=[.!?])\s+", seed)[0].strip() or seed
+    # Drop leading filler words ("please fix the..." -> "fix the..."),
+    # keeping at least one word so the title is never empty.
+    words = first_sentence.split()
+    while len(words) > 1 and words[0].lower().strip(":,") in _TITLE_FILLER_WORDS:
+        words = words[1:]
+    candidate = " ".join(words)
+    if not candidate:
+        return ""
+    # A sentence-final period is noise in a title; keep ? and ! (they mark
+    # a question or imperative, which is real information).
+    if candidate.endswith(".") and not candidate.endswith(".."):
+        candidate = candidate[:-1]
+    return candidate[:60] + ("…" if len(candidate) > 60 else "")
 
 
 def ensure_session_title(session_id: int, objective: str) -> None:
@@ -1303,6 +1441,40 @@ def all_known_session_ids() -> list[int]:
     return sorted(ids)
 
 
+def mint_or_reuse_session_id(
+    workspace_root: str, *, exclude_actively_running: bool = True,
+) -> tuple[int, bool]:
+    """Atomically pick the session id for a workspace launch: reuse the
+    most recently updated idle session already rooted at ``workspace_root``
+    (never a swarm child, never one actively running in another process),
+    or mint the next fresh id. Returns ``(session_id, reused)``.
+
+    The whole decision runs under the cross-process state lock so two
+    concurrent launches in the same directory cannot both observe "no
+    idle session exists" and mint two different ids for the same
+    workspace -- the root cause behind one logical conversation showing
+    up as several near-identical rows in `tamfis-code resume` (each new
+    launch minted its own id, then recorded the same workspace and the
+    same opening objective, so the picker listed the same conversation
+    several times under different ids).
+    """
+    with state_lock():
+        candidates = [
+            (sid, get_session_state(sid)) for sid in all_known_session_ids()
+        ]
+        matching = [
+            (sid, state) for sid, state in candidates
+            if state.primary_workspace == workspace_root
+            and not state.is_swarm_child
+            and not (exclude_actively_running and is_session_actively_running(state))
+        ]
+        if matching:
+            matching.sort(key=lambda pair: pair[1].updated_at or "", reverse=True)
+            return matching[0][0], True
+        known = [sid for sid, _ in candidates]
+        return ((max(known) + 1) if known else 1), False
+
+
 def clear_session_state(session_id: int) -> bool:
     """Remove a session from the active local-session registry.
 
@@ -1311,14 +1483,15 @@ def clear_session_state(session_id: int) -> bool:
     workspace resolution from reusing it. Checkpoints, evidence, and the
     human-readable ``.memory`` snapshot are retained as a recovery archive.
     """
-    data = _load_raw()
-    key = str(int(session_id))
-    existed = key in data or _volatile_key(session_id) in _VOLATILE_STATE
-    if not existed:
-        return False
-    data.pop(key, None)
-    _VOLATILE_STATE.pop(_volatile_key(session_id), None)
-    _save_raw(data)
+    with state_lock():
+        data = _load_raw()
+        key = str(int(session_id))
+        existed = key in data or _volatile_key(session_id) in _VOLATILE_STATE
+        if not existed:
+            return False
+        data.pop(key, None)
+        _VOLATILE_STATE.pop(_volatile_key(session_id), None)
+        _save_raw(data)
     return True
 
 

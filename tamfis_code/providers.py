@@ -1632,6 +1632,8 @@ class ProviderManager:
             # by one specific backend's stricter message-ordering rule, not
             # evidence the user's task is malformed.
             "system message must be at the beginning",
+            "session usage limit",
+            "weekly usage limit",
         )
         return any(marker in message for marker in retryable_markers)
 
@@ -1659,6 +1661,7 @@ class ProviderManager:
             "quota",
             "rate limit",
             "weekly usage limit",
+            "session usage limit",
             "resourceexhausted",
             "resource_exhausted",
             "total request limit reached",

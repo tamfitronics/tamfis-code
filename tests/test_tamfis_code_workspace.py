@@ -517,26 +517,35 @@ class RecentLocalSessionsForWorkspaceTests(unittest.TestCase):
 
 class ListResumableLocalSessionsTests(unittest.TestCase):
     def setUp(self):
-        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self._originals = (
+            state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH,
+        )
         self.tmp = tempfile.TemporaryDirectory()
         base = Path(self.tmp.name)
         state_module.CONFIG_DIR = base / ".config"
         state_module.STATE_PATH = base / ".config" / "state.json"
+        # _LOCK_PATH is bound from CONFIG_DIR at import time, so overriding
+        # CONFIG_DIR alone leaves the lock pointing at the real user config
+        # dir -- under a read-only sandbox every test then emits the
+        # "could not acquire the session-state lock" warning.
+        state_module._LOCK_PATH = base / ".config" / ".state.lock"
 
     def tearDown(self):
-        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        (
+            state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH,
+        ) = self._originals
         self.tmp.cleanup()
 
     def test_excludes_swarm_children_only(self):
-        state_module.save_session_state(1, workspace_root="/a")
-        state_module.save_session_state(2, workspace_root="/b", is_swarm_child=True)
+        state_module.save_session_state(1, workspace_root="/a", active_task={"objective": "Fix the login bug"})
+        state_module.save_session_state(2, workspace_root="/b", is_swarm_child=True, active_task={"objective": "child work"})
         infos = list_resumable_local_sessions()
         self.assertEqual([info.session_id for info in infos], [1])
 
     def test_never_scoped_to_one_workspace_unlike_recent_local_sessions(self):
         with tempfile.TemporaryDirectory() as proj:
-            state_module.save_session_state(1, workspace_root="/somewhere/else")
-            state_module.save_session_state(2, workspace_root=str(Path(proj).resolve()))
+            state_module.save_session_state(1, workspace_root="/somewhere/else", active_task={"objective": "Fix the login bug"})
+            state_module.save_session_state(2, workspace_root=str(Path(proj).resolve()), active_task={"objective": "Fix the footer bug"})
             infos = list_resumable_local_sessions(Path(proj))
         self.assertEqual({info.session_id for info in infos}, {1, 2})
 
@@ -545,9 +554,9 @@ class ListResumableLocalSessionsTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as proj:
             root = str(Path(proj).resolve())
-            state_module.save_session_state(1, workspace_root="/somewhere/else")
+            state_module.save_session_state(1, workspace_root="/somewhere/else", active_task={"objective": "Fix the login bug"})
             time.sleep(0.01)
-            state_module.save_session_state(2, workspace_root=root)
+            state_module.save_session_state(2, workspace_root=root, active_task={"objective": "Fix the footer bug"})
             infos = list_resumable_local_sessions(Path(proj))
         # Session 1 has the more recent updated_at, but session 2 belongs to
         # the current workspace and must still come first.
@@ -555,10 +564,29 @@ class ListResumableLocalSessionsTests(unittest.TestCase):
         self.assertTrue(infos[0].in_current_workspace)
         self.assertFalse(infos[1].in_current_workspace)
 
-    def test_title_falls_back_to_a_generic_label_before_first_turn(self):
+    def test_excludes_sessions_with_no_recorded_activity(self):
+        # Live-reported: `tamfis-code resume` listed one logical conversation
+        # several times -- every launch of a bare `tamfis-code` minted a fresh
+        # session row for the same directory (force_new=True), and read-only
+        # commands (doctor/sessions) registered empty rows too, so the picker
+        # filled up with blank, title-less "Session N" clones of the same
+        # workspace. A session with nothing recorded is not resumable.
         state_module.save_session_state(5, workspace_root="/a")
+        state_module.save_session_state(6, workspace_root="/a", active_task={"objective": "Fix the login bug"})
         infos = list_resumable_local_sessions()
-        self.assertEqual(infos[0].title, "Session 5")
+        self.assertEqual([info.session_id for info in infos], [6])
+
+    def test_deduplicates_by_session_id(self):
+        # Guards the corrupted-state case where the same session id appears
+        # twice in state.json -- the picker must never list it twice.
+        state_module.save_session_state(5, workspace_root="/a", active_task={"objective": "Fix the login bug"})
+        # Simulate a duplicate row by writing the same id twice into the raw
+        # store (a concurrent-write corruption).
+        raw = state_module._load_raw()
+        raw["5"] = dict(raw["5"])
+        state_module._save_raw(raw)
+        infos = list_resumable_local_sessions()
+        self.assertEqual([info.session_id for info in infos], [5])
 
     def test_title_reflects_the_persisted_session_title(self):
         state_module.save_session_state(5, workspace_root="/a")
