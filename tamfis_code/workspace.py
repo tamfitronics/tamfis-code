@@ -443,6 +443,7 @@ def _next_local_session_id() -> int:
 def resolve_local_workspace(
     cwd: Optional[Path] = None, *, discover: bool = True,
     session_id: Optional[int] = None, force_new: bool = False,
+    objective: Optional[str] = None,
 ) -> WorkspaceContext:
     """Resolve a launch directory into a purely local session -- no network
     calls, no RemoteAPIClient, no remote-assigned session/server id.
@@ -483,7 +484,9 @@ def resolve_local_workspace(
         # workspace -- that is exactly how one logical conversation ended
         # up listed several times in `tamfis-code resume` (see
         # state.mint_or_reuse_session_id).
-        session_id, _reused = local_state.mint_or_reuse_session_id(workspace_root)
+        session_id, _reused = local_state.mint_or_reuse_session_id(
+            workspace_root, objective=objective,
+        )
     elif session_id is None:
         with local_state.state_lock():
             known = local_state.all_known_session_ids()

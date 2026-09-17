@@ -1441,8 +1441,60 @@ def all_known_session_ids() -> list[int]:
     return sorted(ids)
 
 
+def _task_compat_tokens(text: str) -> set[str]:
+    """Content tokens for task-identity comparison (2026-09-17 session-leak fix).
+
+    Stop words and generic scaffolding are dropped; surviving tokens are at
+    least 3 characters so greetings/one-word objectives never match anything.
+    """
+    stop = {
+        "a", "an", "the", "and", "or", "but", "if", "then", "else", "for", "to", "of",
+        "in", "on", "at", "by", "with", "from", "into", "onto", "about", "as", "is",
+        "are", "was", "were", "be", "been", "being", "do", "does", "did", "done",
+        "please", "kindly", "just", "also", "again", "now", "this", "that", "these",
+        "those", "it", "its", "he", "she", "they", "them", "their", "you", "your",
+        "i", "me", "my", "we", "our", "us", "can", "could", "should", "would",
+        "will", "shall", "may", "might", "must", "have", "has", "had", "not", "no",
+        "yes", "ok", "okay", "fix", "add", "make", "work", "use", "using", "get",
+        "all", "any", "some", "more", "new", "try", "run", "code", "file", "files",
+    }
+    tokens = re.findall(r"[a-z0-9_][a-z0-9_+-]{2,}", str(text or "").casefold())
+    cleaned = {token.strip("_+-") for token in tokens}
+    return {token for token in cleaned if len(token) >= 3 and token not in stop}
+
+
+def task_objectives_compatible(incoming: str, stored: str) -> bool:
+    """True when ``incoming`` and ``stored`` plausibly describe the same task.
+
+    2026-09-17 (session-leak fix) helper. Two objectives are compatible when
+    the incoming one is a short continuation-shaped message ("continue",
+    "also add a totals column", "proceed") over an existing stored task, or
+    when both texts share at least one distinctive content token. A greeting
+    ("hello"), a distinct new task ("fix the payment bug" vs "write the api
+    tests"), or an empty stored objective never matches.
+    """
+    incoming_text = str(incoming or "").strip()
+    stored_text = str(stored or "").strip()
+    if not incoming_text or not stored_text:
+        return False
+    incoming_lower = incoming_text.casefold()
+    if len(incoming_lower.split()) <= 8 and re.search(
+        r"(?:^|\s)(?:continue|resume|proceed|carry\s*on|go\s*on|keep\s*going|next|"
+        r"step\s*\d+|also|additionally|plus|instead|rather|actually|retry|again|"
+        r"ok(?:ay)?|sure|yes|no|stop|cancel)(?:\s|$|[,.;:!])",
+        incoming_lower,
+    ):
+        return True
+    incoming_tokens = _task_compat_tokens(incoming_lower)
+    stored_tokens = _task_compat_tokens(stored_text.casefold())
+    if not incoming_tokens or not stored_tokens:
+        return False
+    return bool(incoming_tokens & stored_tokens)
+
+
 def mint_or_reuse_session_id(
     workspace_root: str, *, exclude_actively_running: bool = True,
+    objective: Optional[str] = None,
 ) -> tuple[int, bool]:
     """Atomically pick the session id for a workspace launch: reuse the
     most recently updated idle session already rooted at ``workspace_root``
@@ -1457,6 +1509,16 @@ def mint_or_reuse_session_id(
     launch minted its own id, then recorded the same workspace and the
     same opening objective, so the picker listed the same conversation
     several times under different ids).
+
+    2026-09-17 (session-leak fix): reuse is now **task-aware** when an
+    ``objective`` is supplied. A stored session is only reused when its
+    recorded task context is empty OR its objective is compatible with the
+    incoming objective. Previously every launch for a workspace silently
+    inherited the most-recent idle session's full task context -- 31 live
+    sessions all carried primary_workspace=/home, each from an unrelated
+    task, so a fresh launch landed on another conversation's plans,
+    checkpoints, and history. Legacy callers that pass no objective keep
+    the previous most-recent-match behaviour.
     """
     with state_lock():
         candidates = [
@@ -1469,10 +1531,70 @@ def mint_or_reuse_session_id(
             and not (exclude_actively_running and is_session_actively_running(state))
         ]
         if matching:
-            matching.sort(key=lambda pair: pair[1].updated_at or "", reverse=True)
-            return matching[0][0], True
+            if objective is None:
+                # Legacy call sites that have no objective yet (workspace
+                # bookkeeping, read-only helpers): previous behaviour.
+                matching.sort(key=lambda pair: pair[1].updated_at or "", reverse=True)
+                return matching[0][0], True
+            compatible = []
+            for sid, state in matching:
+                checkpoint_objective = ""
+                if state.turn_checkpoint:
+                    checkpoint_objective = str(state.turn_checkpoint.get("objective") or "")
+                stored_objective = str(
+                    (state.active_task or {}).get("objective")
+                    or checkpoint_objective
+                    or (state.saved_plans[-1].get("objective") if state.saved_plans and isinstance(state.saved_plans[-1], dict) else "")
+                    or ""
+                )
+                has_task_context = bool(
+                    stored_objective
+                    or state.conversation_history
+                    or state.turn_checkpoint
+                    or state.active_plan_id
+                )
+                if not has_task_context or task_objectives_compatible(objective, stored_objective):
+                    compatible.append((sid, state))
+            if compatible:
+                compatible.sort(key=lambda pair: pair[1].updated_at or "", reverse=True)
+                return compatible[0][0], True
         known = [sid for sid, _ in candidates]
         return ((max(known) + 1) if known else 1), False
+
+
+def reset_session_task_state(session_id: int) -> bool:
+    """Clear inherited task context from a reused session row (2026-09-17
+    session-leak fix): active plan, checkpoint, history, summary, in-flight
+    instructions, and queued steps -- everything that made a fresh task look
+    like a continuation of a previous conversation's work.
+
+    Does NOT clear: identity/bookkeeping (workspace roots, allowed paths),
+    the mutation ledger (modified_files/inspected_files -- the audit trail of
+    real file changes stays with its session), or swarm metadata.
+    """
+    with state_lock():
+        data = _load_raw()
+        key = str(int(session_id))
+        record = data.get(key)
+        if not isinstance(record, dict):
+            return False
+        record.update({
+            "active_task": None,
+            "turn_checkpoint": None,
+            "active_plan_id": None,
+            "saved_plans": [],
+            "conversation_history": [],
+            "conversation_summary": None,
+            "last_task_id": None,
+            "current_phase": None,
+            "running_action": None,
+            "context_checkpoints": [],
+            "completed_actions": [],
+            "queued_user_instructions": [],
+        })
+        _save_raw(data)
+    _VOLATILE_STATE.pop(_volatile_key(session_id), None)
+    return True
 
 
 def clear_session_state(session_id: int) -> bool:

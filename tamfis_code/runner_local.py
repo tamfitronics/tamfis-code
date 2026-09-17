@@ -2515,8 +2515,20 @@ async def _recover_empty_continuation(
     tools: list[dict[str, Any]],
     renderer: StreamRenderer,
     task_profile: Any,
+    already_emitted: str = "",
 ) -> tuple[str, list[_StreamedToolCall], ProviderType, Any, Any, str]:
-    """Recover an empty post-tool continuation without abandoning the task."""
+    """Recover an empty post-tool continuation without abandoning the task.
+
+    `already_emitted` is the assistant text already shown for this round
+    (2026-09-17: the recovery path's own re-emits -- same-route non-stream
+    retries, same-provider alternate models, cross-provider fallbacks --
+    used to forward their full (overlapping) content as fresh
+    assistant_delta events, and a rotation cycle then re-rendered the same
+    assistant message many times over). The novel-suffix trim used by the
+    reconnect path (_novel_continuation) is applied to every re-emitted
+    chunk here so only text the user has not seen is displayed, while the
+    RETURNED content stays complete for transcript/tool-loop purposes.
+    """
     retry_messages = _empty_continuation_messages(messages, 1)
     last_error: Optional[Exception] = None
 
@@ -2548,10 +2560,12 @@ async def _recover_empty_continuation(
                     tools=tools,
                 )
                 if content:
-                    renderer.handle_event({
-                        "event_type": "assistant_delta",
-                        "payload": {"content": content},
-                    })
+                    novel = _novel_continuation(already_emitted, content)
+                    if novel:
+                        renderer.handle_event({
+                            "event_type": "assistant_delta",
+                            "payload": {"content": novel},
+                        })
             if content.strip() or calls:
                 return content, calls, resolved_provider, config, client, model
         except Exception as exc:  # provider-specific failures are handled below
@@ -2632,10 +2646,12 @@ async def _recover_empty_continuation(
                         tools=tools if candidate_config.tool_calling else [],
                     )
                     if content:
-                        renderer.handle_event({
-                            "event_type": "assistant_delta",
-                            "payload": {"content": content},
-                        })
+                        novel = _novel_continuation(already_emitted, content)
+                        if novel:
+                            renderer.handle_event({
+                                "event_type": "assistant_delta",
+                                "payload": {"content": novel},
+                            })
                 if content.strip() or calls:
                     return (
                         content,
@@ -4048,9 +4064,10 @@ def _plan_created_payload(plan: Any, *, title: str, continuation: bool = False) 
     }
 
 
-def _has_active_prior_plan(session_id: int) -> bool:
-    """True when this session already has a saved plan with at least one
-    step not yet completed, persisted BEFORE this turn's own planning runs.
+def _has_active_prior_plan(session_id: int, objective: str = "") -> bool:
+    """True when this session already has a saved plan for THIS objective
+    with at least one step not yet completed, persisted BEFORE this turn's
+    own planning runs.
 
     Used to distinguish a genuinely new task (show the full plan panel)
     from an ordinary follow-up message continuing an in-progress task in
@@ -4059,6 +4076,17 @@ def _has_active_prior_plan(session_id: int) -> bool:
     "Execution plan" panel, even for a small continuation, since
     should_plan() is evaluated fresh per turn with no notion of "this
     session already has an active plan.")
+
+    2026-09-17 (session-leak fix): the "same objective" qualifier matters
+    because mint_or_reuse_session_id hands a brand-new launch the most
+    recently updated idle session for the same workspace root — 31 live
+    sessions all carry primary_workspace=/home — so a fresh task inherits
+    the previous conversation's unfinished plan. Without the objective
+    check, the new task displayed "Continuing: 2/8 plan steps done" about
+    work it had never seen. Objective matching is deliberately loose (the
+    session's stored active task vs. the current objective's shared
+    keyword content) so genuine follow-ups ("ok continue", "now add X")
+    still count as continuations.
     """
     try:
         plans = local_state.get_session_state(session_id).saved_plans
@@ -4066,8 +4094,44 @@ def _has_active_prior_plan(session_id: int) -> bool:
         return False
     if not plans:
         return False
-    steps = plans[-1].get("steps") or []
-    return any(isinstance(s, dict) and s.get("status") != "completed" for s in steps)
+    latest = plans[-1] or {}
+    steps = latest.get("steps") or []
+    if not any(isinstance(s, dict) and s.get("status") != "completed" for s in steps):
+        return False
+    if not objective:
+        # Legacy callers (no objective available): previous behaviour.
+        return True
+    # Same-conversation check: the stored plan's objective (or the
+    # session's active-task objective) must share real content with the
+    # incoming one. A one-word/greeting objective never matches; a
+    # follow-up like "also exclude cancelled jobs" shares the keyword
+    # overlap with the plan it extends only if the plan's objective is
+    # present in conversation — so also treat "incoming objective is a
+    # short continuation-style message" as continuation when a plan is
+    # genuinely unfinished.
+    stored_objective = str(
+        latest.get("objective")
+        or (local_state.get_session_state(session_id).active_task or {}).get("objective")
+        or ""
+    )
+    current = objective.strip().casefold()
+    stored = stored_objective.strip().casefold()
+    if not stored:
+        return True
+    current_tokens = set(_planning_keywords(current))
+    stored_tokens = set(_planning_keywords(stored))
+    if not current_tokens:
+        # Empty/greeting objective: continuation of whatever is active.
+        return True
+    if current_tokens & stored_tokens:
+        return True
+    # Short follow-ups ("continue", "also add a totals column") without
+    # keyword overlap stay continuations when the message is short and
+    # continuation-shaped.
+    if len(current.split()) <= 6 and _RESUME_REQUEST_RE.match(current):
+        return True
+    # Distinct new objective in a reused session: NOT a continuation.
+    return False
 
 
 def _plan_message_content(plan: Any, *, heading: str) -> str:
@@ -4277,6 +4341,19 @@ _PLANNING_SKIP_DIRS = {
     ".pytest_cache", "__pycache__", ".mypy_cache", ".ruff_cache", "coverage",
     ".venv", "venv", "vendor",
 }
+# Sibling project dirs that a broad launch root (e.g. /home as one git
+# worktree) can swallow into a single plan's inventory. Each entry here is
+# another session's/project's work area -- reconnaissance must not present
+# their manifests and paths as this objective's evidence.
+_PLANNING_FOREIGN_PROJECT_DIRS = {
+    "betpredict", "tamgpt", "tamfiscode", "tamfisgpt", "tamfis-frontend",
+    "tistalents-gig-catalog-worktree", "finima",
+}
+# Other sessions' scratch lives directly under the temp dir; a root AT the
+# temp dir (or the OS temp dir itself) is never a project root -- it is
+# cross-session territory. Skip it entirely; this session's own scratch
+# subpath stays allowed.
+_PLANNING_FOREIGN_ROOT_NAMES = {"tmp", "temp", "var", "root", "home"}
 _PLANNING_STOP_WORDS = {
     "check", "full", "stack", "status", "fix", "bugs", "bug", "all", "and",
     "the", "this", "that", "with", "from", "into", "without", "rely", "please",
@@ -4361,6 +4438,40 @@ def _build_planning_reconnaissance(
         if resolved not in unique_roots:
             unique_roots.append(resolved)
 
+    # A root that IS the OS temp dir (or a top-level home/temp-style
+    # directory that swallows unrelated sibling projects) is cross-session
+    # territory, not a project root: inventorying it pulls every other
+    # session's scratch files and sibling projects' manifests into this
+    # plan. Drop such roots here as defense in depth against any caller
+    # that still passes them through (the primary fix filters scope_roots
+    # before this call).
+    temp_root = Path(tempfile.gettempdir()).resolve()
+    filtered_roots: list[Path] = []
+    for root in unique_roots:
+        if root == temp_root:
+            continue
+        # "Is this root merely a container of unrelated projects?" — the
+        # /home-is-a-git-worktree case: its name is a generic container
+        # name AND it directly contains other known project dirs. Such a
+        # root carries betpredict/tamgpt/tamfiscode manifests into every
+        # session's plan. Inventorying it wholesale is a cross-session
+        # leak; drop it in favour of narrower roots that remain.
+        is_container_root = (
+            root.name in _PLANNING_FOREIGN_ROOT_NAMES
+            and any(
+                (root / foreign).is_dir()
+                for foreign in _PLANNING_FOREIGN_PROJECT_DIRS
+            )
+        )
+        if is_container_root:
+            continue
+        filtered_roots.append(root)
+    if not filtered_roots and unique_roots:
+        # Never leave planning with zero roots: fall back to the launch
+        # workspace, which is always legitimately this session's.
+        filtered_roots = [Path(workspace_root).resolve()]
+    unique_roots = filtered_roots
+
     for root in unique_roots:
         lines.append(f"ROOT: {root}")
         if not root.exists():
@@ -4374,6 +4485,7 @@ def _build_planning_reconnaissance(
             top_level = sorted(
                 item.name for item in root.iterdir()
                 if item.name not in _PLANNING_SKIP_DIRS
+                and item.name not in _PLANNING_FOREIGN_PROJECT_DIRS
             )[:40]
         except OSError as exc:
             lines.append(f"  listing_error: {exc}")
@@ -5075,7 +5187,7 @@ async def _run_local_agent_turn_impl(
     # deterministic template plan for this turn via local_state.save_plan(),
     # which would otherwise make _has_active_prior_plan see this turn's own
     # brand-new plan and wrongly call it "already active."
-    _prior_plan_was_active = _has_active_prior_plan(session_id)
+    _prior_plan_was_active = _has_active_prior_plan(session_id, objective)
     orchestration = orchestrator.begin(objective=objective, messages=messages, read_only=read_only)
     task_profile = orchestration.profile
     turn_read_only = read_only or getattr(task_profile.task_type, "value", "") in {
@@ -5474,8 +5586,21 @@ async def _run_local_agent_turn_impl(
     # full-stack audit alike. A failure here (bad JSON, provider error)
     # silently keeps the template; the turn is never blocked on this.
     if should_plan(task_profile, objective):
+        # 2026-09-17 (cross-session plan leak, owner report): scope_roots
+        # intentionally contains the WHOLE temp dir -- that's a tool-
+        # authority boundary (throwaway code needs /tmp), but feeding it to
+        # _build_planning_reconnaissance made the planner walk and inventory
+        # every other session's scratch directory (/tmp/fp_test/*,
+        # /tmp/full_test_final/*, sibling /tmp/tamfis-code/<other-id>), and
+        # the plan then displayed those as this session's work. Planning is
+        # scoped to the real project roots + THIS session's scratch only;
+        # the tool-authority list is untouched below this point.
+        planning_roots = [
+            root for root in scope_roots
+            if root != Path(tempfile.gettempdir())
+        ]
         planning_reconnaissance = _build_planning_reconnaissance(
-            workspace_root, scope_roots, objective,
+            workspace_root, planning_roots, objective,
         )
         renderer.handle_event({
             "event_type": "diagnostics",
@@ -5502,7 +5627,7 @@ async def _run_local_agent_turn_impl(
             objective, task_profile,
             reconnaissance_summary=planning_reconnaissance,
             workspace_summary=repository_context,
-            scope_roots=scope_roots,
+            scope_roots=planning_roots,
         )
         _plan_reasoning_effort = _reasoning_effort(resolved_provider, resolved_model, task_profile)
         _draft_raw: dict[str, str] = {}
@@ -5512,7 +5637,7 @@ async def _run_local_agent_turn_impl(
             reconnaissance_summary=planning_reconnaissance,
             evidence_summary=resumed_evidence_summary,
             reasoning_effort=_plan_reasoning_effort,
-            scope_roots=scope_roots,
+            scope_roots=planning_roots,
             manager=manager, provider=resolved_provider,
             capture_raw=_draft_raw,
         )
@@ -6942,6 +7067,12 @@ async def _run_local_agent_turn_impl(
                     tools=tools,
                     renderer=renderer,
                     task_profile=task_profile,
+                    # Assistant text already streamed and shown for this
+                    # round. Recovery re-emits are trimmed against it so a
+                    # provider rotation cannot repaint the same message
+                    # (2026-09-17 repetition fix -- see the parameter's
+                    # docstring in _recover_empty_continuation).
+                    already_emitted="".join(checkpoint_partial_parts),
                 )
                 # _recover_empty_continuation's own internal completion calls
                 # don't track finish_reason -- it's genuinely unknown for

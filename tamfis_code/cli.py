@@ -1577,7 +1577,16 @@ async def _run_local_ai_command(
     except ValueError as exc:
         raise click.UsageError(str(exc))
 
-    workspace = resolve_local_workspace(workspace_root, discover=mode != "chat")
+    # 2026-09-17 (session-leak fix): task-aware session resolution. A one-shot
+    # task only reuses an existing session when that session's recorded
+    # objective is compatible with (or empty beside) THIS objective; otherwise
+    # a fresh session is minted. Previously the most-recent idle session for
+    # the workspace was reused unconditionally, so a new task inherited the
+    # previous conversation's history/plans/checkpoint (live: 31 sessions
+    # collapsed onto primary_workspace=/home, each from an unrelated task).
+    workspace = resolve_local_workspace(
+        workspace_root, discover=mode != "chat", objective=objective,
+    )
     if len(objective) > MAX_DIRECT_OBJECTIVE_CHARS:
         prepared, evidence_id = archive_oversized_objective(
             [{"role": "user", "content": objective}],
@@ -1598,6 +1607,25 @@ async def _run_local_ai_command(
             or state.active_task or state.turn_checkpoint or state.conversation_history
         ),
     )
+
+    # 2026-09-17 (session-leak fix): if the resolved session still carries
+    # task context from a DIFFERENT objective (a reused row the compatibility
+    # check allowed through via a generic/empty stored objective), clear the
+    # inherited conversation/plan/checkpoint context before this turn runs.
+    # Continuations and retries pass through untouched -- their objectives
+    # are compatible by construction (retry passes the stored objective back).
+    inherited_objective = str(
+        (state.active_task or {}).get("objective")
+        or (state.turn_checkpoint or {}).get("objective")
+        or ""
+    )
+    if (
+        inherited_objective
+        and not local_state.task_objectives_compatible(objective, inherited_objective)
+        and not _is_resume_request(objective)
+    ):
+        local_state.reset_session_task_state(workspace.session_id)
+        state = local_state.get_session_state(workspace.session_id)
 
     for requested_path in _explicit_absolute_paths(objective):
         try:

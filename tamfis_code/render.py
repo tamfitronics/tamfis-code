@@ -534,6 +534,23 @@ class StreamRenderer:
         self._tool_names_by_call_id: dict[str, str] = {}
         self._selected_provider: Optional[str] = None
         self._announced_route: Optional[tuple[str, str]] = None
+        # 2026-09-17 (degenerate-repetition fix, owner report: a provider-
+        # recovery loop re-rendered the SAME assistant message ~20 times):
+        # the runner's fallback/reconnect chain can re-emit overlapping text
+        # as fresh assistant_delta events. Renderer-side last-resort guard:
+        # track recently displayed content; an incoming delta whose leading
+        # text is already on screen (or which duplicates the immediately
+        # preceding delta) is dropped rather than painted a second time.
+        # Runner-side overlap trimming (_novel_continuation) remains the
+        # primary defense -- this only catches paths that bypass it.
+        self._displayed_content: str = ""
+        self._last_delta: str = ""
+        self._identical_delta_streak: int = 0
+        # Recovery-narration throttle state: one "Switching/Recovering…"
+        # line per episode. task_started resets it (new turn = new
+        # episode budget).
+        self._recovery_line_last: float = 0.0
+        self._recovery_line_count_this_episode: int = 0
         # Model displayed in the persistent PTY/TTY footer. It must be
         # initialised even before routing emits a model_selected event.
         self._model: Optional[str] = None
@@ -788,6 +805,16 @@ class StreamRenderer:
             self._round_tool_counts = {}
             self._announced_route = None
             self._terminal_status = None
+            # New turn: fresh recovery-narration budget and fresh
+            # displayed-content guard (the previous turn's tail must not
+            # suppress legitimate output of the next turn).
+            self._recovery_line_last = 0.0
+            self._recovery_line_count_this_episode = 0
+            self._displayed_content = ""
+            self._last_delta = ""
+            self._identical_delta_streak = 0
+            self._last_plan_fingerprint = None
+            self._route_announce_count = 0
         elif event_type in {"context_reused", "context_rescanned"}:
             self._status_detail = "Preparing repository context"
         elif event_type in {"routing_started", "model_selected"}:
@@ -961,6 +988,34 @@ class StreamRenderer:
     def _refresh_live(self) -> None:
         if self._live is not None:
             self._live.update(self._build_status())
+
+    #: Minimum seconds between two "Switching/Recovering TamfisGPT route…"
+    #: lines. A single recovery episode (planning retry, empty-continuation
+    #: chain, cross-provider fallback) can attempt several routes within a
+    #: couple of seconds; one line per episode communicates the state
+    #: change, one line per attempt is spam.
+    _RECOVERY_LINE_QUIET_SECONDS = 20.0
+    #: A recovery episode is also capped: after this many throttled lines
+    #: within the turn, the narration goes fully quiet until task_started
+    #: resets it -- a session stuck cycling routes must not leak a line
+    #: every 20s for an hour.
+    _RECOVERY_LINE_EPISODE_CAP = 3
+    #: Max "Using <tier>" announcements per turn. The initial route plus a
+    #: couple of genuine fallbacks deserve scrollback; a recovery loop
+    #: cycling between two routes does not (the live footer always shows
+    #: the current tier, so nothing is hidden -- only scrollback churn
+    #: stops).
+    _ROUTE_LINE_PER_TURN_CAP = 4
+
+    def _recovery_line_allowed(self) -> bool:
+        now = time.monotonic()
+        if now - self._recovery_line_last < self._RECOVERY_LINE_QUIET_SECONDS:
+            return False
+        if self._recovery_line_count_this_episode >= self._RECOVERY_LINE_EPISODE_CAP:
+            return False
+        self._recovery_line_last = now
+        self._recovery_line_count_this_episode += 1
+        return True
 
     def _print_plan_snapshot(
         self, items: list[dict[str, Any]], *, title: str,
@@ -1286,6 +1341,44 @@ class StreamRenderer:
             # otherwise each later lifecycle event closes another blank box.
             if not self._assistant_open and not content.strip():
                 return
+            # Last-resort repetition guard (2026-09-17, owner-reported
+            # incident): a mid-task provider-rotation re-rendered the same
+            # assistant message ~20 times. The runner's _novel_continuation
+            # overlap-trim is the primary defense, but every recovery path
+            # (reconnect novel-suffix, empty-continuation non-stream retry,
+            # cross-provider fallback) emits through this one handler, and
+            # any path that bypasses the trim must not paint a duplicate.
+            # Three checks, cheapest first:
+            #   1. exact repeat of the immediately-preceding delta (the
+            #      reconnect/retry re-emit shape) -- dropped;
+            #   2. a delta that is a strict prefix of what is already on
+            #      screen (a shorter re-send of already-shown text) --
+            #      dropped;
+            #   3. identical-delta streak >= 3 (a degenerate loop that
+            #      check 1 misses only because whitespace differs) --
+            #      dropped from the 3rd identical delta onward.
+            # A genuine continuation always starts with NEW text, so this
+            # never trims legitimate streaming: _novel_continuation already
+            # guarantees the runner only forwards the novel suffix.
+            if content.strip():
+                if content == self._last_delta:
+                    self._identical_delta_streak += 1
+                else:
+                    self._identical_delta_streak = 0
+                    # Strict-prefix re-send of displayed content: the
+                    # whole delta is old, drop it entirely.
+                    if self._displayed_content.endswith(content) or self._displayed_content.startswith(content):
+                        self._last_delta = content
+                        return
+                if self._identical_delta_streak >= 2:
+                    return
+            self._last_delta = content
+            if content.strip():
+                # Keep a bounded tail; deltas accumulate quickly on long
+                # answers and an unbounded string would grow for the whole
+                # turn. 16k chars comfortably covers any overlap window the
+                # runner-side trim uses (8k).
+                self._displayed_content = (self._displayed_content + content)[-16_000:]
             if content and self._reasoning_start is not None and self._thought_seconds is None:
                 self._thought_seconds = (self._reasoning_last or self._reasoning_start) - self._reasoning_start
             if not self._assistant_open:
@@ -1335,7 +1428,23 @@ class StreamRenderer:
             self._close_assistant()
             items = payload.get("items") if isinstance(payload.get("items"), list) else []
             if items:
-                self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
+                filtered = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
+                # 2026-09-17 (plan-repaint spam fix): engine.py's
+                # _sync_plan_progress fires on every status transition, and
+                # mid-text (self._live stopped by assistant output) each
+                # event used to paint a FULL durable plan panel -- the
+                # owner-reported "plan box re-rendered wholesale, again and
+                # again". Only print when the visible step list actually
+                # changed (statuses or steps); identical repeats are
+                # dropped, and a durable snapshot is printed at most once
+                # per distinct state.
+                fingerprint = tuple(
+                    (str(i.get("step") or ""), str(i.get("status") or "")) for i in filtered
+                )
+                if fingerprint == getattr(self, "_last_plan_fingerprint", None):
+                    return
+                self._last_plan_fingerprint = fingerprint
+                self._plan_steps = filtered
                 if self._live is not None:
                     self._refresh_live()
                 else:
@@ -1349,6 +1458,10 @@ class StreamRenderer:
             items = payload.get("items") if isinstance(payload.get("items"), list) else []
             if items:
                 self._plan_steps = [item for item in items if isinstance(item, dict) and item.get("status") != "context"]
+                # A new/revised plan resets the progress dedup fingerprint --
+                # the new plan's first plan_step_progress must print even if
+                # its text matches what the previous plan showed.
+                self._last_plan_fingerprint = None
                 self._refresh_live()
                 if payload.get("continuation"):
                     # This turn's plan follows an already-active, unfinished
@@ -1651,6 +1764,16 @@ class StreamRenderer:
             if self._announced_route == route:
                 return
             self._announced_route = route
+            # 2026-09-17 (route-flip spam fix): a recovery loop that cycles
+            # between two routes (Ultra -> Ultima -> Ultra -> …) re-announces
+            # "Using …" on every flip. Announce at most
+            # _ROUTE_LINE_PER_TURN_CAP distinct-route switches per turn;
+            # beyond that the live footer (self._model) still reflects the
+            # current route, so nothing is hidden -- only the scrollback
+            # churn is stopped.
+            self._route_announce_count = getattr(self, "_route_announce_count", 0) + 1
+            if self._route_announce_count > self._ROUTE_LINE_PER_TURN_CAP:
+                return
             reason = payload.get("selection_reason") or "explicit selection or orchestration routing"
             if self.debug:
                 self.console.print(
@@ -1716,10 +1839,19 @@ class StreamRenderer:
                 # durable, sanitized progress line; the transient spinner
                 # alone can disappear when prompt_toolkit and Rich repaint
                 # the same terminal region.
-                self._close_assistant()
-                self.console.print(
-                    "[dim]· Switching TamfisGPT route; task is still running…[/dim]"
-                )
+                # 2026-09-17 (recovery-line spam fix): the planning/fallback
+                # chain can retry several candidates in quick succession --
+                # printing one identical line per attempt produced walls of
+                # "Switching TamfisGPT route…" for a single recovery
+                # episode. Show the first line, then go quiet for
+                # _RECOVERY_LINE_QUIET_SECONDS; a later episode (new
+                # distinct route problem after real work happened) prints
+                # again immediately.
+                if self._recovery_line_allowed():
+                    self._close_assistant()
+                    self.console.print(
+                        "[dim]· Switching TamfisGPT route; task is still running…[/dim]"
+                    )
             return
 
         if event_type == "orchestrator_repair":
@@ -1733,10 +1865,15 @@ class StreamRenderer:
                 # case above, covering fallback/recovery initiated inside
                 # the main model/tool loop. Never render the raw action: it
                 # may contain backend names or HTTP response details.
-                self._close_assistant()
-                self.console.print(
-                    "[dim]· Recovering with another TamfisGPT route; task is still running…[/dim]"
-                )
+                # Same episode-throttle as the diagnostics line above: one
+                # line per recovery episode, not one per attempt (the
+                # owner-reported session showed this line ~20 times back to
+                # back while the fallback chain cycled).
+                if self._recovery_line_allowed():
+                    self._close_assistant()
+                    self.console.print(
+                        "[dim]· Recovering with another TamfisGPT route; task is still running…[/dim]"
+                    )
             return
 
         # Unrecognised event type: show it plainly rather than silently
