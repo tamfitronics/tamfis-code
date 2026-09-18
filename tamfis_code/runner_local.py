@@ -62,6 +62,7 @@ from .routing import (
     TaskType,
     complexity_at_least,
     is_explicit_read_only_request,
+    is_mutation_request,
 )
 from .orchestrator import (
     AgentOrchestrator,
@@ -5193,6 +5194,13 @@ async def _run_local_agent_turn_impl(
     turn_read_only = read_only or getattr(task_profile.task_type, "value", "") in {
         "inspect", "audit", "plan",
     }
+    # A CLI/--read-only flag (or an explicit read-only objective) is an
+    # absolute user promise that must never be auto-lifted mid-turn; a
+    # heuristic INSPECT/AUDIT/PLAN classification is not, and can be
+    # corrected by the escalation path below when the objective itself
+    # turns out to request action.
+    user_requested_read_only = bool(read_only) or is_explicit_read_only_request(objective)
+    _read_only_reject_count = 0
     selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
@@ -8367,27 +8375,65 @@ async def _run_local_agent_turn_impl(
             permission_decision = _turn_permission_decisions.get(tc.call_id)
 
             if turn_read_only and risk != "read_only":
-                hint = ""
-                if tc.name == "execute_command":
-                    hint = (
-                        " Use read_file with offset/limit, search_code, or a recognized read-only "
-                        "pipeline (for example grep/rg piped to head, sed -n, or bounded awk) "
-                        "instead of retrying Python or another general-purpose command. `php -l "
-                        "<one file>` and `bash -n <one file>` (or `sh -n <one file>`) are also "
-                        "read-only syntax checks -- run them per file (find the files first, "
-                        "already read-only, then lint each one individually); a find|xargs fan-out "
-                        "into an interpreter is not supported even in read-only mode."
+                # ESCALATION SAFETY NET (live-confirmed 2026-09: a "read and
+                # execute these instructions end to end, retry if you fail"
+                # objective classified read-only, and the model then spent
+                # the whole turn bouncing off this rejection for read_file,
+                # list_directory, execute_command, ... -- the message even
+                # told it to "use read_file" while read_file was rejected
+                # for its arguments). When the model persistently reaches
+                # for MUTATION tools and the user's own objective asks for
+                # execution/mutation, the read-only classification was the
+                # mistake -- lift it mid-turn and continue instead of
+                # looping. Never escalates when the user explicitly
+                # requested read-only (that promise is absolute).
+                if (
+                    _read_only_reject_count < 2
+                    and not user_requested_read_only
+                    and is_mutation_request(objective)
+                ):
+                    _read_only_reject_count += 1
+                    turn_read_only = False
+                    orchestrator.mark_repair(
+                        f"Escalating to execute mode: the objective requests action "
+                        f"('{tc.name}' was needed) but this turn started read-only."
                     )
-                result = {
-                    "error": (
-                        f"'{tc.name}' is not available in read-only mode with these arguments."
-                        + hint
-                    ),
-                    "success": False,
-                }
-                working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
-                renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
-                continue
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": (
+                            "◆ This task needs write/execute access -- upgrading from "
+                            "read-only to execute mode and continuing."
+                        )},
+                    })
+                    selected_tool_names = allowed_tools(task_profile, read_only=False)
+                    tools = (
+                        mcp_server.tool_schemas_openai(names=selected_tool_names)
+                        if selected_tool_names else []
+                    )
+                    # Re-dispatch THIS call with the lifted restriction:
+                    # fall through to the normal permission flow below.
+                else:
+                    hint = ""
+                    if tc.name == "execute_command":
+                        hint = (
+                            " Use read_file with offset/limit, search_code, or a recognized read-only "
+                            "pipeline (for example grep/rg piped to head, sed -n, or bounded awk) "
+                            "instead of retrying Python or another general-purpose command. `php -l "
+                            "<one file>` and `bash -n <one file>` (or `sh -n <one file>`) are also "
+                            "read-only syntax checks -- run them per file (find the files first, "
+                            "already read-only, then lint each one individually); a find|xargs fan-out "
+                            "into an interpreter is not supported even in read-only mode."
+                        )
+                    result = {
+                        "error": (
+                            f"'{tc.name}' is not available in read-only mode with these arguments."
+                            + hint
+                        ),
+                        "success": False,
+                    }
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                    continue
 
             if permission_decision is not None and permission_decision.action == "deny":
                 result = {"error": permission_decision.reason, "success": False, "permission_rule": permission_decision.rule}

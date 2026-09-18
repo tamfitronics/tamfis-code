@@ -754,3 +754,24 @@ def test_standalone_explicit_tier_iv_route_is_rejected():
         assert "not available in standalone runtime mode" in str(exc)
     else:
         raise AssertionError("standalone Tier IV route was not rejected")
+
+
+def test_execute_instructions_objective_is_not_read_only():
+    """Live-confirmed 2026-09: 'read and executed the instructions ... end
+    to end, retry automatically if you fail' classified as AUDIT -- forced
+    read-only -- and the turn rejected every tool it reached for. Both
+    'execute' and 'retry' are action directives."""
+    text = (
+        "Pleae read  nd executed the instructions in this fiel end to end "
+        "retry automatically if you fail: /home/website-redesign-prompt.docx"
+    )
+    assert classify_task(text).task_type is not TaskType.AUDIT
+    assert classify_task("read and execute the instructions in this file end to end").task_type is not TaskType.AUDIT
+
+
+def test_pure_audit_wording_stays_read_only():
+    assert classify_task("audit the entire repository").task_type is TaskType.AUDIT
+
+
+def test_explicit_read_only_stays_read_only():
+    assert classify_task("review this file read-only, no edits").task_type is TaskType.INSPECT

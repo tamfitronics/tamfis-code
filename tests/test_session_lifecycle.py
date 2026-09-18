@@ -75,7 +75,11 @@ class SetSessionArchivedTests(_StateDirFixture, unittest.TestCase):
         state_module.set_session_archived(1, True)
         state = state_module.get_session_state(1)
         self.assertTrue(state.archived)
-        self.assertEqual(state.session_title, "hi")
+        # The mechanical title generator was removed: titles come only from
+        # the LLM path, so a "hi" objective persists NO title. Archiving
+        # must still leave conversation history (and any persisted title)
+        # untouched.
+        self.assertEqual(state.session_title, "")
         self.assertTrue(state.conversation_history)
 
     def test_session_stays_in_all_known_session_ids_once_archived(self):

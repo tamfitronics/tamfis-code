@@ -588,7 +588,8 @@ class MCPServer:
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "Artifact path in the workspace or an exact attachment path"},
-                    "max_chars": {"type": "integer", "description": "Maximum extracted text characters (default 30000)"},
+                    "max_chars": {"type": "integer", "description": "Maximum extracted text characters per call (default 30000)"},
+                    "offset": {"type": "integer", "description": "Character offset into the extracted text to continue a previous read from (use the reported total_chars/truncated to page). Default 0."},
                 },
                 "required": ["path"],
             },
@@ -1807,7 +1808,9 @@ class MCPServer:
             )
         return result
 
-    async def _inspect_artifact(self, path: str, max_chars: int = 30_000) -> Dict[str, Any]:
+    async def _inspect_artifact(
+        self, path: str, max_chars: int = 30_000, offset: int = 0,
+    ) -> Dict[str, Any]:
         from .artifacts import inspect_artifact
         source = self._resolve_readable_input(path)
         if not source.is_file():
@@ -1816,7 +1819,11 @@ class MCPServer:
             limit = min(max(int(max_chars), 1_000), 100_000)
         except (TypeError, ValueError):
             limit = 30_000
-        return inspect_artifact(source, max_chars=limit)
+        try:
+            skip = max(int(offset), 0)
+        except (TypeError, ValueError):
+            skip = 0
+        return inspect_artifact(source, max_chars=limit, offset=skip)
     
     async def _kill_process_group(self, proc: "asyncio.subprocess.Process") -> None:
         # Kill the whole process group (the shell was started with

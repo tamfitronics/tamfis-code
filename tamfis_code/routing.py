@@ -113,7 +113,15 @@ _EXPLICIT_MUTATION_RE = re.compile(
     r"\bmake\b.{0,80}\b(?:better|faster|smarter|safer|like|resemble|changes?)\b|"
     r"\bresemble\b|\bedit\b|\bmodify\b|\brewrite\b|\brefactor\b|"
     r"\bcreate\b|\badd\b|\bremove\b|\bdelete\b|\bchange\b|"
-    r"\bwrite\b.{0,24}\bfiles?\b|\bcommit\b|\bpush\b|\brestart\b|\binstall\b)",
+    r"\bwrite\b.{0,24}\bfiles?\b|\bcommit\b|\bpush\b|\brestart\b|\binstall\b|"
+    # "execute the instructions" / "retry automatically" are EXECUTION
+    # directives (run, act, redo on failure), not requests to merely read
+    # and report -- live-confirmed 2026-09: "read and executed the
+    # instructions ... end to end, retry automatically if you fail"
+    # classified as AUDIT (read-only) purely because neither "execute"
+    # nor "retry" matched any mutation signal, and the turn then rejected
+    # every tool it reached for.
+    r"\bexecut(?:e|es|ed|ing)\b|\bretr(?:y|ies|ied)\b)",
     re.IGNORECASE,
 )
 
@@ -281,6 +289,10 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
             return profile(TaskType.AUDIT, True, True, True, False, "frontier")
         return profile(TaskType.INSPECT, True, True, False, False, "high")
     if has(("audit", "entire stack", "whole repository", "whole repo", "end-to-end", "end to end")):
+        # ORDER MATTERS: this audit check must only claim the turn after the
+        # combined audit+mutation case below it. (The mutation branch is
+        # reached through this same block, so the structure is: audit words
+        # present -> mutation requested ? MIXED : AUDIT.)
         # Large implementation requests commonly require an audit first
         # ("audit what exists, then implement/fix the gaps").  Treating the
         # word "audit" as the whole turn used to classify that workflow as

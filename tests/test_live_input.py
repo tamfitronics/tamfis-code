@@ -322,8 +322,11 @@ class SessionTitleFooterPrefixTests(_StatePatchMixin, unittest.TestCase):
         self.assertIn("Session 7", rendered)
 
     def test_idle_toolbar_shows_the_persisted_title_once_set(self):
-        state_module.remember_conversation_turn(
-            7, objective="Fix the flaky auth test", answer="Done.",
+        # Titles are persisted ONLY by the LLM path now (the mechanical
+        # generator was removed), so simulate a completed upgrade.
+        state_module.save_session_state(
+            7, workspace_root="/a", session_title="Fix the flaky auth test",
+            title_source="llm",
         )
         fragments = idle_bottom_toolbar(
             _config("ask"), 7, provider="ollama_cloud", model="kimi",
@@ -333,8 +336,8 @@ class SessionTitleFooterPrefixTests(_StatePatchMixin, unittest.TestCase):
         self.assertNotIn("Session 7", rendered)
 
     def test_long_title_is_truncated_in_the_footer(self):
-        state_module.remember_conversation_turn(
-            7, objective="x" * 100, answer="Done.",
+        state_module.save_session_state(
+            7, workspace_root="/a", session_title="x" * 100, title_source="llm",
         )
         fragments = idle_bottom_toolbar(
             _config("ask"), 7, provider="ollama_cloud", model="kimi",
@@ -344,8 +347,9 @@ class SessionTitleFooterPrefixTests(_StatePatchMixin, unittest.TestCase):
         self.assertNotIn("x" * 28, rendered)
 
     def test_in_task_toolbar_also_shows_the_session_title(self):
-        state_module.remember_conversation_turn(
-            9, objective="Refactor the auth middleware", answer="Done.",
+        state_module.save_session_state(
+            9, workspace_root="/a", session_title="Refactor the auth middleware",
+            title_source="llm",
         )
         renderer = StreamRenderer(_console())
         listener = LiveInputListener(session_id=9, renderer=renderer, cli_config=_config("ask"))

@@ -38,7 +38,25 @@ from .config import CONFIG_DIR
 # this bounds the providers path (which can try several providers in turn)
 # while still never blocking task completion meaningfully -- callers await
 # this only AFTER the turn's result is already persisted.
-TITLE_UPGRADE_TIMEOUT_SECONDS = 30
+TITLE_UPGRADE_TIMEOUT_SECONDS = 150
+# Per-attempt cap forwarded to the OpenAI SDK (chat_completion forwards
+# **kwargs into create()): the manager's clients are built with a 120s
+# timeout, so ONE cold provider attempt used to consume the entire title
+# budget before the machinery could fall back to a healthy route.
+_TITLE_ATTEMPT_TIMEOUT_SECONDS = 30
+# Bounded redraws when a route answers with an empty stream (no exception
+# raised, so the machinery itself has nothing to fall back from).
+_TITLE_MAX_MACHINERY_ATTEMPTS = 3
+# Preferred routes for the title call, tried in order through the full
+# machinery (so route health, key rotation, and cross-provider fallback
+# all still apply within each attempt). Live-probed 2026-09 against the
+# real title prompt: OpenRouter returned a correct semantic title, HF's
+# Qwen route returned content=None (an EMPTY stream with HTTP 200 --
+# which the machinery correctly treats as success and therefore never
+# falls back from), NVIDIA NIM timed out, Ollama Cloud was 429'd.
+# OpenRouter first because titles are worth the one route that verifiably
+# answers; a provider not in clients is simply skipped.
+_TITLE_PROVIDER_PREFERENCE = ("openrouter", "grok", "nvidia", "hf", "ollama_cloud")
 
 STATE_PATH = CONFIG_DIR / "state.json"
 _VOLATILE_STATE: dict[tuple[str, int], "SessionState"] = {}
@@ -340,6 +358,15 @@ class SessionState:
     # good title with one describing whatever the user typed most recently
     # instead of what the session as a whole was about.
     ai_title_attempted: bool = False
+    # Title provenance (diagnostics): where the persisted session_title
+    # came from -- "llm" (upgrade_session_title_with_ai), "user" (explicit
+    # rename via /regenerate-title's rename form; NEVER overwritten
+    # automatically) -- and, when the LLM failed, why. title_model/
+    # title_generated_at record which model wrote it and when.
+    title_source: str = ""
+    title_fallback_reason: Optional[str] = None
+    title_model: Optional[str] = None
+    title_generated_at: Optional[str] = None
     # Set exactly once, the first time this session is ever persisted (see
     # put_session_state) -- distinct from updated_at, which changes on every
     # write. Backs the resume picker's "Sort: Created" option.
@@ -930,110 +957,95 @@ def clear_turn_checkpoint(session_id: int) -> None:
 
 
 
-# Leading pleasantry/filler words that carry no meaning at the *start* of a
-# session title. Stripping them lets a short, information-dense title lead
-# with the actual work instead of the objective's first few words -- the
-# live-reported "just picks the first few words" symptom. Deliberately does
-# NOT include question words (what/how/why/which/who/where/when) or common
-# verbs (do/does/is/are/can/could/would/will): stripping "What does a
-# semicolon do in Python?" down to "semicolon do in Python?" destroys a
-# question objective's meaning, so only pure pleasantries are dropped.
-_TITLE_FILLER_WORDS = frozenset({
-    "a", "an", "and", "as", "at", "be", "but", "by", "for", "from",
-    "had", "has", "have", "he", "her", "here", "his", "i", "if", "in",
-    "into", "it", "its", "just", "me", "my", "need", "needs", "no",
-    "not", "of", "on", "or", "our", "please", "so", "some", "that",
-    "the", "their", "them", "then", "there", "these", "they", "this",
-    "to", "us", "very", "was", "we", "were", "with", "you", "your",
-})
-
-
-def _derive_session_title(text: str) -> str:
-    """A short, information-dense label for a session from its objective.
-
-    Smarter than a blind "first 60 characters" cut, which is exactly the
-    live-reported complaint ("just picks the first few words"): the first
-    sentence (or first line) is taken, leading filler/pleasantry words are
-    dropped, and the result is capped at 60 chars. Multi-line objectives
-    are collapsed first so a title can never contain a raw newline.
-    """
-    seed = " ".join((text or "").split()).strip()
-    if not seed:
-        return ""
-    # Prefer the first sentence -- an objective's opening sentence is its
-    # intent; later sentences are usually detail or constraints.
-    first_sentence = re.split(r"(?<=[.!?])\s+", seed)[0].strip() or seed
-    # Drop leading filler words ("please fix the..." -> "fix the..."),
-    # keeping at least one word so the title is never empty.
-    words = first_sentence.split()
-    while len(words) > 1 and words[0].lower().strip(":,") in _TITLE_FILLER_WORDS:
-        words = words[1:]
-    candidate = " ".join(words)
-    if not candidate:
-        return ""
-    # A sentence-final period is noise in a title; keep ? and ! (they mark
-    # a question or imperative, which is real information).
-    if candidate.endswith(".") and not candidate.endswith(".."):
-        candidate = candidate[:-1]
-    return candidate[:60] + ("…" if len(candidate) > 60 else "")
-
-
 def ensure_session_title(session_id: int, objective: str) -> None:
-    """Persist a session_title from `objective` if one isn't already set.
+    """No-op title writer: the mechanical (first-N-words) title generator
+    this used to call was removed entirely -- titles now come ONLY from
+    the LLM (upgrade_session_title_with_ai), which every task-completion
+    call site already awaits.
 
-    Confirmed live: `remember_conversation_turn` (the only place that used
-    to do this) is called from exactly one of at least four places a task
-    completes and clears `active_task` -- the local standalone runner's
-    success path. The other three (a Remote Workspace reattach finding a
-    task finished while disconnected, a `status` command polling a
-    completed remote task, and `runner.py`'s own remote task-stream
-    completion) all clear `active_task` -- the resume picker's *only*
-    other title source (see best_effort_session_label) -- without ever
-    persisting a title first, so any session finishing through one of those
-    three permanently shows as a bare "Session N" forever after, even
-    though the real objective was sitting right there in scope at the
-    clearing call site the whole time. Callers should call this (or
-    remember_conversation_turn, which now calls this too) at every such
-    site, not just the one that already had it.
+    Two deliberate exceptions, both confirmed live:
+    - A user-set title (title_source == "user", via /regenerate-title's
+      rename sibling or a future rename command) is never overwritten.
+    - A previously generated LLM title is kept if the objective carries
+      no new substantive content (a bare "continue" should not retitle
+      the session).
+    Until the LLM title lands, the session has NO persisted title and
+    session_display_title() falls back to live activity snapshots -- an
+    honest "nothing named yet" instead of a fake first-N-words label.
     """
     if not objective or not objective.strip():
         return
     state = get_session_state(session_id)
     if state.session_title:
         return
-    state.session_title = _derive_session_title(objective)
+    if not _is_substantive_objective(objective):
+        return
     put_session_state(state)
 
 
+# A title candidate this short (after trimming) carries no task semantics --
+# "continue", "fix it", "why?" -- so the LLM should not be asked to title a
+# session from it alone (wait for the first substantive message instead).
+_TITLE_MIN_OBJECTIVE_CHARS = 12
+# Words that mark a message as pure conversational steering ("continue",
+# "go on") rather than a task statement.
+_TITLE_NONSUBSTANTIVE_WORDS = frozenset({
+    "continue", "again", "go", "on", "keep", "going", "next", "ok", "okay",
+    "yes", "no", "done", "proceed", "resume", "more", "further", "why?",
+    "hello", "hi", "hey", "thanks", "thank", "you", "me", "help", "us", "we",
+    "please", "kindly", "can", "could", "would", "i", "i'm", "i'd",
+})
+
+
+def _is_substantive_objective(text: str) -> bool:
+    """True when an objective carries enough task semantics to title a
+    session from -- a semantic-content test, not merely character count:
+    a short message made of real task words ("fix login bug", 13 chars)
+    is substantive; a long one made of filler ("please please please help
+    me please") is not.
+    """
+    seed = " ".join((text or "").split()).strip()
+    if not seed:
+        return False
+    if len(seed) < _TITLE_MIN_OBJECTIVE_CHARS:
+        return False
+    words = [w.strip(":,.!?;").lower() for w in seed.split()]
+    content_words = [w for w in words if w and w not in _TITLE_NONSUBSTANTIVE_WORDS]
+    return len(content_words) >= 2
+
+
 async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None:
-    """Best-effort: replace the mechanical title (first ~60 chars of the
-    objective) with a short, LLM-written one via the providers system,
-    using main and fallback providers. Never raises and never blocks a
-    task's completion on this -- ensure_session_title's synchronous,
-    dependency-free title has already been persisted by the time any
-    caller awaits this, so a slow/unreachable/broken model call here only
-    means the session keeps its mechanical title, not that it loses its
-    title.
+    """The ONLY title writer: generate a short, semantic session title
+    from the objective with an LLM via the providers system (main +
+    fallback providers). Never raises and never blocks a task's
+    completion on this.
+
+    The mechanical (first-N-words) generator was removed entirely -- the
+    live-reported symptom was that sessions kept getting titles like
+    "Fist you need to fix" because this path silently failed and a
+    truncated-objective title stood in its place. Now a failed LLM
+    attempt leaves the session with NO persisted title (display falls
+    back to live activity), and the attempt is retried on the next turn.
 
     Every call site awaits this after each completed turn, not just the
     session's first. ai_title_attempted records the one real LLM attempt
-    per session; a failed attempt (empty result, timeout, provider down)
-    does NOT burn that budget -- the next turn retries -- so a transient
-    provider outage on the first turn doesn't leave a session stuck with
-    its mechanical title forever. A SUCCESSFUL upgrade does.
-
-    Uses the providers system (ProviderManager) with proper model
-    selection, retry, and cross-provider resilience rather than a bare
-    httpx call to a Tier IV endpoint. max_tokens is generous (120, not a
-    starvation-prone 20): reasoning models (kimi-k3, glm) can spend the
-    budget on reasoning before writing the title -- a starved call returns
-    empty content, which reads exactly like a provider outage and leaves
-    the mechanical title standing.
+    per session; a failed attempt does NOT burn that budget -- the next
+    turn retries -- so a transient provider outage on the first turn
+    doesn't leave a session untitled forever. A SUCCESSFUL upgrade does.
+    Provenance (title_source, title_fallback_reason, title_model,
+    title_generated_at) is persisted for diagnostics; the user can
+    regenerate at any time via /regenerate-title.
     """
     if not objective or not objective.strip():
         return
     state = get_session_state(session_id)
     if state.ai_title_attempted:
+        return
+    # Never overwrite a user-named session; keep a prior LLM title when
+    # this turn's objective adds nothing substantive to title from.
+    if state.title_source == "user":
+        return
+    if state.session_title and not _is_substantive_objective(objective):
         return
     state.ai_title_attempted = True
     put_session_state(state)
@@ -1051,131 +1063,202 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     ]
 
     try:
-        title = await asyncio.wait_for(
+        title, model_used, failure_reason = await asyncio.wait_for(
             _generate_session_title(messages), timeout=TITLE_UPGRADE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
-        return
-    if not title:
-        # A failed attempt must not burn the one-shot budget: un-mark so a
-        # later turn can retry when the provider is healthy again.
+        print(
+            f"[title] title generation exceeded {TITLE_UPGRADE_TIMEOUT_SECONDS}s across all routes, title not generated",
+            file=sys.stderr,
+        )
         state = get_session_state(session_id)
+        state.title_fallback_reason = "provider_timeout"
         state.ai_title_attempted = False
         put_session_state(state)
         return
+    if not title:
+        # A failed attempt must not burn the one-shot budget: un-mark so a
+        # later turn can retry when the provider is healthy again, and
+        # record WHY (reason-coded, never silent).
+        state = get_session_state(session_id)
+        state.ai_title_attempted = False
+        state.title_fallback_reason = failure_reason or "provider_error"
+        put_session_state(state)
+        return
     state = get_session_state(session_id)
+    if state.title_source == "user":
+        return  # raced with a user rename while the LLM was running
     state.session_title = title
+    state.title_source = "llm"
+    state.title_fallback_reason = None
+    state.title_model = model_used or None
+    from datetime import datetime, timezone
+    state.title_generated_at = datetime.now(timezone.utc).isoformat()
     put_session_state(state)
 
 
-async def _generate_session_title(messages: list) -> str:
-    """Generate a session title using the providers system with main + fallback.
+async def _generate_session_title(messages: list) -> tuple[str, str, str]:
+    """Generate a session title via the providers system's OWN routing
+    machinery (ProviderManager.chat_completion with AUTO + built-in
+    cross-provider fallback).
 
-    Tries the best available provider first, then falls back to the next
-    available provider. Returns empty string on failure so the mechanical
-    title is preserved. Diagnosed (not silent): a skipped provider, an
-    empty/starved response, or a validation reject each log a single
-    diagnostic line -- this is a best-effort path, but it must be visible
-    when it doesn't do what it exists to do.
+    The previous implementation hand-rolled a per-provider loop calling
+    each client directly -- bypassing route-health circuits, key rotation,
+    and fallback -- and live-confirmed (2026-09) it just hung on the first
+    cold provider until the timeout while the main task on the same
+    machine completed fine through the machinery. One call into the real
+    router is the whole fix: it resolves AUTO to a healthy weighted route
+    and falls back across providers on any retryable failure.
+
+    Returns (title, model_used, failure_reason) -- title empty on total
+    failure with a reason-coded failure_reason. Diagnosed, not silent.
     """
     import sys
 
     try:
         from .providers import ProviderManager, ProviderType
-        from .provider_protocols import system_messages_first
     except Exception as exc:
-        print(f"[title] providers unavailable, mechanical title stands: {exc}", file=sys.stderr)
-        return ""
-
-    def _diag(reason: str) -> None:
-        print(f"[title] {reason}", file=sys.stderr)
+        print(f"[title] providers unavailable, title not generated: {exc}", file=sys.stderr)
+        return "", "", "routing_failure"
 
     try:
         manager = ProviderManager()
     except Exception as exc:
-        _diag(f"ProviderManager construction failed, mechanical title stands: {exc}")
-        return ""
+        print(f"[title] ProviderManager construction failed, title not generated: {exc}", file=sys.stderr)
+        return "", "", "routing_failure"
 
-    # Try providers in priority order until one succeeds
-    providers_to_try = list(manager.routing_order)
-    # Remove AUTO from the list; it is a routing directive, not a provider
-    if ProviderType.AUTO in providers_to_try:
-        providers_to_try.remove(ProviderType.AUTO)
+    # Resolve the preferred provider order through the ProviderType enum;
+    # unknown names are skipped, unavailable clients fall through inside
+    # chat_completion's own machinery (health circuits, key rotation,
+    # cross-provider fallback all still apply per attempt).
+    available = {pt.value: pt for pt in ProviderType}
+    preferred = [
+        available[name] for name in _TITLE_PROVIDER_PREFERENCE if name in available
+    ] or [ProviderType.AUTO]
 
-    for provider in providers_to_try:
-        try:
-            client = manager.get_client(provider)
-            if not client:
-                continue
-            config = manager.PROVIDERS.get(provider)
-            if not config:
-                continue
-            resolved_model = manager.select_model(config, None)
-            response = await client.chat.completions.create(
-                model=resolved_model,
-                messages=system_messages_first(messages),
+    last_reason = "empty_response"
+    try:
+        content = ""
+        for attempt in range(1, _TITLE_MAX_MACHINERY_ATTEMPTS + 1):
+            provider = preferred[(attempt - 1) % len(preferred)]
+            chunks: list[str] = []
+            async for chunk in manager.chat_completion(
+                provider,
+                messages,
                 stream=False,
                 temperature=0.3,
                 # Generous on purpose: reasoning models can burn tokens
-                # thinking before writing a 4-word title. A 20-token cap
-                # returned empty content on those providers, which the old
-                # blanket except treated as "provider unavailable".
-                max_tokens=120,
+                # thinking before writing a 4-word title. Live-confirmed
+                # 2026-09: 120 tokens at the machinery's default HIGH
+                # reasoning effort came back with EMPTY content (the budget
+                # was spent reasoning, nothing left for the answer). A large
+                # budget plus low effort lets reasoning models actually
+                # emit the title.
+                max_tokens=600,
+                reasoning_effort="low",
+                # Cap EACH route attempt at 30s so the machinery's
+                # cross-provider fallback actually fits inside
+                # TITLE_UPGRADE_TIMEOUT_SECONDS.
+                timeout=_TITLE_ATTEMPT_TIMEOUT_SECONDS,
+            ):
+                chunks.append(str(chunk or ""))
+            content = "".join(chunks).strip()
+            if content:
+                break
+            last_reason = "empty_response"
+            print(
+                f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS} via "
+                f"{provider.value}: empty response, trying next preferred route",
+                file=sys.stderr,
             )
-            if not response.choices:
-                _diag(f"{provider.value}: empty choices, trying next provider")
-                continue
-            content = str(response.choices[0].message.content or "").strip()
-            if not content and hasattr(response.choices[0].message, "reasoning_content"):
-                # Starved/hidden reasoning shapes: some providers put the
-                # visible text in a secondary field when max_tokens is tight.
-                content = str(getattr(response.choices[0].message, "reasoning_content", None) or "").strip()
-            stripped = content.strip("\"'“”")
-            # Validate before accepting: a real title is short, multi-word
-            # enough to be informative, and never a full sentence. A
-            # response that answers the objective instead of titling it is
-            # rejected so the mechanical title stands (visually, an accepted
-            # truncated sentence is indistinguishable from "first few words").
-            word_count = len(stripped.split())
-            if not stripped or len(stripped) > 80 or word_count > 8 or stripped[-1:] in ".!?":
-                _diag(f"{provider.value}: response rejected by title validation, trying next provider")
-                continue
-            return _derive_session_title(stripped)
-        except Exception as exc:
-            _diag(f"{getattr(provider, 'value', provider)}: provider attempt failed ({type(exc).__name__}), trying next provider")
-            continue
-    return ""
+    except Exception as exc:
+        print(
+            f"[title] provider attempt failed ({type(exc).__name__}: {str(exc)[:120]}), title not generated",
+            file=sys.stderr,
+        )
+        return "", "", "provider_error"
+
+    if not content:
+        print("[title] empty response, title not generated", file=sys.stderr)
+        return "", "", "empty_response"
+    stripped = content.strip("\"'\u201c\u201d \t")
+    # Validate before accepting: a real title is short, multi-word enough
+    # to be informative, and never a full sentence. A response that
+    # answers the objective instead of titling it is rejected so a wrong
+    # label never persists.
+    word_count = len(stripped.split())
+    if not stripped or len(stripped) > 80 or word_count > 8 or stripped[-1:] in ".!?":
+        print("[title] response rejected by title validation", file=sys.stderr)
+        return "", "", "invalid_response"
+    title = _sanitize_llm_title(stripped)
+    if not title:
+        print("[title] sanitized title empty", file=sys.stderr)
+        return "", "", "invalid_response"
+    return title, "auto", ""
+
+
+def _sanitize_llm_title(text: str) -> str:
+    """Light-touch cleanup of an LLM title candidate -- NOT a fallback
+    title generator. Trims quotes/markdown fencing and terminal
+    punctuation, collapses whitespace, enforces the 60-char cap.
+    Returns empty when nothing survives (caller rejects and moves on).
+    """
+    cleaned = (text or "").strip()
+    # markdown fencing a model might wrap the title in
+    if cleaned.startswith("```"):
+        cleaned = cleaned.strip("` \n\t")
+        if cleaned.lower().startswith("text"):
+            cleaned = cleaned[4:]
+    cleaned = " ".join(cleaned.split())
+    # trailing punctuation is noise in a title (keep ? ! -- real info)
+    while cleaned and cleaned[-1] in ".:;," :
+        cleaned = cleaned[:-1].rstrip()
+    if len(cleaned) > 60:
+        cleaned = cleaned[:60].rstrip()
+        # don't cut mid-word
+        if " " in cleaned:
+            cleaned = cleaned[:cleaned.rfind(" ")].rstrip()
+    return cleaned
 
 
 def best_effort_session_label(state: SessionState) -> str:
-    """One-line summary of what a session was/is doing, straight from
-    already-recorded activity (active_task objective, then
+    """One-line summary of what a session is doing RIGHT NOW, straight
+    from already-recorded activity (active_task objective, then
     conversation_summary, then the last user turn) -- no persisted
     session_title required. Empty string if nothing usable is recorded yet
-    (a session with no turns at all). Each seed is whitespace-collapsed
-    onto one line and capped by _derive_session_title, so a multi-line
-    objective can never inject a raw newline into the resume picker's or
-    footer's single-line rendering.
+    (a session with no turns at all).
+
+    Deliberately NOT a title generator: with the mechanical first-N-words
+    generator removed, this is a transient DISPLAY fallback only (footer /
+    resume picker "what is this session doing"), never persisted to
+    session_title -- so nothing that looks like "first few words of the
+    prompt" can ever become the session's name. Multi-line seeds are
+    collapsed via _one_line_label so a raw newline can never reach the
+    resume picker's or footer's single-line rendering.
 
     Shared by session_display_title's fallback below and workspace.py's
-    `_describe_session_activity` (its "detail" line): confirmed live, a
-    session whose first turn hadn't finished yet (or predates the
-    session_title feature) showed as a bare "Session 1380884423" in the
-    resume picker and footer -- unusable for telling several such sessions
-    apart -- even though its active_task objective or last message was
-    sitting right there in state.json the whole time.
+    `_describe_session_activity` (its "detail" line).
     """
     objective = str((state.active_task or {}).get("objective") or "").strip()
     if objective:
-        return _derive_session_title(objective)
+        return _one_line_label(objective)
     if state.conversation_summary:
         last_line = state.conversation_summary.strip().splitlines()[-1]
         if last_line:
-            return _derive_session_title(last_line)
+            return _one_line_label(last_line)
     for entry in reversed(state.conversation_history):
         if entry.get("role") == "user" and str(entry.get("content") or "").strip():
-            return _derive_session_title(str(entry["content"]).strip().splitlines()[0])
+            return _one_line_label(str(entry["content"]).strip().splitlines()[0])
     return ""
+
+
+def _one_line_label(text: str) -> str:
+    """Collapse a multi-line seed onto one display line, hard-capped.
+    Pure display hygiene -- no word selection, no title semantics."""
+    line = " ".join((text or "").split()).strip()
+    if not line:
+        return ""
+    return line[:60] + ("…" if len(line) > 60 else "")
 
 
 def session_display_title(session_id: int) -> str:
@@ -1218,6 +1301,56 @@ def set_session_archived(session_id: int, archived: bool) -> None:
     state = get_session_state(session_id)
     state.archived = archived
     put_session_state(state)
+
+
+def rename_session_title(session_id: int, title: str) -> bool:
+    """User-explicit rename. Persists with title_source="user"; automatic
+    generation NEVER overwrites a user title afterwards. Returns True
+    when applied."""
+    cleaned = _sanitize_llm_title(title)
+    if not cleaned:
+        return False
+    state = get_session_state(session_id)
+    state.session_title = cleaned
+    state.title_source = "user"
+    state.title_fallback_reason = None
+    from datetime import datetime, timezone
+    state.title_generated_at = datetime.now(timezone.utc).isoformat()
+    put_session_state(state)
+    return True
+
+
+def request_session_title_regeneration(session_id: int) -> bool:
+    """Clear the current title so the next upgrade_session_title_with_ai
+    (invoked with the session's own objective) regenerates it from the
+    full conversation. A user-sourced title is never touched.
+    """
+    state = get_session_state(session_id)
+    if state.title_source == "user":
+        return False
+    state.session_title = ""
+    state.ai_title_attempted = False
+    state.title_source = ""
+    state.title_fallback_reason = None
+    state.title_model = None
+    state.title_generated_at = None
+    put_session_state(state)
+    return True
+
+
+def session_title_diagnostics(session_id: int) -> dict:
+    """Inspectable title provenance for debugging -- the acceptance
+    contract's diagnostic record (session_id, title, source, model,
+    generated_at, fallback_reason)."""
+    state = get_session_state(session_id)
+    return {
+        "session_id": session_id,
+        "title": state.session_title or None,
+        "title_source": state.title_source or None,
+        "title_model": state.title_model,
+        "title_generated_at": state.title_generated_at,
+        "fallback_reason": state.title_fallback_reason,
+    }
 
 
 def remember_conversation_turn(

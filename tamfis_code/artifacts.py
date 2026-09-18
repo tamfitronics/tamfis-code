@@ -165,8 +165,23 @@ def _create_pdf(path: Path, content: dict[str, Any]) -> None:
     SimpleDocTemplate(str(path), pagesize=A4, title=title).build(story)
 
 
-def inspect_artifact(path: Path, *, max_chars: int = 30_000) -> dict[str, Any]:
+def inspect_artifact(
+    path: Path, *, max_chars: int = 30_000, offset: int = 0,
+) -> dict[str, Any]:
+    """Extract text from an Office/PDF artifact for the model to read.
+
+    `offset` skips the first `offset` characters of the FULL extracted
+    text (confirmed live 2026-09: a model reading a long .docx got a
+    truncated view and naturally asked for "the rest" with offset -- the
+    tool rejected the argument it needed, and the turn stalled). The
+    response reports both `offset` and the full `total_chars` so the
+    caller can page through deterministically.
+    """
     kind = path.suffix.lower().lstrip(".")
+    try:
+        offset = max(int(offset), 0)
+    except (TypeError, ValueError):
+        offset = 0
     if kind == "docx":
         from docx import Document
         doc = Document(path)
@@ -228,5 +243,8 @@ def inspect_artifact(path: Path, *, max_chars: int = 30_000) -> dict[str, Any]:
         raise ValueError("inspect_artifact supports .docx, .xlsx, .pptx, and .pdf")
     return {
         "success": True, "artifact_type": kind, "path": str(path), **details,
-        "text": text[:max_chars], "truncated": len(text) > max_chars,
+        "total_chars": len(text),
+        "offset": offset,
+        "text": text[offset:offset + max_chars],
+        "truncated": len(text) > offset + max_chars,
     }

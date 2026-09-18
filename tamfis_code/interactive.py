@@ -290,6 +290,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/cd", "change the working directory for this session"),
     ("/copy", "copy the last assistant response to the clipboard"),
     ("/paste-image", "attach an image from the system clipboard to your next message"),
+    ("/regenerate-title", "retitle this session with a fresh AI title (or: /regenerate-title <name> to set it yourself)"),
     ("/doctor", "run connectivity/auth/self-health checks (add --heal to auto-repair fixable findings)"),
     ("/resume", "switch to another session"),
     ("/fork", "branch this conversation into a new independent session"),
@@ -1642,6 +1643,41 @@ async def _run_interactive_impl(
                 console.print(f"[dim]Copied {len(last_response_text):,} characters to clipboard.[/dim]")
             else:
                 console.print("[dim]Can't copy: output isn't attached to a terminal.[/dim]")
+            continue
+        if text.lower().startswith("/regenerate-title"):
+            arg = text[len("/regenerate-title"):].strip().strip('"')
+            if arg:
+                # Explicit user rename -- always wins, never auto-overwritten.
+                if local_state.rename_session_title(workspace.session_id, arg):
+                    console.print(
+                        f"[green]Session renamed[/green] · {arg} "
+                        "[dim](your names are never overwritten)[/dim]"
+                    )
+                else:
+                    print_error(console, "That name is empty or invalid.")
+                continue
+            objective = str((local_state.get_session_state(workspace.session_id).active_task or {}).get("objective") or "")
+            if not objective:
+                history = local_state.get_session_state(workspace.session_id).conversation_history
+                for entry in reversed(history):
+                    if entry.get("role") == "user" and str(entry.get("content") or "").strip():
+                        objective = str(entry["content"])
+                        break
+            if not objective:
+                print_error(console, "Nothing to title from yet -- send a task message first.")
+                continue
+            console.print("[dim]◆ Generating a fresh session title…[/dim]")
+            if not local_state.request_session_title_regeneration(workspace.session_id):
+                console.print("[yellow]This session was renamed manually; use "
+                              '"/regenerate-title <name>" to set it yourself.[/yellow]')
+                continue
+            await local_state.upgrade_session_title_with_ai(workspace.session_id, objective)
+            state_after = local_state.get_session_state(workspace.session_id)
+            if state_after.session_title:
+                console.print(f"[green]Session title[/green] · {state_after.session_title}")
+            else:
+                reason = state_after.title_fallback_reason or "unknown"
+                print_error(console, f"Title generation failed ({reason}); will retry on the next turn.")
             continue
         if _ci_equals(text, "/paste-image"):
             data, reason = await asyncio.to_thread(read_clipboard_image)
