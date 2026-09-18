@@ -129,7 +129,13 @@ def test_explicit_external_path_is_automatically_added_to_grant(tmp_path: Path):
         objective=f"read {target}",
         allowed_roots=allowed,
     )
-    assert result.roots == (target.resolve(),)
+    # A named FILE is an input, not a scope boundary (live-confirmed
+    # 2026-09: a docx objective once narrowed scope_roots to the file
+    # itself, rejecting every project read for the rest of the turn).
+    # The file stays authorized via explicit_paths; roots stay the launch
+    # project.
+    assert result.roots == (current.resolve(),)
+    assert target.resolve() in result.explicit_paths
 
 
 def test_pasted_api_routes_and_error_text_are_not_absolute_targets(tmp_path: Path):
@@ -158,3 +164,33 @@ def test_runner_integrates_authority_and_freshness_rules():
     assert "SUPERSEDED" in text
     assert "current source" in text
     assert "do not present a final audit conclusion" in text
+
+
+def test_named_input_file_never_becomes_the_scope_boundary(tmp_path: Path):
+    """The live 2026-09 dead end: 'read and execute the instructions in
+    /home/<task>.docx' resolved scope roots to exactly that one docx FILE,
+    so every read_file/list_directory/get_git_info of any project directory
+    was an 'external scope' crossing and got rejected for the whole turn.
+    A named file must be authorized for reading while the workspace keeps
+    its normal directory scope."""
+    current = _project(tmp_path / "tamfisseo")
+    doc = tmp_path / "task-instructions.docx"
+    doc.write_text("instructions", encoding="utf-8")
+
+    # Mirror the runner's real two-step flow: auto_grant runs first (an
+    # absolute path named in the objective is direct authorization), then
+    # resolve_workspace_targets decides the turn's directory scope.
+    allowed, added = auto_grant_explicit_targets(
+        launch_root=current,
+        objective=f"read and execute the instructions in {doc} end to end",
+        allowed_roots=[current],
+    )
+    assert doc.resolve() in allowed
+
+    result = resolve_workspace_targets(
+        launch_root=current,
+        objective=f"read and execute the instructions in {doc} end to end",
+        allowed_roots=allowed,
+    )
+    assert result.roots == (current.resolve(),)  # directory scope intact
+    assert doc.resolve() in result.explicit_paths  # input still authorized

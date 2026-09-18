@@ -245,8 +245,19 @@ def resolve_workspace_targets(
             denied=denied, allowed=grant.allowed_roots,
         )
 
+    # A named FILE is an input to the task, not a scope boundary.
+    # Live-confirmed 2026-09: an objective "read and execute the
+    # instructions in /home/<task>.docx" resolved roots to exactly that one
+    # docx file -- so scope_roots became a single FILE, and every read of
+    # any project directory (read_file, list_directory, get_git_info) was
+    # then classified as an external-scope boundary crossing and rejected
+    # "in read-only mode", dead-ending the turn. Files stay authorized
+    # (explicit_paths, grant) for reading; only DIRECTORIES may narrow the
+    # scope roots.
+    directory_targets = [path for path in explicit if path.is_dir()]
+
     selected: list[Path] = []
-    for path in explicit:
+    for path in directory_targets:
         if grant.contains(path) and path not in selected:
             selected.append(path)
 
