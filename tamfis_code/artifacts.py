@@ -76,6 +76,24 @@ def _safe_cell(value: Any, allow_formulas: bool) -> Any:
 
 
 def _create_xlsx(path: Path, content: dict[str, Any]) -> None:
+    """Create an xlsx file, delegating to spreadsheet_engineering when
+    the content contains advanced fields (formulas, styles, charts).
+
+    Falls back to the legacy inline implementation for simple content
+    dicts that only have ``rows``/``header``/``freeze_panes`` so that
+    existing callers are not affected by the new module's API.
+    """
+    # Check if content uses advanced features that require the new module
+    has_advanced = any(
+        key in content
+        for key in ("formulas", "conditional_formatting", "charts", "palette", "theme")
+    )
+    if has_advanced:
+        from .spreadsheet_engineering.xlsx_builder import create_workbook
+        create_workbook(path, content)
+        return
+
+    # Legacy path for simple content dicts
     from openpyxl import Workbook
     from openpyxl.styles import Font
     workbook = Workbook()
@@ -155,16 +173,43 @@ def inspect_artifact(path: Path, *, max_chars: int = 30_000) -> dict[str, Any]:
         text = "\n".join(paragraph.text for paragraph in doc.paragraphs)
         details = {"paragraphs": len(doc.paragraphs)}
     elif kind == "xlsx":
-        from openpyxl import load_workbook
-        book = load_workbook(path, read_only=True, data_only=False)
-        chunks = []
-        details = {"sheets": book.sheetnames}
-        for sheet in book.worksheets:
-            chunks.append(f"## {sheet.title}")
-            for row in sheet.iter_rows(values_only=True):
-                chunks.append("\t".join("" if value is None else str(value) for value in row))
-        text = "\n".join(chunks)
-        book.close()
+        # Try the rich inspector first; fall back to legacy if unavailable
+        try:
+            from .spreadsheet_engineering.xlsx_inspector import inspect_workbook as _rich_inspect
+            rich = _rich_inspect(path, include_formulas=True, include_styles=False, include_charts=True)
+            # Build a text representation for the caller
+            chunks = []
+            for sheet_info in rich.get("sheet_details", []):
+                chunks.append(f"## {sheet_info['name']}")
+                for row in sheet_info.get("formulas", {}):
+                    chunks.append(f"  {row}: {sheet_info['formulas'][row]}")
+                # Also include raw values for non-formula cells
+                from openpyxl import load_workbook
+                book = load_workbook(path, read_only=True, data_only=False)
+                ws = book[sheet_info["name"]]
+                for row in ws.iter_rows(values_only=True):
+                    chunks.append("\t".join("" if value is None else str(value) for value in row))
+                book.close()
+            text = "\n".join(chunks)
+            details = dict(rich.get("summary") or {})
+            # Contract parity with the legacy inspector (and the API test
+            # surface): `sheets` = the ordered sheet-name list. The rich
+            # summary alone carries counts (total_sheets), not the names.
+            details.setdefault(
+                "sheets", rich.get("workbook_info", {}).get("sheet_names", []),
+            )
+        except Exception:
+            # Legacy fallback
+            from openpyxl import load_workbook
+            book = load_workbook(path, read_only=True, data_only=False)
+            chunks = []
+            details = {"sheets": book.sheetnames}
+            for sheet in book.worksheets:
+                chunks.append(f"## {sheet.title}")
+                for row in sheet.iter_rows(values_only=True):
+                    chunks.append("\t".join("" if value is None else str(value) for value in row))
+            text = "\n".join(chunks)
+            book.close()
     elif kind == "pptx":
         from pptx import Presentation
         deck = Presentation(path)

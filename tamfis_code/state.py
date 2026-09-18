@@ -16,6 +16,7 @@ introducing a second state directory.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -31,6 +32,13 @@ from pathlib import Path
 from typing import Any, Iterator, Optional
 
 from .config import CONFIG_DIR
+
+# Ceiling for the one best-effort LLM title-upgrade call per session. The
+# old httpx path used 25s (a 6s timeout failed almost every live call);
+# this bounds the providers path (which can try several providers in turn)
+# while still never blocking task completion meaningfully -- callers await
+# this only AFTER the turn's result is already persisted.
+TITLE_UPGRADE_TIMEOUT_SECONDS = 30
 
 STATE_PATH = CONFIG_DIR / "state.json"
 _VOLATILE_STATE: dict[tuple[str, int], "SessionState"] = {}
@@ -999,29 +1007,28 @@ def ensure_session_title(session_id: int, objective: str) -> None:
 
 async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None:
     """Best-effort: replace the mechanical title (first ~60 chars of the
-    objective) with a short, AI-written one via TamfisGPT's local internal
-    endpoint, when reachable. Never raises and never blocks a task's
-    completion on this -- ensure_session_title's synchronous, dependency-
-    free title has already been persisted by the time any caller awaits
-    this, so a slow/unreachable/broken model call here only means the
-    session keeps its mechanical title, not that it loses its title.
+    objective) with a short, LLM-written one via the providers system,
+    using main and fallback providers. Never raises and never blocks a
+    task's completion on this -- ensure_session_title's synchronous,
+    dependency-free title has already been persisted by the time any
+    caller awaits this, so a slow/unreachable/broken model call here only
+    means the session keeps its mechanical title, not that it loses its
+    title.
 
     Every call site awaits this after each completed turn, not just the
-    session's first -- so this makes (and records, via ai_title_attempted)
-    exactly one attempt per session, from that first turn's objective, and
-    is a fast no-op on every later turn. Without that guard this ran on
-    every turn using *that turn's* objective, so a session's title kept
-    getting silently replaced by a one-off later message instead of staying
-    a stable, accurate label for the session as a whole.
+    session's first. ai_title_attempted records the one real LLM attempt
+    per session; a failed attempt (empty result, timeout, provider down)
+    does NOT burn that budget -- the next turn retries -- so a transient
+    provider outage on the first turn doesn't leave a session stuck with
+    its mechanical title forever. A SUCCESSFUL upgrade does.
 
-    Confirmed live: the model does not reliably follow the "respond with
-    ONLY the title" system prompt below -- it can answer the objective's
-    actual content instead of describing it. The response is validated
-    (short, no terminal sentence punctuation) before being accepted; a
-    response that fails that check is discarded and the mechanical title
-    stands, rather than accepting a truncated sentence that would be
-    visually indistinguishable from the "first few words" mechanical
-    title this function exists to upgrade past.
+    Uses the providers system (ProviderManager) with proper model
+    selection, retry, and cross-provider resilience rather than a bare
+    httpx call to a Tier IV endpoint. max_tokens is generous (120, not a
+    starvation-prone 20): reasoning models (kimi-k3, glm) can spend the
+    budget on reasoning before writing the title -- a starved call returns
+    empty content, which reads exactly like a provider outage and leaves
+    the mechanical title standing.
     """
     if not objective or not objective.strip():
         return
@@ -1030,67 +1037,114 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
         return
     state.ai_title_attempted = True
     put_session_state(state)
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "Write a short session title (3-6 words, no punctuation at the "
+                "end, no quotes) summarizing what this coding task is about. "
+                "Respond with ONLY the title."
+            ),
+        },
+        {"role": "user", "content": objective.strip()[:2000]},
+    ]
+
     try:
-        import httpx
-        base = os.environ.get("TAMGPT_TIER_IV_URL", "http://127.0.0.1:9555").rstrip("/")
-        # Confirmed live against the real Tier IV endpoint: "auto" routing
-        # latency for a real completion varies widely (4.5s, 20.3s, and one
-        # run that exceeded 30s) -- 6.0s failed on nearly every call. This
-        # is still a best-effort upgrade (ensure_session_title's mechanical
-        # title already stands and is never lost), so a generous timeout
-        # here trades a slightly slower completion path for the AI title
-        # actually landing instead of silently no-op'ing almost every time.
-        async with httpx.AsyncClient(timeout=25.0) as client:
-            response = await client.post(
-                f"{base}/v1/chat/completions",
-                json={
-                    "model": "auto",
-                    "temperature": 0.3,
-                    "max_tokens": 20,
-                    "messages": [
-                        {
-                            "role": "system",
-                            "content": (
-                                "Write a short session title (3-6 words, no punctuation at the "
-                                "end, no quotes) summarizing what this coding task is about. "
-                                "Respond with ONLY the title."
-                            ),
-                        },
-                        {"role": "user", "content": objective.strip()[:2000]},
-                    ],
-                },
-            )
-        if response.status_code != 200:
-            return
-        content = str((response.json() or {}).get("choices", [{}])[0].get("message", {}).get("content") or "").strip()
-        stripped = content.strip("\"'")
-        # Confirmed live: the model behind this endpoint doesn't reliably
-        # follow the "respond with ONLY the title" instruction above --
-        # it sometimes starts answering the objective's actual content
-        # instead of describing it, producing a full sentence that then
-        # just got blindly 60-char-truncated by _derive_session_title's
-        # own safety cap. That result is indistinguishable from the
-        # mechanical "first few words" title this call exists to replace,
-        # even though a real model call did happen (this is exactly the
-        # live-reported "still not using LLM, just takes the first few
-        # words" symptom). A real title never needs
-        # _derive_session_title's truncation to kick in at all, and never
-        # ends in sentence-terminal punctuation despite being told not
-        # to. Reject anything that fails those checks and keep the
-        # mechanical fallback -- matches this function's existing
-        # fail-open contract (a rejected/failed upgrade never loses the
-        # mechanical title, it just doesn't improve on it this time).
-        word_count = len(stripped.split())
-        if not stripped or len(stripped) > 80 or word_count > 8 or stripped[-1:] in ".!?":
-            return
-        title = _derive_session_title(stripped)
-    except Exception:
+        title = await asyncio.wait_for(
+            _generate_session_title(messages), timeout=TITLE_UPGRADE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError:
         return
     if not title:
+        # A failed attempt must not burn the one-shot budget: un-mark so a
+        # later turn can retry when the provider is healthy again.
+        state = get_session_state(session_id)
+        state.ai_title_attempted = False
+        put_session_state(state)
         return
     state = get_session_state(session_id)
     state.session_title = title
     put_session_state(state)
+
+
+async def _generate_session_title(messages: list) -> str:
+    """Generate a session title using the providers system with main + fallback.
+
+    Tries the best available provider first, then falls back to the next
+    available provider. Returns empty string on failure so the mechanical
+    title is preserved. Diagnosed (not silent): a skipped provider, an
+    empty/starved response, or a validation reject each log a single
+    diagnostic line -- this is a best-effort path, but it must be visible
+    when it doesn't do what it exists to do.
+    """
+    import sys
+
+    try:
+        from .providers import ProviderManager, ProviderType
+        from .provider_protocols import system_messages_first
+    except Exception as exc:
+        print(f"[title] providers unavailable, mechanical title stands: {exc}", file=sys.stderr)
+        return ""
+
+    def _diag(reason: str) -> None:
+        print(f"[title] {reason}", file=sys.stderr)
+
+    try:
+        manager = ProviderManager()
+    except Exception as exc:
+        _diag(f"ProviderManager construction failed, mechanical title stands: {exc}")
+        return ""
+
+    # Try providers in priority order until one succeeds
+    providers_to_try = list(manager.routing_order)
+    # Remove AUTO from the list; it is a routing directive, not a provider
+    if ProviderType.AUTO in providers_to_try:
+        providers_to_try.remove(ProviderType.AUTO)
+
+    for provider in providers_to_try:
+        try:
+            client = manager.get_client(provider)
+            if not client:
+                continue
+            config = manager.PROVIDERS.get(provider)
+            if not config:
+                continue
+            resolved_model = manager.select_model(config, None)
+            response = await client.chat.completions.create(
+                model=resolved_model,
+                messages=system_messages_first(messages),
+                stream=False,
+                temperature=0.3,
+                # Generous on purpose: reasoning models can burn tokens
+                # thinking before writing a 4-word title. A 20-token cap
+                # returned empty content on those providers, which the old
+                # blanket except treated as "provider unavailable".
+                max_tokens=120,
+            )
+            if not response.choices:
+                _diag(f"{provider.value}: empty choices, trying next provider")
+                continue
+            content = str(response.choices[0].message.content or "").strip()
+            if not content and hasattr(response.choices[0].message, "reasoning_content"):
+                # Starved/hidden reasoning shapes: some providers put the
+                # visible text in a secondary field when max_tokens is tight.
+                content = str(getattr(response.choices[0].message, "reasoning_content", None) or "").strip()
+            stripped = content.strip("\"'“”")
+            # Validate before accepting: a real title is short, multi-word
+            # enough to be informative, and never a full sentence. A
+            # response that answers the objective instead of titling it is
+            # rejected so the mechanical title stands (visually, an accepted
+            # truncated sentence is indistinguishable from "first few words").
+            word_count = len(stripped.split())
+            if not stripped or len(stripped) > 80 or word_count > 8 or stripped[-1:] in ".!?":
+                _diag(f"{provider.value}: response rejected by title validation, trying next provider")
+                continue
+            return _derive_session_title(stripped)
+        except Exception as exc:
+            _diag(f"{getattr(provider, 'value', provider)}: provider attempt failed ({type(exc).__name__}), trying next provider")
+            continue
+    return ""
 
 
 def best_effort_session_label(state: SessionState) -> str:

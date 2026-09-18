@@ -204,6 +204,13 @@ _ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|
 # edge-to-edge.
 _ASSISTANT_BOX_MAX_WIDTH = 100
 _USER_MESSAGE_MAX_DISPLAY_CHARS = 20_000
+# Messages longer than this threshold are shown collapsed with an expand
+# option. Shorter messages render fully as before.
+_MESSAGE_COLLAPSE_THRESHOLD = 500
+# How many still-unexpanded collapsed messages Ctrl+E can walk back
+# through after a turn ends (pruned in _forget_collapsed). Bounds memory:
+# each retained entry holds a full message body.
+_COLLAPSED_QUEUE_RETENTION = 8
 
 
 def _current_tip(elapsed: float) -> Optional[str]:
@@ -287,6 +294,15 @@ def _normalized_tool_name(name: str) -> str:
 
 def _is_read_only_tool(name: str) -> bool:
     return _normalized_tool_name(name) in _READ_ONLY_TOOLS
+
+
+def _next_open_todo_index(todos: list) -> int:
+    """1-based index of the first not-yet-completed todo (for the active
+    marker), or 0 when every step is done."""
+    for index, item in enumerate(todos, start=1):
+        if isinstance(item, dict) and not item.get("completed"):
+            return index
+    return 0
 
 
 def _is_mutation_tool(name: str) -> bool:
@@ -563,6 +579,15 @@ class StreamRenderer:
         self.pending_update_version: Optional[str] = None
         self.streamed_final_text = False  # True once any assistant_delta content is shown
         self.debug = os.environ.get("TAMFIS_CODE_DEBUG", "").lower() in {"1", "true", "yes"}
+        # Collapsible long-message state (show less/show more): collapsed
+        # assistant/user pushes render a hint line; Ctrl+E (live_input.py's
+        # keybinding) pops the newest collapsed message and re-renders it in
+        # full. A message already expanded is remembered so repeated Ctrl+E
+        # walks back through older collapsed messages instead of reprinting
+        # the same one. LIFO matches user expectation: expand what you just
+        # read, then keep going back.
+        self._collapsed_messages: list[tuple[str, str]] = []  # (kind, full_content), newest last
+        self._expanded_message_keys: set[str] = set()
 
         # Live task-visibility status line -- gated on the console actually
         # being a TTY so redirected/piped output (`tamfis-code agent "..." >
@@ -787,6 +812,7 @@ class StreamRenderer:
             else "Stopped" if status in {"cancelled", "exited"}
             else "Failed"
         )
+        self._forget_collapsed()
         self._refresh_live()
         if self.live_input_listener is not None and hasattr(self.live_input_listener, "invalidate"):
             self.live_input_listener.invalidate()
@@ -1231,6 +1257,89 @@ class StreamRenderer:
                 self.console.print(Text(delta), end="")
                 self._assistant_rendered_length = len(self._assistant_buffer)
 
+    def _collapse_or_print_assistant(self, rendered_markdown: str) -> None:
+        """Print a finished assistant message, collapsing it behind a
+        'show more' hint when it exceeds the threshold. The full content is
+        remembered on _collapsed_messages so Ctrl+E (live_input.py) can
+        re-render it in full on demand -- a real expand action, not a dead
+        hyperlink (terminal links cannot call back into this process)."""
+        if len(rendered_markdown) > _MESSAGE_COLLAPSE_THRESHOLD:
+            shown = rendered_markdown[:_MESSAGE_COLLAPSE_THRESHOLD]
+            self.console.print(Panel(
+                Markdown(shown),
+                title="Assistant",
+                border_style="cyan",
+                expand=False,
+                padding=(0, 1),
+            ))
+            remaining = len(rendered_markdown) - _MESSAGE_COLLAPSE_THRESHOLD
+            self._collapsed_messages.append(("assistant", rendered_markdown))
+            self.console.print(
+                f"[dim]· {remaining:,} more chars — press Ctrl+E to show full message[/dim]"
+            )
+        else:
+            self.console.print(Panel(
+                Markdown(rendered_markdown),
+                title="Assistant",
+                border_style="cyan",
+                expand=False,
+                padding=(0, 1),
+            ))
+
+    def _forget_collapsed(self) -> None:
+        """Bound the collapse queue at turn end (called from conclude()).
+
+        Already-expanded entries are dropped -- they have been fully shown,
+        so repeat Ctrl+E has nothing to add. Unexpanded entries are kept so
+        the user can still expand a message AFTER the turn finishes (the
+        Ctrl+E hint is sitting right there in scrollback), but only the
+        most recent few, so a long session cannot accumulate an unbounded
+        history of full message bodies in memory.
+        """
+        kept = self._collapsed_messages[-_COLLAPSED_QUEUE_RETENTION:]
+        offset = len(self._collapsed_messages) - len(kept)
+        fresh = []
+        for offset_i, (kind, content) in enumerate(kept):
+            index = offset + offset_i
+            key = f"{index}:{len(content)}:{content[:64]}"
+            if key not in self._expanded_message_keys:
+                fresh.append((kind, content))
+        self._collapsed_messages = fresh
+
+    def expand_next_collapsed_message(self) -> bool:
+        """Re-render the newest still-collapsed message in full (Ctrl+E).
+
+        Returns True when something was expanded so the keybinding can give
+        feedback on an empty queue. Already-expanded entries stay in the
+        list (marked) so repeat presses walk back through older messages;
+        the list itself is trimmed in _forget_collapsed when its turn ends.
+        """
+        while self._collapsed_messages:
+            # Newest first; find the newest entry not yet expanded.
+            for index in range(len(self._collapsed_messages) - 1, -1, -1):
+                kind, content = self._collapsed_messages[index]
+                key = f"{index}:{len(content)}:{content[:64]}"
+                if key in self._expanded_message_keys:
+                    continue
+                self._expanded_message_keys.add(key)
+                self.console.print()
+                if kind == "assistant":
+                    self.console.print(Panel(
+                        Markdown(content),
+                        title="Assistant (full)",
+                        border_style="cyan",
+                        expand=False,
+                        padding=(0, 1),
+                    ))
+                else:
+                    self.console.print("[bold green]You (full)[/bold green]")
+                    self.console.print(Text(content))
+                self.console.print("[dim]· show less (message above is the full content)[/dim]")
+                self.console.print()
+                return True
+            return False
+        return False
+
     def _close_assistant(self) -> None:
         if self._assistant_open:
             self._flush_assistant(force=True)
@@ -1242,13 +1351,7 @@ class StreamRenderer:
                 self._print_box_bottom()
                 self._box_open = False
             if self._is_tty and self.live_input_listener is not None and rendered_markdown:
-                self.console.print(Panel(
-                    Markdown(rendered_markdown),
-                    title="Assistant",
-                    border_style="cyan",
-                    expand=False,
-                    padding=(0, 1),
-                ))
+                self._collapse_or_print_assistant(rendered_markdown)
             if self._assistant_live is not None:
                 self._assistant_live.stop()
                 self._assistant_live = None
@@ -1316,8 +1419,16 @@ class StreamRenderer:
                         f"\n[dim]… pasted message truncated in display "
                         f"({len(content):,} characters; sent in full)[/dim]"
                     )
-                else:
-                    self.console.print(Text(content), end="")
+                elif len(content) > _MESSAGE_COLLAPSE_THRESHOLD:
+                    # Collapsed with a real expand action (Ctrl+E), same
+                    # contract as the assistant path above.
+                    shown = content[:_MESSAGE_COLLAPSE_THRESHOLD]
+                    self.console.print(Text(shown), end="")
+                    remaining = len(content) - _MESSAGE_COLLAPSE_THRESHOLD
+                    self._collapsed_messages.append(("user", content))
+                    self.console.print(
+                        f"\n[dim]· {remaining:,} more chars — press Ctrl+E to show full message[/dim]"
+                    )
                 self.console.print()
             return
 
@@ -1522,6 +1633,26 @@ class StreamRenderer:
             self._close_assistant()
             name = str(payload.get("name") or payload.get("tool") or "tool")
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+            if _normalized_tool_name(name) == "write_todos":
+                # Render the live plan checklist durably, like a status line
+                # the user can track the agent's progress by (Claude Code's
+                # todo surface). Never buried in generic tool output.
+                self._close_assistant()
+                todos = args.get("todos") if isinstance(args.get("todos"), list) else []
+                if todos:
+                    self.console.print()
+                    for index, item in enumerate(todos, start=1):
+                        if not isinstance(item, dict):
+                            continue
+                        task_text = escape(str(item.get("task") or ""))
+                        if item.get("completed"):
+                            self.console.print(f"  [green]✔[/green] {task_text}")
+                        elif index == _next_open_todo_index(todos):
+                            self.console.print(f"  [cyan]❯[/cyan] {task_text}")
+                        else:
+                            self.console.print(f"  [dim]○[/dim] {task_text}")
+                    self.console.print()
+                return
             if _is_read_only_tool(name):
                 # The live footer already aggregates routine reads/searches.
                 # Avoid leaving one permanent scrollback line per file while
@@ -1802,7 +1933,18 @@ class StreamRenderer:
             self._print_task_failure(payload)
             return
 
-        if event_type in ("ai_task_completed", "assistant_message", "task_cancelled", "heartbeat", "stream_closed"):
+        if event_type in ("ai_task_completed", "task_cancelled"):
+            # runner.py owns lifecycle decisions for these; nothing new to
+            # print. But the assistant panel MUST still be closed here: it
+            # holds the streamed final answer, and _close_assistant() is
+            # where the collapse/expand disclosure fires (confirmed live
+            # 2026-09: nothing else closed it at turn end, so long answers
+            # stayed fully expanded until the NEXT event arrived -- often
+            # never, when the turn simply ended).
+            self._close_assistant()
+            return
+
+        if event_type in ("assistant_message", "heartbeat", "stream_closed"):
             return  # runner.py owns lifecycle decisions for these; nothing new to print
 
         if event_type == "diagnostics":

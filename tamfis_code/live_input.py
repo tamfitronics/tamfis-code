@@ -693,6 +693,23 @@ class LiveInputListener:
                 return
             self.renderer.background_requested.set()
 
+        @bindings.add("c-e")
+        def _expand_collapsed_message(event) -> None:
+            # Ctrl+E expands the newest collapsed long message (user or
+            # assistant) in full -- render.py's collapse hint ("N more chars
+            # -- press Ctrl+E to show full message") points here. Repeat
+            # presses walk back through older collapsed messages; with none
+            # left it is a quiet no-op. Printing happens through the
+            # renderer's own console so the expansion lands in scrollback
+            # exactly where every other message lives.
+            try:
+                self.renderer.expand_next_collapsed_message()
+            except Exception:
+                # A rendering hiccup in an expansion path must never take
+                # down the input loop.
+                pass
+            event.app.invalidate()
+
         @bindings.add("escape")
         def _cancel_running_turn(event) -> None:
             # Escape cancels the active turn immediately and returns control

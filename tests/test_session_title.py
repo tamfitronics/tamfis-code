@@ -243,72 +243,95 @@ class EnsureSessionTitleTests(_StateDirFixture, unittest.TestCase):
         self.assertEqual(state_module.get_session_state(1).session_title, "")
 
 
-def _fake_async_client(post_side_effect):
-    """Mirrors test_mcp.py's own helper of the same name -- stands in for
-    ``async with httpx.AsyncClient(...) as client: await client.post(...)``."""
-    client = MagicMock()
-    client.post = AsyncMock(side_effect=post_side_effect)
-    cm = MagicMock()
-    cm.__aenter__ = AsyncMock(return_value=client)
-    cm.__aexit__ = AsyncMock(return_value=False)
-    return MagicMock(return_value=cm)
+def _fake_providers(content_or_exc, *, provider_name="nvidia"):
+    """Stand in for tamfis_code.providers.ProviderManager inside
+    _generate_session_title: a manager whose first routing provider returns
+    `content_or_exc` (a content string, or an exception instance to raise).
+    Returns (patcher, create_calls) -- the caller must invoke the patcher's
+    stop(); create_calls records each chat.completions.create kwargs dict."""
+    create_calls = []
+
+    class FakeCompletions:
+        async def create(self, **kwargs):
+            create_calls.append(kwargs)
+            if isinstance(content_or_exc, Exception):
+                raise content_or_exc
+            resp = MagicMock()
+            choice = MagicMock()
+            choice.message.content = content_or_exc
+            resp.choices = [choice]
+            return resp
+
+    fake_client = MagicMock()
+    fake_client.chat.completions = FakeCompletions()
+
+    manager = MagicMock()
+    config = MagicMock()
+    config.models = ["kimi-k3"]
+    config.default_model = "kimi-k3"
+    config.free_model = None
+    manager.routing_order = (provider_name,)
+    manager.get_client.return_value = fake_client
+    manager.PROVIDERS = {provider_name: config}
+    manager.select_model.return_value = "kimi-k3"
+
+    patcher = patch("tamfis_code.providers.ProviderManager", return_value=manager)
+    return patcher, create_calls
 
 
 class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
     """The mechanical title (first ~60 chars of the objective) is upgraded,
-    best-effort, to a short AI-written one via TamfisGPT's local Tier IV
-    endpoint. This must never raise or block completion: an unreachable or
-    broken endpoint should simply leave the mechanical title in place."""
+    best-effort, to a short LLM-written one via the providers system
+    (ProviderManager with main + fallback providers). This must never raise
+    or block completion: an unreachable or broken provider should simply
+    leave the mechanical title in place -- visibly, not silently."""
 
     def _run(self, coro):
         import asyncio
         return asyncio.run(coro)
 
+    def _upgrade(self, content_or_exc, objective="Fix the flaky auth test", session_id=1):
+        patcher, calls = _fake_providers(content_or_exc)
+        with patcher:
+            self._run(state_module.upgrade_session_title_with_ai(session_id, objective))
+        patcher.stop()
+        return calls
+
     def test_replaces_the_mechanical_title_on_success(self):
         state_module.save_session_state(1, workspace_root="/a")
         state_module.ensure_session_title(1, "Fix the flaky auth test")
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {
-            "choices": [{"message": {"content": "Fix flaky auth test"}}],
-        }
-
-        async def fake_post(*args, **kwargs):
-            return response
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        calls = self._upgrade("Fix flaky auth test")
+        self.assertEqual(len(calls), 1)
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
 
+    def test_llm_call_uses_a_generous_token_budget_not_a_starving_20(self):
+        """Reasoning models (kimi-k3, glm) can spend the completion budget on
+        reasoning before writing a 4-word title. The old max_tokens=20 made
+        those calls return EMPTY content -- indistinguishable from a provider
+        outage, silently leaving the mechanical title. The providers path
+        must request enough tokens for a reasoning model to actually answer."""
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+        calls = self._upgrade("Fix flaky auth test")
+        self.assertTrue(calls)
+        self.assertGreaterEqual(calls[0].get("max_tokens", 0), 100)
+
     def test_rejects_a_response_that_answers_the_objective_instead_of_titling_it(self):
-        """Confirmed live (2026-09-15): the model behind this endpoint does
-        not reliably follow the "respond with ONLY the title" system
-        prompt -- it can start answering the objective's actual content
-        instead. Before this validation, that full-sentence response got
-        blindly 60-char-truncated by _derive_session_title, producing a
-        title visually indistinguishable from the mechanical "first few
-        words" title this call exists to upgrade past -- the exact
-        live-reported "still not using LLM" symptom, even though a real
-        model call did happen. A response like this (long, ends in
-        sentence-terminal punctuation) must be rejected and the
-        mechanical title left standing."""
+        """Confirmed live (2026-09-15): the model does not reliably follow
+        the "respond with ONLY the title" system prompt -- it can start
+        answering the objective's actual content instead. Before validation,
+        that full-sentence response got blindly 60-char-truncated,
+        producing a title visually indistinguishable from the mechanical
+        "first few words" title -- the exact live-reported "still not using
+        LLM" symptom, even though a real model call did happen."""
         state_module.save_session_state(1, workspace_root="/a")
         state_module.ensure_session_title(1, "What does a semicolon do in Python?")
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {
-            "choices": [{"message": {"content": (
-                "In Python, a semicolon is used to separate multiple "
-                "statements written on a single line, though it is rarely "
-                "used because newlines already terminate statements."
-            )}}],
-        }
-
-        async def fake_post(*args, **kwargs):
-            return response
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "What does a semicolon do in Python?"))
+        self._upgrade(
+            "In Python, a semicolon is used to separate multiple statements "
+            "written on a single line, though it is rarely used because "
+            "newlines already terminate statements.",
+            objective="What does a semicolon do in Python?",
+        )
         self.assertEqual(
             state_module.get_session_state(1).session_title,
             "What does a semicolon do in Python?",
@@ -317,54 +340,19 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
     def test_rejects_a_response_ending_in_terminal_punctuation_even_if_short(self):
         state_module.save_session_state(1, workspace_root="/a")
         state_module.ensure_session_title(1, "Fix the flaky auth test")
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": "It fixes the test."}}]}
-
-        async def fake_post(*args, **kwargs):
-            return response
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self._upgrade("It fixes the test.")
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky auth test")
 
     def test_accepts_a_genuinely_short_compliant_title(self):
         state_module.save_session_state(1, workspace_root="/a")
         state_module.ensure_session_title(1, "Investigate the timeout bug in the retry loop")
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {"choices": [{"message": {"content": "Investigate retry loop timeout"}}]}
-
-        async def fake_post(*args, **kwargs):
-            return response
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "Investigate the timeout bug in the retry loop"))
+        self._upgrade("Investigate retry loop timeout", objective="Investigate the timeout bug in the retry loop")
         self.assertEqual(state_module.get_session_state(1).session_title, "Investigate retry loop timeout")
 
-    def test_leaves_the_mechanical_title_when_endpoint_is_unreachable(self):
-        import httpx as httpx_module
+    def test_leaves_the_mechanical_title_when_provider_fails(self):
         state_module.save_session_state(1, workspace_root="/a")
         state_module.ensure_session_title(1, "Fix the flaky auth test")
-
-        async def fake_post(*args, **kwargs):
-            raise httpx_module.ConnectError("boom")
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
-        self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky auth test")
-
-    def test_leaves_the_mechanical_title_on_non_200(self):
-        state_module.save_session_state(1, workspace_root="/a")
-        state_module.ensure_session_title(1, "Fix the flaky auth test")
-        response = MagicMock()
-        response.status_code = 500
-
-        async def fake_post(*args, **kwargs):
-            return response
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self._upgrade(ConnectionError("boom"))
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky auth test")
 
     def test_blank_objective_is_a_no_op(self):
@@ -372,54 +360,72 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         self._run(state_module.upgrade_session_title_with_ai(1, "   "))
         self.assertEqual(state_module.get_session_state(1).session_title, "")
 
-    def test_a_later_turn_never_re_upgrades_an_already_ai_titled_session(self):
+    def test_a_successful_upgrade_is_never_retried_on_a_later_turn(self):
         """Every call site awaits this after each completed turn, not just
-        the session's first. Before ai_title_attempted existed, that meant a
-        second/third/... turn's own objective silently replaced an already
-        good AI title -- a session about "fix the flaky auth test" would
-        retitle itself after an unrelated later message in the same thread.
-        """
+        the session's first. A successful AI title must never be replaced
+        by a later turn's own objective -- a session about "fix the flaky
+        auth test" must not retitle itself after an unrelated later
+        message in the same thread."""
         state_module.save_session_state(1, workspace_root="/a")
         state_module.ensure_session_title(1, "Fix the flaky auth test")
-        response = MagicMock()
-        response.status_code = 200
-        response.json.return_value = {
-            "choices": [{"message": {"content": "Fix flaky auth test"}}],
-        }
-
-        async def fake_post(*args, **kwargs):
-            return response
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self._upgrade("Fix flaky auth test")
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
 
-        async def fake_post_later_turn(*args, **kwargs):
-            later = MagicMock()
-            later.status_code = 200
-            later.json.return_value = {"choices": [{"message": {"content": "Unrelated later message"}}]}
-            return later
-
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post_later_turn)) as client_cls:
+        patcher, _calls = _fake_providers("Unrelated later message")
+        with patcher as factory:
             self._run(state_module.upgrade_session_title_with_ai(1, "what's the weather like"))
-            client_cls.assert_not_called()
+            factory.assert_not_called()
+        patcher.stop()
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
 
-    def test_an_unreachable_endpoint_on_the_first_turn_still_marks_one_attempt(self):
-        """A failed first attempt still burns the one-attempt budget instead
-        of retrying (and re-blocking turn completion on a 25s timeout) on
-        every subsequent turn for the rest of the session."""
-        import httpx as httpx_module
+    def test_a_failed_attempt_does_not_burn_the_one_shot_budget(self):
+        """A provider outage on the first turn must not leave the session
+        stuck with its mechanical title forever: the attempt is un-marked,
+        so the next turn retries. (The old behavior burned the budget on
+        ANY first attempt, successful or not -- a transient outage on turn
+        one permanently disabled LLM titling for the session.)"""
         state_module.save_session_state(1, workspace_root="/a")
         state_module.ensure_session_title(1, "Fix the flaky auth test")
 
-        async def fake_post(*args, **kwargs):
-            raise httpx_module.ConnectError("boom")
+        self._upgrade(ConnectionError("provider down"))
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix the flaky auth test")
+        self.assertFalse(state_module.get_session_state(1).ai_title_attempted)
 
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)):
-            self._run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        # The next turn retries and succeeds.
+        self._upgrade("Fix flaky auth test", objective="Fix the flaky auth test")
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
         self.assertTrue(state_module.get_session_state(1).ai_title_attempted)
 
-        with patch("httpx.AsyncClient", _fake_async_client(fake_post)) as client_cls:
-            self._run(state_module.upgrade_session_title_with_ai(1, "another turn"))
-            client_cls.assert_not_called()
+    def test_a_validation_reject_also_frees_the_budget_for_retry(self):
+        """An answer-shaped response is a MODEL behavior failure, not a
+        permanent property of the session -- the next turn's objective may
+        title perfectly well, so a rejected attempt must also retry."""
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "What does a semicolon do in Python?")
+        self._upgrade(
+            "A semicolon separates statements on one line, though it is "
+            "rarely used because newlines already separate statements.",
+            objective="What does a semicolon do in Python?",
+        )
+        self.assertFalse(state_module.get_session_state(1).ai_title_attempted)
+
+    def test_a_successful_attempt_marks_the_budget_spent(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+        self._upgrade("Fix flaky auth test")
+        self.assertTrue(state_module.get_session_state(1).ai_title_attempted)
+
+    def test_provider_failure_is_diagnosed_not_silently_swallowed(self):
+        """The old blanket `except Exception: pass` made every failure mode
+        (unconfigured provider, starved model, validation reject) look
+        identical from the outside -- the exact "is this even using the
+        LLM?" debugging black hole. Each skipped provider now logs one
+        diagnostic line."""
+        import contextlib, io
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.ensure_session_title(1, "Fix the flaky auth test")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self._upgrade(ConnectionError("boom"))
+        self.assertIn("[title]", err.getvalue())
+        self.assertIn("provider attempt failed", err.getvalue())

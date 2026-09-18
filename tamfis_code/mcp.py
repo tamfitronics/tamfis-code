@@ -386,7 +386,8 @@ class MCPServer:
                 "Create a new file, or replace an existing file's ENTIRE contents. This is not "
                 "an append or partial update -- any existing content at `path` not included in "
                 "`content` is gone. To change only part of an existing file, use edit_file "
-                "instead so the rest of the file (and any concurrent, unrelated edits) survives."
+                "instead so the rest of the file (and any concurrent, unrelated edits) survives. "
+                "Use the extension the language and project actually use -- never '.txt' for code."
             ),
             parameters={
                 "type": "object",
@@ -435,8 +436,11 @@ class MCPServer:
             description=(
                 "Replace an exact, unique occurrence of old_string with new_string in a file. "
                 "Fails if old_string is not found, or is not unique -- include enough surrounding "
-                "context in old_string to make the match unambiguous. Use write_file instead for "
-                "creating a brand-new file or replacing one's entire contents."
+                "context in old_string to make the match unambiguous. Read the file (or the "
+                "relevant range) first and copy whitespace exactly; after editing, re-read the "
+                "changed region and run the project's checks to confirm the edit does what you "
+                "intended. Use write_file instead for creating a brand-new file or replacing "
+                "one's entire contents."
             ),
             parameters={
                 "type": "object",
@@ -594,8 +598,15 @@ class MCPServer:
         self.register_tool(
             name="execute_command",
             description=(
-                "Execute a shell command. To run it in a subdirectory, pass cwd -- "
-                "do not chain `cd <dir> && ...` into the command string."
+                "Execute a shell command and inspect its real output and exit code -- this "
+                "is how you verify your own work (run the project's tests, typecheck, or "
+                "build after edits and READ the result before claiming success). Prefer "
+                "the project's own documented commands (check AGENTS.md/README, package "
+                "scripts, Makefile, pyproject) over invented ones; run check/test/build "
+                "commands after every non-trivial edit. To run in a subdirectory, pass "
+                "cwd -- do not chain `cd <dir> && ...` into the command string. For "
+                "long-running or daemonized commands use nohup/setsid with output "
+                "redirected to a log file rather than blocking on them."
             ),
             parameters={
                 "type": "object",
@@ -843,6 +854,61 @@ class MCPServer:
             },
             handler=self._ask_user_question,
         )
+
+        self.register_tool(
+            name="write_todos",
+            description=(
+                "Maintain the visible step-by-step plan for the CURRENT task. Call this at the "
+                "start of any non-trivial task (roughly: anything needing 3+ tool calls or "
+                "touching more than one file) to lay out the steps, then call it again every "
+                "time a step completes or the plan genuinely changes -- NOT to narrate routine "
+                "progress like 'read file' or 'run tests'. Each call REPLACES the whole list, "
+                "so always send every step with its current status; never send only the step "
+                "that changed. Keep each task a short imperative outcome ('Fix pagination in "
+                "UserList', not 'Investigate pagination'); mark completed only steps that are "
+                "actually done and verified. The user watches this list live to see what you "
+                "are doing and how far along you are -- keep it honest and current."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "todos": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "task": {"type": "string", "description": "Short imperative description of the step's OUTCOME"},
+                                "completed": {"type": "boolean", "description": "True only when this step is finished AND verified"},
+                            },
+                            "required": ["task", "completed"],
+                        },
+                        "description": "The complete step list in execution order (replaces the previous list)",
+                    },
+                },
+                "required": ["todos"],
+            },
+            handler=self._write_todos,
+        )
+
+    async def _write_todos(self, todos: List[Dict[str, Any]]) -> str:
+        cleaned: List[Dict[str, Any]] = []
+        for item in todos[:50]:
+            if not isinstance(item, dict):
+                continue
+            task_text = str(item.get("task") or "").strip()
+            if not task_text:
+                continue
+            cleaned.append({"task": task_text[:300], "completed": bool(item.get("completed"))})
+        if self.session_id is not None:
+            try:
+                from . import state as local_state
+                local_state.update_task_state(self.session_id, todo_list=cleaned)
+            except Exception:
+                pass  # never let plan bookkeeping fail a task
+        if not cleaned:
+            return "Todo list cleared."
+        done = sum(1 for item in cleaned if item["completed"])
+        return f"Todo list updated: {done}/{len(cleaned)} steps complete."
 
     async def _ask_user_question(self, question: str, options: Optional[List[str]] = None) -> str:
         if self._console is None or not self._interactive:

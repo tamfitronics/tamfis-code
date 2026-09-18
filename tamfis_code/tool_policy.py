@@ -24,10 +24,17 @@ from .routing import TaskProfile, TaskType
 # session files, never this project's), so a plain/inspect/audit turn can
 # still act on "continue what Codex was doing" without needing edit-level
 # tool access just to look that up.
+# write_todos joins every non-plain list for the same reason: it mutates
+# only the session's own task-state ledger (never a workspace file), and
+# the visible step-by-step plan is exactly as valuable during a read-only
+# audit/plan turn as during an edit turn -- the user watches progress
+# either way. Claude Code's TodoWrite and Codex's to-do tracking are both
+# available in every mode for the same reason.
 READ_TOOLS = [
     "list_directory", "search_code", "find_references", "read_file",
     "get_git_info", "ask_user_question", "inspect_artifact", "save_memory",
     "list_external_agent_sessions", "read_external_agent_session",
+    "write_todos",
 ]
 EDIT_TOOLS = [
     *READ_TOOLS,
