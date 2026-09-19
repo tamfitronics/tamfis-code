@@ -419,6 +419,15 @@ class SessionState:
     discovery_fingerprint: str = ""
     selected_model: str = "auto"
     selected_provider: Optional[str] = None
+    # Route provenance for THIS session, newest last: which provider/model a
+    # turn actually ran on, and every time that changed mid-task (automatic
+    # failover, a recovery, or a retry of a route that was cooling down).
+    # Live-reported 2026-09-19: a task stopped on a 402 credit-exhaustion error
+    # while other routes sat configured, and there was no way to see from
+    # /status or the footer that the primary route was dead and nothing had
+    # failed over -- a route switch was visible only as a scrolling-through
+    # debug diagnostic. Bounded (see ROUTE_EVENT_LIMIT) because it is durable.
+    route_events: list[dict] = field(default_factory=list)
     estimated_context_tokens: int = 0
     # Compact, schema-stable ledger for long-horizon execution.  This is
     # intentionally separate from the conversational turn checkpoint: the
@@ -1771,6 +1780,244 @@ def request_session_title_regeneration(session_id: int) -> bool:
     state.title_generated_at = None
     put_session_state(state)
     return True
+
+
+ROUTE_EVENT_LIMIT = 20
+
+
+# Errors that mean "this ACCOUNT cannot serve the request" rather than "this
+# request is bad": the route is dead until credits/quota/billing are fixed, so
+# the only useful recovery is another provider. Matched alongside the numeric
+# status (402 payment required, 401/403, 429) so a wrapper that lost the
+# status attribute is still recognised by its wording.
+_ROUTE_EXHAUSTION_MARKERS = (
+    "depleted",
+    "out of credits",
+    "insufficient credits",
+    "included credits",
+    "pre-paid credits",
+    "prepaid",
+    "credit balance",
+    "billing",
+    "payment required",
+    "quota",
+    "rate limit",
+    "402",
+    "401",
+    "403",
+    "429",
+)
+
+
+def route_error_is_exhaustion(error: Any) -> bool:
+    """True when a provider error is an account-level exhaustion (credits,
+    quota, rate limit) rather than a bad request."""
+    text = str(error or "").lower()
+    return any(marker in text for marker in _ROUTE_EXHAUSTION_MARKERS)
+
+
+def record_route_event(
+    session_id: int,
+    *,
+    provider: str,
+    model: str = "",
+    previous_provider: str = "",
+    previous_model: str = "",
+    reason: str = "",
+    kind: str = "select",
+    exhausted: bool = False,
+) -> None:
+    """Persist one route change for /status and the footer. Never raises:
+    route bookkeeping must not be able to fail a task."""
+    try:
+        state = get_session_state(session_id)
+        events = [event for event in (state.route_events or [])]
+        events.append({
+            "at": _now(),
+            "kind": kind,
+            "provider": str(provider or ""),
+            "model": str(model or ""),
+            "from_provider": str(previous_provider or ""),
+            "from_model": str(previous_model or ""),
+            "reason": str(reason or "")[:400],
+            "exhausted": bool(exhausted),
+        })
+        state.route_events = events[-ROUTE_EVENT_LIMIT:]
+        put_session_state(state)
+    except Exception:
+        return
+
+
+def record_route_error(
+    session_id: int, *, provider: str, model: str = "", error: str = "",
+) -> None:
+    """Persist an ACCOUNT-LEVEL route failure (credits/quota exhausted).
+
+    Kept separate from record_route_event's provider switches so /status can
+    report "the route you were on is exhausted, and here is what it said" even
+    when the task then fell back successfully (or could not fall back at all).
+    """
+    try:
+        state = get_session_state(session_id)
+        events = [event for event in (state.route_events or [])]
+        events.append({
+            "at": _now(),
+            "kind": "exhaustion",
+            "provider": str(provider or ""),
+            "model": str(model or ""),
+            "reason": str(error or "")[:400],
+            "exhausted": True,
+        })
+        state.route_events = events[-ROUTE_EVENT_LIMIT:]
+        put_session_state(state)
+    except Exception:
+        return
+
+
+def route_diagnostics(session_id: int) -> dict:
+    """What route this session is on, and how it got there.
+
+    Returns current provider/model, the failovers seen (with the reason and
+    whether the old route was EXHAUSTED rather than broken), and the list of
+    routes currently cooling down after recent failures.
+    """
+    try:
+        state = get_session_state(session_id)
+    except Exception:
+        return {"current": None, "failovers": [], "cooling": [], "events": []}
+    events = list(state.route_events or [])
+    # The current route is whichever route was established most recently -- a
+    # selection or a failover. Preferring "select" here reported the route the
+    # session STARTED on even after it had failed over to a healthy one.
+    current = next(
+        (
+            event for event in reversed(events)
+            if event.get("kind") in {"select", "failover", "recovery"}
+        ),
+        None,
+    )
+    failovers = [event for event in events if event.get("kind") in {"failover", "recovery"}]
+    exhausted = [event for event in events if event.get("kind") == "exhaustion"]
+    return {
+        "current": current,
+        "failovers": failovers,
+        "exhausted": exhausted,
+        "last_exhaustion": exhausted[-1] if exhausted else None,
+        "cooling": cooling_route_names(),
+        "events": events,
+    }
+
+
+def cooling_route_names() -> list[str]:
+    """Routes whose health circuit is currently open (recent failures), from
+    the providers layer. Empty when the providers module cannot be consulted."""
+    try:
+        import time as _time
+
+        from .providers import _HEALTH_LOCK, _ROUTE_HEALTH  # noqa: PLC0415
+
+        now = _time.monotonic()
+        names: list[str] = []
+        with _HEALTH_LOCK:
+            for (provider_name, _model), health in _ROUTE_HEALTH.items():
+                if health.circuit_open_until > now and provider_name not in names:
+                    names.append(str(provider_name))
+        return names
+    except Exception:
+        return []
+
+
+def route_status_line(
+    session_id: int, *, include_current: bool = True, max_chars: int = 0,
+) -> str:
+    """One compact route line: which route is live plus how it got there, e.g.
+    "tamfisgpt-ultra → nvidia/nim-1 · 1 failover · tamfisgpt-ultra exhausted
+    (credits/quota)".
+
+    The persistent footer already names the current model, so it passes
+    `include_current=False` and gets ONLY the exceptions -- a failover, an
+    exhausted route, or routes cooling down -- which is the information that
+    was previously invisible outside --debug.
+    """
+    diag = route_diagnostics(session_id)
+    current = diag.get("current") or {}
+    provider = str(current.get("provider") or "")
+    count = len(diag.get("failovers") or [])
+    last_exhaustion = diag.get("last_exhaustion") or {}
+    cooling = diag.get("cooling") or []
+    if not provider and not last_exhaustion:
+        return ""
+    if not include_current and not count and not last_exhaustion and not cooling:
+        return ""
+    label = f"{provider}/{current.get('model')}" if provider and current.get("model") else provider
+    if not label and last_exhaustion:
+        label = str(last_exhaustion.get("provider") or "")
+    previous = str(current.get("from_provider") or "")
+    if previous and provider and previous != provider:
+        label = f"{previous} → {label}"
+    if count:
+        label += f" · {count} failover{'s' if count != 1 else ''}"
+    if last_exhaustion:
+        exhausted_by = str(last_exhaustion.get("provider") or "")
+        label += (
+            f" · {exhausted_by} exhausted (credits/quota)" if exhausted_by
+            else " · credits/quota exhausted"
+        )
+    if cooling:
+        label += f" · cooling: {', '.join(cooling)}"
+    # The footer shares one terminal line with the session title, mode, and
+    # agents, and a long note wraps and squeezes them out (live-observed in a
+    # pty at 80 columns). The footer asks for the short form; /status, which
+    # owns a whole block, keeps the full text.
+    if max_chars and len(label) > max_chars:
+        label = label[: max(1, max_chars - 1)].rstrip(" ·→,") + "…"
+    return label
+
+
+def route_status_compact(session_id: int, max_chars: int = 56) -> str:
+    """The FOOTER form of the route note: only what changed and why, small
+    enough to sit beside the session title and mode without being clipped by
+    an 80-column terminal ("⟳ nvidia→openrouter · 1 failover · credits").
+
+    Empty when this session has nothing exceptional to report, so a healthy
+    turn's footer is unchanged.
+    """
+    diag = route_diagnostics(session_id)
+    failovers = diag.get("failovers") or []
+    last_exhaustion = diag.get("last_exhaustion") or {}
+    cooling = diag.get("cooling") or []
+    if failovers:
+        latest = failovers[-1]
+        source = str(latest.get("from_provider") or "")
+        target = str(latest.get("provider") or "")
+        label = f"{source}→{target}" if source and target else (target or source)
+    elif last_exhaustion:
+        label = str(last_exhaustion.get("provider") or "")
+    else:
+        label = ""
+    if not label and not cooling:
+        return ""
+    # Budget-aware suffix order: the REASON outranks the count, because
+    # "the route ran out of credits" is what explains a behaviour change and
+    # the count is only trivia. Each extra is added only while it still fits,
+    # so a long provider name drops the count rather than the reason (the
+    # earlier blind truncation turned "· credits" into "· cre…" on an 80-column
+    # terminal -- the one word that mattered, unreadable).
+    extras = []
+    if last_exhaustion:
+        extras.append("credits")
+    if cooling:
+        extras.append("cooling: " + ",".join(cooling[:2]))
+    if failovers:
+        extras.append(f"{len(failovers)} failover{'s' if len(failovers) != 1 else ''}")
+    note = f"⟳ {label}" if label else "⟳"
+    for extra in extras:
+        candidate = f"{note} · {extra}"
+        if not max_chars or len(candidate) <= max_chars:
+            note = candidate
+    if max_chars and len(note) > max_chars:
+        note = note[: max(1, max_chars - 1)].rstrip(" ·→,") + "…"
+    return note
 
 
 def session_title_diagnostics(session_id: int) -> dict:

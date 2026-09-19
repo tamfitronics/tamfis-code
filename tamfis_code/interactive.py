@@ -1870,6 +1870,44 @@ async def _run_interactive_impl(
                 f"approval_policy={config.approval_policy}  provider={PUBLIC_PROVIDER_NAME}"
                 if standalone else f"approval_policy={config.approval_policy}  api_base={config.api_base}"
             )
+            # Route provenance: which provider/model this session actually runs
+            # on, every failover it took, and whether a route died of credit /
+            # quota exhaustion. Live-reported 2026-09-19: a task stopped on a
+            # TamfisGPT 402 while other routes sat configured, and /status said
+            # nothing about the route being dead -- that story existed only as a
+            # debug diagnostic scrolling past.
+            route_lines = ""
+            try:
+                diag = local_state.route_diagnostics(workspace.session_id)
+                current = diag.get("current") or {}
+                if current.get("provider"):
+                    route_lines += (
+                        f"\nroute={current.get('provider')}"
+                        + (f"/{current.get('model')}" if current.get("model") else "")
+                        + (f"  (was {current.get('from_provider')})"
+                           if current.get("from_provider")
+                           and current.get("from_provider") != current.get("provider") else "")
+                    )
+                last_exhaustion = diag.get("last_exhaustion") or {}
+                if last_exhaustion:
+                    route_lines += (
+                        f"\nexhausted={last_exhaustion.get('provider')}"
+                        f"  at={str(last_exhaustion.get('at') or '')[:19]}"
+                        f"  reason={str(last_exhaustion.get('reason') or '')[:160]}"
+                    )
+                for event in diag.get("failovers") or []:
+                    route_lines += (
+                        f"\nfailover={event.get('from_provider') or '?'} -> "
+                        f"{event.get('provider')}/{event.get('model')}"
+                        f"  at={str(event.get('at') or '')[:19]}"
+                        f"  reason={str(event.get('reason') or '')[:120]}"
+                    )
+                cooling = diag.get("cooling") or []
+                if cooling:
+                    route_lines += f"\ncooling={', '.join(cooling)}"
+            except Exception:
+                pass
+
             ledger_line = ""
             try:
                 from .runtime.ledger import load_ledger
@@ -1895,6 +1933,7 @@ async def _run_interactive_impl(
                 f"saved_plans={len(state.saved_plans)}  active_plan={state.active_plan_id or '-'}\n"
                 f"{backend_line}\n"
                 f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
+                f"{escape(route_lines)}"
                 f"{ledger_line}"
             )
             continue

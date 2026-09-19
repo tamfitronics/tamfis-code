@@ -237,6 +237,41 @@ class AgentOrchestrator:
         # correctly and separately in `self.run.route` above; nothing needs
         # a second, conflated copy in the explicit-preference field.
 
+        # Route provenance for /status and the persistent footer. record_route
+        # is the single authoritative place a route changes -- initial
+        # selection, automatic failover, and mid-turn recovery all come through
+        # here -- so recording it once here means the user can see WHICH route
+        # a task is actually running on and whether it failed over at all,
+        # instead of that being visible only as a debug diagnostic scrolling
+        # past. Never allowed to raise: route bookkeeping must not be able to
+        # break a task.
+        try:
+            from ..state import record_route_event
+
+            previous_provider = str(
+                prior.get("effective_provider") or prior.get("provider") or ""
+            )
+            previous_model = str(prior.get("effective_model") or prior.get("model") or "")
+            changed = bool(previous_provider) and previous_provider != provider
+            fallback_reason = str(self.run.route.get("fallback_reason") or "")
+            if changed or fallback_reason:
+                record_route_event(
+                    self.session_id,
+                    provider=provider,
+                    model=model,
+                    previous_provider=previous_provider,
+                    previous_model=previous_model,
+                    reason=fallback_reason or reason,
+                    kind="failover" if fallback_reason else "select",
+                )
+            elif not prior:
+                record_route_event(
+                    self.session_id, provider=provider, model=model, reason=reason,
+                    kind="select",
+                )
+        except Exception:
+            pass
+
     def start_execution(self) -> None:
         assert self.run is not None
         self.run.runtime.start_execution()

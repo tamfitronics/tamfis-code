@@ -99,18 +99,69 @@ class MalformedArgumentsRefusalMessageTests(unittest.TestCase):
         self.assertNotIn("requires path", result["error"])
 
 
-class TruncatedToolCallIsRefusedNotExecutedTests(_StatePatchMixin, unittest.TestCase):
+class TruncatedWriteIsSalvagedNotLostTests(_StatePatchMixin, unittest.TestCase):
+    """A truncated LARGE write is repaired, not discarded.
+
+    Refusing it outright (the first version of this fix) still threw away a
+    multi-page document the model had already produced. write_file is the one
+    call worth repairing: its arguments were cut off by the output token limit,
+    everything before the cut is real work, and a big document is exactly what
+    cannot fit in one call. The repaired call still goes through the normal
+    guard/approval/dispatch path.
+    """
+
     def _console(self):
         from io import StringIO
         from rich.console import Console
         return Console(file=StringIO(), no_color=True, width=200)
 
-    def test_a_truncated_write_is_refused_and_the_model_is_told_why(self):
+    def test_a_truncated_write_keeps_the_recovered_prefix_and_is_continued(self):
         with tempfile.TemporaryDirectory() as ws:
             target = Path(ws) / "audit.md"
-            # The document is cut off mid-string, exactly as the output token
-            # limit truncates it live -- the JSON never closes.
-            broken = json.dumps({"path": str(target), "content": "x" * 400})[:-20]
+            body = "# Phase 1 audit\n\n" + "finding line\n" * 60
+            broken = json.dumps({"path": str(target), "content": body})[:-40]
+            client = _FakeClient([
+                [_chunk(_delta(content="1. Write the phase 1 audit report"))],
+                [_chunk(
+                    _delta(tool_calls=[_tool_call_delta(
+                        0, call_id="call_1", name="write_file", arguments=broken,
+                    )]),
+                    finish_reason="length",
+                )],
+                [_chunk(_delta(content="Continuing with mode=append."))],
+            ])
+            renderer = _RecordingRenderer()
+
+            asyncio.run(run_local_agent_turn(
+                _FakeManager(client), ProviderType.NVIDIA, None,
+                [{"role": "user", "content": f"create {target} with the phase 1 findings"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto",
+                interactive=False,
+            ))
+
+            self.assertTrue(target.is_file(), "the recovered prefix must be kept")
+            written = target.read_text()
+            self.assertTrue(written.startswith("# Phase 1 audit"))
+            self.assertLess(len(written), len(body), "only the recovered prefix is written")
+            self.assertGreater(len(written), len(body) // 2)
+
+            diagnostics = [
+                str(event.get("payload", {}).get("content", ""))
+                for event in renderer.events
+                if event.get("event_type") == "diagnostics"
+            ]
+            self.assertTrue(
+                any("truncated" in text and "append" in text for text in diagnostics),
+                f"the salvage must be visible and say how to continue: {diagnostics}",
+            )
+
+    def test_a_truncated_call_with_nothing_recoverable_is_refused(self):
+        with tempfile.TemporaryDirectory() as ws:
+            target = Path(ws) / "audit.md"
+            # Cut off before any value completed: there is no path to salvage,
+            # so there is nothing to repair and the call must be refused.
+            broken = '{"path": "' + str(target)[:8]
             client = _FakeClient([
                 # Round 1 is the planner's own completion (the runner asks for
                 # one before the first tool round), so it must be a plain plan.
@@ -132,18 +183,17 @@ class TruncatedToolCallIsRefusedNotExecutedTests(_StatePatchMixin, unittest.Test
                 return await original_call_tool(self, name, arguments or {}, **kwargs)
 
             MCPServer.call_tool = recording_call_tool
-            try:
-                asyncio.run(run_local_agent_turn(
-                    _FakeManager(client), ProviderType.NVIDIA, None,
-                    [{"role": "user", "content": "write the phase 1 audit report"}],
-                    self._console(), renderer,
-                    workspace_root=ws, session_id=1, approval_policy="auto",
-                    interactive=False,
-                ))
+            try:            asyncio.run(run_local_agent_turn(
+                _FakeManager(client), ProviderType.NVIDIA, None,
+                [{"role": "user", "content": f"create {target} with the findings"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto",
+                interactive=False,
+            ))
             finally:
                 MCPServer.call_tool = original_call_tool
 
-            self.assertFalse(target.exists(), "a truncated write must not create the file")
+            self.assertFalse(target.exists(), "an unrecoverable write must not create the file")
 
             tool_results = [
                 event.get("payload", {}).get("result", {})
@@ -160,6 +210,54 @@ class TruncatedToolCallIsRefusedNotExecutedTests(_StatePatchMixin, unittest.Test
             # argument" message that made the model repeat the same call.
             self.assertIn("split", refusal.get("error", "").lower())
             self.assertNotIn("requires path", refusal.get("error", ""))
+
+    def test_a_truncated_non_write_tool_is_never_repaired(self):
+        """Only write_file is repaired. Acting on a partially-recovered
+        command line could turn a truncated call into a WRONG one."""
+        with tempfile.TemporaryDirectory() as ws:
+            broken = json.dumps({"command": "rm -rf " + "/" * 3})[:-4]
+            client = _FakeClient([
+                [_chunk(_delta(content=f"1. create {ws}/cleanup.md with the notes"))],
+                [_chunk(
+                    _delta(tool_calls=[_tool_call_delta(
+                        0, call_id="call_1", name="execute_command", arguments=broken,
+                    )]),
+                    finish_reason="length",
+                )],
+                [_chunk(_delta(content="That call was refused."))],
+                [_chunk(_delta(content="That call was refused."))],
+            ])
+            renderer = _RecordingRenderer()
+            dispatched: list[str] = []
+            original_call_tool = MCPServer.call_tool
+
+            async def recording_call_tool(self, name, arguments=None, **kwargs):
+                dispatched.append(name)
+                return await original_call_tool(self, name, arguments or {}, **kwargs)
+
+            MCPServer.call_tool = recording_call_tool
+            try:
+                asyncio.run(run_local_agent_turn(
+                    _FakeManager(client), ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": f"create {ws}/cleanup.md with the notes"}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto",
+                    interactive=False,
+                ))
+            finally:
+                MCPServer.call_tool = original_call_tool
+
+            self.assertEqual(
+                [name for name in dispatched if name == "execute_command"], [],
+                "a truncated command must never be repaired and run",
+            )
+            refusals = [
+                event.get("payload", {}).get("result", {})
+                for event in renderer.events
+                if event.get("event_type") == "tool_output"
+                and event.get("payload", {}).get("tool") == "execute_command"
+            ]
+            self.assertTrue(refusals and refusals[0].get("malformed_tool_arguments"))
 
             diagnostics = [
                 str(event.get("payload", {}).get("content", ""))

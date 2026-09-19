@@ -271,6 +271,128 @@ _TOOL_PARAMETER_ALIASES: Dict[str, tuple[str, ...]] = {
     "command": ("cmd", "shell_command"),
 }
 
+def salvage_truncated_tool_arguments(raw_arguments: str) -> dict[str, Any]:
+    """Recover as much as possible from a TRUNCATED tool-call argument object.
+
+    A model's tool-call arguments are bounded by its output token limit, so a
+    genuinely large `write_file` (a multi-page report, a long generated file)
+    arrives with its JSON cut off mid-string. Everything before the cut is real
+    work; the runner uses this to keep it instead of discarding the call (see
+    the malformed-arguments branch in runner_local.py).
+
+    Returns a dict of the members that could be recovered. A truncated FINAL
+    string value is closed and returned as-is (a partial document is far more
+    useful than nothing, and the caller tells the model how much was kept so it
+    can append the remainder). Returns {} when nothing usable is present.
+    """
+    text = (raw_arguments or "").strip()
+    if not text.startswith("{"):
+        return {}
+
+    def _try(blob: str) -> Optional[dict[str, Any]]:
+        try:
+            parsed = json.loads(blob)
+        except json.JSONDecodeError:
+            return None
+        return parsed if isinstance(parsed, dict) else None
+
+    # 1. Truncate at the last COMPLETE top-level member and close the object.
+    #    Scanning member boundaries rather than guessing an offset means a
+    #    nested object/array inside a complete member can never be cut open.
+    # A member boundary is only real once a VALUE has been read. Tracking
+    # `in_key` separately matters: without it, the closing quote of the KEY
+    # ("content") looked like a completed member, and the recovered prefix was
+    # `{"path": "/a", "content"}` -- unparseable, so a truncated write
+    # salvaged nothing.
+    boundary = 1  # just after the opening brace
+    depth = 1
+    in_string = False
+    in_key = False
+    expect_key = True  # the first token inside an object is a key
+    escaped = False
+    for index in range(1, len(text)):
+        char = text[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+                if depth == 1 and not in_key:
+                    boundary = index + 1
+            continue
+        if char == '"':
+            in_string = True
+            in_key = expect_key
+            expect_key = False
+            continue
+        if char in "{[":
+            depth += 1
+            expect_key = True
+        elif char in "}]":
+            depth -= 1
+            if depth == 0:
+                # The object actually closed -- not truncated at all.
+                complete = _try(text[: index + 1])
+                return complete or {}
+            if depth == 1:
+                boundary = index + 1
+        elif char == "," and depth == 1:
+            boundary = index
+            expect_key = True
+    recovered = _try(text[:boundary].rstrip().rstrip(",") + "}") or {}
+
+    # 2. The cut may have landed inside the value of the member AFTER the last
+    #    complete one (typically `"content"`). Recover the key and whatever of
+    #    its string value arrived, so a partial document is preserved.
+    tail = text[boundary:]
+    key_match = re.match(r'\s*,?\s*"([A-Za-z_][A-Za-z0-9_]*)"\s*:\s*"', tail)
+    if key_match:
+        partial = tail[key_match.end():]
+        if partial.endswith("\\"):
+            partial = partial[:-1]
+        recovered.setdefault(key_match.group(1), _unescape_partial_json_string(partial))
+    return recovered
+
+
+def _unescape_partial_json_string(text: str) -> str:
+    """Decode the JSON escapes in a string that was cut off mid-value.
+
+    A trailing lone backslash (the escape character itself was the last byte)
+    is dropped rather than raising, and any other malformed escape is kept
+    literally -- the point is to preserve the model's text, not to be strict.
+    """
+    try:
+        return json.loads('"' + text + '"')
+    except json.JSONDecodeError:
+        pass
+    out: list[str] = []
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if char != "\\" or index + 1 >= len(text):
+            out.append(char)
+            index += 1
+            continue
+        nxt = text[index + 1]
+        mapping = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f"}
+        if nxt in mapping:
+            out.append(mapping[nxt])
+            index += 2
+            continue
+        if nxt == "u" and index + 5 < len(text):
+            try:
+                out.append(chr(int(text[index + 2:index + 6], 16)))
+                index += 6
+                continue
+            except ValueError:
+                pass
+        out.append(nxt)
+        index += 2
+    return "".join(out)
+
+
 class MCPServer:
     """MCP server for tool execution"""
 
@@ -387,13 +509,26 @@ class MCPServer:
                 "an append or partial update -- any existing content at `path` not included in "
                 "`content` is gone. To change only part of an existing file, use edit_file "
                 "instead so the rest of the file (and any concurrent, unrelated edits) survives. "
-                "Use the extension the language and project actually use -- never '.txt' for code."
+                "Use the extension the language and project actually use -- never '.txt' for code. "
+                "For a LARGE document (roughly over 6,000 characters, or a multi-page report), do "
+                "not send it in one call: your arguments are bounded by the output token limit and "
+                "an oversized call arrives truncated. Write the first part, then continue with "
+                "mode=\"append\" calls for the remainder."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "File path"},
-                    "content": {"type": "string", "description": "File content"}
+                    "content": {"type": "string", "description": "File content"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["write", "append"],
+                        "description": (
+                            "'write' (default) replaces the file; 'append' adds `content` to "
+                            "the end of the existing file -- use it to continue a large "
+                            "document in a second call."
+                        ),
+                    },
                 },
                 "required": ["path", "content"]
             },
@@ -1350,14 +1485,28 @@ class MCPServer:
                 os.unlink(temp_name)
             raise
 
-    async def _write_file(self, path: str, content: str | None = None, **aliases: Any) -> str:
+    async def _write_file(
+        self, path: str, content: str | None = None, mode: str | None = None,
+        **aliases: Any,
+    ) -> str:  # noqa: D401 - see the mode comment inside
         content = content if content is not None else aliases.pop("text", None)
         content = content if content is not None else aliases.pop("new_content", None)
         content = content if content is not None else aliases.pop("file_content", None)
         if content is None:
             return "❌ Error: write_file requires content"
+        # mode="append" is how a LARGE document gets written at all: a single
+        # tool call's arguments are bounded by the model's output token limit,
+        # so one oversized write_file arrives truncated (see
+        # salvage_truncated_tool_arguments in runner_local.py). Writing the
+        # document in parts -- an initial write, then appends -- keeps every
+        # call inside the limit. Anything other than "append" (the default,
+        # including a missing value) means overwrite, so an old caller that
+        # never heard of `mode` behaves exactly as before.
+        append = str(mode or "write").strip().lower() == "append"
         p = self._resolve_in_workspace(path)
         original_content = p.read_text(encoding="utf-8", errors="ignore") if p.is_file() else None
+        if append and original_content is not None:
+            content = original_content + content
         self._atomic_write_text(p, content)
         if p.read_text(encoding="utf-8", errors="strict") != content:
             return f"❌ Failed to verify write to '{path}'"
@@ -1367,6 +1516,11 @@ class MCPServer:
                 self.session_id, path=str(p), operation="create" if original_content is None else "update",
                 original_content=original_content, new_content=content,
                 transaction_id=self.transaction_id,
+            )
+        if append and original_content is not None:
+            return (
+                f"✅ Appended {len(content) - len(original_content)} bytes to '{path}' "
+                f"(file is now {len(content)} bytes)"
             )
         return f"✅ Successfully wrote {len(content)} bytes to '{path}'"
 

@@ -129,6 +129,26 @@ def _active_agent_count(exclude_session_id: int) -> int:
     )
 
 
+def _route_note_html(session_id: int) -> str:
+    """Footer fragment for a route exception (failover / exhausted / cooling).
+
+    Empty for a healthy session, so nothing changes on the common path. Short
+    by construction (route_status_compact) and designed to sit immediately
+    after the session title so an 80-column terminal cannot clip it away.
+    """
+    try:
+        from .state import route_status_compact
+
+        note = route_status_compact(session_id)
+    except Exception:
+        return ""
+    if not note:
+        return ""
+    from xml.sax.saxutils import escape as _xml_escape
+
+    return f" <ansiyellow>{_xml_escape(note)}</ansiyellow>"
+
+
 def _mode_and_agents_html(
     cli_config: Config,
     session_id: int,
@@ -192,8 +212,12 @@ def idle_bottom_toolbar(
     resolved_agents = (
         _active_agent_count(session_id) if active_agents is None else active_agents
     )
+    # Same route-exception note as the live in-task footer (see
+    # LiveInputListener._bottom_toolbar), so the information survives the
+    # moment the turn ends instead of disappearing with the in-task bar.
+    route_html = _route_note_html(session_id)
     left = (
-        f" {_session_title_prefix(session_id)}"
+        f" {_session_title_prefix(session_id)}{route_html}"
         f"<ansigray>ready · {public_model_name(model)} ·</ansigray> "
         f"{_mode_and_agents_html(cli_config, session_id, active_agents=resolved_agents)}"
         f"{suggestion_hint}"
@@ -597,8 +621,20 @@ class LiveInputListener:
             self.session_id,
             active_agents=self._active_agents,
         )
+        # Route exceptions on the live footer: a failover, an exhausted route,
+        # or routes cooling down. Live-reported 2026-09-19: a task stopped on a
+        # 402 ("you have depleted your monthly included credits") while other
+        # routes sat configured, and the footer kept showing a normal route --
+        # the switch was only visible as a debug diagnostic scrolling past.
+        # include_current=False: the footer already names the active model, so
+        # only the exception is added, and a healthy turn adds nothing.
+        route_html = _route_note_html(self.session_id)
+        # Placed right after the session title, NOT at the end: the toolbar is
+        # one terminal row, and on an 80-column terminal a note appended last
+        # was the part that got clipped (live-observed in a pty), which is
+        # exactly the information that must not disappear.
         left = (
-            f" {_session_title_prefix(self.session_id)}"
+            f" {_session_title_prefix(self.session_id)}{route_html}"
             f"<ansigray>{status} · ↑ edit queued · esc to interrupt ·</ansigray> "
             f"{mode_and_agents_html}"
         )

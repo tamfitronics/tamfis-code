@@ -7028,6 +7028,24 @@ async def _run_local_agent_turn_impl(
                     stream=True,
                     tool_call=bool(tools),
                 )
+            # Record WHY this route died when it is an account-level failure
+            # (credits/quota/rate limit), so /status and the footer can say the
+            # primary route is exhausted rather than leaving that visible only
+            # as a debug diagnostic. Live-reported 2026-09-19: the run stopped
+            # on a TamfisGPT 402 while NVIDIA NIM sat configured and unused, and
+            # nothing in the UI said so.
+            try:
+                from .state import record_route_error, route_error_is_exhaustion
+
+                if route_error_is_exhaustion(root_exc):
+                    record_route_error(
+                        session_id,
+                        provider=failed_provider.value,
+                        model=resolved_model,
+                        error=str(root_exc),
+                    )
+            except Exception:
+                pass
             # Infra/account failures (rate limits, quota exhaustion, 5xx,
             # connection errors) must trigger cross-provider fallback even
             # when the user (or session default) explicitly pinned a
@@ -8548,6 +8566,51 @@ async def _run_local_agent_turn_impl(
 
         for tc in tool_calls:
             arguments, malformed_reason = parse_tool_call_arguments(tc.arguments)
+            salvage_note = ""
+            if malformed_reason is not None:
+                # A large write is the one call worth REPAIRING rather than
+                # refusing: its arguments were cut off by the output token
+                # limit, but everything before the cut is real work -- and a
+                # multi-page report is exactly what the model cannot fit into
+                # one call. Recover the path and the partial content, run the
+                # repaired call through the NORMAL guard/approval/dispatch
+                # path (nothing bypasses safety), and tell the model how to
+                # continue in chunks. Restricted to write_file: acting on a
+                # partially-recovered command line or edit could turn a
+                # truncated call into a wrong one.
+                if tc.name == "write_file":
+                    from .mcp import salvage_truncated_tool_arguments
+
+                    salvaged = salvage_truncated_tool_arguments(tc.arguments)
+                    salvaged_path = salvaged.get("path")
+                    salvaged_content = salvaged.get("content")
+                    if (
+                        isinstance(salvaged_path, str) and salvaged_path.strip()
+                        and isinstance(salvaged_content, str) and salvaged_content
+                    ):
+                        arguments = {"path": salvaged_path, "content": salvaged_content}
+                        malformed_reason = None
+                        salvage_note = (
+                            f"Your write_file arguments were truncated at the output "
+                            f"token limit. I recovered the first "
+                            f"{len(salvaged_content):,} characters of `content` and wrote "
+                            f"them to {salvaged_path}. The file now holds that prefix -- "
+                            f"do NOT resend it. Continue the document in a second call: "
+                            f"write_file(path={salvaged_path!r}, mode=\"append\", "
+                            f"content=\"<the remainder>\"). Keep each call under roughly "
+                            f"6,000 characters so it cannot be truncated again."
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {"content": (
+                                f"◆ write_file arguments were truncated at the output token "
+                                f"limit; recovered and wrote the first "
+                                f"{len(salvaged_content):,} characters of "
+                                f"{salvaged_path} (continue with mode=\"append\")."
+                            )},
+                        })
+                        working_messages.append({"role": "system", "content": salvage_note})
+
             if malformed_reason is not None:
                 # NEVER execute a call whose arguments did not parse. The old
                 # code silently substituted {} here, so a truncated tool call
