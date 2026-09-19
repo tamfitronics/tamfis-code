@@ -422,6 +422,26 @@ def _requests_no_confirmation(text: str) -> bool:
 _CHARS_PER_TOKEN_ESTIMATE = 4
 MAX_TOKENS_PER_REQUEST = 4096
 
+# Pre-emptive write chunking: a single response carries at most
+# MAX_TOKENS_PER_REQUEST of output, so a write_file whose `content` runs far
+# past the response budget WILL be cut off mid-JSON (the live 43-minute loop:
+# the truncated call arrived as no-arguments, the model was told it forgot
+# path/content, and it retried). Instead of letting the model spend the rest of
+# its budget on characters that are going to be discarded, the stream is
+# stopped as soon as a write_file argument string has grown past the size one
+# response can comfortably carry while still mid-write; the recovered prefix is
+# written and the model is told to continue with mode=append.
+#
+# 6,000 characters of content is ~1,500 tokens -- comfortably inside the budget
+# with room for the path and the surrounding JSON. Overridable for tuning.
+WRITE_PREEMPT_CHARS = max(
+    500, int(os.environ.get("TAMFIS_CODE_WRITE_PREEMPT_CHARS", "6000"))
+)
+# Slack over the content limit before the stream is actually cut: the argument
+# string also holds the key names, escaping, and the path, so the content size
+# the model is told about stays at or under WRITE_PREEMPT_CHARS.
+_WRITE_PREEMPT_ARGS_CHARS = WRITE_PREEMPT_CHARS + 2_000
+
 # FIX: _stream_one_completion's chunk loop had no bound on the gap between
 # two consecutive stream chunks -- a provider connection that stalls
 # mid-response (server hangs without closing, a proxy silently drops the
@@ -3936,6 +3956,9 @@ async def _stream_one_completion_impl(
     content_parts: list[str] = []
     tool_calls_by_index: dict[int, _StreamedToolCall] = {}
     finish_reason: Optional[str] = None
+    # Set when the stream is cut short because a write_file is larger than one
+    # response can carry (see the tool_call_delta branch below).
+    write_preempted = False
     offered_tool_names = {
         str((tool.get("function") or {}).get("name") or "")
         for tool in tools
@@ -4104,8 +4127,42 @@ async def _stream_one_completion_impl(
                 slot.call_id = str(event.payload.get("id") or slot.call_id)
                 slot.name = str(event.payload.get("name") or slot.name)
                 slot.arguments += str(event.payload.get("arguments") or "")
+                if (
+                    slot.name == "write_file"
+                    and len(slot.arguments) > _WRITE_PREEMPT_ARGS_CHARS
+                ):
+                    # Pre-split BEFORE the output limit is reached. Only a
+                    # still-unterminated argument string qualifies: if the model
+                    # already emitted a complete object, the write fit inside
+                    # its budget and cutting it short would be pointless.
+                    _, _write_malformed = parse_tool_call_arguments(slot.arguments)
+                    if _write_malformed is not None:
+                        write_preempted = True
+                        break
             elif event.event_type.value == "done":
                 finish_reason = event.payload.get("reason") or finish_reason
+        if write_preempted:
+            # Stop pulling chunks: everything after this point would be more
+            # characters of a document that is already over one response's
+            # budget, and would have to be discarded. The partial call below is
+            # recovered and written in parts instead.
+            with contextlib.suppress(Exception):
+                close = getattr(stream, "close", None) or getattr(stream, "aclose", None)
+                if callable(close):
+                    result_close = close()
+                    if inspect.isawaitable(result_close):
+                        await result_close
+            finish_reason = "write_preempted"
+            if emit:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": (
+                        "◆ write_file is larger than one response can carry -- "
+                        "writing it in parts instead of letting the response be "
+                        "cut off mid-file."
+                    )},
+                })
+            break
         if quality_failure_reason:
             break
 
@@ -8588,6 +8645,19 @@ async def _run_local_agent_turn_impl(
                         isinstance(salvaged_path, str) and salvaged_path.strip()
                         and isinstance(salvaged_content, str) and salvaged_content
                     ):
+                        # Cap the recovered prefix at one response's worth. The
+                        # stream is pre-empted between deltas, so the recovered
+                        # text can overshoot the limit by up to one delta -- and
+                        # the continuation instruction tells the model to keep
+                        # each call under WRITE_PREEMPT_CHARS, so the write we
+                        # make on its behalf must honour the same bound.
+                        # Trimmed at a line boundary when one is available so a
+                        # document never keeps half a line.
+                        if len(salvaged_content) > WRITE_PREEMPT_CHARS:
+                            cut = salvaged_content.rfind("\n", 0, WRITE_PREEMPT_CHARS)
+                            salvaged_content = salvaged_content[
+                                : cut if cut >= WRITE_PREEMPT_CHARS // 2 else WRITE_PREEMPT_CHARS
+                            ]
                         arguments = {"path": salvaged_path, "content": salvaged_content}
                         malformed_reason = None
                         salvage_note = (

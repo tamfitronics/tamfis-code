@@ -283,6 +283,7 @@ Not yet implemented in this pass: /notifications.
 SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show this help"),
     ("/status", "show session/workspace/approval status"),
+    ("/routes", "show the provider route timeline with how long each one held the task"),
     ("/usage", "show your TamfisGPT credit balance (day/week/month)"),
     ("/context", "show cached repository/task context"),
     ("/reports", "show the repository report index"),
@@ -1936,6 +1937,57 @@ async def _run_interactive_impl(
                 f"{escape(route_lines)}"
                 f"{ledger_line}"
             )
+            continue
+        if _ci_equals(text, "/routes"):
+            # Which provider actually ran this session, in order, and how long
+            # each one held it. The stored events answer "what route am I on";
+            # the complaint they answer here is "why is this so slow / why did
+            # it keep switching" -- which needs durations, not just names.
+            history = local_state.route_history(workspace.session_id)
+            if not history:
+                console.print(
+                    "[dim]No route recorded for this session yet -- run a task first.[/dim]"
+                )
+                continue
+            table = Table(show_header=True, header_style="bold")
+            for column in ("TIME", "EVENT", "ROUTE", "HELD", "DETAIL"):
+                table.add_column(column, overflow="fold")
+            for event in history:
+                kind = str(event.get("kind") or "")
+                route = str(event.get("provider") or "")
+                if event.get("model"):
+                    route += f"/{event['model']}"
+                if event.get("from_provider") and event.get("from_provider") != event.get("provider"):
+                    route = f"{event['from_provider']} → {route}"
+                held = event.get("held_seconds")
+                held_cell = "-" if kind == "exhaustion" else (
+                    f"{held:.1f}s" if isinstance(held, (int, float)) else "-"
+                )
+                table.add_row(
+                    str(event.get("at") or "")[11:19], kind, route, held_cell,
+                    str(event.get("reason") or "")[:120],
+                )
+            console.print(table)
+            totals = local_state.route_hold_totals(workspace.session_id)
+            if totals:
+                console.print("[dim]held per route: " + "  ·  ".join(
+                    f"{provider} {seconds:.0f}s ({count})" for provider, seconds, count in totals
+                ) + "[/dim]")
+            last_exhaustion = (local_state.route_diagnostics(workspace.session_id) or {}).get(
+                "last_exhaustion"
+            )
+            if last_exhaustion:
+                console.print(
+                    "[yellow]Last account-level failure:[/yellow] "
+                    + escape(
+                        f"{last_exhaustion.get('provider')} at "
+                        f"{str(last_exhaustion.get('at') or '')[:19]} -- "
+                        f"{str(last_exhaustion.get('reason') or '')[:200]}"
+                    )
+                )
+            cooling = local_state.cooling_route_names()
+            if cooling:
+                console.print(f"[yellow]Cooling down (recent failures):[/yellow] {', '.join(cooling)}")
             continue
         if _ci_equals(text, "/usage"):
             # Real per-feature credit balance from the SAME ledger the

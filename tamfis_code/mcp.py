@@ -510,10 +510,12 @@ class MCPServer:
                 "`content` is gone. To change only part of an existing file, use edit_file "
                 "instead so the rest of the file (and any concurrent, unrelated edits) survives. "
                 "Use the extension the language and project actually use -- never '.txt' for code. "
-                "For a LARGE document (roughly over 6,000 characters, or a multi-page report), do "
-                "not send it in one call: your arguments are bounded by the output token limit and "
-                "an oversized call arrives truncated. Write the first part, then continue with "
-                "mode=\"append\" calls for the remainder."
+                "For a LARGE document, NEVER send it in one call: your arguments are bounded by "
+                "your own output token limit, and a call much over roughly 6,000 characters of "
+                "`content` will be cut off mid-file. Send at most ~6,000 characters per call -- "
+                "write the first part, then continue with mode=\"append\" calls for the remainder. "
+                "Example: write_file(path=\"report.md\", content=\"<part 1: up to 6,000 chars>\") "
+                "then write_file(path=\"report.md\", mode=\"append\", content=\"<part 2>\")."
             ),
             parameters={
                 "type": "object",

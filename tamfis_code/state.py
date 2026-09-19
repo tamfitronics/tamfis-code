@@ -1974,6 +1974,79 @@ def route_status_line(
     return label
 
 
+def route_history(session_id: int) -> list[dict]:
+    """This session's route timeline, oldest first, with how long each route
+    actually HELD the task.
+
+    Each returned entry is the stored event plus `held_seconds` -- the gap to
+    the next route event (or to now, for the route still in effect). "How long
+    did each provider hold the task" is the question a route-churn complaint
+    actually asks, and the raw event timestamps alone do not answer it.
+    """
+    diag = route_diagnostics(session_id)
+    events = [dict(event) for event in (diag.get("events") or [])]
+    for index, event in enumerate(events):
+        if event.get("kind") not in {"select", "failover", "recovery"}:
+            # An exhaustion note describes the CURRENT route, it does not hold
+            # the task for any length of time -- reporting a duration for it
+            # would put a meaningless number in the /routes table.
+            event["held_seconds"] = None
+            continue
+        start = _parse_route_timestamp(event.get("at"))
+        following = next(
+            (
+                other for other in events[index + 1:]
+                # Only a route CHANGE ends a route's hold; an exhaustion note is
+                # about the same route, not a new one.
+                if other.get("kind") in {"select", "failover", "recovery"}
+            ),
+            None,
+        )
+        end = (
+            _parse_route_timestamp(following.get("at")) if following is not None
+            else _parse_route_timestamp(_now())
+        )
+        if start is not None and end is not None and end >= start:
+            event["held_seconds"] = round((end - start).total_seconds(), 1)
+        else:
+            event["held_seconds"] = None
+    return events
+
+
+def route_hold_totals(session_id: int) -> list[tuple[str, float, int]]:
+    """(provider, seconds_held, turns) per provider, longest-held first."""
+    totals: dict[str, list[float]] = {}
+    for event in route_history(session_id):
+        if event.get("kind") not in {"select", "failover", "recovery"}:
+            continue
+        provider = str(event.get("provider") or "")
+        if not provider:
+            continue
+        held = event.get("held_seconds")
+        entry = totals.setdefault(provider, [0.0, 0.0])
+        if isinstance(held, (int, float)):
+            entry[0] += float(held)
+        entry[1] += 1
+    return sorted(
+        ((provider, values[0], int(values[1])) for provider, values in totals.items()),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+
+
+def _parse_route_timestamp(value: Any) -> Optional[datetime]:
+    """Parse a stored route timestamp; None when it is missing/unparseable."""
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
 def route_status_compact(session_id: int, max_chars: int = 56) -> str:
     """The FOOTER form of the route note: only what changed and why, small
     enough to sit beside the session title and mode without being clipped by

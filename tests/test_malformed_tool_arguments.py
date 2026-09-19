@@ -31,6 +31,7 @@ from pathlib import Path
 from tamfis_code.mcp import MCPServer
 from tamfis_code.providers import ProviderType
 from tamfis_code.runner_local import (
+    WRITE_PREEMPT_CHARS,
     malformed_tool_arguments_result,
     parse_tool_call_arguments,
     run_local_agent_turn,
@@ -267,6 +268,108 @@ class TruncatedWriteIsSalvagedNotLostTests(_StatePatchMixin, unittest.TestCase):
             self.assertTrue(
                 any("unparseable" in text for text in diagnostics),
                 f"the refusal must be visible, not silent: {diagnostics}",
+            )
+
+
+class OversizedWriteIsSplitBeforeTheLimitTests(_StatePatchMixin, unittest.TestCase):
+    """A write too large for one response is split AS IT STREAMS.
+
+    Waiting for the provider to cut the JSON off wastes the rest of the
+    response budget on characters that get discarded; the stream is stopped as
+    soon as a still-unterminated write_file argument string passes the size one
+    response can carry, and the recovered prefix is written immediately.
+    """
+
+    def _console(self):
+        from io import StringIO
+        from rich.console import Console
+        return Console(file=StringIO(), no_color=True, width=200)
+
+    def _write_call_chunks(self, path, content):
+        """One tool call delivered as many small argument deltas, the way a
+        provider actually streams it."""
+        raw = json.dumps({"path": str(path), "content": content})
+        pieces = [raw[i:i + 200] for i in range(0, len(raw), 200)]
+        return [
+            _chunk(_delta(tool_calls=[_tool_call_delta(
+                0, call_id="call_1", name="write_file", arguments=piece,
+            )]))
+            for piece in pieces
+        ]
+
+    def test_a_huge_write_is_cut_early_and_continued_with_append(self):
+        with tempfile.TemporaryDirectory() as ws:
+            target = Path(ws) / "big.md"
+            content = "Z" * (WRITE_PREEMPT_CHARS * 4)
+            chunks = self._write_call_chunks(target, content)
+            # The first scripted round is the planner's; the rest is the write.
+            client = _FakeClient([
+                [_chunk(_delta(content="1. create the big document"))],
+                chunks,
+                [_chunk(_delta(content="Continuing the document with mode=append."))],
+                [_chunk(_delta(content="Continuing the document with mode=append."))],
+            ])
+            renderer = _RecordingRenderer()
+
+            asyncio.run(run_local_agent_turn(
+                _FakeManager(client), ProviderType.NVIDIA, None,
+                [{"role": "user", "content": f"create {target} with the findings"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto",
+                interactive=False,
+            ))
+
+            self.assertTrue(target.is_file(), "the recovered prefix must be written")
+            written = len(target.read_text())
+            self.assertLess(written, len(content), "the whole oversized body is not sent")
+            # Bounded to roughly one response's worth, not the whole document.
+            self.assertLessEqual(written, WRITE_PREEMPT_CHARS)
+            self.assertGreater(written, 0)
+
+            diagnostics = [
+                str(event.get("payload", {}).get("content", ""))
+                for event in renderer.events
+                if event.get("event_type") == "diagnostics"
+            ]
+            self.assertTrue(
+                any("one response can carry" in text for text in diagnostics),
+                f"the split must be explained, not silent: {diagnostics}",
+            )
+            self.assertTrue(
+                any("append" in text for text in diagnostics),
+                f"the model must be told how to continue: {diagnostics}",
+            )
+
+    def test_a_write_that_fits_is_not_cut_short(self):
+        with tempfile.TemporaryDirectory() as ws:
+            target = Path(ws) / "small.md"
+            body = "normal document content\n" * 20
+            client = _FakeClient([
+                [_chunk(_delta(content="1. create the document"))],
+                self._write_call_chunks(target, body),
+                [_chunk(_delta(content="Done."))],
+                [_chunk(_delta(content="Done."))],
+            ])
+            renderer = _RecordingRenderer()
+
+            asyncio.run(run_local_agent_turn(
+                _FakeManager(client), ProviderType.NVIDIA, None,
+                [{"role": "user", "content": f"create {target} with the notes"}],
+                self._console(), renderer,
+                workspace_root=ws, session_id=1, approval_policy="auto",
+                interactive=False,
+            ))
+
+            self.assertTrue(target.is_file())
+            self.assertEqual(target.read_text(), body)
+            diagnostics = [
+                str(event.get("payload", {}).get("content", ""))
+                for event in renderer.events
+                if event.get("event_type") == "diagnostics"
+            ]
+            self.assertFalse(
+                any("one response can carry" in text for text in diagnostics),
+                "a write that fits must not be pre-empted",
             )
 
 

@@ -36,8 +36,20 @@ class RouteEventFixture(unittest.TestCase):
         state_module.STATE_PATH = base / ".config" / "state.json"
         state_module._LOCK_PATH = base / ".config" / ".state.lock"
         state_module._STATE_CACHE = None
+        # Route-health circuits live in providers as process-global state and are
+        # opened by any failing route anywhere in the suite (a real behaviour: a
+        # cooling route IS reported). Isolate it so these assertions are about
+        # the session's own record, not about which tests ran first.
+        from tamfis_code import providers as providers_module
+
+        self._health_snapshot = dict(providers_module._ROUTE_HEALTH)
+        providers_module._ROUTE_HEALTH.clear()
 
     def tearDown(self):
+        from tamfis_code import providers as providers_module
+
+        providers_module._ROUTE_HEALTH.clear()
+        providers_module._ROUTE_HEALTH.update(self._health_snapshot)
         (
             state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH,
         ) = self._originals
@@ -129,6 +141,53 @@ class RouteDiagnosticsTests(RouteEventFixture):
     def test_recording_never_raises_for_an_unknown_session(self):
         state_module.record_route_event(424242, provider="nvidia")
         state_module.record_route_error(424242, provider="nvidia", error="402")
+
+
+class RouteHistoryWithTimingsTests(RouteEventFixture):
+    """/routes answers "which provider held this task, and for how long" -- the
+    stored events alone only say what happened, not how long each route was
+    actually carrying the work."""
+
+    def test_each_route_reports_how_long_it_held_the_task(self):
+        import time
+
+        state_module.save_session_state(1, workspace_root="/home")
+        state_module.record_route_event(1, provider="tamfisgpt-ultra", model="ultra")
+        time.sleep(0.05)
+        state_module.record_route_error(1, provider="tamfisgpt-ultra", error="402 credits")
+        state_module.record_route_event(
+            1, provider="nvidia", model="nim-1",
+            previous_provider="tamfisgpt-ultra", reason="402", kind="failover",
+        )
+        time.sleep(0.05)
+
+        history = state_module.route_history(1)
+        self.assertEqual([event["kind"] for event in history],
+                         ["select", "exhaustion", "failover"])
+        # The first route held the task until the failover replaced it.
+        self.assertGreaterEqual(history[0]["held_seconds"], 0.05)
+        # The exhaustion note does not end a route's hold.
+        self.assertIsNone(history[1]["held_seconds"])
+        # The route still in effect is measured against now.
+        self.assertGreaterEqual(history[2]["held_seconds"], 0.05)
+
+    def test_hold_totals_aggregate_per_provider(self):
+        state_module.save_session_state(1, workspace_root="/home")
+        state_module.record_route_event(1, provider="nvidia", model="nim-1")
+        state_module.record_route_event(
+            1, provider="openrouter", model="owl",
+            previous_provider="nvidia", reason="recovered", kind="recovery",
+        )
+        totals = state_module.route_hold_totals(1)
+        providers = [provider for provider, _seconds, _count in totals]
+        self.assertIn("nvidia", providers)
+        self.assertIn("openrouter", providers)
+        self.assertTrue(all(seconds >= 0 for _p, seconds, _c in totals))
+
+    def test_the_routes_command_is_registered(self):
+        from tamfis_code.interactive import SLASH_COMMANDS
+
+        self.assertIn("/routes", [name for name, _description in SLASH_COMMANDS])
 
 
 class OrchestratorRecordsRouteChangesTests(RouteEventFixture):
