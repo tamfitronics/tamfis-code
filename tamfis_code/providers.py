@@ -21,6 +21,7 @@ packages use process/user configuration and never assume a builder's path.
 from __future__ import annotations
 
 import itertools
+import asyncio
 import os
 import random
 import threading
@@ -298,6 +299,17 @@ class RoutingTelemetry:
         return self.nim_selected_requests / self.nim_eligible_requests
 
 
+# Time-to-first-byte bound shared by every provider request (see the
+# chat_completion call site's comment for the live incident). Env-tunable for
+# slow/queued endpoints; a route that has sent nothing by then is treated as a
+# retryable route failure rather than held until the 120s transport timeout.
+try:
+    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = max(
+        5.0, float(os.environ.get("TAMFIS_CODE_FIRST_BYTE_TIMEOUT", "45"))
+    )
+except (TypeError, ValueError):
+    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = 45.0
+
 _HEALTH_LOCK = threading.RLock()
 _ROUTE_HEALTH: Dict[tuple[str, str], RouteHealth] = {}
 _ROUTING_TELEMETRY = RoutingTelemetry()
@@ -305,6 +317,74 @@ _ROUTING_TELEMETRY = RoutingTelemetry()
 
 def _increment(mapping: Dict[str, int], key: str) -> None:
     mapping[key] = mapping.get(key, 0) + 1
+
+
+def record_route_failure_for(
+    provider: ProviderType,
+    model: str,
+    exc: Exception,
+    *,
+    provider_config: Optional[ProviderConfig] = None,
+    status: Optional[int] = None,
+    stream: bool = False,
+    tool_call: bool = False,
+) -> None:
+    """Record a route failure without needing a ProviderManager instance.
+
+    Exists because a large part of the runtime does NOT go through
+    `chat_completion`: planning, plan revision, empty-continuation recovery and
+    stream reconnection all drive a pre-resolved client directly. Those paths
+    used to leave route health completely untouched, so a route that hung
+    (rather than erroring) was never demoted -- the very next request resolved
+    to the same hung route and hung again. That is the route churn: every
+    attempt paying the full client timeout on a route the runtime already knew
+    was not answering.
+    """
+    if status is None:
+        try:
+            status = ProviderManager.provider_error_status(exc)
+        except Exception:
+            status = None
+    deterministic = status in {400, 401, 402, 403, 404}
+    cooldown = 300.0 if deterministic else 30.0
+    now = time.monotonic()
+    with _HEALTH_LOCK:
+        state = _ROUTE_HEALTH.setdefault((provider.value, model or "*"), RouteHealth())
+        state.failures += 1
+        state.last_failure = now
+        state.last_error_class = type(exc).__name__
+        state.circuit_open_until = max(state.circuit_open_until, now + cooldown)
+        # Non-NIM providers currently expose a single selected route per task,
+        # so cool the provider immediately. NIM is demoted only after every
+        # configured sibling model is unavailable.
+        configured_models = list(dict.fromkeys([
+            getattr(provider_config, "default_model", ""),
+            *(getattr(provider_config, "models", ()) or ()),
+        ]))
+        all_models_unhealthy = bool(configured_models) and all(
+            not (_route_health_is_healthy(provider, candidate))
+            for candidate in configured_models if candidate
+        )
+        if provider != ProviderType.NVIDIA or all_models_unhealthy:
+            provider_state = _ROUTE_HEALTH.setdefault((provider.value, "*"), RouteHealth())
+            provider_state.failures += 1
+            provider_state.last_failure = now
+            provider_state.last_error_class = type(exc).__name__
+            provider_state.circuit_open_until = max(
+                provider_state.circuit_open_until, now + cooldown,
+            )
+        _increment(_ROUTING_TELEMETRY.provider_failures, provider.value)
+        if stream:
+            _increment(_ROUTING_TELEMETRY.provider_stream_failures, provider.value)
+        if tool_call:
+            _increment(_ROUTING_TELEMETRY.provider_tool_failures, provider.value)
+
+
+def _route_health_is_healthy(provider: ProviderType, model: str) -> bool:
+    """Lock-held variant of ProviderManager.route_is_healthy (the lock is
+    re-entrant, so this is safe to call from inside record_route_failure_for)."""
+    state = _ROUTE_HEALTH.get((provider.value, model or "*"))
+    return state is None or state.circuit_open_until <= time.monotonic()
 
 
 # NIM multi-key rotation: the owner runs multiple NVIDIA NIM accounts (each
@@ -1298,43 +1378,12 @@ class ProviderManager:
         stream: bool = False,
         tool_call: bool = False,
     ) -> None:
-        status = self.provider_error_status(exc)
-        deterministic = status in {400, 401, 402, 403, 404}
-        cooldown = 300.0 if deterministic else 30.0
-        now = time.monotonic()
-        with _HEALTH_LOCK:
-            state = _ROUTE_HEALTH.setdefault((provider.value, model), RouteHealth())
-            state.failures += 1
-            state.last_failure = now
-            state.last_error_class = type(exc).__name__
-            state.circuit_open_until = max(state.circuit_open_until, now + cooldown)
-            # Non-NIM providers currently expose a single selected route per
-            # task, so cool the provider immediately. NIM is demoted only
-            # after every configured sibling model is unavailable.
-            provider_config = self.PROVIDERS.get(provider)
-            configured_models = list(dict.fromkeys(
-                [
-                    getattr(provider_config, "default_model", ""),
-                    *(getattr(provider_config, "models", ()) or ()),
-                ]
-            ))
-            all_models_unhealthy = bool(configured_models) and all(
-                not self.route_is_healthy(provider, candidate)
-                for candidate in configured_models if candidate
-            )
-            if provider != ProviderType.NVIDIA or all_models_unhealthy:
-                provider_state = _ROUTE_HEALTH.setdefault((provider.value, "*"), RouteHealth())
-                provider_state.failures += 1
-                provider_state.last_failure = now
-                provider_state.last_error_class = type(exc).__name__
-                provider_state.circuit_open_until = max(
-                    provider_state.circuit_open_until, now + cooldown,
-                )
-            _increment(_ROUTING_TELEMETRY.provider_failures, provider.value)
-            if stream:
-                _increment(_ROUTING_TELEMETRY.provider_stream_failures, provider.value)
-            if tool_call:
-                _increment(_ROUTING_TELEMETRY.provider_tool_failures, provider.value)
+        record_route_failure_for(
+            provider, model, exc,
+            provider_config=self.PROVIDERS.get(provider),
+            status=self.provider_error_status(exc),
+            stream=stream, tool_call=tool_call,
+        )
 
     def record_fallback(self, provider: ProviderType) -> None:
         with _HEALTH_LOCK:
@@ -1908,9 +1957,51 @@ class ProviderManager:
                 model=selected_model,
                 operation="chat_completion",
             ):
-                response = await client.chat.completions.create(**request_kwargs)
+                # Time-to-first-byte bound. The SDK's own timeout is 120s and,
+                # live-measured 2026-09-19, a route that accepts the connection
+                # and then goes quiet did NOT trip it within 200s -- every
+                # attempt on that route parked the whole turn, and the fallback
+                # chain only ran after that. A route that has not started
+                # answering is not going to finish a coding turn either way, so
+                # fail it fast and let is_retryable_provider_error (which
+                # classifies TimeoutError by TYPE) move down the chain.
+                try:
+                    response = await asyncio.wait_for(
+                        client.chat.completions.create(**request_kwargs),
+                        timeout=PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS,
+                    )
+                except asyncio.TimeoutError as exc:
+                    self.record_route_failure(
+                        resolved, selected_model,
+                        asyncio.TimeoutError(
+                            f"Provider sent no response within "
+                            f"{PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS:.0f}s "
+                            "(time-to-first-byte timeout)"
+                        ),
+                        stream=stream, tool_call=bool(request_kwargs.get("tools")),
+                    )
+                    raise asyncio.TimeoutError(
+                        f"Provider sent no response within "
+                        f"{PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS:.0f}s "
+                        "(time-to-first-byte timeout)"
+                    ) from exc
 
                 if stream:
+                    # Live-measured 2026-09-19: a route can complete its stream
+                    # with HTTP 200 and ZERO content chunks (the same
+                    # empty-shape failure the session-title route already
+                    # documented for an HF-hosted model). That is not an
+                    # answer -- treating it as a success strand the caller
+                    # with nothing and stopped the fallback chain, which is
+                    # exactly the "silent route" churn this watchdog exists
+                    # to kill. Content-less streams are only legitimate for
+                    # tool-calling requests (a tool call carries its whole
+                    # payload in tool_calls), so a plain request that yields
+                    # nothing is a route failure and falls through to the next
+                    # provider. ConnectionError is classified retryable BY TYPE
+                    # (see is_retryable_provider_error), so this rides the
+                    # existing fallback path rather than inventing a new one.
+                    yielded_content = False
                     async for chunk in response:
                         usage = getattr(chunk, "usage", None)
                         if usage is not None:
@@ -1922,7 +2013,19 @@ class ProviderManager:
                             continue
                         content = chunk.choices[0].delta.content
                         if content:
+                            yielded_content = True
                             yield content
+                    if not yielded_content and not request_kwargs.get("tools"):
+                        self.record_route_failure(
+                            resolved, selected_model,
+                            ConnectionError(
+                                "Provider streamed no content (empty response)"
+                            ),
+                            stream=True, tool_call=False,
+                        )
+                        raise ConnectionError(
+                            "Provider streamed no content (empty response)"
+                        )
                     self.record_route_success(resolved, selected_model)
                     return
 

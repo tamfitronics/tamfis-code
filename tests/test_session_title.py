@@ -15,6 +15,7 @@ rename (title_source="user", never auto-overwritten) or ask for a fresh
 LLM title at any time (/regenerate-title).
 """
 import asyncio
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -148,9 +149,10 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         self._upgrade("Fix flaky auth test")
         state = state_module.get_session_state(1)
         self.assertEqual(state.title_source, "llm")
-        # model attribution reports the AUTO routing directive; the
-        # concrete underlying model lives in the router's own telemetry.
-        self.assertEqual(state.title_model, "auto")
+        # model attribution names the route that ACTUALLY answered (the first
+        # preferred route here), not a generic "auto": "which model named
+        # this session" is the first question a bad title raises.
+        self.assertEqual(state.title_model, state_module.title_route_preference()[0])
         self.assertTrue(state.title_generated_at)
         self.assertIsNone(state.title_fallback_reason)
         self.assertTrue(state.ai_title_attempted)
@@ -187,7 +189,7 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         self._upgrade("Investigate retry loop timeout",
                       objective="Investigate the timeout bug in the retry loop")
         self.assertEqual(
-            state_module.get_session_state(1).session_title, "Investigate retry loop timeout",
+            state_module.get_session_state(1).session_title, "Investigate Retry Loop Timeout",
         )
 
     def test_provider_failure_leaves_no_title_and_frees_the_budget(self):
@@ -201,7 +203,8 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         self.assertFalse(state.ai_title_attempted)  # next turn retries
 
         self._upgrade("Fix flaky auth test")
-        self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
+        # The accepted title is tightened (Title Case) before it is persisted.
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix Flaky Auth Test")
 
     def test_blank_objective_is_a_no_op(self):
         state_module.save_session_state(1, workspace_root="/a")
@@ -216,7 +219,7 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
             self._run(state_module.upgrade_session_title_with_ai(1, "what's the weather like"))
             factory.assert_not_called()
         patcher.stop()
-        self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix Flaky Auth Test")
 
     def test_a_nonsubstantive_later_turn_does_not_retitle_the_session(self):
         """Acceptance TEST 9: 'Continue' must not produce a useless title,
@@ -224,7 +227,7 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         state_module.save_session_state(1, workspace_root="/a")
         self._upgrade("Fix flaky auth test")
         self._upgrade("Fix the auth retry storm", objective="Continue")
-        self.assertEqual(state_module.get_session_state(1).session_title, "Fix flaky auth test")
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix Flaky Auth Test")
 
     def test_user_rename_is_never_overwritten_by_the_llm(self):
         """Acceptance TEST 8: an explicit user title survives every later
@@ -278,22 +281,24 @@ class RenameAndRegenerateTests(_StateDirFixture, unittest.TestCase):
         """Acceptance TEST 10's core: /regenerate-title clears a stale
         title so the next upgrade generates a fresh one."""
         state_module.save_session_state(1, workspace_root="/a")
-        patcher, _ = _fake_providers("Stale title")
+        patcher, _ = _fake_providers("Fix Flaky Auth Test")
         with patcher:
-            asyncio.run(state_module.upgrade_session_title_with_ai(1, "objective"))
+            asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
         patcher.stop()
-        self.assertEqual(state_module.get_session_state(1).session_title, "Stale title")
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix Flaky Auth Test")
 
         self.assertTrue(state_module.request_session_title_regeneration(1))
         state = state_module.get_session_state(1)
         self.assertEqual(state.session_title, "")
         self.assertFalse(state.ai_title_attempted)
 
-        patcher, _ = _fake_providers("Fresh Semantic Title")
+        patcher, _ = _fake_providers("Add Streaming Retry Budget")
         with patcher:
-            asyncio.run(state_module.upgrade_session_title_with_ai(1, "new objective"))
+            asyncio.run(state_module.upgrade_session_title_with_ai(1, "Add a streaming retry budget"))
         patcher.stop()
-        self.assertEqual(state_module.get_session_state(1).session_title, "Fresh Semantic Title")
+        self.assertEqual(
+            state_module.get_session_state(1).session_title, "Add Streaming Retry Budget",
+        )
 
     def test_regeneration_refuses_to_touch_a_user_title(self):
         state_module.save_session_state(1, workspace_root="/a")
@@ -308,11 +313,388 @@ class RenameAndRegenerateTests(_StateDirFixture, unittest.TestCase):
             asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
         patcher.stop()
         diag = state_module.session_title_diagnostics(1)
-        self.assertEqual(diag["title"], "Fix flaky auth test")
+        self.assertEqual(diag["title"], "Fix Flaky Auth Test")
         self.assertEqual(diag["title_source"], "llm")
-        self.assertEqual(diag["title_model"], "auto")
+        self.assertEqual(diag["title_model"], state_module.title_route_preference()[0])
         self.assertTrue(diag["title_generated_at"])
         self.assertIsNone(diag["fallback_reason"])
+
+
+# --------------------------------------------------------------------------
+# Tight titling: what a title is allowed to be (live-reported: /regenerate
+# "did nothing", and titles that were still echoes of the request)
+# --------------------------------------------------------------------------
+
+
+class TitleValidationTests(unittest.TestCase):
+    """The acceptance table from the titling contract: the GOOD examples must
+    be accepted, the BAD (first-words / truncation / filler) must not."""
+
+    CASES = (
+        (
+            "Please investigate why image and video workspace generation keeps "
+            "throwing errors after the routing changes",
+            ("Fix Image & Video Workspace", "Image & Video Workspace Generation"),
+            ("Please investigate why image and", "Please"),
+        ),
+        (
+            "Fist you need to fix tamfis-code to properly keep track of sessions "
+            "so users can use multiple sessions",
+            ("Fix Tamfis-Code Sessions", "Fix Session Tracking"),
+            ("Fist you need to fix", "Fist"),
+        ),
+        (
+            "Build a production-grade spreadsheet engineering skill with workbook "
+            "reconciliation and validation",
+            ("Spreadsheet Engineering Skill", "Build Spreadsheet Capability"),
+            ("Build a production-grade spreadsheet", "Build a"),
+        ),
+        (
+            "Fix tamfis-code so multiple sessions don't leak into one another and "
+            "resume doesn't show duplicates",
+            ("Fix Session Isolation", "Fix Session Management"),
+            # "Fix tamfis-code" alone is a legitimate verb+system title (the
+            # contract's own "Train TamGPT-3.0" is that shape); what must never
+            # be accepted is the mid-sentence truncation.
+            ("Fix tamfis-code so multiple",),
+        ),
+        (
+            "Please please can you kindly help me to fix streaming because responses "
+            "keep repeating",
+            ("Fix Streaming Repetition", "Fix Streaming"),
+            ("Please please can you", "Please"),
+        ),
+        (
+            "Train TamGPT-3.0 with the new corpus and report loss curves",
+            ("Train TamGPT-3.0", "Train TamGPT-3.0 Corpus"),
+            (),
+        ),
+        (
+            "Investigate and repair provider weighting so AUTO stops churning routes",
+            ("Repair Provider Weighting", "Fix Route Churn"),
+            (),
+        ),
+    )
+
+    def test_good_titles_are_accepted(self):
+        for objective, good, _bad in self.CASES:
+            for candidate in good:
+                accepted, reason = state_module.validate_session_title(candidate, objective=objective)
+                self.assertTrue(accepted, f"{candidate!r} rejected for {objective!r}: {reason}")
+                self.assertEqual(reason, "")
+
+    def test_first_words_and_truncations_are_rejected(self):
+        for objective, _good, bad in self.CASES:
+            for candidate in bad:
+                accepted, reason = state_module.validate_session_title(candidate, objective=objective)
+                self.assertFalse(accepted, f"{candidate!r} was accepted for {objective!r}")
+                self.assertTrue(reason, "a rejection must carry a reason for the corrective retry")
+
+    def test_structural_rejections(self):
+        objective = "Fix the flaky auth test in the login flow"
+        for candidate, fragment in (
+            ("", "empty"),
+            ("Fix", "single word"),
+            ("Fix the flaky auth test in the login flow now please", "sentence"),
+            ("Session Task Request", "filler/meta"),
+            ("Totally Unrelated Words", "shares no words"),
+        ):
+            accepted, reason = state_module.validate_session_title(candidate, objective=objective)
+            self.assertFalse(accepted, f"{candidate!r} was accepted")
+            self.assertIn(fragment, reason)
+
+    def test_a_title_identical_to_the_existing_one_is_rejected(self):
+        accepted, reason = state_module.validate_session_title(
+            "Fix Flaky Auth Test",
+            objective="Fix the flaky auth test in the login flow",
+            previous_title="Fix Flaky Auth Test",
+        )
+        self.assertFalse(accepted)
+        self.assertIn("identical", reason)
+
+
+class TitleCommandAliasTests(unittest.TestCase):
+    """Live-reported: `/regenerate title` did nothing. Every natural spelling
+    must resolve to the command, and a non-command must not."""
+
+    def _argument(self, text: str):
+        from tamfis_code.interactive import _title_command_argument
+
+        return _title_command_argument(text)
+
+    def test_every_alias_resolves_to_regeneration(self):
+        for text in (
+            "/regenerate-title", "/regenerate-title title", "/regenerate", "/regenerate title",
+            "/REGENERATE", "/retitle", "/title", "/title session title", "/regenerate-title  ",
+        ):
+            self.assertEqual(self._argument(text), "", f"{text!r} did not resolve to regeneration")
+
+    def test_an_argument_is_a_rename_target(self):
+        self.assertEqual(self._argument("/regenerate-title Fix Session Isolation"), "Fix Session Isolation")
+        self.assertEqual(self._argument('/retitle "My Session"'), "My Session")
+        self.assertEqual(self._argument("/title Spreadsheet Skill"), "Spreadsheet Skill")
+
+    def test_non_title_commands_are_not_claimed(self):
+        for text in ("/status", "/titlecase", "/regeneration", "regenerate title", "/help"):
+            self.assertIsNone(self._argument(text), f"{text!r} was wrongly treated as a title command")
+
+
+class UnknownSlashCommandGuardTests(unittest.TestCase):
+    def test_a_mistyped_command_is_shaped_as_a_command(self):
+        from tamfis_code.interactive import _looks_like_unknown_slash_command
+
+        self.assertEqual(_looks_like_unknown_slash_command("/regenrate"), "/regenrate")
+        self.assertEqual(
+            _looks_like_unknown_slash_command("/regenerat title now"), "/regenerat",
+        )
+
+    def test_paths_and_prose_are_never_treated_as_commands(self):
+        from tamfis_code.interactive import _looks_like_unknown_slash_command
+
+        for text in (
+            "/home/tamfiscode/file.py",
+            "/tmp/website-redesign-prompt.docx",
+            "no slash here",
+            "/2 split ratios",
+            "/",
+        ):
+            self.assertIsNone(_looks_like_unknown_slash_command(text), f"{text!r} was treated as a command")
+
+
+class TitleSeedTests(unittest.TestCase):
+    """The title model must be given what the session is ABOUT, not just the
+    latest (possibly trivial) message."""
+
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH)
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        state_module._LOCK_PATH = base / ".config" / ".state.lock"
+        state_module._STATE_CACHE = None
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH = self._originals
+        state_module._STATE_CACHE = None
+        self._tmp.cleanup()
+
+    def test_active_task_objective_wins(self):
+        state_module.save_session_state(
+            1, workspace_root="/a",
+            active_task={"objective": "Fix the image workspace generation"},
+        )
+        state = state_module.get_session_state(1)
+        from tamfis_code.interactive import _title_seed_objective
+
+        self.assertEqual(_title_seed_objective(state), "Fix the image workspace generation")
+
+    def test_falls_back_to_the_last_substantive_turn_then_summary(self):
+        from tamfis_code.interactive import _title_seed_objective
+
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.remember_conversation_turn(
+            1, objective="Refactor the provider router", answer="Done.",
+        )
+        self.assertEqual(_title_seed_objective(state_module.get_session_state(1)), "Refactor the provider router")
+
+        state_module.save_session_state(2, workspace_root="/a", conversation_summary="compacted recap text")
+        self.assertEqual(_title_seed_objective(state_module.get_session_state(2)), "compacted recap text")
+
+    def test_the_title_prompt_carries_session_context_and_strict_rules(self):
+        state_module.save_session_state(1, workspace_root="/a/workspace")
+        state_module.remember_conversation_turn(1, objective="Fix image generation", answer="ok")
+        messages = state_module.build_session_title_messages(1, "Fix image generation")
+        self.assertIn("3 to 6 words", messages[0]["content"])
+        self.assertIn("NEVER repeat the opening words", messages[0]["content"])
+        self.assertIn("Fix Image & Video Workspace", messages[0]["content"])
+        self.assertIn("Primary request: Fix image generation", messages[1]["content"])
+        self.assertIn("Workspace: /a/workspace", messages[1]["content"])
+
+
+class CorrectiveRetryTests(unittest.TestCase):
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH)
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        state_module._LOCK_PATH = base / ".config" / ".state.lock"
+        state_module._STATE_CACHE = None
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH = self._originals
+        state_module._STATE_CACHE = None
+        self._tmp.cleanup()
+
+    def test_a_rejected_title_triggers_one_corrective_retry(self):
+        objective = "Please investigate why image and video workspace generation keeps failing"
+        candidates = ["Please investigate why image and", "Fix Image Video Workspace"]
+        seen: list[list[dict]] = []
+
+        async def fake_generate(messages):
+            seen.append(list(messages))
+            return candidates[len(seen) - 1], "nvidia", ""
+
+        with patch.object(state_module, "_generate_session_title", fake_generate):
+            title, model, reason = asyncio.run(
+                state_module._generate_and_validate_title(1, objective)
+            )
+        self.assertEqual(title, "Fix Image Video Workspace")
+        self.assertEqual(model, "nvidia")
+        self.assertEqual(reason, "")
+        self.assertEqual(len(seen), 2, "one retry, not an unbounded negotiation")
+        # The retry carries the rejection reason so the model can correct it.
+        self.assertIn("rejected", seen[1][-1]["content"])
+
+    def test_two_rejections_yield_no_title_rather_than_a_bad_one(self):
+        async def fake_generate(messages):
+            return "Please investigate why image and", "nvidia", ""
+
+        with patch.object(state_module, "_generate_session_title", fake_generate):
+            title, _model, reason = asyncio.run(
+                state_module._generate_and_validate_title(
+                    1, "Please investigate why image and video workspace generation keeps failing",
+                )
+            )
+        self.assertEqual(title, "")
+        self.assertEqual(reason, "invalid_response")
+
+    def test_a_provider_failure_is_reported_not_masked(self):
+        async def fake_generate(messages):
+            return "", "", "provider_timeout"
+
+        with patch.object(state_module, "_generate_session_title", fake_generate):
+            title, _model, reason = asyncio.run(
+                state_module._generate_and_validate_title(1, "Fix the flaky auth test")
+            )
+        self.assertEqual(title, "")
+        self.assertEqual(reason, "provider_timeout")
+
+
+class AcceptedTitlesAreTightened(unittest.TestCase):
+    """An accepted LLM title gets a deterministic tightening pass, so every
+    title reads like a task name: imperative opener, Title Case, "&" between
+    the halves of a compound task, product/API names left exactly as written.
+    """
+
+    def _title(self, candidate, objective):
+        title, reason = state_module.validate_session_title(
+            candidate, objective=objective,
+        )
+        self.assertEqual(reason, "")
+        return title
+
+    def test_a_gerund_opener_becomes_the_imperative(self):
+        self.assertEqual(
+            self._title(
+                "Investigating image video workspace errors",
+                "Please investigate why image and video workspace generation keeps throwing errors",
+            ),
+            "Investigate Image Video Workspace Errors",
+        )
+
+    def test_a_compound_subject_uses_the_ampersand_form(self):
+        # The reference title for this exact request is "Fix Image & Video
+        # Workspace" -- the "and" form is the loose version of it.
+        self.assertEqual(
+            self._title(
+                "Investigating image and video workspace errors",
+                "Please investigate why image and video workspace generation keeps throwing errors",
+            ),
+            "Investigate Image & Video Workspace Errors",
+        )
+
+    def test_a_lowercase_candidate_is_title_cased(self):
+        self.assertEqual(
+            self._title(
+                "fix streaming repetition",
+                "Please help me fix streaming because responses keep repeating",
+            ),
+            "Fix Streaming Repetition",
+        )
+
+    def test_product_and_version_names_keep_their_exact_form(self):
+        self.assertEqual(
+            self._title("Train TamGPT-3.0", "Train TamGPT-3.0 on the new corpus"),
+            "Train TamGPT-3.0",
+        )
+        self.assertEqual(
+            self._title(
+                "Reconcile MSC-2 revenue",
+                "Reconcile the MSC-2 revenue recognition and validation",
+            ),
+            "Reconcile MSC-2 Revenue",
+        )
+
+    def test_a_hyphenated_product_name_is_a_name_not_prose(self):
+        self.assertEqual(
+            self._title(
+                "Fix tamfis-code sessions",
+                "First you need to fix tamfis-code to properly keep track of sessions",
+            ),
+            "Fix Tamfis-Code Sessions",
+        )
+
+    def test_tightening_is_not_a_generator(self):
+        """It may only re-shape the model's own words -- a title the validator
+        rejected must still be rejected, and tightening must never invent one."""
+        title, reason = state_module.validate_session_title(
+            "Please investigate why image and",
+            objective="Please investigate why image and video workspace generation keeps failing",
+        )
+        self.assertEqual(title, "")
+        self.assertTrue(reason)
+        self.assertEqual(state_module._tighten_llm_title(""), "")
+
+
+class TitleCommandReportSurvivesRichMarkup(unittest.TestCase):
+    """Live-reproduced 2026-09-19: /regenerate-title generated the title and
+    then crashed the whole REPL rendering its own report -- one opening green
+    tag, two closing ones. From the user's side, "the command did nothing".
+    """
+
+    def _render(self, markup):
+        from rich.console import Console
+        import io
+        buffer = io.StringIO()
+        Console(file=buffer, width=400).print(markup)
+        return buffer.getvalue()
+
+    def test_the_report_has_balanced_markup(self):
+        from tamfis_code.interactive import session_title_report
+
+        report = session_title_report(
+            "Add Hello Output", "Send Hello Message", "openrouter",
+        )
+        self.assertEqual(report.count("["), report.count("]"))
+        # One opening green tag, one closing -- the old line had TWO closes and
+        # rich raised MarkupError, killing the REPL.
+        self.assertEqual(report.count("[green]"), 1)
+        self.assertEqual(report.count("[/green]"), 1)
+        self.assertTrue(report.startswith("[green]"))
+        rendered = self._render(report)
+        self.assertIn("Send Hello Message", rendered)
+        self.assertIn("Add Hello Output", rendered)  # "was:" line
+
+    def test_a_bracket_laden_title_renders_instead_of_raising(self):
+        from rich.errors import MarkupError
+
+        from tamfis_code.interactive import session_title_report
+
+        report = session_title_report("Build A", "Fix [beta] Routing [/green]", "auto")
+        try:
+            rendered = self._render(report)
+        except MarkupError as exc:  # pragma: no cover - the regression
+            self.fail(f"title report raised MarkupError: {exc}")
+        self.assertIn("Fix [beta] Routing [/green]", rendered)
+
+    def test_an_unchanged_title_says_so(self):
+        from tamfis_code.interactive import session_title_report
+
+        report = session_title_report("Fix Sessions", "Fix Sessions", "auto")
+        self.assertIn("unchanged", report)
+        self.assertIn("Fix Sessions", self._render(report))
 
 
 if __name__ == "__main__":

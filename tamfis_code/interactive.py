@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 from contextlib import suppress
 from dataclasses import dataclass
+import difflib
 import inspect
 import re
 import uuid
@@ -290,7 +291,9 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/cd", "change the working directory for this session"),
     ("/copy", "copy the last assistant response to the clipboard"),
     ("/paste-image", "attach an image from the system clipboard to your next message"),
-    ("/regenerate-title", "retitle this session with a fresh AI title (or: /regenerate-title <name> to set it yourself)"),
+    ("/regenerate-title", "retitle this session with a fresh AI title (also: /retitle, /regenerate, /title; add a name to set it yourself)"),
+    ("/retitle", "alias for /regenerate-title"),
+    ("/title", "alias for /regenerate-title"),
     ("/mailbox", "list swarm approval requests awaiting the coordinator (or: /mailbox approve|deny <id>)"),
     ("/doctor", "run connectivity/auth/self-health checks (add --heal to auto-repair fixable findings)"),
     ("/resume", "switch to another session"),
@@ -793,6 +796,96 @@ def _ci_startswith(text: str, prefix: str) -> bool:
     why. The argument text itself keeps its original case; only the
     command word is compared case-insensitively."""
     return text.lower().startswith(prefix.lower())
+
+
+# Every name that means "retitle this session". Live-reported gap: the only
+# accepted spelling used to be the literal "/regenerate-title", so the
+# natural phrasings ("/regenerate", "/retitle", "/title") fell through to
+# parse_intent and were sent to the model as an ordinary objective -- nothing
+# visible happened and the title never changed.
+TITLE_COMMAND_NAMES: tuple[str, ...] = (
+    "/regenerate-title", "/retitle", "/regenerate", "/title",
+)
+# Words that mean "the title" in the no-argument form: "/regenerate title".
+_TITLE_COMMAND_NOOP_ARGS = frozenset({"title", "session title", "session-title", "name"})
+
+
+def _title_command_argument(text: str) -> Optional[str]:
+    """('' == regenerate now), (a name == rename), or None when this is not a
+    title command at all. Shared by the dispatch and by the unknown-command
+    guard, so both agree on what a title command is."""
+    stripped = (text or "").strip()
+    lowered = stripped.lower()
+    for name in TITLE_COMMAND_NAMES:
+        if lowered == name or lowered.startswith(name + " "):
+            argument = stripped[len(name):].strip().strip('"').strip()
+            if argument.lower() in _TITLE_COMMAND_NOOP_ARGS:
+                return ""
+            return argument
+    return None
+
+
+def _title_seed_objective(state: Any) -> str:
+    """What this session is about, best-first: the active task's objective,
+    then the most recent substantive user turn, then the interrupted turn's
+    checkpoint, then the recorded summary."""
+    objective = str(((state.active_task or {}) or {}).get("objective") or "").strip()
+    if objective and local_state.is_substantive_objective(objective):
+        return objective
+    for entry in reversed(list(state.conversation_history or [])):
+        if entry.get("role") != "user":
+            continue
+        content = str(entry.get("content") or "").strip()
+        if content and local_state.is_substantive_objective(content):
+            return content
+    checkpoint = state.turn_checkpoint or {}
+    checkpoint_objective = str(checkpoint.get("objective") or "").strip()
+    if checkpoint_objective and local_state.is_substantive_objective(checkpoint_objective):
+        return checkpoint_objective
+    if objective:
+        return objective
+    return str(state.conversation_summary or "").strip()[:400]
+
+
+def session_title_report(previous_title: str, current_title: str, model_name: str = "") -> str:
+    """The rich-markup line the title command prints after a successful
+    (re)generation. Extracted so it is unit-testable: the old inline version
+    emitted an unbalanced ``[/green]`` and rich raised MarkupError, which took
+    the whole REPL process down exactly when the user had asked for a fresh
+    title (live-reported as "/regenerate session title did not do anything").
+
+    Every dynamic value is escaped -- a model- or user-chosen title may contain
+    brackets (markdown, code, "[beta]") and would otherwise crash the same way.
+    """
+    new_title = escape(str(current_title or ""))
+    model_note = (
+        f" [dim]({escape(str(model_name))})[/dim]" if model_name else ""
+    )
+    if previous_title and previous_title == current_title:
+        detail = " [dim](unchanged -- that title already described this session)[/dim]"
+    elif previous_title:
+        detail = f"\n  [dim]was: {escape(str(previous_title))}[/dim]"
+    else:
+        detail = ""
+    return f"[green]Session title[/green] · {new_title}{model_note}{detail}"
+
+
+def _looks_like_unknown_slash_command(text: str) -> Optional[str]:
+    """The command name when `text` is shaped like a slash command (a single
+    `/word` token) that matched no built-in -- else None.
+
+    Deliberately narrow: a pasted filesystem path (``/home/x/y.docx``) or a
+    ratio/markdown fragment must keep flowing through as an ordinary message,
+    so only one bare ``/``-token with no extension and no further slashes
+    qualifies. Without this, a mistyped command silently became a model turn.
+    """
+    stripped = (text or "").strip()
+    if not stripped.startswith("/"):
+        return None
+    first = stripped.split()[0] if stripped.split() else ""
+    if not re.fullmatch(r"/[A-Za-z][A-Za-z0-9_-]*", first):
+        return None
+    return first
 
 
 def parse_intent(raw: str, custom_commands: Optional[dict[str, CustomCommand]] = None) -> Intent:
@@ -1645,27 +1738,29 @@ async def _run_interactive_impl(
             else:
                 console.print("[dim]Can't copy: output isn't attached to a terminal.[/dim]")
             continue
-        if text.lower().startswith("/regenerate-title"):
-            arg = text[len("/regenerate-title"):].strip().strip('"')
-            if arg:
+        title_arg = _title_command_argument(text)
+        if title_arg is not None:
+            if title_arg:
                 # Explicit user rename -- always wins, never auto-overwritten.
-                if local_state.rename_session_title(workspace.session_id, arg):
+                state_before = local_state.get_session_state(workspace.session_id)
+                previous = state_before.session_title
+                if local_state.rename_session_title(workspace.session_id, title_arg):
                     console.print(
-                        f"[green]Session renamed[/green] · {arg} "
+                        f"[green]Session renamed[/green] · {title_arg} "
                         "[dim](your names are never overwritten)[/dim]"
                     )
                 else:
                     print_error(console, "That name is empty or invalid.")
                 continue
-            objective = str((local_state.get_session_state(workspace.session_id).active_task or {}).get("objective") or "")
+            state_before = local_state.get_session_state(workspace.session_id)
+            previous_title = state_before.session_title
+            objective = _title_seed_objective(state_before)
             if not objective:
-                history = local_state.get_session_state(workspace.session_id).conversation_history
-                for entry in reversed(history):
-                    if entry.get("role") == "user" and str(entry.get("content") or "").strip():
-                        objective = str(entry["content"])
-                        break
-            if not objective:
-                print_error(console, "Nothing to title from yet -- send a task message first.")
+                print_error(
+                    console,
+                    "Nothing to title from yet -- send a task message first "
+                    "(or name it yourself: /regenerate-title <name>).",
+                )
                 continue
             console.print("[dim]◆ Generating a fresh session title…[/dim]")
             if not local_state.request_session_title_regeneration(workspace.session_id):
@@ -1675,10 +1770,29 @@ async def _run_interactive_impl(
             await local_state.upgrade_session_title_with_ai(workspace.session_id, objective)
             state_after = local_state.get_session_state(workspace.session_id)
             if state_after.session_title:
-                console.print(f"[green]Session title[/green] · {state_after.session_title}")
+                # Live-reproduced 2026-09-19 (operator report: "/regenerate
+                # session title did not do anything"): this line emitted an
+                # UNBALANCED closing [/green] (one open tag, two closes), so
+                # rich raised MarkupError and took the whole REPL process
+                # down the moment the regenerated title was reported. The
+                # title itself generated fine in ~13s -- the command's own
+                # report was the crash, which is why it looked like nothing
+                # happened. Every dynamic value is escaped too: an LLM or
+                # user title containing "[" (e.g. "Fix [beta] Routing") would
+                # otherwise crash the same way.
+                console.print(session_title_report(
+                    str(previous_title or ""),
+                    str(state_after.session_title),
+                    str(state_after.title_model or ""),
+                ))
             else:
                 reason = state_after.title_fallback_reason or "unknown"
-                print_error(console, f"Title generation failed ({reason}); will retry on the next turn.")
+                routes = ", ".join(local_state.title_route_preference()) or "the configured providers"
+                print_error(
+                    console,
+                    f"Could not generate a session title ({reason}). Tried: {routes}. "
+                    "Set one yourself with \"/regenerate-title <name>\"; it will retry on the next turn.",
+                )
             continue
         if text.lower().startswith("/mailbox"):
             # Coordinator side of the swarm mailbox (Pillar 3): a background
@@ -1847,7 +1961,18 @@ async def _run_interactive_impl(
             state = local_state.get_session_state(workspace.session_id)
             console.print(f"repository={context.get('repository_root')}  branch={context.get('branch') or '-'}  dirty={context.get('dirty')}")
             console.print(f"cwd={context.get('working_directory')}  indexed_files={context.get('indexed_file_count')}")
-            console.print(f"task={(state.active_task or {}).get('objective') or state.conversation_summary or '-'}")
+            # escape(): the objective/summary is free user or model text and
+            # routinely contains markdown or code ("[beta]", "[/dim]", pasted
+            # brackets); interpolating it raw into rich markup raises
+            # MarkupError and killed the REPL on a plain /status.
+            console.print(escape(
+                "task="
+                + str(
+                    (state.active_task or {}).get("objective")
+                    or state.conversation_summary
+                    or "-"
+                )
+            ))
             for path in context.get("instruction_files", []):
                 console.print(f"  instruction: {path}")
             continue
@@ -1908,7 +2033,9 @@ async def _run_interactive_impl(
                 item = local_state.enqueue_instruction(workspace.session_id, arg)
                 console.print(f"[cyan]Queued[/cyan] {item.id}")
             for item in local_state.get_session_state(workspace.session_id).queued_user_instructions:
-                console.print(f"  {item.get('id')}  {item.get('status')}  {item.get('classification')}  {item.get('text')}")
+                console.print(escape(
+                    f"  {item.get('id')}  {item.get('status')}  {item.get('classification')}  {item.get('text')}"
+                ))
             continue
         if _ci_equals(text, "/model") or _ci_startswith(text, "/model "):
             arg = text[len("/model"):].strip()
@@ -2393,10 +2520,14 @@ async def _run_interactive_impl(
             )
             for r in results:
                 marker = "✅" if r["status"] == "completed" else "❌"
-                console.print(f"{marker} {r['description']}")
+                # escape(): worker descriptions and model-written summaries are
+                # arbitrary text (markdown, code, bracketed IDs). Raw
+                # interpolation makes rich raise MarkupError, which used to
+                # take the whole REPL down after a /delegate or /swarm run.
+                console.print(f"{marker} " + escape(str(r['description'])))
                 summary = (r.get("result") or {}).get("summary") or (r.get("result") or {}).get("error")
                 if summary:
-                    console.print(f"   {summary}")
+                    console.print("   " + escape(str(summary)))
             continue
         if _ci_equals(text, "/swarm") or _ci_startswith(text, "/swarm "):
             if not config.enable_subagent_delegation:
@@ -2444,10 +2575,14 @@ async def _run_interactive_impl(
                 continue
             for r in results:
                 marker = "✅" if r["status"] == "completed" else "❌"
-                console.print(f"{marker} {r['description']}")
+                # escape(): worker descriptions and model-written summaries are
+                # arbitrary text (markdown, code, bracketed IDs). Raw
+                # interpolation makes rich raise MarkupError, which used to
+                # take the whole REPL down after a /delegate or /swarm run.
+                console.print(f"{marker} " + escape(str(r['description'])))
                 summary = (r.get("result") or {}).get("summary") or (r.get("result") or {}).get("error")
                 if summary:
-                    console.print(f"   {summary}")
+                    console.print("   " + escape(str(summary)))
             continue
         if _ci_equals(text, "/diffs") or _ci_startswith(text, "/diffs "):
             arg = text[len("/diffs"):].strip()
@@ -2565,7 +2700,9 @@ async def _run_interactive_impl(
                 last_response_text = None
                 console.print(f"[green]Resumed session {workspace.session_id}[/green]  workspace_root={workspace.workspace_root}")
                 if target_state.conversation_summary:
-                    console.print(f"[dim]{target_state.conversation_summary[-1000:]}[/dim]")
+                    console.print(
+                "[dim]" + escape(str(target_state.conversation_summary[-1000:])) + "[/dim]"
+            )
                 print_resume_plan_status(console, target_state)
                 continue
             try:
@@ -2709,6 +2846,26 @@ async def _run_interactive_impl(
                 or reply_state.turn_checkpoint or reply_state.conversation_history
             ),
         )
+        # A mistyped command used to be handed to the model as an ordinary
+        # objective: the user saw nothing happen, the title/setting never
+        # changed, and a model turn was spent on the typo. Say so instead, and
+        # suggest the real command. A token that resolves to an existing path
+        # (a pasted `/home/x`) is never treated as a command.
+        unknown_command = _looks_like_unknown_slash_command(text)
+        if unknown_command is not None:
+            known_names = {name for name, _ in SLASH_COMMANDS} | set(TITLE_COMMAND_NAMES)
+            custom_names = {f"/{name}" for name in (custom_commands or {})}
+            trimmed = unknown_command.rstrip(".")
+            try:
+                is_real_path = Path(trimmed).exists()
+            except (OSError, ValueError):
+                is_real_path = False
+            if trimmed not in known_names and trimmed not in custom_names and not is_real_path:
+                matches = difflib.get_close_matches(trimmed, sorted(known_names | custom_names), n=1, cutoff=0.6)
+                hint = f" Did you mean {matches[0]}?" if matches else " Type /help for the command list."
+                print_error(console, f"'{unknown_command}' is not a command -- nothing was run.{hint}")
+                continue
+
         submitted_text = text
         intent = parse_intent(text, custom_commands=custom_commands)
         try:

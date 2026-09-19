@@ -1050,21 +1050,10 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     state.ai_title_attempted = True
     put_session_state(state)
 
-    messages = [
-        {
-            "role": "system",
-            "content": (
-                "Write a short session title (3-6 words, no punctuation at the "
-                "end, no quotes) summarizing what this coding task is about. "
-                "Respond with ONLY the title."
-            ),
-        },
-        {"role": "user", "content": objective.strip()[:2000]},
-    ]
-
     try:
         title, model_used, failure_reason = await asyncio.wait_for(
-            _generate_session_title(messages), timeout=TITLE_UPGRADE_TIMEOUT_SECONDS,
+            _generate_and_validate_title(session_id, objective),
+            timeout=TITLE_UPGRADE_TIMEOUT_SECONDS,
         )
     except asyncio.TimeoutError:
         print(
@@ -1095,6 +1084,251 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     from datetime import datetime, timezone
     state.title_generated_at = datetime.now(timezone.utc).isoformat()
     put_session_state(state)
+    print(f"[title] accepted {title!r} via {model_used or 'unknown'}", file=sys.stderr)
+
+
+# --------------------------------------------------------------------------
+# Title generation: prompt, validation, and one bounded corrective retry
+# --------------------------------------------------------------------------
+
+# A title is worth one corrective retry, not a negotiation.
+_TITLE_MAX_VALIDATION_ATTEMPTS = 2
+# A title must never simply BE the opening words of the request. These are the
+# openers that make a candidate obviously an echo of the prompt rather than a
+# description of the task.
+_TITLE_BAD_OPENERS = frozenset({
+    "please", "kindly", "can", "could", "would", "will", "help", "i", "we",
+    "you", "first", "fist", "now", "then", "just", "so", "ok", "okay", "the",
+    "a", "an", "hi", "hello", "hey", "session", "task", "request",
+    "conversation", "why", "what", "how", "when", "where", "need", "needs",
+    "want", "wants", "lets", "let's", "make", "lets", "there", "here",
+})
+# Words that carry no task semantics on their own.
+_TITLE_META_WORDS = frozenset({
+    "session", "task", "request", "conversation", "chat", "prompt", "user",
+    "assistant", "agent", "code", "coding", "work", "working", "thing",
+    "things", "stuff", "help", "issue", "problem", "stuff", "misc",
+})
+# Function words that betray an arbitrary truncation when a candidate is
+# simply the opening words of the request ("...why image and", "...so
+# multiple"): a real title names a thing or an action at its end, not a
+# conjunction or a determiner.
+_TITLE_TRAILING_FUNCTION_WORDS = frozenset({
+    "and", "or", "so", "the", "a", "an", "with", "to", "of", "for", "in", "on",
+    "at", "by", "as", "from", "into", "about", "after", "before", "than", "that",
+    "which", "while", "because", "if", "when", "my", "our", "your", "its", "it",
+    "this", "these", "those", "be", "is", "are", "was", "were", "not", "no",
+    "do", "does", "did", "then", "next", "also", "plus", "multiple", "some",
+    "all", "any", "every", "both", "first", "please", "help", "can", "could",
+    "would", "should", "need", "needs", "want", "wants", "i", "we", "you",
+})
+
+# Engineering verbs a good title normally leads with.
+_TITLE_ACTION_VERBS = frozenset({
+    "fix", "fixing", "build", "building", "add", "adding", "implement",
+    "implementing", "refactor", "refactoring", "repair", "repairing",
+    "investigate", "investigating", "debug", "debugging", "improve",
+    "improving", "harden", "hardening", "reconcile", "reconciling", "train",
+    "training", "migrate", "migrating", "rebalance", "rebalancing",
+    "redesign", "redesigning", "remove", "removing", "upgrade", "upgrading",
+    "document", "documenting", "test", "testing", "profile", "optimise",
+    "optimize", "optimizing", "speed", "restore", "restoring", "review",
+    "reviewing", "speed", "verify", "verifying", "wire", "wiring",
+    "integrate", "integrating", "generate", "generating", "configure",
+    "deploy", "deploying", "export", "exporting", "repair", "retitle",
+    "write", "writing", "rewrite", "rewriting", "clean", "cleanup", "split",
+    "merge", "enable", "disable", "guard", "parse", "stream", "plan",
+    "spreadsheet", "pipeline", "support", "stabilise", "stabilize",
+})
+
+TITLE_SYSTEM_PROMPT = (
+    "You name coding sessions for an agent CLI. You are shown a request and some "
+    "context; you output ONE short title naming the ENGINEERING TASK."
+    "\n\nHard rules:"
+    "\n- 3 to 6 words, at most 60 characters."
+    "\n- Title Case (capitalise important words; lowercase articles/prepositions)."
+    "\n- Describe the actual task: what is being built, fixed, or investigated."
+    "\n- Start with the engineering verb or the key subject (Fix, Add, Refactor, "
+    "Investigate, Repair, Harden, Migrate, Train, Reconcile, Remove...)."
+    "\n- NEVER repeat the opening words of the request, and never copy a sentence "
+    "from it."
+    "\n- Never lead with filler or meta words (please, can you, help me, first, "
+    "session, task, request, thing)."
+    "\n- No quotes, no markdown, no code fences, no trailing punctuation, no "
+    "explanation."
+    "\n- Output the title alone and nothing else."
+    "\n\nExamples:"
+    "\nRequest: \"Please investigate why image and video workspace generation keeps "
+    "throwing errors after the routing changes\" -> Fix Image & Video Workspace"
+    "\nRequest: \"First you need to fix tamfis-code to properly keep track of "
+    "sessions so users can use multiple sessions\" -> Fix Tamfis-Code Sessions"
+    "\nRequest: \"Build a production-grade spreadsheet engineering skill with "
+    "workbook reconciliation and validation\" -> Spreadsheet Engineering Skill"
+    "\nRequest: \"Please please can you kindly help me to fix streaming because "
+    "responses keep repeating\" -> Fix Streaming Repetition"
+    "\nRequest: \"Train TamGPT-3.0 on the new corpus and report loss curves\" -> "
+    "Train TamGPT-3.0"
+)
+
+_TITLE_CORRECTION_PROMPT = (
+    "That title was rejected: {reason}. Reply with a better title only -- 3 to 6 "
+    "Title Case words, starting with the engineering verb or key subject, never "
+    "the request's opening words, no filler, no quotes, no trailing punctuation."
+)
+
+
+def _title_normalized_words(text: str) -> list[str]:
+    return [w for w in re.findall(r"[a-z0-9]+", (text or "").lower()) if w]
+
+
+def validate_session_title(
+    candidate: str,
+    *,
+    objective: str,
+    previous_title: str = "",
+) -> tuple[str, str]:
+    """Accept or reject one title candidate. Returns (title, "") when it is
+    usable, or ("", reason) when it is not -- the reason is fed back to the
+    model for one corrective retry and recorded when it never recovers.
+
+    This is the part that makes the titles tight: the model's own output is
+    checked against what a title is NOT allowed to be (an echo of the
+    request's opening words, filler, meta words, a fragment, a sentence).
+    """
+    cleaned = _sanitize_llm_title(candidate or "")
+    if not cleaned:
+        return "", "empty after sanitising"
+    words = cleaned.split()
+    if len(words) < 2:
+        return "", "a single word is not a descriptive title"
+    if len(words) > 7:
+        return "", f"{len(words)} words is a sentence, not a title"
+    if cleaned[-1:] in ".!?:;,":
+        return "", "trailing punctuation"
+    lowered = [w.strip("&,").lower() for w in words]
+    if lowered[0] in _TITLE_BAD_OPENERS:
+        return "", f"starts with filler/meta word {lowered[0]!r}"
+    if all(word in _TITLE_META_WORDS or word in _TITLE_BAD_OPENERS for word in lowered):
+        return "", "contains no task-specific words"
+    objective_words = _title_normalized_words(objective)
+    # Compare on the SAME tokenisation as the objective (punctuation/hyphens
+    # split), or "Fix tamfis-code so multiple" would not be recognised as an
+    # echo of "Fix tamfis-code so multiple sessions don't leak...".
+    candidate_words = _title_normalized_words(cleaned)
+    if objective_words and candidate_words:
+        # Echo detection: the candidate is (a prefix of) how the request began.
+        prefix_len = min(len(candidate_words), len(objective_words))
+        is_prefix = (
+            prefix_len >= 2
+            and len(candidate_words) < len(objective_words)
+            and candidate_words[:prefix_len] == objective_words[:prefix_len]
+        )
+        if is_prefix:
+            # A genuine title may legitimately quote the start of the request
+            # ("Train TamGPT-3.0" for "Train TamGPT-3.0 with the new corpus...").
+            # Two shapes mark an arbitrary truncation instead: it STOPS on a
+            # function word ("...why image and", "...so multiple"), or it stops
+            # just before the words that actually carry the task
+            # ("Build a production-grade spreadsheet" | "engineering skill...").
+            if candidate_words[-1] in _TITLE_TRAILING_FUNCTION_WORDS:
+                return "", "it stops mid-sentence in the request's own wording, not a description of the task"
+            if objective_words[prefix_len] not in _TITLE_TRAILING_FUNCTION_WORDS:
+                return "", "it is the first few words of the request with the actual task left out"
+        if (
+            not any(word in objective_words for word in candidate_words)
+            and candidate_words[0] not in _TITLE_ACTION_VERBS
+        ):
+            return "", "it shares no words with the request and names no engineering action"
+    if previous_title and cleaned.lower() == previous_title.strip().lower():
+        return "", "identical to the existing title"
+    # Validation judges the model's own words; the accepted title then gets the
+    # deterministic tightening pass (imperative opener, Title Case, "&",
+    # identifiers preserved) so every path -- automatic titling and
+    # /regenerate-title alike -- persists the same tight shape.
+    return _tighten_llm_title(cleaned), ""
+
+
+def _session_title_seed(state: SessionState, objective: str) -> str:
+    """Bounded, most-informative-first context for the title model.
+
+    A bare objective is a poor titling input on its own: at turn 30, the last
+    message may be "also add tests", which titles nothing. The request is
+    always first (it is what the session is about), followed by the earlier
+    substantive user turns, the workspace name, and the files actually touched.
+    """
+    lines = [f"Primary request: {_one_line_label(objective.strip())[:400]}"]
+    earlier: list[str] = []
+    for entry in list(state.conversation_history or []):
+        if entry.get("role") != "user":
+            continue
+        content = " ".join(str(entry.get("content") or "").split())
+        if not content or not _is_substantive_objective(content):
+            continue
+        if content == " ".join(objective.split()):
+            continue
+        earlier.append(_one_line_label(content)[:200])
+    if earlier:
+        lines.append("Earlier substantive requests: " + " | ".join(earlier[-3:]))
+    active = (state.active_task or {}).get("objective") if state.active_task else None
+    if active and str(active).strip() and str(active).strip() != objective.strip():
+        lines.append(f"Active task: {_one_line_label(str(active))[:200]}")
+    touched = [str(path) for path in list(state.inspected_files or [])[-5:]]
+    if touched:
+        lines.append("Files involved: " + ", ".join(touched))
+    if state.workspace_root:
+        lines.append(f"Workspace: {state.workspace_root}")
+    return "\n".join(lines)[:2000]
+
+
+def build_session_title_messages(session_id: int, objective: str) -> list[dict[str, str]]:
+    """The exact title request: a strict system contract plus the bounded
+    session seed. Shared by the automatic upgrade and /regenerate-title, so
+    both produce the same quality of title."""
+    try:
+        state = get_session_state(session_id)
+    except Exception:  # pragma: no cover - defensive
+        state = SessionState(session_id=session_id)
+    return [
+        {"role": "system", "content": TITLE_SYSTEM_PROMPT},
+        {"role": "user", "content": _session_title_seed(state, objective)},
+    ]
+
+
+async def _generate_and_validate_title(session_id: int, objective: str) -> tuple[str, str, str]:
+    """Generate a title, validate it, and allow ONE corrective retry.
+
+    Returns (title, model_used, failure_reason); title is empty on failure
+    with a reason-coded failure_reason. Never raises.
+    """
+    messages = build_session_title_messages(session_id, objective)
+    previous_title = ""
+    try:
+        previous_title = get_session_state(session_id).session_title or ""
+    except Exception:
+        previous_title = ""
+    model_used = ""
+    for attempt in range(1, _TITLE_MAX_VALIDATION_ATTEMPTS + 1):
+        title, model_used, failure_reason = await _generate_session_title(messages)
+        if not title:
+            return "", model_used, failure_reason
+        accepted, reason = validate_session_title(
+            title, objective=objective, previous_title=previous_title,
+        )
+        if accepted:
+            return accepted, model_used, ""
+        print(
+            f"[title] attempt {attempt}/{_TITLE_MAX_VALIDATION_ATTEMPTS} rejected "
+            f"({reason}): {title!r}",
+            file=sys.stderr,
+        )
+        if attempt >= _TITLE_MAX_VALIDATION_ATTEMPTS:
+            return "", model_used, "invalid_response"
+        messages = [
+            *messages,
+            {"role": "assistant", "content": title},
+            {"role": "user", "content": _TITLE_CORRECTION_PROMPT.format(reason=reason)},
+        ]
+    return "", model_used, "invalid_response"
 
 
 async def _generate_session_title(messages: list) -> tuple[str, str, str]:
@@ -1137,6 +1371,7 @@ async def _generate_session_title(messages: list) -> tuple[str, str, str]:
     ] or [ProviderType.AUTO]
 
     last_reason = "empty_response"
+    model_used = ""
     try:
         content = ""
         for attempt in range(1, _TITLE_MAX_MACHINERY_ATTEMPTS + 1):
@@ -1164,6 +1399,11 @@ async def _generate_session_title(messages: list) -> tuple[str, str, str]:
                 chunks.append(str(chunk or ""))
             content = "".join(chunks).strip()
             if content:
+                # Report the route that ACTUALLY answered, not a generic
+                # "auto": the provenance field is what /regenerate-title and
+                # session_title_diagnostics show, and "which model named this
+                # session" is exactly the question a bad title raises.
+                model_used = provider.value
                 break
             last_reason = "empty_response"
             print(
@@ -1194,7 +1434,7 @@ async def _generate_session_title(messages: list) -> tuple[str, str, str]:
     if not title:
         print("[title] sanitized title empty", file=sys.stderr)
         return "", "", "invalid_response"
-    return title, "auto", ""
+    return title, model_used, ""
 
 
 def _sanitize_llm_title(text: str) -> str:
@@ -1219,6 +1459,119 @@ def _sanitize_llm_title(text: str) -> str:
         if " " in cleaned:
             cleaned = cleaned[:cleaned.rfind(" ")].rstrip()
     return cleaned
+
+
+# Gerund -> imperative. A title that opens "Investigating ..." reads like a
+# sentence fragment; the reference titles all open with the imperative
+# ("Investigate image video workspace errors" -> "Investigate Image & Video
+# Workspace", "Fix Image & Video Workspace").
+_TITLE_GERUND_TO_VERB = {
+    "investigating": "Investigate", "fixing": "Fix", "building": "Build",
+    "adding": "Add", "implementing": "Implement", "refactoring": "Refactor",
+    "repairing": "Repair", "debugging": "Debug", "improving": "Improve",
+    "hardening": "Harden", "reconciling": "Reconcile", "training": "Train",
+    "migrating": "Migrate", "redesigning": "Redesign", "removing": "Remove",
+    "upgrading": "Upgrade", "optimising": "Optimise", "optimizing": "Optimize",
+    "documenting": "Document", "testing": "Test", "profiling": "Profile",
+    "integrating": "Integrate", "generating": "Generate", "configuring": "Configure",
+    "deploying": "Deploy", "exporting": "Export", "writing": "Write",
+    "rewriting": "Rewrite", "reviewing": "Review", "verifying": "Verify",
+    "wiring": "Wire", "merging": "Merge", "splitting": "Split",
+    "streaming": "Stream", "restoring": "Restore", "rebalancing": "Rebalance",
+    "stabilising": "Stabilise", "stabilizing": "Stabilize", "cleaning": "Clean",
+    "enabling": "Enable", "disabling": "Disable", "guarding": "Guard",
+    "parsing": "Parse", "planning": "Plan", "speeding": "Speed",
+    "installing": "Install", "packaging": "Package", "uploading": "Upload",
+    "downloading": "Download", "rendering": "Render", "compressing": "Compress",
+    "switching": "Switch", "replacing": "Replace", "updating": "Update",
+    "scaling": "Scale", "freeing": "Free", "summarising": "Summarise",
+    "summarizing": "Summarize", "auditing": "Audit", "benchmarking": "Benchmark",
+}
+
+# Kept lowercase inside a title (never first or last) once it is title-cased.
+_TITLE_SMALL_WORDS = frozenset({
+    "a", "an", "and", "or", "of", "the", "to", "for", "in", "on", "with",
+    "at", "by", "as", "per", "over", "under", "via", "from", "into",
+})
+
+
+def _title_word_is_identifier(core: str) -> bool:
+    """True when a word is a name, not prose to sentence-case: any digit
+    (TamGPT-3.0, MSC-2, v1.6.52), an all-caps token (API, HTTP, PTY), or an
+    internal capital (TamfisGPT, CodeBuff). These are preserved exactly."""
+    if not core:
+        return False
+    if any(ch.isdigit() for ch in core):
+        return True
+    if len(core) >= 2 and core.isupper():
+        return True
+    return any(ch.isupper() for ch in core[1:])
+
+
+def _tighten_llm_title(title: str) -> str:
+    """Deterministic quality pass over an ACCEPTED LLM title. Not a title
+    generator: it only re-shapes words that are already in the model's own
+    candidate, so a rejected title can never sneak back in through here.
+
+    Live-reported titles were correct but loose ("Invesitgate image video
+    workspace errors", "Add docstring and subtract function"). What makes a
+    title read as a task name instead of a truncated sentence:
+      * the imperative instead of a gerund opener,
+      * Title Case with product/API names left exactly as written,
+      * "&" between the two halves of a compound task,
+      * no trailing punctuation.
+    """
+    cleaned = _sanitize_llm_title(title)
+    if not cleaned:
+        return ""
+    words = cleaned.split()
+    opener = words[0].strip("()[],;:&'\"")
+    verb = _TITLE_GERUND_TO_VERB.get(opener.lower())
+    if verb:
+        words[0] = verb + words[0][len(opener):]
+    # "Image and Video" -> "Image & Video": the ampersand form is tighter and
+    # is what every reference title uses for a compound subject.
+    if len(words) > 2:
+        joined = " ".join(words)
+        joined = re.sub(
+            r"(\b[A-Za-z][A-Za-z0-9-]*)\s+and\s+([A-Za-z][A-Za-z0-9-]*\b)",
+            r"\1 & \2", joined, flags=re.IGNORECASE,
+        )
+        words = joined.split()
+    cased: list[str] = []
+    last = len(words) - 1
+    for index, word in enumerate(words):
+        core = word.strip("()[],;:&'\"")
+        if not core:
+            cased.append(word)
+            continue
+        start = word.index(core)
+        prefix, suffix = word[:start], word[start + len(core):]
+        if _title_word_is_identifier(core):
+            body = core
+        elif (
+            "-" in core
+            and all(part.islower() for part in core.split("-") if part)
+        ):
+            # A hyphenated product name the model wrote in lowercase
+            # ("tamfis-code", "kimi-code") is a NAME: capitalise each segment
+            # rather than just the first letter, or the title reads as prose
+            # ("Fix Tamfis-code Sessions").
+            body = "-".join(
+                part[:1].upper() + part[1:] for part in core.split("-")
+            )
+        elif core.lower() in _TITLE_SMALL_WORDS and 0 < index < last:
+            body = core.lower()
+        else:
+            body = core[0].upper() + core[1:]
+        cased.append(prefix + body + suffix)
+    text = " ".join(" ".join(cased).split())
+    # Same envelope the validator enforces: if the reshaping somehow pushed it
+    # out of bounds, keep the validated (untightened) form rather than a
+    # truncated, mangled one.
+    if not text or len(text) > 60 or len(text.split()) > 7:
+        return cleaned
+    return text
 
 
 def best_effort_session_label(state: SessionState) -> str:
@@ -1345,6 +1698,20 @@ def rename_session_title(session_id: int, title: str) -> bool:
     state.title_generated_at = datetime.now(timezone.utc).isoformat()
     put_session_state(state)
     return True
+
+
+def is_substantive_objective(text: str) -> bool:
+    """Public form of the substantive-message test (see
+    _is_substantive_objective) -- used by /regenerate-title to decide which
+    recorded turn is worth titling the session from."""
+    return _is_substantive_objective(text)
+
+
+def title_route_preference() -> list[str]:
+    """The provider routes a title attempt walks, in order -- surfaced in the
+    failure message so a failed /regenerate-title names what it tried instead
+    of reporting an opaque reason."""
+    return list(_TITLE_PROVIDER_PREFERENCE)
 
 
 def request_session_title_regeneration(session_id: int) -> bool:

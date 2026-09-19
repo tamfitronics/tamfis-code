@@ -443,6 +443,35 @@ try:
     )
 except (TypeError, ValueError):
     STREAM_IDLE_TIMEOUT_SECONDS = 90.0
+
+# ROUTE-CHURN FIX (2026-09-19, live-reported): the idle timeout above bounds
+# the gap between chunks, but NOT the wait for the first one. The SDK's own
+# timeout is 120s (providers.py's AsyncOpenAI(timeout=120.0, max_retries=0)),
+# so a provider that accepts the connection and then never answers parked every
+# route attempt for two minutes -- observed live: a single `tamfis-code ask`
+# turn spent its whole 270s wall cycling two routes ("Switching TamfisGPT
+# route; task is still running…") without ever reaching the model. Time to
+# first byte is now bounded separately and much tighter than the transport
+# timeout, because a route that has not started answering is not going to
+# finish a coding turn either way -- failing fast lets the existing
+# cross-provider fallback do its job. Env-tunable for slow/queued endpoints.
+try:
+    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = max(
+        5.0, float(os.getenv("TAMFIS_CODE_FIRST_BYTE_TIMEOUT", "45"))
+    )
+except (TypeError, ValueError):
+    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = 45.0
+
+# Total wall-clock a single turn may spend cycling provider routes before it
+# gives up and reports which routes were tried. Without a cap the fallback
+# chains (planning, recovery, per-candidate retries) compose into minutes of
+# silence; with it, the turn fails with a reason a user can act on.
+try:
+    PROVIDER_RECOVERY_BUDGET_SECONDS = max(
+        30.0, float(os.getenv("TAMFIS_CODE_PROVIDER_RECOVERY_BUDGET", "120"))
+    )
+except (TypeError, ValueError):
+    PROVIDER_RECOVERY_BUDGET_SECONDS = 120.0
 # Leave headroom below the provider's stated context_window: it's a
 # conservative estimate already (see providers.py), and this estimate's own
 # char/token ratio is approximate too.
@@ -3864,7 +3893,21 @@ async def _stream_one_completion_impl(
     if reasoning_effort:
         request_kwargs["reasoning_effort"] = reasoning_effort
 
-    stream = await client.chat.completions.create(**request_kwargs)
+    # Time-to-first-byte bound -- see PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS. A
+    # TimeoutError here is classified retryable by
+    # ProviderManager.is_retryable_provider_error (by exception TYPE, not by
+    # message), so every caller's existing fallback path picks a different
+    # route instead of stalling on this one for the SDK's full 120s.
+    try:
+        stream = await asyncio.wait_for(
+            client.chat.completions.create(**request_kwargs),
+            timeout=PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS,
+        )
+    except asyncio.TimeoutError as exc:
+        raise asyncio.TimeoutError(
+            f"Provider sent no response within {PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS:.0f}s "
+            "(time-to-first-byte timeout)"
+        ) from exc
     # Bounded rolling tail, not the full accumulated content -- checking a
     # fixed-size window on every chunk keeps this O(1) per chunk regardless
     # of how long a genuinely long (non-degenerate) response gets, instead
@@ -4045,6 +4088,39 @@ async def _stream_one_completion_impl(
     return final_content, ordered_calls, finish_reason
 
 
+def _note_direct_route_failure(
+    exc: Exception, *, provider: Optional[ProviderType] = None, model: str = "",
+) -> None:
+    """Record a failure for a call that bypassed ProviderManager.
+    chat_completion (see the call site's comment). Never raises: unhealthy-route
+    bookkeeping must not be able to fail a turn."""
+    try:
+        from .providers import ProviderType as _ProviderType, record_route_failure_for
+    except Exception:
+        return
+    target: Optional[ProviderType] = provider if isinstance(provider, ProviderType) else None
+    if target is None:
+        # The call sites wrap their request in telemetry's provider_context, so
+        # the resolved route is still known here even when the caller did not
+        # pass it explicitly.
+        try:
+            from .runtime.telemetry import current_provider
+
+            name = str(current_provider() or "").strip().lower()
+            target = next(
+                (candidate for candidate in _ProviderType if candidate.value.lower() == name),
+                None,
+            )
+        except Exception:
+            target = None
+    if target is None or target is _ProviderType.AUTO:
+        return  # an unresolved/AUTO route has nothing specific to demote
+    try:
+        record_route_failure_for(target, model or "*", exc, stream=True)
+    except Exception:
+        pass
+
+
 async def _stream_one_completion(
     client,
     *,
@@ -4065,16 +4141,27 @@ async def _stream_one_completion(
         else str(provider or current_provider() or "unknown")
     )
     with span("provider.invoke", provider=provider_name, model=model, operation="stream"):
-        return await _stream_one_completion_impl(
-            client,
-            model=model,
-            messages=messages,
-            tools=tools,
-            renderer=renderer,
-            reasoning_effort=reasoning_effort,
-            emit=emit,
-            progress_callback=progress_callback,
-        )
+        try:
+            return await _stream_one_completion_impl(
+                client,
+                model=model,
+                messages=messages,
+                tools=tools,
+                renderer=renderer,
+                reasoning_effort=reasoning_effort,
+                emit=emit,
+                progress_callback=progress_callback,
+            )
+        except Exception as exc:
+            # Every direct-client path (planning, plan revision, recovery,
+            # stream reconnection) funnels through here, and none of them used
+            # to touch route health -- so a HUNG route was never demoted and
+            # the next attempt resolved straight back to it. Recording the
+            # failure opens that route's circuit (30s, or 300s for a
+            # deterministic 4xx), which is what makes the fallback pick a
+            # genuinely different route instead of churning.
+            _note_direct_route_failure(exc, provider=provider, model=model)
+            raise
 
 
 # Internal context rollover: a segment can be checkpointed out to durable
@@ -4800,8 +4887,13 @@ async def _attempt_reasoning_plan(
     )
     attempt_client, attempt_model = client, model
     tried_providers: set[ProviderType] = set()
+    attempted_labels: list[str] = []
     last_exc: Optional[Exception] = None
+    recovery_started = time.monotonic()
     while True:
+        attempted_labels.append(
+            f"{(provider.value if provider is not None else 'unknown')}:{attempt_model or '?'}"
+        )
         try:
             from .runtime.telemetry import provider_context
             with provider_context(provider.value if provider is not None else "unknown"):
@@ -4839,11 +4931,31 @@ async def _attempt_reasoning_plan(
                     "payload": {"content": f"Planning request failed ({last_exc}); using the existing plan."},
                 })
                 return None
+            # ROUTE-CHURN BUDGET (2026-09-19): the fallback chain is finite per
+            # error, but a chain of chains is not -- observed live: a single
+            # planning phase cycled routes for the whole turn, printing
+            # "Switching TamfisGPT route" and never producing a plan. Once the
+            # budget is spent, stop cycling and say exactly which routes were
+            # tried, so the user (or a retry) knows what is actually down.
+            elapsed = time.monotonic() - recovery_started
+            if elapsed >= PROVIDER_RECOVERY_BUDGET_SECONDS:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": (
+                        f"Planning gave up after {PROVIDER_RECOVERY_BUDGET_SECONDS:.0f}s across "
+                        f"{len(attempted_labels)} route attempt(s) ({', '.join(attempted_labels)}); "
+                        "continuing with the existing plan."
+                    )},
+                })
+                return None
             tried_providers.add(provider)
             attempt_client, attempt_model = fallback_client, fallback_model
             renderer.handle_event({
                 "event_type": "diagnostics",
-                "payload": {"content": f"Planning request failed ({exc}); retrying with a different provider."},
+                "payload": {"content": (
+                    f"Planning request failed ({exc}); retrying with a different provider "
+                    f"({elapsed:.0f}s of {PROVIDER_RECOVERY_BUDGET_SECONDS:.0f}s route-recovery budget used)."
+                )},
             })
     if finish_reason in {"degenerate_repetition", "conversation_echo", "repeated_content", "corrupted_output"}:
         renderer.handle_event({
