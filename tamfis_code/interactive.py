@@ -34,6 +34,7 @@ from rich.table import Table
 
 from . import __version__
 from . import state as local_state
+from . import slash_registry
 from .api_client import AuthRequiredError, RemoteAPIClient, RemoteAPIError
 from .clipboard import MAX_CLIPBOARD_IMAGE_BYTES, copy_to_clipboard, read_clipboard_image
 from .config import (
@@ -340,6 +341,15 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/background", "start a detached agent task"),
     ("/goal", "start a supervised background objective"),
 )
+
+# Commands added from the Claude Code / Codex / Kimi Code / Freebuff comparison live
+# in slash_registry.py; merge them in so completion, /help and the unknown-command
+# check all know them.
+_LEGACY_COMMAND_NAMES = {name for name, _ in SLASH_COMMANDS}
+SLASH_COMMANDS = SLASH_COMMANDS + tuple(
+    entry for entry in slash_registry.slash_command_entries() if entry[0] not in _LEGACY_COMMAND_NAMES
+)
+HELP_TEXT += slash_registry.help_text()
 
 
 class _SlashCommandCompleter(Completer):
@@ -1607,6 +1617,38 @@ async def _run_interactive_impl(
                 "[dim]diagnostics: Preserved oversized paste as "
                 f"{evidence_id}; the agent can search or page through all content.[/dim]"
             )
+        # Commands from the registry (see slash_registry.py). An alias or a
+        # prompt-shaped command returns a Rewrite, which is dispatched again (so
+        # /rewind -> /undo resolves) and then falls through to the normal handlers
+        # and turn machinery below.
+        if text.startswith("/"):
+            from . import __version__ as _tamfis_version
+
+            def _reload_custom_commands() -> int:
+                custom_commands.clear()
+                custom_commands.update(load_custom_commands(workspace.workspace_root))
+                return len(custom_commands)
+
+            slash_ctx = slash_registry.SlashContext(
+                console=console, config=config, workspace=workspace,
+                conversation_history=conversation_history, last_turn=last_turn,
+                last_response_text=last_response_text, session=session,
+                standalone=standalone, custom_commands=custom_commands,
+                reload_custom_commands=_reload_custom_commands, version=_tamfis_version,
+            )
+            registry_handled = False
+            for _ in range(3):
+                slash_result = await slash_registry.dispatch(text, slash_ctx)
+                if isinstance(slash_result, slash_registry.Rewrite):
+                    text = slash_result.text
+                    continue
+                registry_handled = slash_result is not None
+                break
+            workspace = slash_ctx.workspace
+            last_turn = slash_ctx.last_turn
+            last_response_text = slash_ctx.last_response_text
+            if registry_handled:
+                continue
         if text.lower() in ("/exit", "/quit", "/detach"):
             # No task submitted through this REPL outlives this process's
             # lifetime any differently based on which of these three the

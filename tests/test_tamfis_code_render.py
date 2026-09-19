@@ -182,8 +182,12 @@ class StreamRendererTests(unittest.TestCase):
             "event_type": "tool_output",
             "payload": {"tool": "read_file", "arguments": {"path": "src/app.ts"}, "content": "secret implementation\n"},
         })
+        renderer.conclude("completed")  # a run of reads is printed when the run ends
         output = console.file.getvalue()
-        self.assertIn("Reading src/app.ts", output)
+        # Claude Code-style record: "● Read(path)" + "⎿ Read N lines" -- the file's
+        # contents are never dumped into the scrollback.
+        self.assertIn("● Read(src/app.ts)", output)
+        self.assertIn("⎿  Read 1 line", output)
         self.assertNotIn("secret implementation", output)
         self.assertNotIn("→", output)
 
@@ -770,9 +774,8 @@ class StreamRendererTests(unittest.TestCase):
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "remote_exec", "content": "ok", "success": True}})
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "remote_exec", "content": "Error: bad", "success": False}})
         output = console.file.getvalue()
-        self.assertIn("Ran command", output)
-        self.assertIn("✓", output)
-        self.assertIn("✗", output)
+        self.assertIn("⎿  ok", output)  # success: the command's output
+        self.assertIn("⎿  Error: bad", output)  # failure: named as an error, with the reason
 
     def test_failed_read_shows_the_actual_reason_not_just_the_target(self):
         # Live-caught bug: this used to print only "Read failed <target>"
@@ -811,8 +814,9 @@ class StreamRendererTests(unittest.TestCase):
             },
         })
         output = console.file.getvalue()
-        self.assertIn("✗ Edit failed", output)
-        self.assertNotIn("✓ Edited", output)
+        self.assertIn("Edit failed:", output)
+        self.assertIn("old_string not found", output)
+        self.assertNotIn("Edited", output)
 
     def test_empty_tool_completion_envelope_is_not_rendered_as_fake_result(self):
         console = _console()

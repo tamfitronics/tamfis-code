@@ -752,9 +752,14 @@ class BuildSystemPromptTests(_StatePatchMixin, unittest.TestCase):
     def test_instruction_content_is_bounded(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
+            bare = len(build_system_prompt(1, root))
             (root / "AGENTS.md").write_text("x" * 50_000)
             prompt = build_system_prompt(1, root)
-        self.assertLess(len(prompt), 40_000)
+        # The instruction file's contribution is capped (32 KiB of the 50,000
+        # characters), whatever size the base prompt has grown to -- an absolute
+        # cap here just penalised every new line of guidance in the base prompt.
+        self.assertLess(len(prompt) - bare, 33_000)
+        self.assertLess(len(prompt), 45_000)
         self.assertIn("(truncated)", prompt)
 
     def test_instruction_chain_uses_root_to_cwd_order(self):

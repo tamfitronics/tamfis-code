@@ -1074,26 +1074,60 @@ class MCPServer:
         self.register_tool(
             name="ask_user_question",
             description=(
-                "Pause and ask the human at the terminal a direct clarifying question when you "
-                "are genuinely uncertain about something only they can resolve -- e.g. which of "
-                "two conflicting conventions to follow, which of several ambiguous targets they "
-                "mean, or confirming a stated fact you cannot verify with a tool (project type, "
-                "intended scope, which environment). Do not use this for anything answerable by "
-                "reading files or running a tool yourself -- investigate first. Only available in "
-                "a real interactive terminal session; if unavailable, proceed on your best "
-                "judgement and say what you assumed."
+                "Stop and ask the person at the terminal a real decision, with concrete options "
+                "they pick with the arrow keys. Use it when the answer is genuinely theirs to "
+                "give and guessing would be costly: (1) BEFORE any hard-to-reverse or "
+                "outward-facing action -- deleting or overwriting data, restarting or taking a "
+                "service offline (which drops connections), pushing or publishing, spending "
+                "money or quota; (2) at a real fork with material trade-offs (two valid "
+                "approaches, two conflicting conventions); (3) when the request's scope is "
+                "ambiguous in a way reading the code cannot settle. Batch related decisions into "
+                "ONE call (up to 4 questions). Give each question 2-4 options, each with a "
+                "one-line `description` of what choosing it does; put the option you recommend "
+                "FIRST and end its label with \"(Recommended)\". The person can always type "
+                "their own answer instead. Do NOT ask what a tool can tell you (read the code, "
+                "run the command, check the config first), do not ask trivial or purely "
+                "stylistic questions, and do not ask permission for routine work you were "
+                "already asked to do. Only works in an interactive terminal; if unavailable the "
+                "result says so -- then choose the reversible/safest option or stop and report "
+                "the decision you need."
             ),
             parameters={
                 "type": "object",
                 "properties": {
-                    "question": {"type": "string", "description": "The question to ask, in plain language"},
+                    "questions": {
+                        "type": "array",
+                        "description": "1-4 questions to ask together",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "question": {"type": "string", "description": "The full question, ending with a question mark"},
+                                "header": {"type": "string", "description": "A very short label (max ~12 chars), e.g. \"Restart\""},
+                                "options": {
+                                    "type": "array",
+                                    "description": "2-4 choices; recommended first, labelled \"(Recommended)\"",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {"type": "string", "description": "Short choice text (1-5 words)"},
+                                            "description": {"type": "string", "description": "What choosing this does / its trade-off"},
+                                        },
+                                        "required": ["label"],
+                                    },
+                                },
+                                "multiSelect": {"type": "boolean", "description": "Allow choosing several options"},
+                            },
+                            "required": ["question"],
+                        },
+                    },
+                    "question": {"type": "string", "description": "Single-question shorthand (use `questions` for choices with descriptions)"},
                     "options": {
                         "type": "array",
                         "items": {"type": "string"},
-                        "description": "Optional short list of suggested answers -- the user may still type something else",
+                        "description": "Single-question shorthand: short suggested answers",
                     },
                 },
-                "required": ["question"],
+                "required": [],
             },
             handler=self._ask_user_question,
         )
@@ -1153,32 +1187,32 @@ class MCPServer:
         done = sum(1 for item in cleaned if item["completed"])
         return f"Todo list updated: {done}/{len(cleaned)} steps complete."
 
-    async def _ask_user_question(self, question: str, options: Optional[List[str]] = None) -> str:
-        if self._console is None or not self._interactive:
-            return (
-                "ask_user_question is unavailable in this session (no attached interactive "
-                "terminal) -- proceed using your best judgement from the evidence already "
-                "gathered, and clearly state what you assumed in your final answer."
-            )
-        # Same ordering discipline as the approval-gate panel (see safety.py's
-        # module docstring / STATUS.md's v0.4.5 fix): suspend the live status
-        # line before the panel prints, not just before the blocking input
-        # call, so a stray background redraw can never land between them.
-        suspend_live_if_active(self._renderer)
+    async def _ask_user_question(
+        self, question: Optional[str] = None, options: Optional[List[Any]] = None,
+        questions: Optional[List[Any]] = None,
+    ) -> str:
+        from . import ask_user
+
         try:
-            self._console.print(Panel(question, title="Question from the agent", border_style="cyan", expand=False))
-            if options:
-                for index, option in enumerate(options, start=1):
-                    self._console.print(f"  {index}. {option}")
-                raw = self._console.input(
-                    "Your answer (type a number above, or free text): "
-                ).strip()
-                if raw.isdigit() and 1 <= int(raw) <= len(options):
-                    return options[int(raw) - 1]
-                return raw or "(no answer given)"
-            return self._console.input("Your answer: ").strip() or "(no answer given)"
+            parsed = ask_user.normalize_questions(questions, question, options)
+        except ValueError as exc:
+            return f"ask_user_question could not be shown: {exc}"
+        if self._console is None or not self._interactive:
+            return ask_user.unavailable_message()
+        # Same ordering discipline as the approval gate: pause the live status AND
+        # the live input listener, and wait until it has actually released the
+        # terminal, before a new interactive prompt starts reading keys.
+        from .render import resume_live_if_active, suspend_live_async_if_active
+
+        await suspend_live_async_if_active(self._renderer)
+        try:
+            answers = await ask_user.ask_questions(self._console, parsed)
         finally:
             resume_live_if_active(self._renderer)
+        if question and not questions:
+            # The original single-question form returned just the answer; keep that.
+            return answers[0].text()
+        return ask_user.answers_to_text(parsed, answers)
 
     async def _list_external_agent_sessions(
         self, tool: Optional[str] = None, all_workspaces: bool = False, limit: int = 20,

@@ -39,6 +39,7 @@ from .public_identity import (
     sanitize_public_event,
 )
 from .safety import redact_secrets
+from . import tool_display as _tool_display
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 
@@ -667,6 +668,12 @@ class StreamRenderer:
         # outlives this per-turn renderer.
         self._collapsed = COLLAPSED_MESSAGES
 
+        # Claude Code-style tool records (see tool_display.py): consecutive
+        # read-only calls are collected here and printed as ONE grouped line;
+        # every other call's arguments wait here for its result line.
+        self._read_group: list[dict[str, Any]] = []
+        self._tool_args_queue: dict[str, list[dict[str, Any]]] = {}
+
         # Live task-visibility status line -- gated on the console actually
         # being a TTY so redirected/piped output (`tamfis-code agent "..." >
         # out.txt`) keeps today's clean plain-text behaviour untouched.
@@ -921,6 +928,7 @@ class StreamRenderer:
 
     def conclude(self, status: str) -> None:
         """Clear transient activity before the terminal returns to the REPL."""
+        self._flush_read_group()
         self._round_tool_counts = {}
         self._running_command = None
         self._running_command_started = None
@@ -1296,6 +1304,65 @@ class StreamRenderer:
             row.append(" │", style="cyan")
             self.console.print(row)
 
+    # ------------------------------------------------------------------
+    # Claude Code-style tool records:  ● Read(path)  /  ⎿  Read 400 lines
+    # ------------------------------------------------------------------
+
+    def _tool_target_limit(self) -> int:
+        try:
+            width = int(self.console.width)
+        except Exception:
+            width = 100
+        return max(30, min(100, width - 14))
+
+    def _print_tool_header(self, tool: str, arguments: Optional[dict[str, Any]]) -> None:
+        line = Text()
+        line.append("● ", style="green")
+        line.append(_tool_display.display_name(tool), style="bold")
+        target = _tool_display.display_target(tool, arguments, limit=self._tool_target_limit())
+        if target:
+            line.append(f"({target})", style="dim")
+        self.console.print(line, highlight=False)
+
+    def _print_tool_result(self, lines: list[str], failed: bool) -> None:
+        for index, text in enumerate(lines):
+            row = Text("  ⎿  " if index == 0 else "     ", style="dim")
+            row.append(text, style="red" if failed and index == 0 else "dim")
+            self.console.print(row, highlight=False)
+
+    def _flush_read_group(self) -> None:
+        """Print the pending read-only calls: one full record for a single call,
+        one collapsed line ("Read 3 files, searched for 2 patterns") for several."""
+        group, self._read_group = self._read_group, []
+        if not group:
+            return
+        if len(group) == 1:
+            item = group[0]
+            self._print_tool_header(item["tool"], item["args"])
+            self._print_tool_result(item["lines"] or ["Done"], item["failed"])
+            return
+        counts: dict[str, int] = {}
+        for item in group:
+            counts[item["tool"]] = counts.get(item["tool"], 0) + 1
+        header = Text()
+        header.append("● ", style="green")
+        header.append(_tool_display.group_header(counts) or f"{len(group)} tool calls", style="bold")
+        self.console.print(header, highlight=False)
+        names = [item["short"] for item in group if item["short"]]
+        shown = ", ".join(names[:4]) + (f" … +{len(names) - 4} more" if len(names) > 4 else "")
+        if shown:
+            self._print_tool_result([shown], False)
+        for item in group:
+            if item["failed"]:
+                reason = (item["lines"] or ["failed"])[0]
+                self._print_tool_result([f"✗ {item['short'] or item['tool']}: {reason}"], True)
+
+    def _keeps_read_group_open(self, event_type: str, payload: dict[str, Any]) -> bool:
+        if event_type in ("tool_call_requested", "tool_output"):
+            tool = str(payload.get("name") or payload.get("tool") or "")
+            return _tool_display.is_groupable(tool)
+        return event_type == "reasoning_delta"
+
     def _record_tokens(self, content: str) -> None:
         if not content:
             return
@@ -1498,6 +1565,9 @@ class StreamRenderer:
         event = sanitize_public_event(event)
         event_type = event.get("event_type") or event.get("event") or event.get("type")
         payload = event.get("payload") or {}
+
+        if self._read_group and not self._keeps_read_group_open(event_type, payload):
+            self._flush_read_group()
 
         self._update_status_detail(event_type, payload)
 
@@ -1756,72 +1826,66 @@ class StreamRenderer:
                             self.console.print(f"  [dim]○[/dim] {task_text}")
                     self.console.print()
                 return
-            if _is_read_only_tool(name):
-                # The live footer already aggregates routine reads/searches.
-                # Avoid leaving one permanent scrollback line per file while
-                # preserving explicit lines in redirected/non-interactive
-                # logs and preserving durable read failures below.
-                if self._is_tty and self.live_input_listener is not None:
-                    return
-                self.console.print(f"[dim]Reading {escape(_read_target(args))}[/dim]")
+            normalized = _tool_display.normalized_name(name)
+            if _tool_display.is_groupable(name):
+                # Consecutive reads/searches collapse into one line, printed when
+                # the run of them ends (see _flush_read_group).
+                target = _tool_display.display_target(name, args)
+                short = (
+                    target.rsplit("/", 1)[-1] if normalized in {"read_file", "list_directory", "get_git_info"}
+                    else target
+                )
+                self._read_group.append({
+                    "tool": normalized, "args": args, "short": short,
+                    "lines": None, "failed": False, "done": False,
+                })
                 return
-            # On an interactive terminal the persistent live status line is
-            # the progress indicator.  Printing a second arrow line for an
-            # edit/write leaves duplicate history behind; the durable
-            # file_mutation event below is the single completed summary.
-            if _is_mutation_tool(name) and self._is_tty:
-                return
-            self.console.print(f"[bold yellow]→ {escape(_tool_action_label(name, args))}[/bold yellow]")
+            # Every other call is a durable record: "● Bash(cmd)" now, its
+            # "⎿ result" line when the output arrives. (Edits and writes used to
+            # print nothing at all on a terminal.)
+            self._print_tool_header(name, args)
+            self._tool_args_queue.setdefault(normalized, []).append(args)
             return
 
         if event_type == "tool_output":
             self._close_assistant()
             tool = str(payload.get("tool", "tool"))
-            result_envelope = payload.get("result") if isinstance(payload.get("result"), dict) else payload
-            if _is_read_only_tool(tool):
-                success = result_envelope.get("success")
-                if success is False or result_envelope.get("status") in {"failed", "error"}:
-                    args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else result_envelope
-                    reason, _failed = _tool_result_message(payload)
-                    self.console.print(
-                        f"[red]Read failed[/red] {escape(_read_target(args))}: {escape(reason)}"
-                    )
-                return
-            # A successful edit/write is represented by the compact
-            # file_mutation card. Rendering the tool envelope too can expose
-            # the entire inserted file and makes one change appear twice.
-            # Failures still render in full because they are actionable.
-            if _is_mutation_tool(tool) and self._is_tty:
-                _content, mutation_failed = _tool_result_message(payload)
-                if not mutation_failed:
-                    return
-            # Command/file events already carry the useful result. Some
-            # canonical tool-completion envelopes contain only a tool name
-            # and success flag; rendering those produced the misleading,
-            # repetitive "Tool completed without a structured result" card.
-            if not any(
-                result_envelope.get(key) not in (None, "", [], {})
-                for key in (
-                    "content", "stdout", "stderr", "message", "error",
-                    "error_code", "status", "exit_code", "resolved_path",
-                    "path", "requested_path",
+            normalized = _tool_display.normalized_name(tool)
+            if normalized == "write_todos":
+                return  # rendered as the live checklist when requested
+            queued = self._tool_args_queue.get(normalized) or []
+            matched_request = bool(queued)
+            args = queued.pop(0) if queued else (
+                payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
+            )
+            pending = None
+            if _tool_display.is_groupable(tool):
+                pending = next(
+                    (item for item in self._read_group if item["tool"] == normalized and not item["done"]),
+                    None,
                 )
-            ):
+                matched_request = matched_request or pending is not None
+            if not matched_request and not _tool_display.has_result_content(payload):
+                # An envelope that carries only "success" and answers no request we
+                # printed: rendering it invented a result out of nothing.
                 return
-            content, failed = _tool_result_message(payload)
-            result = result_envelope
-            args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
-            if not args and isinstance(result, dict):
-                args = {
-                    "path": result.get("resolved_path") or result.get("path"),
-                    "command": result.get("command"),
-                }
-            label = _tool_action_label(tool, args, completed=True)
-            if failed and _normalized_tool_name(tool) in {"execute_command", "run_command", "remote_exec"}:
-                label = "Command failed"
-            if failed and _normalized_tool_name(tool) == "edit_file":
-                label = "Edit failed"
-            _render_result_block(self.console, ok=not failed, label=label, content=content)
+            lines, failed = _tool_display.summarize_result(tool, payload, args)
+            if failed and not (lines and lines[0].startswith("Exit code")):
+                # The canonical reason ("Permission denied: /etc/shadow", the
+                # tool's own error) rather than a generic one.
+                reason, _ = _tool_result_message(payload)
+                lines = [_tool_display.failure_line(tool, reason)]
+            if pending is not None:
+                pending.update(lines=lines, failed=failed, done=True)
+                if failed:
+                    # Errors are shown promptly, not held behind a pending group.
+                    self._flush_read_group()
+                return
+            if _tool_display.is_groupable(tool):
+                # A result with no matching request (e.g. a blocked read): give it
+                # its own complete record rather than dropping it.
+                self._print_tool_header(tool, args)
+            self._print_tool_result(lines, failed)
             return
 
         if event_type in (
@@ -1854,9 +1918,10 @@ class StreamRenderer:
             added, removed = payload.get("lines_added", 0), payload.get("lines_removed", 0)
             mutation_id = payload.get("mutation_id", "?")
             label = _change_kind(path)
+            # A continuation of the "⎿ Edited path" line above it, not a separate
+            # card: same information (kind, size, /diff and /revert handles).
             self.console.print(
-                f"[bold blue]▸ {escape(label)}[/bold blue] · {escape(str(path))}  "
-                f"[dim]+{added}/-{removed} · /diff {escape(str(mutation_id))} to expand · "
+                f"     [dim]{escape(label)} · +{added}/-{removed} · /diff {escape(str(mutation_id))} to expand · "
                 f"/revert {escape(str(mutation_id))}[/dim]"
             )
             return

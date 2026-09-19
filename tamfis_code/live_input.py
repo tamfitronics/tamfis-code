@@ -97,6 +97,11 @@ def _tip_text(session_id: Optional[int] = None, active_agents: int = 0) -> str:
     return applicable[int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(applicable)]
 
 
+def _truncate(text: str, limit: int) -> str:
+    text = " ".join(str(text).split())
+    return text if len(text) <= limit else text[: max(1, limit - 1)].rstrip() + "…"
+
+
 def composer_rule_html() -> str:
     """A full-width horizontal rule, the top/bottom edge of the composer.
 
@@ -675,7 +680,23 @@ class LiveInputListener:
         lines = []
         activity = self.renderer.live_input_activity_line()
         if activity:
-            lines.append(f" <ansigray>{_xml_escape(activity)}</ansigray>")
+            # "Reading 3 files…  ⎿  $ pytest -q (12s)" is two facts: what the round is
+            # doing, and the command running right now. Claude Code shows the
+            # command on its own "⎿" line under the activity title.
+            import shutil
+
+            head, marker, running = activity.partition("  ⎿  ")
+            room = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns - 6)
+            if head.strip():
+                lines.append(f" <ansigray>{_xml_escape(_truncate(head.strip(), room))}</ansigray>")
+            if marker:
+                # Cut the COMMAND to fit, never its elapsed-time suffix "(12s)".
+                body, elapsed = running, ""
+                match = re.match(r"^(.*?)(\s\(\d[^)]*\))$", running)
+                if match:
+                    body, elapsed = match.group(1), match.group(2)
+                shown = _truncate(body, max(10, room - 5 - len(elapsed))) + elapsed
+                lines.append(f" <ansigray>  ⎿  {_xml_escape(shown)}</ansigray>")
         headline = self.renderer.live_input_headline(spinner)
         headline_html = f" <ansicyan>{_xml_escape(headline)}</ansicyan>"
         # A route exception (failover / exhausted route) rides on the SAME line,

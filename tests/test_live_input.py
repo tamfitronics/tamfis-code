@@ -973,3 +973,30 @@ class RunningComposerStateTests(_StatePatchMixin, unittest.TestCase):
             footer = self._toolbar_text(listener).split("\n")[1]
         self.assertIn("esc to interrupt", footer)
         self.assertLessEqual(len(footer), 72)
+
+
+
+class RunningCommandActivityTests(_StatePatchMixin, unittest.TestCase):
+    """While a command runs, the activity shows on two lines like Claude Code:
+    the round's title, then "⎿ $ command (12s)" beneath it."""
+
+    def _message(self, width=100):
+        renderer = StreamRenderer(_console())
+        renderer.handle_event({"event_type": "task_started", "payload": {"mode": "local"}})
+        renderer._round_tool_counts = {"read_file": 3, "search_code": 2}
+        renderer._running_command = "python3 -m pytest tests/test_live_input.py -q -p no:cacheprovider " * 3
+        renderer._running_command_started = __import__("time").monotonic() - 12
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((width, 24))):
+            return "".join(text for _s, text in listener._composer_message().__pt_formatted_text__()).split("\n")
+
+    def test_the_title_and_the_running_command_are_separate_lines(self):
+        lines = self._message()
+        title = next(i for i, line in enumerate(lines) if "Reading 3 files" in line)
+        self.assertNotIn("$", lines[title])
+        self.assertIn("⎿  $ python3 -m pytest", lines[title + 1])
+        self.assertTrue(lines[title + 1].rstrip().endswith("(12s)"), lines[title + 1])
+
+    def test_a_long_command_is_cut_to_the_terminal_width(self):
+        for line in self._message(width=72):
+            self.assertLessEqual(len(line), 72, line)

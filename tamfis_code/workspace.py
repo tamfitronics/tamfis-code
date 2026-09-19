@@ -1480,6 +1480,12 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "never delete or overwrite data destructively, and treat the git history, the "
         "canonical workspace location, and environment files as untouchable unless the "
         "request requires them.",
+        "\n6. Ask before you act on a real decision. Use ask_user_question -- with concrete "
+        "options, your recommended one first and marked (Recommended) -- BEFORE a hard-to-"
+        "reverse or outward-facing action (deleting data, restarting or taking a service "
+        "offline, pushing or publishing) and at a genuine fork with material trade-offs. "
+        "Batch related decisions into one call. Investigate first: never ask what a tool "
+        "can tell you, and don't ask permission for routine work you were already asked to do.",
         "\n## Communication",
         "\n- Be concise and factual. Lead with the outcome, then the specifics.",
         "\n- Your visible text is for explaining and summarizing -- the actual work "
