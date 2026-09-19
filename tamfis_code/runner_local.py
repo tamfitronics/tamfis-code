@@ -4062,6 +4062,11 @@ def _insufficient_novel_evidence(rounds: int, novel_observations: int) -> bool:
     return rounds >= 20 and novel_observations < max(4, rounds // 5)
 
 
+# Tool-call / hidden-call output is reported to the renderer's token count in
+# batches of about this many characters (about a hundred tokens).
+_TOKEN_REPORT_BATCH_CHARS = 400
+
+
 async def _stream_one_completion_impl(
     client, *, model: str, messages: list[dict[str, Any]], tools: list[dict[str, Any]],
     renderer: StreamRenderer, reasoning_effort: Optional[str] = None, emit: bool = True,
@@ -4097,6 +4102,21 @@ async def _stream_one_completion_impl(
     were the model's real answer."""
     content_parts: list[str] = []
     tool_calls_by_index: dict[int, _StreamedToolCall] = {}
+    # Output the renderer would not otherwise count as used tokens: tool-call
+    # arguments always, and -- for a hidden call (emit=False, e.g. planning) --
+    # its reasoning and answer text too. Reported in batches, not per delta.
+    record_stream_chars = getattr(renderer, "record_stream_chars", None)
+    pending_token_chars = 0
+
+    def _count_output_chars(chars: int, *, force: bool = False) -> None:
+        nonlocal pending_token_chars
+        pending_token_chars += chars
+        if (
+            callable(record_stream_chars) and pending_token_chars > 0
+            and (force or pending_token_chars >= _TOKEN_REPORT_BATCH_CHARS)
+        ):
+            record_stream_chars(pending_token_chars)
+            pending_token_chars = 0
     finish_reason: Optional[str] = None
     # Set when the stream is cut short because a write_file is larger than one
     # response can carry (see the tool_call_delta branch below).
@@ -4237,6 +4257,8 @@ async def _stream_one_completion_impl(
                 reasoning = str(event.payload.get("content") or "")
                 if reasoning and emit:
                     renderer.handle_event({"event_type": "reasoning_delta", "payload": {"content": reasoning}})
+                elif reasoning:
+                    _count_output_chars(len(reasoning))
             elif event.event_type.value == "assistant_delta":
                 content = str(event.payload.get("content") or "")
                 if content:
@@ -4268,7 +4290,9 @@ async def _stream_one_completion_impl(
                 slot = tool_calls_by_index.setdefault(index, _StreamedToolCall())
                 slot.call_id = str(event.payload.get("id") or slot.call_id)
                 slot.name = str(event.payload.get("name") or slot.name)
-                slot.arguments += str(event.payload.get("arguments") or "")
+                _argument_delta = str(event.payload.get("arguments") or "")
+                slot.arguments += _argument_delta
+                _count_output_chars(len(_argument_delta) + len(str(event.payload.get("name") or "")))
                 if (
                     slot.name == "write_file"
                     and len(slot.arguments) > _WRITE_PREEMPT_ARGS_CHARS
@@ -4343,6 +4367,9 @@ async def _stream_one_completion_impl(
         else:
             forward(pending_content)
             pending_content = ""
+    if not emit:
+        _count_output_chars(sum(len(part) for part in content_parts))
+    _count_output_chars(0, force=True)
     if stream_error is not None and not quality_failure_reason:
         raise stream_error
     ordered_calls = (

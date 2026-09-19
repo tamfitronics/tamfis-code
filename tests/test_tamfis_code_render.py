@@ -1,4 +1,5 @@
 import tempfile
+import time
 import unittest
 from io import StringIO
 from pathlib import Path
@@ -1208,3 +1209,121 @@ class CollapsedMessageTests(unittest.TestCase):
         expand_collapsed_or_end_of_line(event, console)
         self.assertEqual(buffer.cursor_position, len("hello world"))
         self.assertEqual(console.file.getvalue(), "")
+
+
+class UsedTokenStatusTests(unittest.TestCase):
+    """Live-reported 2026-09-19: the used-token count "is no longer in the status
+    update". It only counted streamed ANSWER text, so in an agentic turn -- the
+    model reasoning and calling tools, saying little -- it stayed at 0 and the
+    "↓ N tokens" part of the running status never appeared. Reasoning, tool-call
+    arguments and hidden calls (planning) are output tokens too."""
+
+    def _renderer(self):
+        renderer = StreamRenderer(_console())
+        renderer.handle_event({"event_type": "task_started", "payload": {"mode": "local"}})
+        return renderer
+
+    def test_answer_text_counts_as_before(self):
+        renderer = self._renderer()
+        renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": "word " * 800}})
+        self.assertEqual(renderer._metrics.metrics.tokens_used, 1000)
+        self.assertIn("↓ 1.0k tokens", renderer.live_input_headline("✢"))
+
+    def test_reasoning_text_counts_and_shows_in_the_status(self):
+        renderer = self._renderer()
+        self.assertNotIn("tokens", renderer.live_input_headline("✢"))
+        renderer.handle_event({"event_type": "reasoning_delta", "payload": {"content": "thinking " * 800}})
+        self.assertGreater(renderer._metrics.metrics.tokens_used, 1000)
+        self.assertIn("↓ 1.8k tokens", renderer.live_input_headline("✢"))
+
+    def test_streamed_tool_call_output_counts_through_record_stream_chars(self):
+        renderer = self._renderer()
+        renderer.record_stream_chars(3200)
+        self.assertEqual(renderer._metrics.metrics.tokens_used, 800)
+        renderer.record_stream_chars(0)
+        renderer.record_stream_chars(-5)
+        self.assertEqual(renderer._metrics.metrics.tokens_used, 800)
+
+    def test_the_status_shows_thinking_only_while_reasoning_is_arriving(self):
+        renderer = self._renderer()
+        self.assertNotIn("thinking", renderer.live_input_headline("✢"))
+        renderer.handle_event({"event_type": "reasoning_delta", "payload": {"content": "hmm " * 50}})
+        self.assertIn("thinking", renderer.live_input_headline("✢"))
+        # ...and it stops once the reasoning stream has gone quiet,
+        renderer._reasoning_last -= 10
+        self.assertNotIn("thinking", renderer.live_input_headline("✢"))
+        # ...or once the real answer has started.
+        renderer._reasoning_last = time.monotonic()
+        renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": "Here is the answer."}})
+        self.assertNotIn("thinking", renderer.live_input_headline("✢"))
+
+    def test_the_headline_matches_the_claude_code_shape(self):
+        renderer = self._renderer()
+        renderer.handle_event({"event_type": "reasoning_delta", "payload": {"content": "x" * 30800}})
+        headline = renderer.live_input_headline("✢")
+        self.assertRegex(headline, r"^✢ \S+… \(\d+s · ↓ 7\.7k tokens · thinking\)$")
+
+
+def _prose(chars):
+    """Varied text of about `chars` characters -- the stream loop rightly discards
+    a wall of one repeated character as a degenerate loop."""
+    words, size, i = [], 0, 0
+    while size < chars:
+        word = f"word{i}"
+        words.append(word)
+        size += len(word) + 1
+        i += 1
+    return " ".join(words)[:chars]
+
+
+class StreamCountsToolCallAndHiddenOutputTests(unittest.TestCase):
+    """_stream_one_completion reports the output the renderer would not otherwise
+    count, so an agentic turn's status shows a real, growing token figure."""
+
+    def _stream(self, chunks, *, emit=True):
+        import asyncio
+
+        from test_reasoning_plan import _FakeClient
+        from tamfis_code.runner_local import _stream_one_completion
+
+        renderer = StreamRenderer(_console())
+        renderer.handle_event({"event_type": "task_started", "payload": {"mode": "local"}})
+        client = _FakeClient([chunks])
+        asyncio.run(_stream_one_completion(
+            client, model="m", messages=[{"role": "user", "content": "go"}], tools=[],
+            renderer=renderer, emit=emit,
+        ))
+        return renderer
+
+    def _tool_chunks(self, total_chars, pieces=10):
+        from test_reasoning_plan import _chunk, _delta, _tool_call_delta
+
+        size = total_chars // pieces
+        chunks = [_chunk(_delta(tool_calls=[_tool_call_delta(0, call_id="c1", name="write_file", arguments="")]))]
+        chunks += [_chunk(_delta(tool_calls=[_tool_call_delta(0, arguments="a" * size)])) for _ in range(pieces)]
+        chunks.append(_chunk(_delta(), finish_reason="tool_calls"))
+        return chunks
+
+    def test_tool_call_arguments_count_towards_used_tokens(self):
+        renderer = self._stream(self._tool_chunks(4000))
+        # ~4000 argument chars + the tool name, at 4 chars/token.
+        self.assertGreaterEqual(renderer._metrics.metrics.tokens_used, 900)
+        self.assertLessEqual(renderer._metrics.metrics.tokens_used, 1100)
+
+    def test_a_hidden_call_counts_its_reasoning_and_answer_text_too(self):
+        from types import SimpleNamespace
+
+        from test_reasoning_plan import _chunk
+
+        reasoning = SimpleNamespace(content=None, tool_calls=None, reasoning_content=_prose(2000))
+        answer = SimpleNamespace(content=_prose(2000), tool_calls=None)
+        renderer = self._stream([_chunk(reasoning), _chunk(answer), _chunk(SimpleNamespace(content=None, tool_calls=None), "stop")], emit=False)
+        self.assertGreaterEqual(renderer._metrics.metrics.tokens_used, 900)
+
+    def test_a_visible_call_is_not_double_counted(self):
+        """emit=True: the renderer already counts answer/reasoning text from the
+        forwarded events; the stream must add ONLY the tool-call output."""
+        from test_reasoning_plan import _chunk, _delta
+
+        renderer = self._stream([_chunk(_delta(content=_prose(4000))), _chunk(_delta(), "stop")])
+        self.assertEqual(renderer._metrics.metrics.tokens_used, 1000)

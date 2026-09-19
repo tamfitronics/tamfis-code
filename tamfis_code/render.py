@@ -111,6 +111,8 @@ _PHASE_BY_EVENT = {
 # assistant_delta payloads carry raw text, not a real token count -- the
 # live panel labels this "~" to avoid presenting false precision.
 _CHARS_PER_TOKEN_ESTIMATE = 4
+# Reasoning counts as "thinking" until this long after its last delta.
+_THINKING_STALE_SECONDS = 3.0
 
 # One friendly present-participle per phase for the single-line live status
 # (spinner + "Verb... (elapsed - tokens)"), grounded in what's actually
@@ -828,6 +830,16 @@ class StreamRenderer:
         prefix = f"{spinner_frame} " if spinner_frame else ""
         return f"{prefix}{verb}… · {model} · {details}"
 
+    def _is_thinking(self) -> bool:
+        """True while reasoning text is actively arriving (the last reasoning
+        delta was moments ago and the answer has not started) -- the "· thinking"
+        marker in the running status, as Claude Code shows it."""
+        return (
+            self._thought_seconds is None
+            and self._reasoning_last is not None
+            and time.monotonic() - self._reasoning_last < _THINKING_STALE_SECONDS
+        )
+
     def live_input_headline(self, spinner_frame: str = "") -> str:
         """The one-line running status shown ABOVE the composer, Claude/Codex
         style: "⠴ Musing… (5m 45s · ↓ 12.9k tokens)".
@@ -841,6 +853,8 @@ class StreamRenderer:
         tokens = self._metrics.metrics.tokens_used
         if tokens:
             details.append(f"↓ {_format_token_count(tokens)} tokens")
+        if self._is_thinking():
+            details.append("thinking")
         if self._model:
             # The persistent footer no longer carries the model (it holds only
             # title and mode), so the running status names it.
@@ -1285,12 +1299,30 @@ class StreamRenderer:
     def _record_tokens(self, content: str) -> None:
         if not content:
             return
-        estimated_tokens = max(1, len(content) // _CHARS_PER_TOKEN_ESTIMATE)
+        self._record_token_chars(len(content))
+
+    def _record_token_chars(self, chars: int) -> None:
+        estimated_tokens = max(1, chars // _CHARS_PER_TOKEN_ESTIMATE)
         elapsed_ms = (time.monotonic() - self._task_start) * 1000
         self._metrics.record(estimated_tokens, elapsed_ms, model=self._model or "default")
         cost_warning = self._metrics.check_cost_cap()
         if cost_warning:
             self.console.print(f"\n[yellow]{escape(cost_warning)}[/yellow]")
+
+    def record_stream_chars(self, chars: int) -> None:
+        """Count model OUTPUT that never reaches the screen as answer text --
+        tool-call arguments, and the reasoning/answer text of hidden calls such
+        as planning -- towards the used-token figure in the status line.
+
+        Live-reported 2026-09-19: the token count "is no longer in the status
+        update". It only ever counted streamed ANSWER text, so in an agentic turn
+        (the model reasoning and calling tools, saying little) it stayed at 0 and
+        the "↓ N tokens" part of the status simply never appeared. A direct
+        method rather than a new event type: nothing is added to the event stream
+        that --json output and other renderers would have to know about.
+        """
+        if chars > 0:
+            self._record_token_chars(chars)
 
     def _flush_assistant(self, *, force: bool = False) -> None:
         """Flush buffered assistant text in coherent blocks.
@@ -1505,6 +1537,7 @@ class StreamRenderer:
         if event_type == "reasoning_delta":
             content = str(payload.get("content", ""))
             if content:
+                self._record_tokens(content)  # reasoning is output the model spent tokens on
                 now = time.monotonic()
                 if self._reasoning_start is None:
                     self._reasoning_start = now

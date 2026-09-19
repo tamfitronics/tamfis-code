@@ -32,6 +32,12 @@ _SHIFT_TAB = b"\x1b[Z"
 _CTRL_T = b"\x14"
 _CTRL_Y = b"\x19"
 _STATUS_SPINNER_FRAMES = ("⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏")
+# The running status above the composer cycles Claude Code's star glyph
+# ("✢ Mustering… (1m 58s · ↓ 7.7k tokens · thinking)").
+_HEADLINE_GLYPHS = ("✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳")
+# One tick counter drives both animations (10 braille frames, 8 star glyphs);
+# wrapping at their least common multiple keeps each cycle smooth.
+_STATUS_TICK_PERIOD = 40
 _STATUS_REFRESH_INTERVAL_SECONDS = 0.25
 _STDOUT_BATCH_INTERVAL_SECONDS = 0.01
 
@@ -515,7 +521,7 @@ class LiveInputListener:
         try:
             while self._active:
                 await asyncio.sleep(_STATUS_REFRESH_INTERVAL_SECONDS)
-                self._status_tick = (self._status_tick + 1) % len(_STATUS_SPINNER_FRAMES)
+                self._status_tick = (self._status_tick + 1) % _STATUS_TICK_PERIOD
                 self.invalidate()
         except asyncio.CancelledError:
             raise
@@ -665,7 +671,7 @@ class LiveInputListener:
         """
         from xml.sax.saxutils import escape as _xml_escape
 
-        spinner = _STATUS_SPINNER_FRAMES[self._status_tick % len(_STATUS_SPINNER_FRAMES)]
+        spinner = _HEADLINE_GLYPHS[self._status_tick % len(_HEADLINE_GLYPHS)]
         lines = []
         activity = self.renderer.live_input_activity_line()
         if activity:

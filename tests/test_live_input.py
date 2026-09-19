@@ -204,13 +204,13 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         listener._status_tick = 2
         message = self._message_text(listener)
 
-        self.assertIn("⠹", message)
+        self.assertIn("✶", message)  # star glyph for tick 2 (Claude Code's "✢ Mustering…")
         self.assertTrue(any(word in message for word in ("Evaluating", "Checking", "Verifying")))
         self.assertIn("TamfisGPT-Pro", message)
         self.assertRegex(message, r"\(\d.*\)")  # "(5m 45s · ...)" timing block
         # ...and none of it is in the footer any more.
         footer = self._toolbar_text(listener)
-        self.assertNotIn("⠹", footer)
+        self.assertNotIn("✶", footer)
         self.assertNotIn("TamfisGPT-Pro", footer)
 
     def test_the_composer_is_split_status_and_tip_above_rules_around_the_input_mode_below(self):
