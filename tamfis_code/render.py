@@ -828,6 +828,33 @@ class StreamRenderer:
         prefix = f"{spinner_frame} " if spinner_frame else ""
         return f"{prefix}{verb}… · {model} · {details}"
 
+    def live_input_headline(self, spinner_frame: str = "") -> str:
+        """The one-line running status shown ABOVE the composer, Claude/Codex
+        style: "⠴ Musing… (5m 45s · ↓ 12.9k tokens)".
+
+        Distinct from live_input_status, which packs the model name and phase
+        into the footer text: the running status belongs above the input box
+        (with the tip), and the footer keeps only mode and shortcuts.
+        """
+        elapsed = _format_elapsed(time.monotonic() - self._task_start)
+        details = [elapsed]
+        tokens = self._metrics.metrics.tokens_used
+        if tokens:
+            details.append(f"↓ {_format_token_count(tokens)} tokens")
+        if self._model:
+            # The persistent footer no longer carries the model (it holds only
+            # title and mode), so the running status names it.
+            details.append(str(self._model))
+        joined = " · ".join(details)
+        if self._terminal_status is not None:
+            return f"{self._terminal_status} ({joined})"
+        activities = _ACTIVITY_VARIANTS_BY_PHASE.get(
+            self._phase,
+            (_VERB_BY_PHASE.get(self._phase, self._phase).capitalize(),),
+        )
+        verb = activities[int((time.monotonic() - self._task_start) // 2) % len(activities)]
+        return f"{spinner_frame or '✽'} {verb}… ({joined})"
+
     def print_work_summary(self, status: str = "completed") -> None:
         """Leave one Claude-style durable timing line after live UI exits."""
         elapsed = _format_elapsed(time.monotonic() - self._task_start)

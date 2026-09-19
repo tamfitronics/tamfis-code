@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import re
 import sys
 import time
 from typing import Any, Awaitable, Callable, Optional
@@ -66,16 +67,18 @@ _ROTATING_TIPS: tuple[tuple[Callable[[Any, int], bool], str], ...] = (
     (lambda state, agents: bool(state.conversation_history), "/retry to rerun the last turn"),
     (lambda state, agents: bool(state.unresolved_issues), "/doctor to check unresolved issues"),
     (_ALWAYS, "/status for session, task, cwd"),
+    (
+        lambda state, agents: any(
+            item.get("status") == "queued" for item in (state.queued_user_instructions or [])
+        ),
+        "↑ to edit your queued message",
+    ),
 )
 _TIP_ROTATE_SECONDS = 8.0
 
 
-def _right_chip(session_id: Optional[int] = None, active_agents: int = 0) -> str:
-    # ansibrightblack (the ghost-text/auto-suggestion color -- deliberately
-    # dim) renders as unreadable-to-invisible against some terminal themes'
-    # backgrounds for ordinary body text. ansigray is the same tone the rest
-    # of this toolbar's left-side status already uses, so the chip stays
-    # visually secondary without disappearing.
+def _tip_text(session_id: Optional[int] = None, active_agents: int = 0) -> str:
+    """The plain text of the currently rotating tip."""
     if session_id is None:
         applicable = [text for predicate, text in _ROTATING_TIPS if predicate is _ALWAYS]
     else:
@@ -85,8 +88,29 @@ def _right_chip(session_id: Optional[int] = None, active_agents: int = 0) -> str
         ]
     if not applicable:
         applicable = [text for _, text in _ROTATING_TIPS]
-    index = int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(applicable)
-    return f"<ansigray>{applicable[index]}</ansigray>"
+    return applicable[int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(applicable)]
+
+
+def composer_rule_html() -> str:
+    """A full-width horizontal rule, the top/bottom edge of the composer.
+
+    Claude Code and Codex draw the input between two plain rules with the
+    running status ABOVE it and the mode line BELOW -- not a framed box with
+    everything packed into one toolbar underneath.
+    """
+    import shutil
+
+    width = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+    return f"<ansigray>{'─' * width}</ansigray>"
+
+
+def _right_chip(session_id: Optional[int] = None, active_agents: int = 0) -> str:
+    # ansibrightblack (the ghost-text/auto-suggestion color -- deliberately
+    # dim) renders as unreadable-to-invisible against some terminal themes'
+    # backgrounds for ordinary body text. ansigray is the same tone the rest
+    # of this toolbar's left-side status already uses, so the chip stays
+    # visually secondary without disappearing.
+    return f"<ansigray>{_tip_text(session_id, active_agents)}</ansigray>"
 
 
 def _right_align(left_html: str, right_html: str, *, min_gap: int = 2) -> str:
@@ -149,12 +173,7 @@ def _route_note_html(session_id: int) -> str:
     return f" <ansiyellow>{_xml_escape(note)}</ansiyellow>"
 
 
-def _mode_and_agents_html(
-    cli_config: Config,
-    session_id: int,
-    *,
-    active_agents: Optional[int] = None,
-) -> str:
+def _mode_html(cli_config: Config) -> str:
     mode = mode_label_for_policy(cli_config.approval_policy)
     mode_on = _MODE_ON_LABEL.get(mode)
     mode_line = (
@@ -162,13 +181,25 @@ def _mode_and_agents_html(
         if mode_on
         else f"<ansigray>⏵⏵ {mode} · shift+tab</ansigray>"
     )
+    return mode_line
+
+
+def _agents_suffix_html(agents: int) -> str:
+    return f" <ansigray>· ← {agents} agent{'s' if agents != 1 else ''}</ansigray>" if agents else ""
+
+
+def _mode_and_agents_html(
+    cli_config: Config,
+    session_id: int,
+    *,
+    active_agents: Optional[int] = None,
+) -> str:
     agents = (
         _active_agent_count(session_id)
         if active_agents is None
         else active_agents
     )
-    agents_suffix = f" <ansigray>· ← {agents} agent{'s' if agents != 1 else ''}</ansigray>" if agents else ""
-    return f"{mode_line}{agents_suffix}"
+    return f"{_mode_html(cli_config)}{_agents_suffix_html(agents)}"
 
 
 _FOOTER_TITLE_MAX_CHARS = 28
@@ -226,7 +257,22 @@ def idle_bottom_toolbar(
         f"<update-action>↑ Install v{update_version} · click or Ctrl+U</update-action>"
         if update_version else _right_chip(session_id, resolved_agents)
     )
-    rendered = HTML(_right_align(left, chip + " "))
+    if not update_version:
+        # A rotating tip is a nicety: when the footer is already full it used to
+        # be sliced mid-word at the terminal edge ("Tip: Use /btw for a q").
+        # Show it only when it fits whole. The install chip is important and
+        # is always kept.
+        import shutil
+
+        def _visible(fragment: str) -> int:
+            return len(re.sub(r"<[^>]+>", "", fragment))
+
+        columns = shutil.get_terminal_size(fallback=(80, 24)).columns
+        if _visible(left) + _visible(chip) + 3 > columns:
+            chip = ""
+    # The composer's bottom edge: a plain rule, then the footer line -- the
+    # same Claude/Codex split the running composer uses.
+    rendered = HTML(f"{composer_rule_html()}\n{_right_align(left, chip + ' ')}")
     if not update_version or update_handler is None:
         return rendered
     # prompt_toolkit supports a mouse handler as the optional third item in
@@ -605,9 +651,66 @@ class LiveInputListener:
             self._last_invalidate = now
             app.invalidate()
 
+    def _composer_message(self):
+        """Everything ABOVE the input, then the input's own top rule and the
+        `❯` prompt -- Claude Code / Codex layout.
+
+            ⠴ Musing… (5m 45s · ↓ 12.9k tokens)
+            Tip: Use /btw for a quick side question…
+            ──────────────────────────────────────
+            ❯ <input>
+
+        The running status and the tip used to sit in the bottom toolbar
+        squeezed in with the mode, title and route note, under a framed box.
+        """
+        from xml.sax.saxutils import escape as _xml_escape
+
+        spinner = _STATUS_SPINNER_FRAMES[self._status_tick % len(_STATUS_SPINNER_FRAMES)]
+        lines = []
+        activity = self.renderer.live_input_activity_line()
+        if activity:
+            lines.append(f" <ansigray>{_xml_escape(activity)}</ansigray>")
+        headline = self.renderer.live_input_headline(spinner)
+        headline_html = f" <ansicyan>{_xml_escape(headline)}</ansicyan>"
+        # A route exception (failover / exhausted route) rides on the SAME line,
+        # right-aligned: this line is short, so it cannot be clipped away the
+        # way it was when it shared the crowded footer. Product vocabulary only
+        # (route_status_compact) -- never a provider name.
+        try:
+            from .state import route_status_compact
+
+            note = route_status_compact(self.session_id)
+        except Exception:
+            note = ""
+        if note:
+            headline_html = _right_align(
+                headline_html, f"<ansiyellow>{_xml_escape(note)}</ansiyellow> ",
+            )
+        lines.append(headline_html)
+        pending_update = getattr(self.renderer, "pending_update_version", None)
+        if pending_update:
+            # Informational only: self_update.py's apply_update()/reexec()
+            # deliberately never run mid-task (re-exec would abandon the
+            # in-flight turn), so this has no click/Ctrl+U handler -- that
+            # action stays on the idle toolbar (idle_bottom_toolbar).
+            lines.append(
+                f" <ansiyellow>↑ v{_xml_escape(str(pending_update))} available · update when idle</ansiyellow>"
+            )
+        else:
+            tip = _tip_text(self.session_id, self._active_agents)
+            if not tip.startswith("Tip"):
+                tip = f"Tip: {tip}"
+            lines.append(f" <ansigray>{_xml_escape(tip)}</ansigray>")
+        lines.append(composer_rule_html())
+        return HTML("\n".join(lines) + "\n<ansicyan><b>❯</b></ansicyan> ")
+
     def _bottom_toolbar(self):
-        spinner = _STATUS_SPINNER_FRAMES[self._status_tick]
-        status = self.renderer.live_input_status(spinner)
+        """Everything BELOW the input: the bottom rule, then ONE footer line --
+        the pinned session title, then mode and shortcuts. The running status,
+        tip and route note are above the input (see _composer_message)."""
+        import shutil
+        from xml.sax.saxutils import escape as _xml_escape
+
         # FIX (2026-08-21): a multi-line function call inside an f-string
         # expression (the {...} spanning several lines) is PEP 701 syntax,
         # Python 3.12+ only -- pyproject.toml declares requires-python
@@ -616,52 +719,24 @@ class LiveInputListener:
         # because CI never actually ran pytest until today's fix wired that
         # in (see the CI-gating commit history). Computing the value first
         # is unambiguous across every supported Python version.
-        mode_and_agents_html = _mode_and_agents_html(
-            self.cli_config,
-            self.session_id,
-            active_agents=self._active_agents,
+        agents_suffix = _agents_suffix_html(self._active_agents)
+        rest = (
+            f"{_mode_html(self.cli_config)}"
+            f"<ansigray> · esc to interrupt</ansigray>{agents_suffix}"
         )
-        # Route exceptions on the live footer: a failover, an exhausted route,
-        # or routes cooling down. Live-reported 2026-09-19: a task stopped on a
-        # 402 ("you have depleted your monthly included credits") while other
-        # routes sat configured, and the footer kept showing a normal route --
-        # the switch was only visible as a debug diagnostic scrolling past.
-        # include_current=False: the footer already names the active model, so
-        # only the exception is added, and a healthy turn adds nothing.
-        route_html = _route_note_html(self.session_id)
-        # Placed right after the session title, NOT at the end: the toolbar is
-        # one terminal row, and on an 80-column terminal a note appended last
-        # was the part that got clipped (live-observed in a pty), which is
-        # exactly the information that must not disappear.
-        left = (
-            f" {_session_title_prefix(self.session_id)}{route_html}"
-            f"<ansigray>{status} · ↑ edit queued · esc to interrupt ·</ansigray> "
-            f"{mode_and_agents_html}"
-        )
-        # FIX (2026-09-16, operator request): the status/mode line and the
-        # right-side chip used to be squeezed onto one `_right_align`ed row,
-        # which crowded out both the status text and the chip on anything
-        # but a wide terminal. Each now gets its own full-width row -- the
-        # chip is still right-aligned, just on a row of its own instead of
-        # sharing space with `left`.
-        pending_update = getattr(self.renderer, "pending_update_version", None)
-        chip = (
-            # Informational only: self_update.py's apply_update()/reexec()
-            # deliberately never run mid-task (re-exec would abandon the
-            # in-flight turn), so this chip has no click/Ctrl+U handler --
-            # that action stays on the idle toolbar (idle_bottom_toolbar).
-            f"<ansiyellow>↑ v{pending_update} available · update when idle</ansiyellow>"
-            if pending_update else _right_chip(self.session_id, self._active_agents)
-        )
-        chip_line = _right_align("", chip + " ")
-        activity = self.renderer.live_input_activity_line()
-        lines = []
-        if activity:
-            from xml.sax.saxutils import escape as _xml_escape
-            lines.append(f" <ansigray>{_xml_escape(activity)}</ansigray>")
-        lines.append(left)
-        lines.append(chip_line)
-        return HTML("\n".join(lines))
+        width = shutil.get_terminal_size(fallback=(80, 24)).columns
+        # The session title is pinned at the far left of the footer at all
+        # times (idle and mid-task), but never at the cost of clipping the mode
+        # and shortcuts: it takes what is left, truncated, or is dropped.
+        rest_len = len(re.sub(r"<[^>]+>", "", rest))
+        title_room = min(60, width - rest_len - 6)
+        title_html = ""
+        if title_room >= 8:
+            title = local_state.session_display_title(self.session_id)
+            if len(title) > title_room:
+                title = title[: title_room - 1] + "…"
+            title_html = f"<ansicyan>{_xml_escape(title)}</ansicyan> <ansigray>·</ansigray> "
+        return HTML(f"{composer_rule_html()}\n {title_html}{rest}")
 
     async def _input_loop(self) -> None:
         from prompt_toolkit import PromptSession
@@ -758,12 +833,13 @@ class LiveInputListener:
             if not event.app.is_done:
                 event.app.exit(result="")
 
-        # Keep the same boxed composer while a task is running. Replacing the
-        # idle editor with a bare "message>" line made the interface jump
-        # between two unrelated layouts and hid the footer hierarchy.
+        # The running composer is the same as the idle one: the input between
+        # two plain rules, the running status and tip ABOVE it, the mode line
+        # BELOW (see _composer_message / _bottom_toolbar) -- Claude Code and
+        # Codex's layout, not a framed box with everything under it.
         session = PromptSession(
             key_bindings=bindings,
-            show_frame=True,
+            show_frame=False,
             reserve_space_for_menu=0,
             style=composer_style(),
             auto_suggest=_LiveProgressAutoSuggest(self.renderer),
@@ -809,9 +885,9 @@ class LiveInputListener:
                 try:
                     with responsive_patch_stdout(raw=True):
                         text = await session.prompt_async(
-                            "message› ",
+                            self._composer_message,
                             bottom_toolbar=self._bottom_toolbar,
-                            show_frame=True,
+                            show_frame=False,
                             set_exception_handler=False,
                             pre_run=_prepare_prompt,
                         )

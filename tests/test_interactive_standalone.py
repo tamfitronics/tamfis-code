@@ -387,10 +387,14 @@ class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
         rendered = "".join(
             text for _style, text in message_prompt().__pt_formatted_text__()
         )
-        self.assertEqual(rendered, "message› ")
+        # The input's TOP rule, then the prompt glyph -- Claude Code / Codex
+        # layout (owner request 2026-09-19). The mode lives in the footer only.
+        top_rule, prompt = rendered.split("\n")
+        self.assertEqual(set(top_rule), {"─"})
+        self.assertEqual(prompt, "❯ ")
         self.assertNotIn("manual", rendered)
 
-    def test_interactive_prompt_uses_a_real_composer_frame(self):
+    def test_interactive_prompt_is_split_by_rules_not_boxed_in_a_frame(self):
         with patch("tamfis_code.interactive.Console", return_value=Console(file=io.StringIO())), \
                 patch("tamfis_code.interactive.PromptSession") as session_cls, \
                 patch("tamfis_code.interactive.print_banner"):
@@ -401,8 +405,10 @@ class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
                 workspace=WorkspaceContext(session_id=99, workspace_root="/tmp/fake-workspace"),
             ))
 
-        self.assertTrue(session_cls.call_args.kwargs["show_frame"])
-        self.assertTrue(
+        # No framed box: the composer is the input between two rules, with the
+        # bottom rule and the mode line supplied by the toolbar.
+        self.assertFalse(session_cls.call_args.kwargs["show_frame"])
+        self.assertFalse(
             session_cls.return_value.prompt_async.await_args.kwargs["show_frame"]
         )
 

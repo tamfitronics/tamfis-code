@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import tempfile
 import unittest
 from pathlib import Path
@@ -407,7 +408,7 @@ class _NimFlakyManager(_ExhaustionChainManager):
         return self.other_errors.get(provider)
 
 
-class NimAnchoredFailoverTests(unittest.TestCase):
+class _NimPolicyHarness(unittest.TestCase):
     """Owner ruling 2026-09-19: NIM first; Ollama Cloud / HF / OpenRouter / Grok
     only while they have credit; when they are erroring (429, 503, 403, 402) go
     back to NIM and keep trying until a 200 arrives -- never hand the user a raw
@@ -472,6 +473,11 @@ class NimAnchoredFailoverTests(unittest.TestCase):
             str(event.get("payload", {}).get("error", ""))
             for event in renderer.events if event.get("event_type") == "ai_task_failed"
         ]
+
+
+
+class NimAnchoredFailoverTests(_NimPolicyHarness):
+    """NIM first; other providers only with credit; back to NIM until a 200."""
 
     def test_a_503_storm_on_nim_returns_to_nim_until_a_200(self):
         manager = _NimFlakyManager(nim_failures=3)
@@ -624,3 +630,123 @@ class NimRetryModelRotationTests(unittest.TestCase):
         from tamfis_code.runner_local import _nim_retry_model
 
         self.assertIsNone(_nim_retry_model(SimpleNamespace(default_model="", models=[]), 1))
+
+
+
+class PlannerPathFailoverTests(_NimPolicyHarness):
+    """Planning / reconnaissance calls follow the same policy as the answer
+    stream. Before, a planning call that hit a dead route (403 credit wall,
+    usage-limit 429) neither recorded the failure nor moved the turn: the main
+    stream then opened on the SAME dead route and paid a second full timeout --
+    the "nearly ten minutes before it stopped" shape."""
+
+    def test_a_credit_wall_during_planning_moves_the_whole_turn_off_that_route(self):
+        manager = _NimFlakyManager(nim_failures=0)
+        manager._primary_error = Exception(LIVE_TAMFIS_403)
+        # The subscription route is the turn's own route, and it is out of credit.
+        manager.other_errors[ProviderType.TAMFIS] = manager._primary_error
+        outcome, renderer = self._run(manager, 71, provider=ProviderType.TAMFIS)
+        self.assertEqual(self._failures(renderer), [])
+        # One planning attempt hit the dead route; the main stream never went back to it.
+        self.assertEqual(manager.attempts.count("tamfis"), 1, manager.attempts)
+        self.assertIn("nvidia", manager.attempts)
+        # It is parked for 15 minutes, not merely paused.
+        self.assertFalse(self.providers.ProviderManager.route_is_healthy(ProviderType.TAMFIS, "*"))
+        # ...and /status + the footer still learn that the route ran out of credit.
+        diag = state_module.route_diagnostics(71)
+        self.assertEqual(diag["last_exhaustion"]["provider"], "tamfis")
+        self.assertEqual(diag["current"]["provider"], "nvidia")
+
+    def test_planning_diagnostics_never_show_a_raw_provider_error(self):
+        manager = _NimFlakyManager(nim_failures=0)
+        manager.other_errors[ProviderType.TAMFIS] = Exception(LIVE_TAMFIS_403)
+        outcome, renderer = self._run(manager, 72, provider=ProviderType.TAMFIS)
+        texts = [
+            str(event.get("payload", {}).get("content", ""))
+            for event in renderer.events if event.get("event_type") == "diagnostics"
+        ]
+        planning = [text for text in texts if text.startswith("Planning request failed")]
+        self.assertTrue(planning, texts)
+        for text in planning:
+            for leak in ("403", "Error code", "c7f035e2", "permission-denied"):
+                self.assertNotIn(leak, text)
+
+    def test_the_mutation_check_the_turn_would_otherwise_return_to_the_dead_route(self):
+        """Guards the test above: with the post-planning re-resolve disabled the
+        main stream DOES go back to the dead route (2 attempts), so the
+        assertion there is really measuring the fix."""
+        manager = _NimFlakyManager(nim_failures=0)
+        manager.other_errors[ProviderType.TAMFIS] = Exception(LIVE_TAMFIS_403)
+        with patch("tamfis_code.runner_local._fresh_fallback_route", return_value=None):
+            self._run(manager, 73, provider=ProviderType.TAMFIS)
+        self.assertGreaterEqual(manager.attempts.count("tamfis"), 2, manager.attempts)
+
+
+
+_RAW_BACKEND_NAMES = re.compile(
+    r"(?i)(nvidia|\bnim\b|ollama|hugging\s*face|\bhf\b|openrouter|\bgrok\b|x-ai|kimi|glm|nemotron|"
+    r"qwen|deepseek|moonshot|z-ai|tier[_ -]?iv|minimax|llama|mistral|gemma|gpt-oss|tamfis-gpt-)"
+)
+
+
+class NoRawBackendNamesReachTheUserTests(_NimPolicyHarness):
+    """Owner ruling (repeated 2026-09-19): native provider and model names are
+    deployment details and must never reach the public terminal. Drives the REAL
+    StreamRenderer with debug output ON (every diagnostic prints) through the
+    failover scenarios and scans everything it printed."""
+
+    def _printed(self, manager, session_id, *, provider=ProviderType.NVIDIA, env=None):
+        from io import StringIO
+
+        from rich.console import Console
+
+        from tamfis_code.render import StreamRenderer
+
+        buffer = StringIO()
+        console = Console(file=buffer, no_color=True, width=200, force_terminal=False)
+        with patch.dict("os.environ", {"TAMFIS_CODE_DEBUG": "1", **(env or {})}):
+            renderer = StreamRenderer(console)
+            state_module.save_session_state(session_id, workspace_root="/tmp")
+            with _wire_stream(manager):
+                asyncio.run(run_local_agent_turn(
+                    manager, provider, None,
+                    [{"role": "user", "content": "continue the audit"}],
+                    console, renderer, workspace_root="/tmp", session_id=session_id,
+                    approval_policy="auto", interactive=False,
+                ))
+        return buffer.getvalue()
+
+    def _assert_clean(self, printed, scenario):
+        leaks = sorted({match.group(0) for match in _RAW_BACKEND_NAMES.finditer(printed)})
+        self.assertEqual(leaks, [], f"{scenario}: raw backend names reached the terminal: {leaks}")
+        self.assertGreater(len(printed.strip()), 0)
+
+    def test_a_nim_503_storm_with_out_of_credit_alternatives(self):
+        manager = _NimFlakyManager(nim_failures=3)
+        self._park_as_out_of_credit(ProviderType.HF, ProviderType.OPENROUTER, ProviderType.GROK,
+                                    ProviderType.OLLAMA_CLOUD)
+        self._assert_clean(self._printed(manager, 81), "NIM 503 storm")
+
+    def test_a_credit_wall_during_planning(self):
+        manager = _NimFlakyManager(nim_failures=0)
+        manager.other_errors[ProviderType.TAMFIS] = Exception(LIVE_TAMFIS_403)
+        self._assert_clean(self._printed(manager, 82, provider=ProviderType.TAMFIS), "planner 403")
+
+    def test_the_failure_after_the_retry_budget_is_spent(self):
+        manager = _NimFlakyManager(nim_failures=-1, nim_error=LIVE_OLLAMA_429)
+        self._park_as_out_of_credit(ProviderType.HF, ProviderType.OPENROUTER, ProviderType.GROK,
+                                    ProviderType.OLLAMA_CLOUD)
+        with patch("tamfis_code.runner_local._nim_retry_delay", return_value=0.05):
+            printed = self._printed(
+                manager, 83, env={"TAMFIS_CODE_NIM_RETRY_SECONDS": "0.3"},
+            )
+        self._assert_clean(printed, "budget spent")
+        self.assertIn("checkpointed", printed)
+
+    def test_the_scan_really_detects_a_leak(self):
+        """Guards the scan itself: with the public-event sanitizer bypassed, the
+        very same scenario DOES print raw names."""
+        manager = _NimFlakyManager(nim_failures=1)
+        with patch("tamfis_code.render.sanitize_public_event", side_effect=lambda event: event):
+            printed = self._printed(manager, 84)
+        self.assertTrue(_RAW_BACKEND_NAMES.search(printed), "scan is blind: no raw name found even unsanitized")

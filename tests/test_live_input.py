@@ -1,4 +1,6 @@
 import asyncio
+import os
+import re
 import tempfile
 import unittest
 from io import StringIO
@@ -126,9 +128,13 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertIn("shift+tab", rendered)
 
     def test_idle_toolbar_right_aligns_a_rotating_chip(self):
-        fragments = idle_bottom_toolbar(
-            _config("ask"), 1, provider="ollama_cloud", model="kimi",
-        ).__pt_formatted_text__()
+        # A wide terminal: the tip is shown only when it fits whole (see
+        # IdleFooterTipFitTests), and the 80-column fallback used in a test
+        # process is too narrow for the longest tips.
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((200, 24))):
+            fragments = idle_bottom_toolbar(
+                _config("ask"), 1, provider="ollama_cloud", model="kimi",
+            ).__pt_formatted_text__()
         rendered = "".join(text for _style, text in fragments)
 
         chip = _right_chip(1, 0)
@@ -182,52 +188,67 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertEqual(ghost.color, "ansibrightblack")
         self.assertTrue(ghost.italic)
 
-    def test_running_footer_has_animation_and_phase_activity(self):
+    def _message_text(self, listener) -> str:
+        return "".join(text for _style, text in listener._composer_message().__pt_formatted_text__())
+
+    def _toolbar_text(self, listener) -> str:
+        return "".join(text for _style, text in listener._bottom_toolbar().__pt_formatted_text__())
+
+    def test_running_status_sits_above_the_input_with_animation_and_phase_activity(self):
+        # Claude Code / Codex layout (owner request 2026-09-19): the running
+        # status is ABOVE the input, not packed into the footer under a box.
         renderer = StreamRenderer(_console())
         renderer._phase = "validate"
-        renderer._model = "kimi-k2.7-code:cloud"
-        listener = LiveInputListener(
-            session_id=1,
-            renderer=renderer,
-            cli_config=_config("ask"),
-        )
+        renderer._model = "TamfisGPT-Pro"
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
         listener._status_tick = 2
-        rendered = "".join(
-            text for _style, text in listener._bottom_toolbar().__pt_formatted_text__()
-        )
+        message = self._message_text(listener)
 
-        self.assertIn("⠹", rendered)
-        self.assertTrue(
-            any(word in rendered for word in ("Evaluating", "Checking", "Verifying"))
-        )
-        self.assertIn("kimi-k2.7-code:cloud", rendered)
+        self.assertIn("⠹", message)
+        self.assertTrue(any(word in message for word in ("Evaluating", "Checking", "Verifying")))
+        self.assertIn("TamfisGPT-Pro", message)
+        self.assertRegex(message, r"\(\d.*\)")  # "(5m 45s · ...)" timing block
+        # ...and none of it is in the footer any more.
+        footer = self._toolbar_text(listener)
+        self.assertNotIn("⠹", footer)
+        self.assertNotIn("TamfisGPT-Pro", footer)
 
-    def test_running_footer_puts_the_corner_chip_on_its_own_line(self):
-        # FIX (2026-09-16, operator request): status/mode text and the
-        # right-side chip used to be squeezed onto one right-aligned row,
-        # crowding both out on anything but a wide terminal. Each now gets
-        # its own row.
+    def test_the_composer_is_split_status_and_tip_above_rules_around_the_input_mode_below(self):
         renderer = StreamRenderer(_console())
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
+        message_lines = self._message_text(listener).split("\n")
+        footer_lines = self._toolbar_text(listener).split("\n")
 
-        toolbar_lines = listener._bottom_toolbar().value.split("\n")
+        # above the input: status, tip, then the input's TOP rule, then the prompt
+        self.assertGreaterEqual(len(message_lines), 4)
+        self.assertIn("Tip:", message_lines[-3])
+        self.assertTrue(set(message_lines[-2]) == {"─"}, message_lines[-2])
+        self.assertTrue(message_lines[-1].startswith("❯"))
+        # below the input: the BOTTOM rule, then exactly one footer line
+        self.assertEqual(len(footer_lines), 2)
+        self.assertTrue(set(footer_lines[0]) == {"─"}, footer_lines[0])
+        self.assertIn("esc to interrupt", footer_lines[1])
+        self.assertNotIn("Tip:", footer_lines[1])
 
-        self.assertEqual(len(toolbar_lines), 2)
-        self.assertNotIn("Tip:", toolbar_lines[0])
-        self.assertIn("esc to interrupt", toolbar_lines[0])
+    def test_rules_span_the_terminal_width(self):
+        from tamfis_code.live_input import composer_rule_html
 
-    def test_pending_update_replaces_the_corner_chip_mid_task(self):
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((120, 30))):
+            rule = re.sub(r"<[^>]+>", "", composer_rule_html())
+        self.assertEqual(rule, "─" * 120)
+
+    def test_pending_update_replaces_the_tip_above_the_input_mid_task(self):
         # Informational only: self_update.py never installs/re-execs
         # mid-task, so this chip has no click/Ctrl+U handler, unlike the
         # idle toolbar's clickable install chip.
         renderer = StreamRenderer(_console())
         renderer.pending_update_version = "1.6.99"
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
+        message = self._message_text(listener)
 
-        rendered = listener._bottom_toolbar().value
-
-        self.assertIn("1.6.99", rendered)
-        self.assertIn("update when idle", rendered)
+        self.assertIn("1.6.99", message)
+        self.assertIn("update when idle", message)
+        self.assertNotIn("Tip:", message)
 
     def test_toolbar_is_not_suppressed_when_terminal_cpr_is_unknown(self):
         from prompt_toolkit import PromptSession
@@ -877,3 +898,78 @@ class HandlePromptLoopExceptionTests(_StatePatchMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class IdleFooterTipFitTests(_StatePatchMixin, unittest.TestCase):
+    """The rotating tip is a nicety: shown only when it fits WHOLE. It used to
+    be sliced mid-word at the terminal edge ("Tip: Use /btw for a q")."""
+
+    def _footer(self, columns, **kwargs):
+        state_module.save_session_state(1, workspace_root="/a")
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((columns, 24))):
+            rendered = idle_bottom_toolbar(Config(), 1, model="auto", **kwargs)
+        return "".join(text for _style, text in rendered.__pt_formatted_text__()).split("\n")
+
+    def test_the_idle_toolbar_is_a_rule_then_one_footer_line(self):
+        lines = self._footer(120)
+        self.assertEqual(len(lines), 2)
+        self.assertEqual(set(lines[0]), {"─"})
+        self.assertEqual(len(lines[0]), 120)
+
+    def test_the_tip_is_dropped_when_the_footer_is_too_narrow_for_it(self):
+        footer = self._footer(70)[1]
+        self.assertNotIn("/", footer.split("shift+tab", 1)[1])  # nothing after the mode text
+        self.assertLessEqual(len(footer), 70)
+
+    def test_the_tip_is_kept_when_it_fits_whole(self):
+        footer = self._footer(200)[1]
+        self.assertIn("shift+tab", footer)
+        self.assertTrue(footer.rstrip().endswith(("task", "model", "diff", "retry", "issues", "plan", "executing", "models", "running", "agents", "cwd", "message")) or "/" in footer.split("shift+tab", 1)[1])
+
+    def test_the_install_chip_is_always_kept(self):
+        footer = self._footer(70, update_version="9.9.9")[1]
+        self.assertIn("Install v9.9.9", footer)
+
+
+
+class RunningComposerStateTests(_StatePatchMixin, unittest.TestCase):
+    """Running-composer behaviour that reads or writes session state -- isolated
+    in a temp state file (a bare unittest.TestCase here wrote to session 1 and
+    leaked route events into unrelated tests)."""
+
+    def _message_text(self, listener) -> str:
+        return "".join(text for _style, text in listener._composer_message().__pt_formatted_text__())
+
+    def _toolbar_text(self, listener) -> str:
+        return "".join(text for _style, text in listener._bottom_toolbar().__pt_formatted_text__())
+
+    def test_a_route_exception_rides_on_the_status_line_and_names_no_provider(self):
+        state_module.save_session_state(1, workspace_root="/home")
+        state_module.record_route_event(1, provider="nvidia", model="nim-1")
+        state_module.record_route_event(
+            1, provider="ollama_cloud", model="m",
+            previous_provider="nvidia", reason="429", kind="failover",
+        )
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
+        status_line = next(
+            line for line in self._message_text(listener).split("\n") if "(" in line and ")" in line
+        )
+        self.assertIn("⟳ rerouted", status_line)
+        self.assertIn("1 failover", status_line)
+        for backend in ("nvidia", "ollama", "nim-1"):
+            self.assertNotIn(backend, self._message_text(listener) + self._toolbar_text(listener))
+
+    def test_the_footer_never_clips_the_mode_line_for_a_long_title(self):
+        state_module.save_session_state(
+            1, workspace_root="/a", session_title="Refactor the whole authentication middleware stack",
+            title_source="llm",
+        )
+        listener = LiveInputListener(
+            session_id=1, renderer=StreamRenderer(_console()), cli_config=_config("ask"),
+        )
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((72, 24))):
+            footer = self._toolbar_text(listener).split("\n")[1]
+        self.assertIn("esc to interrupt", footer)
+        self.assertLessEqual(len(footer), 72)

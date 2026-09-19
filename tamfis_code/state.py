@@ -1534,13 +1534,13 @@ async def _generate_session_title(
     try:
         from .providers import ProviderManager, ProviderType
     except Exception as exc:
-        print(f"[title] providers unavailable, title not generated: {exc}", file=sys.stderr)
+        print(f"[title] providers unavailable, title not generated: {_redacted(str(exc))}", file=sys.stderr)
         return "", "", "routing_failure"
 
     try:
         manager = ProviderManager()
     except Exception as exc:
-        print(f"[title] ProviderManager construction failed, title not generated: {exc}", file=sys.stderr)
+        print(f"[title] routing unavailable, title not generated: {_redacted(str(exc))}", file=sys.stderr)
         return "", "", "routing_failure"
 
     # NIM only, one model per attempt (see _TITLE_NIM_MODELS). Pinning

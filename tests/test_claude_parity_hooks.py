@@ -11,6 +11,7 @@ established for session_interrupted.
 """
 import asyncio
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -177,6 +178,34 @@ class UpdatedInputMutationTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(target.read_text(), "sanitized content")
 
 
+def _stub_prompt_hook_endpoint(*, status=200, content="", raises=None):
+    """Replace ONLY the prompt hook's HTTP call with a canned reply.
+
+    A subclass of the real httpx.AsyncClient that overrides just `post` (the
+    call the hook makes): the model SDK's own clients are httpx clients too and
+    must keep working untouched inside the same turn."""
+    import httpx
+    from unittest.mock import patch as _patch
+
+    class _Response:
+        status_code = status
+
+        def json(self):
+            return {"choices": [{"message": {"content": content}}]}
+
+    real = httpx.AsyncClient
+
+    class _Client(real):
+        async def post(self, url, *args, **kwargs):
+            if "/v1/chat/completions" in str(url) and "9555" in str(url):
+                if raises is not None:
+                    raise raises
+                return _Response()
+            return await super().post(url, *args, **kwargs)
+
+    return _patch("httpx.AsyncClient", _Client)
+
+
 class PromptBasedHookTests(_StatePatchMixin, unittest.TestCase):
     """Claude-Code-parity addition (`type = "prompt"`): a hook asks an LLM
     to decide the outcome instead of running a shell command. This test
@@ -189,7 +218,9 @@ class PromptBasedHookTests(_StatePatchMixin, unittest.TestCase):
         from rich.console import Console
         return Console(file=StringIO(), no_color=True, width=200)
 
-    def test_a_prompt_hook_denying_a_command_blocks_the_call_before_it_runs(self):
+    def _run_turn_with_a_denying_prompt_hook(self):
+        """Run one turn whose only tool call is a shell command a prompt hook is
+        asked to judge. Returns (command_ran, execute_command tool outputs)."""
         with tempfile.TemporaryDirectory() as ws:
             marker = Path(ws) / "should_never_exist.txt"
             hooks_dir = Path(ws) / ".tamfis"
@@ -211,26 +242,137 @@ class PromptBasedHookTests(_StatePatchMixin, unittest.TestCase):
             manager = _FakeManager(client)
             renderer = _RecordingRenderer()
 
-            outcome = asyncio.run(run_local_agent_turn(
-                manager, ProviderType.NVIDIA, None,
-                [{"role": "user", "content": f"run: {command}"}],
-                self._console(), renderer,
-                workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
-            ))
+            # The end-of-turn LLM session title would otherwise call the network.
+            from unittest.mock import AsyncMock, patch as _patch_title
 
-            # A single blocked tool call doesn't fail the whole turn -- the
-            # model still gets to answer using the block as evidence (here,
-            # the fake model's scripted round-2 response). What actually
-            # matters: the command was never really executed, and the
-            # blocking hook's reasoning is visible in the tool result.
-            self.assertFalse(marker.exists(), "the denied command must never actually have run")
+            with _patch_title("tamfis_code.state.upgrade_session_title_with_ai", new=AsyncMock()):
+                outcome = asyncio.run(run_local_agent_turn(
+                    manager, ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": f"run: {command}"}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                ))
+
             tool_outputs = [
                 e["payload"] for e in renderer.events
                 if e["event_type"] == "tool_output" and e["payload"].get("tool") == "execute_command"
             ]
-            self.assertEqual(len(tool_outputs), 1)
-            self.assertFalse(tool_outputs[0]["result"]["success"])
-            self.assertIn("Blocked by hook", tool_outputs[0]["result"]["error"])
+            return marker.exists(), tool_outputs
+
+    def _assert_blocked(self, command_ran, tool_outputs):
+        # A single blocked tool call doesn't fail the whole turn -- the model
+        # still gets to answer using the block as evidence (here, the fake
+        # model's scripted round-2 response). What actually matters: the
+        # command was never really executed, and the blocking hook's reasoning
+        # is visible in the tool result.
+        self.assertFalse(command_ran, "the denied command must never actually have run")
+        self.assertEqual(len(tool_outputs), 1)
+        self.assertFalse(tool_outputs[0]["result"]["success"])
+        self.assertIn("Blocked by hook", tool_outputs[0]["result"]["error"])
+
+    def test_a_prompt_hook_denying_a_command_blocks_the_call_before_it_runs(self):
+        """Deterministic: the endpoint is stubbed to answer "deny", so this pins
+        the runner's contract (a deny blocks the call BEFORE it runs) without
+        depending on a live model being reachable or agreeing."""
+        with _stub_prompt_hook_endpoint(content='{"decision": "deny", "reason": "wipes the filesystem"}'):
+            command_ran, tool_outputs = self._run_turn_with_a_denying_prompt_hook()
+        self._assert_blocked(command_ran, tool_outputs)
+        self.assertIn("wipes the filesystem", tool_outputs[0]["result"]["error"])
+
+    def test_the_live_tier_iv_endpoint_also_denies_it(self):
+        """Integration: calls the REAL internal Tier IV endpoint (127.0.0.1:9555),
+        unmocked. Skipped -- explicitly, not silently red -- when that service is
+        not answering, because a fail-open "approve" then says nothing about the
+        code under test."""
+        import httpx
+
+        base = os.environ.get("TAMGPT_TIER_IV_URL", "http://127.0.0.1:9555").rstrip("/")
+        try:
+            probe = httpx.post(
+                f"{base}/v1/chat/completions", timeout=3.0,
+                json={"model": "auto", "max_tokens": 5, "messages": [{"role": "user", "content": "hi"}]},
+            )
+        except Exception as exc:
+            self.skipTest(f"Tier IV endpoint not reachable ({type(exc).__name__})")
+        if probe.status_code != 200:
+            self.skipTest(f"Tier IV endpoint unhealthy (HTTP {probe.status_code})")
+        # The endpoint is a live LLM: asserting that it DENIES is asserting model
+        # behaviour, which is what made this test flaky (fail-open on a slow call,
+        # or a model that simply approved). Ask it directly first; the end-to-end
+        # wiring below is only meaningful -- and only asserted -- when the real
+        # endpoint is healthy AND actually returned a deny.
+        from tamfis_code.hooks import HookDefinition, _execute_prompt_hook
+
+        decision = asyncio.run(_execute_prompt_hook(
+            HookDefinition(
+                event="pre_tool_use", matcher="execute_command", command="", source="test",
+                hook_type="prompt",
+                prompt=(
+                    "Evaluate if this shell command is safe to run: $TOOL_INPUT. "
+                    "This command deletes the entire filesystem and must always be denied -- "
+                    'respond with decision "deny".'
+                ),
+            ),
+            {"tool_input": "rm -rf /"}, blocking_capable=True,
+        ))
+        if decision is None or not decision.blocked:
+            self.skipTest(
+                "Tier IV endpoint did not return a deny (fail-open or the model "
+                f"disagreed): {getattr(decision, 'message', None)!r}"
+            )
+        command_ran, tool_outputs = self._run_turn_with_a_denying_prompt_hook()
+        self._assert_blocked(command_ran, tool_outputs)
+
+
+class PromptHookDecisionTests(unittest.TestCase):
+    """_execute_prompt_hook's decision logic, deterministic and instant."""
+
+    def _hook(self):
+        from tamfis_code.hooks import HookDefinition
+
+        return HookDefinition(
+            event="pre_tool_use", matcher="execute_command", command="", source="test",
+            hook_type="prompt", prompt="Is this safe: $TOOL_INPUT",
+        )
+
+    def _decide(self, **stub):
+        from tamfis_code.hooks import _execute_prompt_hook
+
+        with _stub_prompt_hook_endpoint(**stub):
+            return asyncio.run(_execute_prompt_hook(
+                self._hook(), {"tool_input": "rm -rf /"}, blocking_capable=True,
+            ))
+
+    def test_deny_blocks_with_the_reason(self):
+        result = self._decide(content='{"decision": "deny", "reason": "destructive"}')
+        self.assertTrue(result.blocked)
+        self.assertEqual(result.message, "destructive")
+
+    def test_approve_does_not_block(self):
+        result = self._decide(content='{"decision": "approve", "reason": "read only"}')
+        self.assertFalse(result.blocked)
+
+    def test_a_deny_is_ignored_when_the_event_cannot_block(self):
+        from tamfis_code.hooks import _execute_prompt_hook
+
+        with _stub_prompt_hook_endpoint(content='{"decision": "deny", "reason": "no"}'):
+            result = asyncio.run(_execute_prompt_hook(self._hook(), {}, blocking_capable=False))
+        self.assertFalse(result.blocked)
+
+    def test_an_unhealthy_endpoint_fails_open(self):
+        result = self._decide(status=503, content="")
+        self.assertFalse(result.blocked)
+        self.assertIn("fail open", result.message)
+
+    def test_a_malformed_answer_fails_open(self):
+        result = self._decide(content="I think this is probably fine!")
+        self.assertFalse(result.blocked)
+        self.assertIn("fail open", result.message)
+
+    def test_a_timeout_fails_open(self):
+        result = self._decide(raises=TimeoutError("timed out"))
+        self.assertFalse(result.blocked)
+        self.assertIn("fail open", result.message)
 
 
 class AsyncRewakeTests(_StatePatchMixin, unittest.TestCase):

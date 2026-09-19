@@ -689,8 +689,12 @@ def _seed_next_message_suggestion(
 
 
 def message_prompt() -> HTML:
-    """The uncluttered editable-line label used by the interactive REPL."""
-    return HTML("<b>message</b><ansicyan>›</ansicyan> ")
+    """The editable-line prompt used by the interactive REPL: the input's top
+    rule, then `❯` -- the bottom rule and the mode line come from
+    idle_bottom_toolbar. Claude Code / Codex layout, not a framed box."""
+    from .live_input import composer_rule_html
+
+    return HTML(f"{composer_rule_html()}\n<ansicyan><b>❯</b></ansicyan> ")
 
 
 def _prompt_history(history_path: Path, console: Console):
@@ -1342,7 +1346,7 @@ async def _run_interactive_impl(
         # multiline editor. This is the composer box the previous prompt-only
         # change failed to provide; the status/mode toolbar remains directly
         # below the frame, matching Codex/Claude Code's visual hierarchy.
-        show_frame=True,
+        show_frame=False,
         # Mouse mode is enabled only while there is an actionable update
         # chip. This keeps normal terminal selection behavior unchanged for
         # the overwhelmingly common up-to-date case. Fixed at construction
@@ -1521,7 +1525,7 @@ async def _run_interactive_impl(
                 )
                 try:
                     text = await session.prompt_async(
-                        _prompt_message, show_frame=True,
+                        _prompt_message, show_frame=False,
                         pre_run=lambda: _seed_next_message_suggestion(
                             session, last_response_text,
                             last_turn[0] if last_turn else None,

@@ -2038,7 +2038,8 @@ def _public_failure_detail(manager: Any, error: Exception) -> str:
 
     status = None
     try:
-        status = manager.provider_error_status(error)
+        status_of = getattr(manager, "provider_error_status", None) or ProviderManager.provider_error_status
+        status = status_of(error)
     except Exception:
         status = None
     if status in {429, 500, 502, 503, 504}:
@@ -5169,6 +5170,35 @@ async def _attempt_reasoning_plan(
         except Exception as exc:
             last_exc = exc
             fallback_client = fallback_model = None
+            # Record WHY this route failed, exactly like the main answer path.
+            # Planning used to leave route health untouched, so a provider that
+            # had just answered 403/402/429 (out of credit) still looked
+            # healthy: the main loop then opened its first stream on that same
+            # dead route and paid a second full timeout before failing over --
+            # the "nearly ten minutes before it stopped" shape. Recording it
+            # parks an out-of-credit provider (15 min) and lets the turn start
+            # on a route that works.
+            if manager is not None and provider is not None:
+                try:
+                    manager.record_route_failure(
+                        provider, attempt_model or "*", exc, stream=True,
+                    )
+                except Exception:
+                    pass
+                # ...and remember an account-level failure for /status and the
+                # footer. The turn now moves off this route BEFORE the main
+                # stream, so the main path's own record_route_error would never
+                # see it and the UI would stop saying the route ran out of credit.
+                try:
+                    from .state import record_route_error, route_error_is_exhaustion
+
+                    if route_error_is_exhaustion(exc):
+                        record_route_error(
+                            session_id, provider=provider.value,
+                            model=attempt_model or "", error=str(exc),
+                        )
+                except Exception:
+                    pass
             if (
                 manager is not None and provider is not None
                 and manager.is_retryable_provider_error(exc)
@@ -5192,7 +5222,7 @@ async def _attempt_reasoning_plan(
             if fallback_client is None:
                 renderer.handle_event({
                     "event_type": "diagnostics",
-                    "payload": {"content": f"Planning request failed ({last_exc}); using the existing plan."},
+                    "payload": {"content": f"Planning request failed ({_public_failure_detail(manager, last_exc)}); using the existing plan."},
                 })
                 return None
             # ROUTE-CHURN BUDGET (2026-09-19): the fallback chain is finite per
@@ -5217,7 +5247,7 @@ async def _attempt_reasoning_plan(
             renderer.handle_event({
                 "event_type": "diagnostics",
                 "payload": {"content": (
-                    f"Planning request failed ({exc}); retrying with a different provider "
+                    f"Planning request failed ({_public_failure_detail(manager, exc)}); retrying with a different provider "
                     f"({elapsed:.0f}s of {PROVIDER_RECOVERY_BUDGET_SECONDS:.0f}s route-recovery budget used)."
                 )},
             })
@@ -6237,6 +6267,33 @@ async def _run_local_agent_turn_impl(
             capture_raw=_draft_raw,
         )
         selected_plan = reasoning_plan or grounded_fallback
+
+        # If planning just parked the turn's own route (it answered 402 / 403 /
+        # a usage-limit 429, or every attempt timed out), start the turn's
+        # remaining calls -- phase drafts, plan critique and the main answer
+        # stream -- on a route that can answer, instead of paying the same
+        # failure again. NIM siblings come first (fallback_candidates), then
+        # only providers that still have credit. No healthy route -> keep this
+        # one and let the main loop's NIM retry handle it.
+        if (
+            _auto_provider_fallback_enabled(manager)
+        ) and hasattr(manager, "route_is_healthy") and not (
+            manager.route_is_healthy(resolved_provider, "*")
+            and manager.route_is_healthy(resolved_provider, resolved_model)
+        ):
+            recovered_route = _fresh_fallback_route(
+                manager, resolved_provider, task_profile, model,
+                requires_vision=bool(image_content_blocks),
+                allow_premium_primary=True,
+            )
+            if recovered_route is not None:
+                resolved_provider, config, client, resolved_model = recovered_route
+                orchestrator.record_route(
+                    provider=resolved_provider.value, model=resolved_model,
+                    reason="planning found the selected route unavailable",
+                    fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+                )
+                _plan_reasoning_effort = _reasoning_effort(resolved_provider, resolved_model, task_profile)
 
         # Bounded multi-pass drafting for a genuinely large objective only
         # (is_formal_planning_objective is the narrower gate -- excludes
