@@ -1,6 +1,6 @@
 # Coding-agent feature parity benchmark
 
-Snapshot date: 2026-08-10.
+Snapshot date: 2026-09-19.
 
 This is a feature-presence benchmark, not a model-quality benchmark. A `yes`
 means the feature is implemented in TamfisGPT Code or documented by the named
@@ -16,18 +16,25 @@ python3 benchmarks/feature_parity.py --verify
 ```
 
 Pass 1 scans the current source tree for implementation evidence. Pass 2 runs
-focused tests plus fifteen named behavioral regression scenarios. Those scenarios
+focused tests plus the named behavioral regression scenarios listed in
+`benchmarks/feature_parity.py`. Those scenarios
 exercise persistent permission precedence and protected paths, exactly-once
 background result reinjection, natural-language background and goal controls,
 read-only enforcement, proportional planning, failure-triggered replanning,
 semantic plan progress, paginated reads, usable read-only inspection pipelines,
 session-fork isolation, detached saved-plan and shell execution, editable
 queued follow-ups,
-duplicate-evidence loop termination, and route-banner deduplication. The
-executable matrix is the source of truth for
+duplicate-evidence loop termination, route-banner deduplication, and the four
+supremacy pillars' own acceptance scenarios (a 200k-token conversation that
+still remembers state through the structured summary layer, a stable cacheable
+prompt prefix, signature-only pruning of superseded reads, a catastrophic
+command denied before any prompt, a classifier deny beating a later human
+approval, exactly-once mailbox claims under concurrency, coordinator-gated
+swarm workers, and degraded plugin manifests). The executable matrix is the
+source of truth for
 feature-presence scores; the behavioral pass is reported separately.
 
-Current result: **TAMFIS-CODE** scores **25/25 (100%)** against the combined
+Current result: **TAMFIS-CODE** scores **29/29 (100%)** against the combined
 feature union. The former material gaps now have executable surfaces:
 
 1. **IDE integration:** `tamfis-code acp` exposes ACP v1 over stdio with
@@ -39,6 +46,26 @@ feature union. The former material gaps now have executable surfaces:
 4. **Session branching:** `/fork` and `tamfis-code fork [session_id]` clone
    durable conversation/repository context into an independent local session,
    while clearing in-flight task state and preserving the original unchanged.
+
+Beyond feature presence, four mechanisms are benchmarked as capabilities in
+their own right, each with source evidence and behavioral scenarios:
+
+1. **Context invincibility** (`orchestrator/compression.py`): a budget-driven
+   cascade of micro truncation, a bounded structured "State of the Union" at
+   80% full, and signature-only pruning of superseded file reads, plus a
+   cacheable static prompt prefix (`orchestrator/context.py`) so provider
+   prefix caching is not invalidated every turn.
+2. **Permission racing** (`permission_race.py`): the static deny-list, an AI
+   intent classifier, and the user prompt run concurrently and take the first
+   decisive answer. A static deny is absolute, a classifier can never approve
+   past a policy that wanted to ask, and a failed prompt fails closed.
+3. **Coordinator/worker mailbox** (`mailbox.py`, `swarm.py`): a parallel
+   sub-agent cannot approve its own destructive call; it files a request in a
+   shared SQLite mailbox, claimed atomically (`BEGIN IMMEDIATE`, exactly-once),
+   and the coordinator answers it against the user's policy.
+4. **Degraded-mode plugin bridge** (`plugins.py`): manifests such as
+   `kimi.plugin.json` load best-effort -- a broken file, schema version, or
+   tool entry is recorded and skipped, and the built-in tools keep working.
 
 This score remains a feature-presence result. It does not mean every vendor's
 UI or proprietary hosted service has been cloned.
