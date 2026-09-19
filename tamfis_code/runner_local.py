@@ -1924,15 +1924,19 @@ def _fallback_candidates_for_turn(
     task_profile: Any,
     *,
     allow_premium_primary: bool = False,
+    include_cooling: bool = False,
 ) -> list[ProviderType]:
     method = getattr(manager, "fallback_candidates", None)
     if not callable(method):
         return []
     try:
-        return list(method(current, task_profile, allow_premium_primary=allow_premium_primary))
+        return list(method(
+            current, task_profile, allow_premium_primary=allow_premium_primary,
+            include_cooling=include_cooling,
+        ))
     except TypeError:
         # Compatibility with lightweight provider doubles used by older
-        # integrations and tests.
+        # integrations and tests (they accept neither extra keyword).
         return list(method(current, task_profile))
 
 
@@ -2432,6 +2436,68 @@ def _estimate_tokens(messages: list[dict[str, Any]]) -> int:
             function = tool_call.get("function") or {}
             total_chars += len(str(function.get("arguments") or ""))
     return total_chars // _CHARS_PER_TOKEN_ESTIMATE
+
+
+def parse_tool_call_arguments(raw_arguments: str) -> tuple[dict[str, Any], Optional[str]]:
+    """Parse one streamed tool call's argument JSON.
+
+    Returns (arguments, malformed_reason): `arguments` is the parsed object
+    (empty when there was nothing to parse) and `malformed_reason` is a
+    human-readable explanation when the model's JSON did NOT parse -- or None
+    when the call is well-formed (including a legitimate no-argument call,
+    whose raw arguments are empty).
+
+    The distinction is the whole point. The old inline code was
+    `except json.JSONDecodeError: arguments = {}`, which turned a TRUNCATED
+    tool call into a no-argument one: live-reported 2026-09-19, a write_file
+    whose document was cut off at the output token limit ran with `{}`, the
+    tool answered "requires path, content", the model -- convinced it had
+    supplied them -- repeated the identical call, and a 43-minute task died in
+    that loop. An unparseable call must be refused and explained, never
+    silently executed as if the model had sent no arguments.
+    """
+    raw = raw_arguments or ""
+    if not raw.strip():
+        return {}, None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        return {}, str(exc)
+    if not isinstance(parsed, dict):
+        return {}, (
+            f"arguments were a {type(parsed).__name__}, not an object of named arguments"
+        )
+    return parsed, None
+
+
+def malformed_tool_arguments_result(
+    tool_name: str, malformed_reason: str, *, truncated: bool,
+) -> dict[str, Any]:
+    """The tool result returned for a call whose argument JSON did not parse.
+
+    It must explain what actually went wrong and how to recover, because the
+    generic "requires <arg>; retry with the missing argument(s)" message is
+    what made the live 43-minute loop possible: the model HAD sent the
+    arguments, they were cut off at the output token limit, so being told it
+    "forgot" an argument made it repeat the identical call.
+    """
+    return {
+        "success": False,
+        "error": (
+            f"{tool_name} was NOT executed: its arguments did not arrive "
+            f"as valid JSON ({malformed_reason}). "
+            + (
+                "The response hit the output token limit, so the argument "
+                "JSON was cut off mid-value. "
+                if truncated else ""
+            )
+            + "Resend this call with complete, valid JSON arguments. If "
+            "the content is large, split it into smaller pieces "
+            "(write the first part with write_file, then add the rest "
+            "in a separate call) instead of one oversized call."
+        ),
+        "malformed_tool_arguments": True,
+    }
 
 
 def _tool_output_for_render(result: dict[str, Any]) -> dict[str, Any]:
@@ -7042,6 +7108,37 @@ async def _run_local_agent_turn_impl(
                     task_profile,
                     allow_premium_primary=allow_premium_primary,
                 )
+                if not candidates:
+                    # Nothing healthy was available -- but "not healthy" here
+                    # means a route is COOLING DOWN after a recent failure, not
+                    # that it is unusable. A definitive provider failure such
+                    # as an exhausted account must not end the task while a
+                    # configured alternative is merely resting: live-reported
+                    # 2026-09-19, a 35-minute run stopped with "type `continue`
+                    # to resume" on a TamfisGPT 402 with NVIDIA NIM configured
+                    # and unused. Re-ask including cooling routes, so the turn
+                    # continues on one of them the same way it would have
+                    # before the circuit opened.
+                    cooling = _fallback_candidates_for_turn(
+                        manager,
+                        failed_provider,
+                        task_profile,
+                        allow_premium_primary=allow_premium_primary,
+                        include_cooling=True,
+                    )
+                    if cooling:
+                        candidates = cooling
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    "Every other configured route is cooling down after "
+                                    "recent failures; retrying "
+                                    + ", ".join(provider.value for provider in cooling)
+                                    + " anyway instead of stopping the task."
+                                ),
+                            },
+                        })
                 for candidate in candidates:
                     candidate_client = manager.get_client(candidate)
                     candidate_config = manager.PROVIDERS.get(candidate)
@@ -8075,11 +8172,16 @@ async def _run_local_agent_turn_impl(
         _turn_batch = ApprovalBatch()
         _turn_batch_args: dict[str, dict[str, Any]] = {}
         _turn_permission_decisions = {}
+        # A call whose argument JSON did not parse can never be executed (the
+        # dispatch loop below refuses it outright), so it must not appear in
+        # the approval prompt either: live-reported 2026-09-19, a truncated
+        # write_file was shown and approved as "write_file({})", which asked a
+        # human to authorise an action that could never run.
+        _turn_malformed_ids: set[str] = set()
         for _tc in tool_calls:
-            try:
-                _tc_args = json.loads(_tc.arguments or "{}")
-            except json.JSONDecodeError:
-                _tc_args = {}
+            _tc_args, _tc_malformed_reason = parse_tool_call_arguments(_tc.arguments)
+            if _tc_malformed_reason is not None:
+                _turn_malformed_ids.add(_tc.call_id)
             _turn_batch_args[_tc.call_id] = _tc_args
             _turn_permission_decisions[_tc.call_id] = decide_permission(
                 _tc.name, _tc_args, workspace_root=workspace_root,
@@ -8091,10 +8193,11 @@ async def _run_local_agent_turn_impl(
                 _tc.name, _tc_args, workspace_root=workspace_root,
                 extra_safe_roots=(scratch_root(session_id), *scope_roots),
             )
-            _turn_batch.add(ApprovalAction(
-                _tc.name, _tc_args, purpose=f"Execute {_tc.name}", risk=_tc_risk,
-                cwd=str(_tc_args.get("cwd") or workspace_root),
-            ))
+            if _tc.call_id not in _turn_malformed_ids:
+                _turn_batch.add(ApprovalAction(
+                    _tc.name, _tc_args, purpose=f"Execute {_tc.name}", risk=_tc_risk,
+                    cwd=str(_tc_args.get("cwd") or workspace_root),
+                ))
         _batch_approved_once_ids: set[str] = set()
         _batch_denied_ids: set[str] = set()
         _risky_batch_actions = _turn_batch.risky_actions
@@ -8125,7 +8228,8 @@ async def _run_local_agent_turn_impl(
                 resume_live_if_active(renderer)
             _risky_ids = {
                 _tc.call_id for _tc in tool_calls
-                if classify_tool_call_risk(
+                if _tc.call_id not in _turn_malformed_ids
+                and classify_tool_call_risk(
                     _tc.name, _turn_batch_args[_tc.call_id], workspace_root=workspace_root,
                     extra_safe_roots=(scratch_root(session_id), *scope_roots),
                 ) != "read_only"
@@ -8443,10 +8547,39 @@ async def _run_local_agent_turn_impl(
             return None
 
         for tc in tool_calls:
-            try:
-                arguments = json.loads(tc.arguments or "{}")
-            except json.JSONDecodeError:
-                arguments = {}
+            arguments, malformed_reason = parse_tool_call_arguments(tc.arguments)
+            if malformed_reason is not None:
+                # NEVER execute a call whose arguments did not parse. The old
+                # code silently substituted {} here, so a truncated tool call
+                # ran with NO arguments: write_file answered "requires path,
+                # content", the model -- which had in fact emitted a full
+                # document whose JSON was cut off -- retried the identical
+                # call, and the repeated-action guard then failed a 43-minute
+                # task in a loop (live-reported 2026-09-19). Refusing with a
+                # reason the model can act on (split the write, resend valid
+                # JSON) is the only exit from that loop.
+                truncated = finish_reason == "length"
+                correction = malformed_tool_arguments_result(
+                    tc.name, malformed_reason, truncated=truncated,
+                )
+                working_messages.append({
+                    "role": "tool", "tool_call_id": tc.call_id,
+                    "content": json.dumps(correction),
+                })
+                renderer.handle_event({
+                    "event_type": "tool_output",
+                    "payload": {"tool": tc.name, "result": correction},
+                })
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": (
+                        f"✗ {tc.name} arguments were unparseable"
+                        + (" (output token limit reached)" if truncated else "")
+                        + " -- not running it with empty arguments; asked the "
+                        "model to resend complete JSON."
+                    )},
+                })
+                continue
 
             guard = orchestrator.guard_tool_call(tc.name, arguments)
             if not guard.allowed:

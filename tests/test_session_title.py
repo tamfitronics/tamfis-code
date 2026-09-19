@@ -245,9 +245,16 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         state_module.save_session_state(1, workspace_root="/a")
         err = io.StringIO()
         with contextlib.redirect_stderr(err):
-            self._upgrade(ConnectionError("boom"))
+            calls = self._upgrade(ConnectionError("boom"))
         self.assertIn("[title]", err.getvalue())
-        self.assertIn("provider attempt failed", err.getvalue())
+        # One route raising must not abort the chain: every preferred route
+        # is still attempted, each attempt named, and the last reason kept.
+        self.assertIn("failed (ConnectionError: boom)", err.getvalue())
+        self.assertIn("trying next preferred route", err.getvalue())
+        self.assertEqual(len(calls), state_module._TITLE_MAX_MACHINERY_ATTEMPTS)
+        self.assertEqual(
+            state_module.get_session_state(1).title_fallback_reason, "provider_error",
+        )
 
 
 class DisplayFallbackTests(_StateDirFixture, unittest.TestCase):
@@ -532,8 +539,11 @@ class CorrectiveRetryTests(unittest.TestCase):
         candidates = ["Please investigate why image and", "Fix Image Video Workspace"]
         seen: list[list[dict]] = []
 
-        async def fake_generate(messages):
+        offsets: list[int] = []
+
+        async def fake_generate(messages, route_offset=0):
             seen.append(list(messages))
+            offsets.append(route_offset)
             return candidates[len(seen) - 1], "nvidia", ""
 
         with patch.object(state_module, "_generate_session_title", fake_generate):
@@ -546,9 +556,12 @@ class CorrectiveRetryTests(unittest.TestCase):
         self.assertEqual(len(seen), 2, "one retry, not an unbounded negotiation")
         # The retry carries the rejection reason so the model can correct it.
         self.assertIn("rejected", seen[1][-1]["content"])
+        # ...and rotates the preferred route, so one weak model that cannot
+        # follow the contract isn't the session's only chance at a title.
+        self.assertEqual(offsets, [0, 1])
 
     def test_two_rejections_yield_no_title_rather_than_a_bad_one(self):
-        async def fake_generate(messages):
+        async def fake_generate(messages, route_offset=0):
             return "Please investigate why image and", "nvidia", ""
 
         with patch.object(state_module, "_generate_session_title", fake_generate):
@@ -561,7 +574,7 @@ class CorrectiveRetryTests(unittest.TestCase):
         self.assertEqual(reason, "invalid_response")
 
     def test_a_provider_failure_is_reported_not_masked(self):
-        async def fake_generate(messages):
+        async def fake_generate(messages, route_offset=0):
             return "", "", "provider_timeout"
 
         with patch.object(state_module, "_generate_session_title", fake_generate):

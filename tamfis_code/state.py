@@ -38,12 +38,18 @@ from .config import CONFIG_DIR
 # this bounds the providers path (which can try several providers in turn)
 # while still never blocking task completion meaningfully -- callers await
 # this only AFTER the turn's result is already persisted.
-TITLE_UPGRADE_TIMEOUT_SECONDS = 150
+# Live-measured 2026-09-19: 150s was too generous for something the user is
+# watching -- a slow route chain made /regenerate-title look hung and made an
+# automatic retitle drag on after the answer was already delivered. Three
+# attempts of 20s fit exactly inside this wall, and the fast route
+# (OpenRouter) answers a title in 2-6s, so the budget is only spent when the
+# preferred routes are genuinely unhealthy.
+TITLE_UPGRADE_TIMEOUT_SECONDS = 60
 # Per-attempt cap forwarded to the OpenAI SDK (chat_completion forwards
 # **kwargs into create()): the manager's clients are built with a 120s
 # timeout, so ONE cold provider attempt used to consume the entire title
 # budget before the machinery could fall back to a healthy route.
-_TITLE_ATTEMPT_TIMEOUT_SECONDS = 30
+_TITLE_ATTEMPT_TIMEOUT_SECONDS = 20
 # Bounded redraws when a route answers with an empty stream (no exception
 # raised, so the machinery itself has nothing to fall back from).
 _TITLE_MAX_MACHINERY_ATTEMPTS = 3
@@ -1257,6 +1263,16 @@ def _session_title_seed(state: SessionState, objective: str) -> str:
     substantive user turns, the workspace name, and the files actually touched.
     """
     lines = [f"Primary request: {_one_line_label(objective.strip())[:400]}"]
+    # A self-sufficient request must not be outvoted by the session's older
+    # history. Live-measured 2026-09-19: retitling an "add hello message"
+    # session with the full spreadsheet-engineering brief produced "Add Hello
+    # Message" -- the title described where the session CAME FROM because the
+    # earlier requests and touched files were part of the seed. When the
+    # request itself is long enough to name the task on its own, the seed is
+    # the request alone; short follow-ups ("continue the migration") still get
+    # the history they need to mean anything.
+    if len(objective.split()) >= 20 or len(objective.strip()) >= 160:
+        return lines[0]
     earlier: list[str] = []
     for entry in list(state.conversation_history or []):
         if entry.get("role") != "user":
@@ -1308,7 +1324,9 @@ async def _generate_and_validate_title(session_id: int, objective: str) -> tuple
         previous_title = ""
     model_used = ""
     for attempt in range(1, _TITLE_MAX_VALIDATION_ATTEMPTS + 1):
-        title, model_used, failure_reason = await _generate_session_title(messages)
+        title, model_used, failure_reason = await _generate_session_title(
+            messages, route_offset=attempt - 1,
+        )
         if not title:
             return "", model_used, failure_reason
         accepted, reason = validate_session_title(
@@ -1331,7 +1349,9 @@ async def _generate_and_validate_title(session_id: int, objective: str) -> tuple
     return "", model_used, "invalid_response"
 
 
-async def _generate_session_title(messages: list) -> tuple[str, str, str]:
+async def _generate_session_title(
+    messages: list, route_offset: int = 0,
+) -> tuple[str, str, str]:
     """Generate a session title via the providers system's OWN routing
     machinery (ProviderManager.chat_completion with AUTO + built-in
     cross-provider fallback).
@@ -1343,6 +1363,14 @@ async def _generate_session_title(messages: list) -> tuple[str, str, str]:
     machine completed fine through the machinery. One call into the real
     router is the whole fix: it resolves AUTO to a healthy weighted route
     and falls back across providers on any retryable failure.
+
+    `route_offset` rotates the preferred-route order, so a corrective retry
+    after a REJECTED candidate (not merely an empty one) does not walk into the
+    same weak model that produced the rejected title. Live-measured
+    2026-09-19: two of three otherwise identical regenerations came back
+    perfect ("Fix Tamfis-Code Sessions", "Fix Streaming Repetition") while one
+    was rejected twice and left the session untitled -- a single route unable
+    to follow the contract should not be the session's only chance.
 
     Returns (title, model_used, failure_reason) -- title empty on total
     failure with a reason-coded failure_reason. Diagnosed, not silent.
@@ -1372,11 +1400,17 @@ async def _generate_session_title(messages: list) -> tuple[str, str, str]:
 
     last_reason = "empty_response"
     model_used = ""
-    try:
-        content = ""
-        for attempt in range(1, _TITLE_MAX_MACHINERY_ATTEMPTS + 1):
-            provider = preferred[(attempt - 1) % len(preferred)]
-            chunks: list[str] = []
+    content = ""
+    for attempt in range(1, _TITLE_MAX_MACHINERY_ATTEMPTS + 1):
+        provider = preferred[(attempt - 1 + max(0, route_offset)) % len(preferred)]
+        chunks: list[str] = []
+        # Per-attempt try, not one try around the whole loop. Live-measured
+        # 2026-09-19: a single route raising (dead socket, 429, SDK error)
+        # aborted EVERY remaining preferred route and returned
+        # provider_error with no title, while the very next route answered
+        # fine -- exactly the "one bad provider decides the session stays
+        # unnamed" failure this ordering exists to avoid.
+        try:
             async for chunk in manager.chat_completion(
                 provider,
                 messages,
@@ -1397,30 +1431,37 @@ async def _generate_session_title(messages: list) -> tuple[str, str, str]:
                 timeout=_TITLE_ATTEMPT_TIMEOUT_SECONDS,
             ):
                 chunks.append(str(chunk or ""))
-            content = "".join(chunks).strip()
-            if content:
-                # Report the route that ACTUALLY answered, not a generic
-                # "auto": the provenance field is what /regenerate-title and
-                # session_title_diagnostics show, and "which model named this
-                # session" is exactly the question a bad title raises.
-                model_used = provider.value
-                break
-            last_reason = "empty_response"
+        except Exception as exc:
+            last_reason = "provider_error"
             print(
                 f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS} via "
-                f"{provider.value}: empty response, trying next preferred route",
+                f"{provider.value} failed ({type(exc).__name__}: {str(exc)[:120]}), "
+                "trying next preferred route",
                 file=sys.stderr,
             )
-    except Exception as exc:
+            continue
+        content = "".join(chunks).strip()
+        if content:
+            # Report the route that ACTUALLY answered, not a generic
+            # "auto": the provenance field is what /regenerate-title and
+            # session_title_diagnostics show, and "which model named this
+            # session" is exactly the question a bad title raises.
+            model_used = provider.value
+            break
+        last_reason = "empty_response"
         print(
-            f"[title] provider attempt failed ({type(exc).__name__}: {str(exc)[:120]}), title not generated",
+            f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS} via "
+            f"{provider.value}: empty response, trying next preferred route",
             file=sys.stderr,
         )
-        return "", "", "provider_error"
 
     if not content:
-        print("[title] empty response, title not generated", file=sys.stderr)
-        return "", "", "empty_response"
+        print(
+            f"[title] no title after {_TITLE_MAX_MACHINERY_ATTEMPTS} preferred "
+            f"routes ({last_reason})",
+            file=sys.stderr,
+        )
+        return "", "", last_reason
     stripped = content.strip("\"'\u201c\u201d \t")
     # Validate before accepting: a real title is short, multi-word enough
     # to be informative, and never a full sentence. A response that

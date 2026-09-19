@@ -24,6 +24,7 @@ import itertools
 import asyncio
 import os
 import random
+import re
 import threading
 import time
 from dataclasses import dataclass, field
@@ -1543,7 +1544,27 @@ class ProviderManager:
 
         response = getattr(exc, "response", None)
         response_status = getattr(response, "status_code", None)
-        return response_status if isinstance(response_status, int) else None
+        if isinstance(response_status, int):
+            return response_status
+
+        # Last resort: the OpenAI SDK formats HTTP failures as
+        # "Error code: 402 - {...}", and that text is all that survives once a
+        # wrapper (or a checkpoint/replay) carries the message without the
+        # exception object. Live-reported 2026-09-19: exactly that happened to
+        # a 402 "you have depleted your monthly included credits", so the
+        # status read as None, no marker matched the credit wording, the error
+        # was classified non-retryable, and a 35-minute task STOPPED with
+        # "type `continue` to resume" while NVIDIA NIM sat configured and
+        # unused. Reading the code back out of the message restores the
+        # routing decision the SDK attribute would have made.
+        match = re.search(
+            r"\b(?:error code|http status|status code|http)\s*[:=]?\s*(\d{3})\b",
+            str(exc),
+            re.IGNORECASE,
+        )
+        if match:
+            return int(match.group(1))
+        return None
 
     @classmethod
     def is_retryable_provider_error(cls, exc: Exception) -> bool:
@@ -1652,6 +1673,19 @@ class ProviderManager:
         retryable_markers = (
             "insufficient credits",
             "payment required",
+            # Credit/billing exhaustion by any wording ("you have depleted your
+            # monthly included credits", "purchase pre-paid credits", "out of
+            # credits"): the provider account is the problem, another
+            # configured route is the answer.
+            "depleted",
+            "out of credits",
+            "no credits",
+            "included credits",
+            "pre-paid credits",
+            "prepaid credits",
+            "credit balance",
+            "billing",
+            "payment",
             "quota",
             "rate limit",
             "resourceexhausted",
@@ -1733,8 +1767,20 @@ class ProviderManager:
         task_profile: Optional["TaskProfile"] = None,
         *,
         allow_premium_primary: bool = False,
+        include_cooling: bool = False,
     ) -> List[ProviderType]:
-        """Return usable alternatives in canonical policy order."""
+        """Return usable alternatives in canonical policy order.
+
+        `route_is_healthy` (the health circuit) normally excludes a route that
+        recently failed, because retrying a broken route wastes the turn's
+        latency budget. `include_cooling=True` keeps those routes in the list
+        anyway -- the circuit is a latency heuristic, not proof the route is
+        unusable, and a definitive account-level failure (e.g. the primary
+        provider's credits are exhausted) must not strand the task while a
+        configured alternative is merely "cooling". Live-reported 2026-09-19:
+        a 35-minute run stopped with "type `continue` to resume" on a
+        TamfisGPT 402 while NVIDIA NIM sat configured and unused.
+        """
 
         if (
             self.ollama_cloud_is_premium_primary()
@@ -1778,7 +1824,7 @@ class ProviderManager:
                 continue
             if not self._has_valid_api_key(provider):
                 continue
-            if not self.route_is_healthy(provider, "*"):
+            if not include_cooling and not self.route_is_healthy(provider, "*"):
                 continue
 
             config = self.PROVIDERS[provider]
