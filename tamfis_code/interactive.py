@@ -291,6 +291,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/copy", "copy the last assistant response to the clipboard"),
     ("/paste-image", "attach an image from the system clipboard to your next message"),
     ("/regenerate-title", "retitle this session with a fresh AI title (or: /regenerate-title <name> to set it yourself)"),
+    ("/mailbox", "list swarm approval requests awaiting the coordinator (or: /mailbox approve|deny <id>)"),
     ("/doctor", "run connectivity/auth/self-health checks (add --heal to auto-repair fixable findings)"),
     ("/resume", "switch to another session"),
     ("/fork", "branch this conversation into a new independent session"),
@@ -1678,6 +1679,49 @@ async def _run_interactive_impl(
             else:
                 reason = state_after.title_fallback_reason or "unknown"
                 print_error(console, f"Title generation failed ({reason}); will retry on the next turn.")
+            continue
+        if text.lower().startswith("/mailbox"):
+            # Coordinator side of the swarm mailbox (Pillar 3): a background
+            # swarm's workers cannot approve their own destructive calls, so
+            # their requests land here for this session's human to answer.
+            from .mailbox import Mailbox
+
+            mailbox = Mailbox()
+            arg = text[len("/mailbox"):].strip()
+            if arg.lower().startswith(("approve", "deny")):
+                parts = arg.split()
+                verb = parts[0].lower()
+                request_id = parts[1] if len(parts) > 1 else ""
+                if not request_id:
+                    print_error(console, f"Usage: /mailbox {verb} <request-id>")
+                else:
+                    record = mailbox.get(request_id)
+                    if record is None:
+                        print_error(console, f"No such mailbox request: {request_id}")
+                    elif mailbox.resolve(request_id, verb, coordinator=f"repl_{workspace.session_id}"):
+                        outcome = "approved" if verb == "approve" else "denied"
+                        console.print(f"[green]Mailbox request {outcome}[/green] · {request_id}")
+                    else:
+                        print_error(
+                            console,
+                            "That request could not be resolved -- it may already be answered, "
+                            "or it came from a worker that may not approve itself.",
+                        )
+                continue
+            pending = mailbox.pending()
+            if not pending:
+                console.print("[dim]No swarm approval requests are waiting.[/dim]")
+                continue
+            table = Table(show_header=True, header_style="bold")
+            for column in ("ID", "WORKER", "TOOL", "RISK", "COMMAND"):
+                table.add_column(column, overflow="fold")
+            for record in pending:
+                table.add_row(
+                    str(record.get("id")), str(record.get("worker")), str(record.get("tool")),
+                    str(record.get("risk")), str(record.get("command") or "")[:80],
+                )
+            console.print(table)
+            console.print("[dim]/mailbox approve <id> · /mailbox deny <id>[/dim]")
             continue
         if _ci_equals(text, "/paste-image"):
             data, reason = await asyncio.to_thread(read_clipboard_image)

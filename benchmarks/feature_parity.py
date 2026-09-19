@@ -38,6 +38,24 @@ FEATURES = (
     Feature("Durable resume", "tamfis_code/state.py", r"turn_checkpoint"),
     Feature("Session branching / fork", "tamfis_code/state.py", r"def fork_session_state"),
     Feature("Context compaction", "tamfis_code/state.py", r"context_checkpoints"),
+    # The four supremacy pillars. Their evidence is the mechanism itself
+    # (a class/function that must exist in source), not a claim in docs.
+    Feature(
+        "Multi-stage context compression", "tamfis_code/orchestrator/compression.py",
+        r"class CompressionCascade", kimi="partial", claude="yes", codex="partial",
+    ),
+    Feature(
+        "Prompt cache boundary", "tamfis_code/orchestrator/context.py",
+        r"CacheBoundary", kimi="partial", claude="yes", codex="partial",
+    ),
+    Feature(
+        "Permission racing (parallel safety)", "tamfis_code/permission_race.py",
+        r"async def race_permission", kimi="no", claude="partial", codex="partial",
+    ),
+    Feature(
+        "Coordinator/worker approval mailbox", "tamfis_code/mailbox.py",
+        r"def claim_next", kimi="no", claude="partial", codex="no",
+    ),
     Feature("Image input", "tamfis_code/runner_local.py", r"build_vision_content_blocks"),
     Feature("Browser and screenshots", "tamfis_code/cli.py", r"screenshot_cmd"),
     Feature("Web research tool", "tamfis_code/tool_policy.py", r"web_search"),
@@ -58,6 +76,11 @@ FEATURES = (
 )
 
 VERIFY_TESTS = (
+    "tests/test_swarm.py",
+    "tests/test_context_compression.py",
+    "tests/test_permission_race.py",
+    "tests/test_mailbox.py",
+    "tests/test_plugins.py",
     "tests/test_agent_definitions.py",
     "tests/test_hooks.py",
     "tests/test_mcp_stdio_server.py",
@@ -87,6 +110,58 @@ BEHAVIOR_SCENARIOS = (
     ("saved plans support detached local execution", "tests/test_cli_commands.py::StandaloneDefaultDispatchTests::test_execute_plan_bg_without_remote_spawns_a_detached_job"),
     ("shell commands support detached local execution", "tests/test_cli_commands.py::StandaloneInfoCommandTests::test_run_bg_without_remote_spawns_a_detached_job"),
     ("queued follow-ups can be recalled and edited", "tests/test_live_input.py::CtrlTInjectsFollowUpTests::test_submitting_recalled_text_updates_queue_without_duplication"),
+    # Pillar 1 -- context invincibility.
+    (
+        "200k-token conversation keeps state through the structured summary",
+        "tests/test_context_compression.py::test_200k_token_conversation_still_remembers_a_variable_from_100_messages_ago",
+    ),
+    (
+        "cacheable static prefix stays byte-identical across turns",
+        "tests/test_context_compression.py::test_context_bundle_keeps_a_stable_static_prefix_and_puts_volatile_state_second",
+    ),
+    (
+        "superseded file reads keep their signatures, not their bodies",
+        "tests/test_context_compression.py::test_stage3_prunes_superseded_file_reads_to_a_signature_view",
+    ),
+    # Pillar 2 -- permission racing.
+    (
+        "catastrophic commands are denied before any prompt",
+        "tests/test_permission_race.py::test_catastrophic_command_is_denied_without_prompting_the_human",
+    ),
+    (
+        "read-only calls never wait on a classifier or a human",
+        "tests/test_permission_race.py::test_read_only_calls_are_decided_by_the_static_process_alone",
+    ),
+    (
+        "classifier deny beats a later human approval",
+        "tests/test_permission_race.py::test_classifier_deny_beats_a_human_approval_that_arrives_later",
+    ),
+    # Pillar 3 -- the mailbox pattern.
+    (
+        "concurrent coordinators never double-claim a request",
+        "tests/test_mailbox.py::test_concurrent_coordinators_never_double_claim",
+    ),
+    (
+        "swarm workers are gated by the coordinator mailbox",
+        "tests/test_mailbox.py::test_swarm_runs_workers_through_the_coordinator_mailbox",
+    ),
+    (
+        "a worker cannot approve its own request",
+        "tests/test_mailbox.py::test_a_worker_cannot_approve_its_own_request",
+    ),
+    # Pillar 4 -- protocol and plugin bridge.
+    (
+        "broken plugin manifests degrade instead of crashing",
+        "tests/test_plugins.py::test_a_broken_manifest_degrades_instead_of_crashing",
+    ),
+    (
+        "ACP JSON-RPC framing, cancel, and session updates",
+        "tests/test_acp.py",
+    ),
+    (
+        "the live tool dispatch blocks a catastrophic command before it runs",
+        "tests/test_runner_permission_race.py::RunnerPermissionRaceTests::test_a_catastrophic_command_is_blocked_before_dispatch",
+    ),
 )
 
 

@@ -9,6 +9,13 @@ from .. import state as local_state
 from ..routing import TaskProfile
 from ..workspace import build_system_prompt, discover_local_repository
 from ..openhands.skills import skill_prompt
+from .compression import CacheBoundary, signature_view
+
+# Elastic-injection caps (Stage 3): how many recently inspected files may
+# contribute a signature view, and how large each view may be. Small on
+# purpose -- the layer exists to give structure without re-inflating context.
+_SIGNATURE_FILES = 6
+_SIGNATURE_FILE_CHARS = 2_000
 
 
 @dataclass
@@ -16,6 +23,39 @@ class ContextBundle:
     messages: list[dict[str, Any]]
     layers: dict[str, Any]
     reused: bool
+
+
+def _signature_layer(state: Any, root: Path | None = None, *, limit: int = _SIGNATURE_FILES) -> tuple[str, list[str]]:
+    """Stage 3 (elastic) injection for the context layer.
+
+    Instead of listing only paths (or, worse, whole file bodies) for files
+    the session already touched, inject each file's signature/docstring view
+    plus a re-read pointer: enough structure to reason about the code, a
+    fraction of the tokens. Best-effort -- an unreadable path is skipped, so
+    this layer can never break context assembly.
+    """
+    rendered: list[str] = []
+    included: list[str] = []
+    for raw_path in list(getattr(state, "inspected_files", []) or [])[-limit:]:
+        path = str(raw_path)
+        if root is not None and not Path(path).is_absolute():
+            path = str(Path(root) / path)
+        try:
+            view = signature_view(path, max_chars=_SIGNATURE_FILE_CHARS)
+        except Exception:  # pragma: no cover - defensive: layer is optional
+            continue
+        if not view:
+            continue
+        rendered.append(f"--- {path} (signature view) ---\n{view}")
+        included.append(path)
+    if not rendered:
+        return "", []
+    return (
+        "\n\nSignatures of files already inspected this session "
+        "(bodies deliberately omitted -- re-read a path for its full body):\n"
+        + "\n".join(rendered),
+        included,
+    )
 
 
 def build_context_bundle(
@@ -36,18 +76,20 @@ def build_context_bundle(
     repository = discover_local_repository(session_id, Path(workspace_root))
     state = local_state.get_session_state(session_id)
     reused = bool(previous_fingerprint and previous_fingerprint == state.discovery_fingerprint)
-    system = build_system_prompt(session_id, Path(workspace_root))
-    skills = skill_prompt(workspace_root, objective)
-    if skills:
-        system += "\n\n" + skills
+    # Static, cacheable prefix: workspace instructions, rules, tools. Kept
+    # byte-identical turn to turn so the provider's prefix cache can hit.
+    static_prefix = build_system_prompt(session_id, Path(workspace_root))
+    skills = skill_prompt(workspace_root, objective) or ""
+    signature_text, signature_files = _signature_layer(state, Path(workspace_root))
     recent_tools = state.completed_actions[-8:]
     layers = {
-        "policy": system,
+        "policy": static_prefix,
         "skills": skills,
         "objective": objective,
         "workspace_summary": repository,
         "relevant_prior_turns": conversation_messages[-12:],
         "retrieved_files": list(state.inspected_files)[-20:],
+        "signature_files": signature_files,
         "recent_tool_results": recent_tools,
         "active_plan": plan or {},
         "validation_state": state.validation_results[-10:],
@@ -77,7 +119,18 @@ def build_context_bundle(
         f"Active plan: {bounded_plan or 'none'}\n"
         f"Recent validation evidence: {state.validation_results[-5:]}"
     )
+    # Cache boundary: static prefix first, volatile per-turn state in its own
+    # system message after it. Appending the volatile parts to the static
+    # message (as this used to) invalidated the provider's prefix cache every
+    # single turn -- the fingerprint/goal/validation evidence changes on
+    # every request, and caching is prefix-based.
+    volatile_parts = [part for part in (skills, supplemental, signature_text) if part]
+    boundary = CacheBoundary(static_prefix, "\n\n".join(volatile_parts))
+    layers["cache_boundary"] = {
+        "static_chars": len(boundary.static_prefix),
+        "volatile_chars": len(boundary.volatile_suffix),
+    }
     return ContextBundle(
-        [{"role": "system", "content": system + supplemental}, *conversation_messages],
+        [*boundary.as_system_messages(), *conversation_messages],
         layers, reused,
     )

@@ -18,6 +18,7 @@ Three concrete gaps closed here:
 
 from __future__ import annotations
 
+import asyncio
 from typing import Any, Callable, Optional
 
 # Mirrors the exact policy groupings runner.py's _decision_for_policy
@@ -88,6 +89,102 @@ class BufferedSubagentRenderer:
     def finish(self) -> None:
         """No-op -- nothing was ever opened (no Live, no open assistant
         block) that would need closing."""
+
+
+class SwarmCoordinator:
+    """The root agent's half of the mailbox pattern.
+
+    A swarm worker cannot approve its own destructive call, so it files a
+    request and waits; this loop claims those requests (atomically -- see
+    Mailbox.claim_next) and answers them the only way the coordinator can:
+    through the user's own approval policy, and through the real console prompt
+    when the policy says a human must decide. The coordinator runs as a
+    background task alongside the workers, so answering one worker never stalls
+    the others.
+    """
+
+    def __init__(
+        self, mailbox, *, approval_policy: str, console, interactive: bool,
+        config: Any = None, poll_interval: float = 0.25, stale_after_seconds: float = 900.0,
+    ) -> None:
+        self.mailbox = mailbox
+        self.approval_policy = approval_policy
+        self.console = console
+        self.interactive = interactive
+        self.config = config
+        self.poll_interval = poll_interval
+        self.stale_after_seconds = stale_after_seconds
+        self.coordinator_id = f"coordinator_{id(self):x}"
+        self.resolved = 0
+        self.denied = 0
+
+    async def _decide(self, request: dict[str, Any]) -> str:
+        from .runner import _decision_for_policy, resolve_approval_decision_async
+
+        risk = str(request.get("risk") or "medium")
+        command = str(request.get("command") or request.get("tool") or "")
+        try:
+            decision = _decision_for_policy(self.approval_policy, risk, self.interactive)
+        except Exception:
+            decision = None
+        if decision is None and self.interactive and self.console is not None:
+            try:
+                decision = await resolve_approval_decision_async(
+                    self.console, command, risk, self.approval_policy, True,
+                    config=self.config,
+                )
+            except Exception:
+                decision = None
+        if decision in ("approve_once", "approve_session"):
+            return "approve_once"
+        return "deny"
+
+    async def handle(self, request: dict[str, Any]) -> None:
+        decision = await self._decide(request)
+        try:
+            resolved = await asyncio.to_thread(
+                self.mailbox.resolve, request["id"], decision,
+                coordinator=self.coordinator_id,
+                note=f"swarm coordinator ({self.approval_policy} policy)",
+            )
+        except Exception as exc:
+            print(f"[mailbox] coordinator could not resolve {request.get('id')}: {exc}")
+            return
+        if not resolved:
+            return  # already answered (or a worker tried to answer itself)
+        self.resolved += 1
+        if decision != "approve_once":
+            self.denied += 1
+        try:
+            self.console.print(
+                f"[dim]mailbox: {'approved' if decision == 'approve_once' else 'denied'} "
+                f"{request.get('tool')} for worker {request.get('worker')}[/dim]"
+            )
+        except Exception:
+            pass
+
+    async def drain(self, stop: asyncio.Event) -> None:
+        """Answer requests until `stop` is set. Never raises -- a coordinator
+        that dies would leave every worker waiting for its timeout."""
+        # Sweep first: a request left behind by a swarm that died must not be
+        # answered now (its worker is long gone and it may describe work that
+        # is no longer wanted) nor sit in front of this swarm's own requests.
+        try:
+            await asyncio.to_thread(self.mailbox.expire_stale, max_age_seconds=self.stale_after_seconds)
+        except Exception:
+            pass
+        while not stop.is_set():
+            try:
+                request = await asyncio.to_thread(self.mailbox.claim_next, self.coordinator_id)
+            except Exception:
+                request = None
+            if request is None:
+                try:
+                    await asyncio.wait_for(stop.wait(), timeout=self.poll_interval)
+                except asyncio.TimeoutError:
+                    pass
+                continue
+            await self.handle(request)
 
 
 async def run_swarm(
@@ -164,6 +261,29 @@ async def run_swarm(
             live.update(_build_swarm_group(status, order))
         return BufferedSubagentRenderer(task_id, description, on_update=on_update)
 
+    # Mailbox + coordinator (only for a mutating swarm: a read-only swarm never
+    # issues an approvable call, so giving it a mailbox would be pure overhead).
+    mailbox = None
+    coordinator: Optional[SwarmCoordinator] = None
+    stop_event = asyncio.Event()
+    drain_task: Optional[asyncio.Task[Any]] = None
+    if mutate:
+        from .mailbox import mailbox_for_swarm, worker_context
+
+        mailbox = mailbox_for_swarm(session_id)
+        coordinator = SwarmCoordinator(
+            mailbox, approval_policy=approval_policy, console=console,
+            interactive=bool(getattr(console, "is_terminal", False)),
+        )
+        drain_task = asyncio.ensure_future(coordinator.drain(stop_event))
+
+    def _worker_context_factory(worker_id: str, worker_session_id: int, description: str):
+        from .mailbox import WorkerContext
+
+        return worker_context(WorkerContext(
+            worker_id=worker_id, mailbox=mailbox, session_id=worker_session_id,
+        ))
+
     try:
         agent_manager = AgentManager()
         results = await agent_manager.execute_tasks(
@@ -173,8 +293,17 @@ async def run_swarm(
             max_concurrency=max_concurrency, parent_session_id=session_id,
             renderer_factory=renderer_factory,
             agent_types=agent_types,
+            worker_context_factory=_worker_context_factory if mailbox is not None else None,
         )
     finally:
+        stop_event.set()
+        if drain_task is not None:
+            try:
+                await asyncio.wait_for(drain_task, timeout=5.0)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                drain_task.cancel()
+            except Exception:
+                pass
         if live is not None:
             live.stop()
 

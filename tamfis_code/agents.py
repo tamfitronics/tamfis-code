@@ -358,6 +358,7 @@ class AgentManager:
         parent_session_id: Optional[int] = None,
         renderer_factory: Optional[Callable[[str, str], Any]] = None,
         agent_types: Optional[List[Optional[str]]] = None,
+        worker_context_factory: Optional[Callable[[str, int, str], Any]] = None,
     ) -> List[Dict[str, Any]]:
         """Fan out N sub-objectives concurrently (bounded by max_concurrency),
         each delegated to the standalone agent loop in its own local session.
@@ -385,6 +386,15 @@ class AgentManager:
         > 1 (see swarm.BufferedSubagentRenderer) to avoid N concurrent
         rich.live.Live regions colliding on one Console. None (the default)
         preserves today's exact behavior for every existing caller.
+
+        worker_context_factory(task_id, session_id, description), when given,
+        must return a context manager that is entered for exactly the duration
+        of that one sub-task's execution -- this is how swarm.run_swarm binds
+        each worker's approval mailbox to its own asyncio task (see
+        mailbox.worker_context), so a sub-agent's mutating calls are routed to
+        the coordinator rather than answered locally. Each sub-task runs in
+        its own task, so the binding cannot leak between workers; None (the
+        default) leaves every existing caller unchanged.
 
         agent_types, when given, is a list the same length as descriptions
         (None entries mean "no override" -- every existing caller omitting
@@ -448,7 +458,17 @@ class AgentManager:
                         ),
                         extra_system_prompt=extra_system_prompt,
                     )
-                    result = await agent.execute(task)
+                    context_manager = (
+                        worker_context_factory(task.id, workspace.session_id, description)
+                        if worker_context_factory is not None else None
+                    )
+                    if context_manager is not None:
+                        context_manager.__enter__()
+                    try:
+                        result = await agent.execute(task)
+                    finally:
+                        if context_manager is not None:
+                            context_manager.__exit__(None, None, None)
                     task.result = result
                     task.status = AgentStatus.COMPLETED if result.get("status") == "completed" else AgentStatus.FAILED
                     task.error = result.get("error")

@@ -1223,8 +1223,8 @@ def _sanitize_llm_title(text: str) -> str:
 
 def best_effort_session_label(state: SessionState) -> str:
     """One-line summary of what a session is doing RIGHT NOW, straight
-    from already-recorded activity (active_task objective, then
-    conversation_summary, then the last user turn) -- no persisted
+    from already-recorded activity (active_task objective, then the most
+    recent SUBSTANTIVE user turn, then conversation_summary) -- no persisted
     session_title required. Empty string if nothing usable is recorded yet
     (a session with no turns at all).
 
@@ -1242,14 +1242,41 @@ def best_effort_session_label(state: SessionState) -> str:
     objective = str((state.active_task or {}).get("objective") or "").strip()
     if objective:
         return _one_line_label(objective)
+    # The user's own most recent substantive request describes the session far
+    # better than the assistant's last line: conversation_summary holds the
+    # ASSISTANT's final answer, so preferring it labelled a real session
+    # "Done." -- useless in the resume picker. Scan back past trivial
+    # acknowledgements ("continue", "ok") to the last request that actually
+    # says something.
+    trivial_fallback = ""
+    for entry in reversed(state.conversation_history or []):
+        if entry.get("role") != "user":
+            continue
+        content = str(entry.get("content") or "").strip()
+        if not content:
+            continue
+        candidate = _one_line_label(content.splitlines()[0])
+        if not candidate:
+            continue
+        if candidate.lower().rstrip(".!") in _TRIVIAL_ACTIVITY_LABELS:
+            trivial_fallback = trivial_fallback or candidate
+            continue
+        return candidate
     if state.conversation_summary:
-        last_line = state.conversation_summary.strip().splitlines()[-1]
-        if last_line:
-            return _one_line_label(last_line)
-    for entry in reversed(state.conversation_history):
-        if entry.get("role") == "user" and str(entry.get("content") or "").strip():
-            return _one_line_label(str(entry["content"]).strip().splitlines()[0])
-    return ""
+        last_line = _one_line_label(state.conversation_summary.strip().splitlines()[-1])
+        if last_line and last_line.lower().rstrip(".!") not in _TRIVIAL_ACTIVITY_LABELS:
+            return last_line
+    return trivial_fallback
+
+
+# Labels that carry no information about what a session is about. Used ONLY
+# by best_effort_session_label's display fallback -- never by title
+# generation, which is LLM-only (see _generate_session_title).
+_TRIVIAL_ACTIVITY_LABELS = frozenset({
+    "done", "ok", "okay", "k", "yes", "y", "yep", "ya", "no", "n", "nope",
+    "thanks", "thank you", "ty", "continue", "go on", "proceed", "sure",
+    "hi", "hello", "hey", "test", "nice", "great", "cool", "wtf", "why",
+})
 
 
 def _one_line_label(text: str) -> str:

@@ -31,6 +31,7 @@ import os
 import random
 import re
 import shlex
+import sys
 import tempfile
 import time
 import uuid
@@ -88,8 +89,9 @@ from .public_identity import (
     public_model_name,
 )
 from .permissions import decide_permission
-from .runner import TaskOutcome, resolve_approval_decision_async
+from .runner import TaskOutcome, _decision_for_policy, resolve_approval_decision_async
 from .safety import (
+    READ_ONLY_TOOLS,
     _unified_diff,
     classify_tool_call_risk,
     redact_secrets,
@@ -482,6 +484,208 @@ _SCOPE_PATH_TOOLS = {
     "inspect_artifact",
 }
 _EXTERNAL_SCOPE_PATHS_KEY = "_tamfis_external_scope_paths"
+
+# Process B of the permission race: built once per process, lazily, and never
+# in a way that can fail a turn (None simply means the race runs without it).
+_INTENT_CLASSIFIER: Any = None
+_INTENT_CLASSIFIER_RESOLVED = False
+
+
+def _intent_classifier() -> Any:
+    global _INTENT_CLASSIFIER, _INTENT_CLASSIFIER_RESOLVED
+    if not _INTENT_CLASSIFIER_RESOLVED:
+        _INTENT_CLASSIFIER_RESOLVED = True
+        try:
+            from .permission_race import make_intent_classifier
+
+            _INTENT_CLASSIFIER = make_intent_classifier()
+        except Exception:
+            _INTENT_CLASSIFIER = None
+    return _INTENT_CLASSIFIER
+
+
+async def _raced_approval_decision(
+    console: Any,
+    display_command: str,
+    risk: str,
+    approval_policy: str,
+    interactive: bool,
+    *,
+    config: Any = None,
+    tool_name: str = "",
+    arguments: Optional[dict[str, Any]] = None,
+    renderer: Any = None,
+) -> str:
+    """Decide one tool call by racing the three safety processes.
+
+    Replaces the sequential "check, then ask" flow with: static rule check ->
+    AI intent classifier -> user prompt, run concurrently, first decisive
+    answer wins (see permission_race's module docstring for the exact
+    invariants). Always falls back to the plain sequential resolver on any
+    failure, so this can only ever add a faster decision, never a broken one.
+    """
+    async def _sequential() -> str:
+        return await resolve_approval_decision_async(
+            console, display_command, risk, approval_policy, interactive,
+            display_preview=False, config=config,
+        )
+
+    try:
+        from .permission_race import DECISION_DENY, WINNER_STATIC, race_permission
+    except Exception:
+        return await _sequential()
+
+    live_policy = config.approval_policy if config is not None else approval_policy
+    try:
+        outcome = await race_permission(
+            tool_name or "tool",
+            arguments or {},
+            risk=risk,
+            policy=live_policy,
+            interactive=interactive,
+            ui_prompt=_sequential if interactive else None,
+            classifier=_intent_classifier(),
+            policy_decision=_decision_for_policy,
+            read_only_tools=READ_ONLY_TOOLS,
+        )
+    except Exception as exc:
+        print(
+            f"[permission-race] falling back to sequential approval ({type(exc).__name__}: {exc})",
+            file=sys.stderr,
+        )
+        return await _sequential()
+
+    # Observable, never silent: a denial that did not come from the user (or
+    # from the user's own policy) is always reported, so a blocked command is
+    # explainable rather than mysterious.
+    if renderer is not None and outcome.winner == WINNER_STATIC:
+        try:
+            reason = str(outcome.detail.get("reason") or "deny-list rule")
+            if outcome.decision == DECISION_DENY:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": (
+                        f"\u26d4 Blocked before prompting -- {reason}. "
+                        "This rule cannot be overridden from the approval prompt."
+                    )},
+                })
+        except Exception:
+            pass
+    elif renderer is not None and outcome.winner == "classifier" and outcome.decision == DECISION_DENY:
+        try:
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": (
+                    "\u26d4 Safety classifier flagged this call as unsafe "
+                    f"({outcome.elapsed_ms:.0f} ms); the action was stopped."
+                )},
+            })
+        except Exception:
+            pass
+    return outcome.decision
+
+
+def _current_worker_context() -> Any:
+    """The swarm worker context bound to this task, if this turn IS a
+    sub-agent -- None for an ordinary (root) session."""
+    try:
+        from .mailbox import current_worker
+
+        return current_worker()
+    except Exception:
+        return None
+
+
+async def _worker_mailbox_decision(
+    worker: Any,
+    *,
+    tool_name: str,
+    arguments: Optional[dict[str, Any]],
+    display_command: str,
+    risk: str,
+    renderer: Any = None,
+) -> str:
+    """Ask the coordinator, not ourselves: a swarm worker has no console and
+    no user policy of its own, so a mutating call it cannot get approved
+    locally is filed in the shared mailbox and awaited (bounded). Anything
+    other than a real approval -- including a timeout -- denies."""
+    try:
+        from .mailbox import DECISION_APPROVE
+    except Exception:
+        return "deny"
+    try:
+        decision = await worker.request_approval(
+            tool=tool_name, arguments=arguments, risk=risk, command=display_command,
+        )
+    except Exception as exc:
+        print(f"[mailbox] worker approval request failed ({type(exc).__name__}: {exc}); denying", file=sys.stderr)
+        if renderer is not None:
+            try:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": f"Mailbox unavailable ({type(exc).__name__}); denying '{tool_name}'."},
+                })
+            except Exception:
+                pass
+        return "deny"
+    if decision == DECISION_APPROVE:
+        if renderer is not None:
+            try:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": f"Coordinator approved '{tool_name}' via the approval mailbox."},
+                })
+            except Exception:
+                pass
+        return "approve_once"
+    if renderer is not None:
+        try:
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": (
+                    f"Coordinator did not approve '{tool_name}' ({decision}); "
+                    "the sub-task will continue without it."
+                )},
+            })
+        except Exception:
+            pass
+    return "deny"
+
+
+def _compress_context_stages(
+    messages: list[dict[str, Any]],
+    *,
+    token_budget: int,
+    session_id: Optional[int] = None,
+    final_trim: Optional[Callable[[list[dict[str, Any]], int], bool]] = None,
+) -> Any:
+    """Run the multi-stage compression cascade over the working context.
+
+    Thin, defensive wrapper so the agent loop never depends on the cascade
+    module importing cleanly or succeeding: any failure returns None and the
+    caller's existing compaction path proceeds exactly as before.
+    """
+    try:
+        from .orchestrator.compression import CompressionCascade
+    except Exception:
+        return None
+    state = None
+    if session_id is not None:
+        try:
+            state = local_state.get_session_state(session_id)
+        except Exception:
+            state = None
+    try:
+        cascade = CompressionCascade()
+        return cascade.compact(
+            messages,
+            token_budget=token_budget,
+            target_tokens=int(token_budget * 0.85),
+            session_state=state,
+            final_trim=final_trim,
+        )
+    except Exception:
+        return None
 
 
 def _is_project_root(path: Path) -> bool:
@@ -6440,6 +6644,17 @@ async def _run_local_agent_turn_impl(
         local_state.save_session_state(session_id, estimated_context_tokens=input_tokens)
         if input_tokens > token_budget:
             before_compaction = input_tokens
+            # Multi-stage cascade FIRST (Pillar 1 -- context invincibility):
+            # micro truncation -> structured State-of-the-Union -> elastic
+            # signature pruning of superseded file reads. Each stage is
+            # cheaper than the next and only runs while the context is still
+            # over budget, and the generic compactor below stays as the final
+            # backstop, so this strictly adds capability without changing what
+            # happens when nothing else can help.
+            cascade_report = _compress_context_stages(
+                working_messages, token_budget=token_budget, session_id=session_id,
+                final_trim=lambda msgs, target: _trim_tool_outputs(msgs, target),
+            )
             # Compact well below the hard budget rather than right up to its
             # edge -- confirmed live: trimming to exactly `token_budget`
             # meant the very next tool result (a directory listing, a file
@@ -6460,9 +6675,11 @@ async def _run_local_agent_turn_impl(
                 # one-liner so a long turn doesn't scroll the transcript
                 # full of near-identical "Context compacted" lines.
                 if compaction_count <= 2:
+                    layers = cascade_report.layers_applied if cascade_report is not None else []
+                    stage_note = f" [layers: {', '.join(layers)}]" if layers else ""
                     content = (
                         f"Context compacted from ~{before_compaction} to "
-                        f"~{input_tokens} estimated tokens for "
+                        f"~{input_tokens} estimated tokens{stage_note} for "
                         f"{resolved_provider.value}'s context window."
                     )
                 elif compaction_count % 5 == 0:
@@ -8447,6 +8664,39 @@ async def _run_local_agent_turn_impl(
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                 continue
 
+            # Swarm worker gate (Pillar 3): a sub-agent cannot approve its own
+            # mutating call. It files the request in the coordinator's mailbox
+            # and waits; the coordinator -- which owns the user's policy and
+            # the only console -- answers. Approved calls are recorded as
+            # one-shot approvals for this exact call id, so the ordinary
+            # approval block below neither prompts nor re-asks.
+            worker_context = _current_worker_context()
+            if (
+                worker_context is not None
+                and risk != "read_only"
+                and (permission_decision is None or permission_decision.action != "allow")
+                and tc.call_id not in _batch_approved_once_ids
+            ):
+                worker_decision = await _worker_mailbox_decision(
+                    worker_context, tool_name=tc.name, arguments=arguments,
+                    display_command=str(arguments.get("command") or tc.name), risk=risk,
+                    renderer=renderer,
+                )
+                if worker_decision != "approve_once":
+                    result = {
+                        "error": (
+                            "Not approved: this call is a sub-task action, and destructive "
+                            "sub-task actions must be approved by the coordinator's mailbox. "
+                            "Continue with a different approach."
+                        ),
+                        "success": False,
+                    }
+                    arguments.pop(_EXTERNAL_SCOPE_PATHS_KEY, None)
+                    working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result)})
+                    renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
+                    continue
+                _batch_approved_once_ids.add(tc.call_id)
+
             if (
                 risk != "read_only"
                 and (permission_decision is None or permission_decision.action != "allow")
@@ -8533,11 +8783,12 @@ async def _run_local_agent_turn_impl(
                 # second, less-informative panel for the same approval
                 # (matches runner.py's remote-path fix for the same trap).
                 try:
-                    decision = await resolve_approval_decision_async(
+                    decision = await _raced_approval_decision(
                         console, display_command, risk,
                         "ask" if permission_decision is not None and permission_decision.action == "ask" else _effective_approval_policy(),
                         interactive,
-                        display_preview=False, config=cli_config,
+                        config=cli_config, tool_name=tc.name, arguments=arguments,
+                        renderer=renderer,
                     )
                 finally:
                     resume_live_if_active(renderer)

@@ -588,7 +588,26 @@ class ListResumableLocalSessionsTests(unittest.TestCase):
         infos = list_resumable_local_sessions()
         self.assertEqual([info.session_id for info in infos], [5])
 
-    def test_title_reflects_the_persisted_session_title(self):
+    def test_title_prefers_the_persisted_llm_session_title(self):
+        # Titles are LLM-only (the mechanical first-N-words generator was
+        # removed); this pins that a persisted title wins in the picker
+        # regardless of what the recorded activity happens to say.
+        state_module.save_session_state(5, workspace_root="/a")
+        state_module.remember_conversation_turn(
+            5, objective="Fix the flaky auth test", answer="Done.",
+        )
+        state = state_module.get_session_state(5)
+        state.session_title = "Fix Flaky Auth Test"
+        state.title_source = "llm"
+        state_module.put_session_state(state)
+        infos = list_resumable_local_sessions()
+        self.assertEqual(infos[0].title, "Fix Flaky Auth Test")
+
+    def test_title_falls_back_to_the_last_substantive_user_request(self):
+        # Without a persisted title the picker shows recorded activity -- and
+        # it must describe the REQUEST, not the assistant's last line: the
+        # summary here holds "Done.", which as a session label told the user
+        # nothing about what the session was actually for.
         state_module.save_session_state(5, workspace_root="/a")
         state_module.remember_conversation_turn(
             5, objective="Fix the flaky auth test", answer="Done.",
