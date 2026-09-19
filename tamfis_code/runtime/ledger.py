@@ -188,6 +188,10 @@ class TaskLedger:
     # Plan (Layer A)
     plan_steps: list[PlanStep] = field(default_factory=list)
     current_step_index: int = 0
+    # The parts of the plan that are not per-step progress (assumptions,
+    # components, validation criteria, risks, phase names), so a resume can
+    # rebuild the SAME plan rather than a template. See runtime/resume.py.
+    plan_static: dict[str, Any] = field(default_factory=dict)
 
     # Working set (Layer A/B boundary)
     relevant_files: list[str] = field(default_factory=list)
@@ -268,6 +272,7 @@ class TaskLedger:
             updated_at=str(payload.get("updated_at") or _now()),
         )
         ledger.plan_steps = [PlanStep.from_dict(p) for p in (payload.get("plan_steps") or [])]
+        ledger.plan_static = dict(payload.get("plan_static") or {})
         ledger.discoveries = [LedgerDiscovery.from_dict(p) for p in (payload.get("discoveries") or [])]
         ledger.edits = [LedgerEdit.from_dict(p) for p in (payload.get("edits") or [])]
         ledger.tests = [LedgerTest.from_dict(p) for p in (payload.get("tests") or [])]

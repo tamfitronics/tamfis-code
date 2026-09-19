@@ -4,17 +4,26 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
 import re
-from typing import Any, Callable
+from typing import Any, Callable, Optional
 
 from .. import state as local_state
 from ..routing import TaskProfile, classify_task
 from .context import ContextBundle, build_context_bundle
-from .planner import ExecutionPlan, create_plan
+from .planner import ExecutionPlan, PlanStep, create_plan
 from .protocols import AgentPhase, ToolEnvelope, classify_failure
 from .validator import ValidationReport, validate_completion
 from ..workspace import load_instruction_text
 from ..runtime import ExecutionController, GuardDecision, ObservationDecision
+from ..runtime.resume import ResumeSnapshot
 from ..runtime.budgets import RuntimeBudgets
+
+
+# The durable task-record lists that describe WHAT HAS BEEN DONE so far.
+_TASK_RECORD_KEYS = (
+    "blocked_steps", "assumptions", "decisions", "files_read", "files_modified",
+    "artifacts_created", "commands_run", "tests", "failures", "retries",
+    "completion_evidence",
+)
 
 
 @dataclass
@@ -31,6 +40,9 @@ class OrchestrationRun:
     route: dict[str, Any] = field(default_factory=dict)
     repair_attempts: int = 0
     reasoning_plan: bool = False
+    # True when this turn CONTINUES a saved plan (steps keep their statuses)
+    # instead of starting from a fresh template. See begin(restore=...).
+    plan_restored: bool = False
     runtime: ExecutionController = field(default_factory=ExecutionController)
 
 
@@ -66,26 +78,65 @@ class AgentOrchestrator:
             phase=phase.value, current_step=action,
         )
 
-    def begin(self, *, objective: str, messages: list[dict[str, Any]], read_only: bool) -> OrchestrationRun:
+    def begin(
+        self, *, objective: str, messages: list[dict[str, Any]], read_only: bool,
+        restore: Optional["ResumeSnapshot"] = None,
+    ) -> OrchestrationRun:
+        """Start a turn.
+
+        With `restore` (a ResumeSnapshot of an interrupted task) this CONTINUES
+        that task: the saved plan keeps every step's status, the durable task
+        record (files read, decisions, commands, failures...) is kept, and the
+        ledger's next_action says where the task stands. Without it this is a
+        new task and the record is reset, as before.
+
+        Live-reported 2026-09-19: begin() used to reset all of that on EVERY
+        turn, resume included, so a task interrupted at 3 of 4 steps came back
+        as 0 of 4 and had to be re-evaluated from scratch, again and again.
+        """
         profile = classify_task(objective, read_only=read_only)
         self.run = OrchestrationRun(self.session_id, objective, profile, runtime=ExecutionController(self.budgets))
+        restored = restore is not None and restore.resume_index is not None
         local_state.save_session_state(
             self.session_id,
             active_task={"objective": objective, "task_type": profile.task_type.value, "complexity": profile.complexity},
             current_phase=AgentPhase.UNDERSTAND.value, execution_status="running",
         )
-        local_state.update_task_state(
-            self.session_id, task_id=str(self.session_id), objective=objective,
-            status="running", phase=AgentPhase.UNDERSTAND.value,
-            plan=[], completed_steps=[], pending_steps=[], blocked_steps=[],
-            assumptions=[], decisions=[], files_read=[], files_modified=[],
-            artifacts_created=[], commands_run=[], tests=[], failures=[],
-            retries=[], completion_evidence=[], next_action="Classify the request",
-        )
+        if restored:
+            names = [step["name"] for step in restore.steps]
+            # The plan can be picked up from ANOTHER session (`resume` selects
+            # the newest interrupted one for this workspace); its durable task
+            # record must come with it, or only the plan would survive.
+            carried = (
+                {key: restore.task_state[key] for key in _TASK_RECORD_KEYS if key in restore.task_state}
+                if restore.session_id != self.session_id else {}
+            )
+            local_state.update_task_state(
+                self.session_id, task_id=str(self.session_id), objective=objective,
+                status="running", phase=AgentPhase.UNDERSTAND.value,
+                **carried,
+                plan=names,
+                completed_steps=[s["name"] for s in restore.steps if s["status"] == "completed"],
+                pending_steps=[s["name"] for s in restore.steps if s["status"] != "completed"],
+                next_action=restore.next_action(),
+            )
+        else:
+            local_state.update_task_state(
+                self.session_id, task_id=str(self.session_id), objective=objective,
+                status="running", phase=AgentPhase.UNDERSTAND.value,
+                plan=[], completed_steps=[], pending_steps=[], blocked_steps=[],
+                assumptions=[], decisions=[], files_read=[], files_modified=[],
+                artifacts_created=[], commands_run=[], tests=[], failures=[],
+                retries=[], completion_evidence=[], next_action="Classify the request",
+            )
         self.transition(AgentPhase.UNDERSTAND, action="Classify the request deterministically")
         if profile.requires_repository_context:
             self.transition(AgentPhase.INSPECT, action="Load or refresh repository context")
-        self.run.plan = create_plan(objective, profile)
+        if restored:
+            self.run.plan = self._plan_from_snapshot(objective, profile, restore)
+            self.run.plan_restored = True
+        else:
+            self.run.plan = create_plan(objective, profile)
         self.run.runtime.start_planning()
         plan_dict = self.run.plan.to_dict() if self.run.plan else None
         self.run.context = build_context_bundle(
@@ -93,23 +144,68 @@ class AgentOrchestrator:
             objective=objective, profile=profile, conversation_messages=messages, plan=plan_dict,
         )
         if self.run.plan:
-            self.transition(AgentPhase.PLAN, action="Persist an executable plan")
-            saved = local_state.save_plan(
-                self.session_id, objective=objective,
-                content="\n".join(f"{s.index}. {s.name}" for s in self.run.plan.steps),
-                steps=[{"index": s.index, "step": s.name, "status": s.status} for s in self.run.plan.steps],
-            )
-            self.run.plan_id = saved.id
+            self.transition(AgentPhase.PLAN, action="Restore the saved plan" if restored else "Persist an executable plan")
+            if restored and restore.session_id == self.session_id and restore.plan_id:
+                # Same session: keep the plan that is already persisted (and its
+                # id) instead of saving a second copy with every step reset.
+                self.run.plan_id = restore.plan_id
+                local_state.save_session_state(self.session_id, active_plan_id=restore.plan_id)
+            else:
+                saved = local_state.save_plan(
+                    self.session_id, objective=objective,
+                    content="\n".join(f"{s.index}. {s.name}" for s in self.run.plan.steps),
+                    steps=self._plan_items(self.run.plan),
+                )
+                self.run.plan_id = saved.id
         # Re-anchor the first epoch's clock now that one-time task setup
         # (state persistence, planning, context building) is actually done,
         # so that setup latency is never silently deducted from the first
         # epoch's own execution budget.
         self.run.runtime.begin_epoch_clock()
         try:
-            self.save_task_ledger(status="running", next_action="begin executing the plan")
+            self.save_task_ledger(
+                status="running",
+                next_action=restore.next_action() if restored else "begin executing the plan",
+            )
         except Exception:
             pass
         return self.run
+
+    @staticmethod
+    def _plan_items(plan: ExecutionPlan) -> list[dict[str, Any]]:
+        """A plan's steps as persisted: name, status, and the evidence/phase a
+        resume needs to rebuild the same plan."""
+        return [
+            {
+                "index": s.index, "step": s.name, "status": s.status,
+                "evidence": list(s.evidence[-5:]), "phase": s.phase,
+            }
+            for s in plan.steps
+        ]
+
+    def _plan_from_snapshot(
+        self, objective: str, profile: TaskProfile, restore: "ResumeSnapshot",
+    ) -> ExecutionPlan:
+        """Rebuild the interrupted plan: its own steps and statuses, with the
+        non-step parts (assumptions, risks, validation criteria) from what the
+        ledger kept, falling back to the template's for a legacy record."""
+        template = create_plan(objective, profile)
+        static = restore.static or {}
+        return ExecutionPlan(
+            objective=objective,
+            assumptions=list(static.get("assumptions") or template.assumptions),
+            components=list(static.get("components") or template.components),
+            steps=[
+                PlanStep(
+                    index=position, name=step["name"], status=step["status"],
+                    evidence=list(step.get("evidence") or []), phase=int(step.get("phase") or 0),
+                )
+                for position, step in enumerate(restore.steps, start=1)
+            ],
+            validation_criteria=list(static.get("validation_criteria") or template.validation_criteria),
+            risks=list(static.get("risks") or template.risks),
+            phase_names=list(static.get("phase_names") or []),
+        )
 
     def replace_plan(self, plan: ExecutionPlan) -> None:
         """Swap in a plan grounded in real evidence (the initial reasoning
@@ -147,7 +243,7 @@ class AgentOrchestrator:
         saved = local_state.save_plan(
             self.session_id, objective=self.run.objective,
             content="\n".join(f"{s.index}. {s.name}" for s in plan.steps),
-            steps=[{"index": s.index, "step": s.name, "status": s.status} for s in plan.steps],
+            steps=self._plan_items(plan),
         )
         self.run.plan = plan
         self.run.plan_id = saved.id
@@ -162,7 +258,10 @@ class AgentOrchestrator:
         assert self.run is not None
         if self.run.plan is None or self.run.plan_id is None:
             return
-        items = [{"step": s.name, "status": s.status} for s in self.run.plan.steps]
+        items = [
+            {"step": s.name, "status": s.status, "evidence": list(s.evidence[-5:]), "phase": s.phase}
+            for s in self.run.plan.steps
+        ]
         local_state.update_plan_steps(self.session_id, self.run.plan_id, items)
         # Deliberately a distinct event type from "plan_created" -- that
         # event means "a new/revised plan now exists" (renderer reprints
@@ -382,6 +481,21 @@ class AgentOrchestrator:
             ]
             completed = sum(1 for s in ledger.plan_steps if s.status == "completed")
             ledger.current_step_index = min(completed, max(len(ledger.plan_steps) - 1, 0))
+            ledger.plan_static = {
+                "assumptions": list(self.run.plan.assumptions or []),
+                "components": list(self.run.plan.components or []),
+                "validation_criteria": list(self.run.plan.validation_criteria or []),
+                "risks": list(self.run.plan.risks or []),
+                "phase_names": list(self.run.plan.phase_names or []),
+            }
+        else:
+            # A task with no plan has no plan steps. The ledger is keyed by
+            # session, so without this a new one-line task inherited the PREVIOUS
+            # task's "3/4 steps done" and /status reported progress that
+            # belonged to different work.
+            ledger.plan_steps = []
+            ledger.current_step_index = 0
+            ledger.plan_static = {}
         # Reuses the same modified_files list safety.py's record_mutation
         # already maintains per session -- a real recap needs to show real
         # changed files, not a second, separately-tracked copy that could

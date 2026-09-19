@@ -1938,6 +1938,21 @@ async def _run_interactive_impl(
                     )
             except Exception:
                 pass
+            # Where a `continue` picks up: the first plan step not yet done,
+            # from the same saved plan a resume restores (so /status and the
+            # resume can never disagree).
+            resume_line = ""
+            try:
+                from .runtime.resume import describe_resume_point
+
+                point = describe_resume_point(workspace.session_id)
+                if point:
+                    resume_line = (
+                        f"\nresume_at=step {point['step']}/{point['total']}: {point['name']}  "
+                        f"({point['done']} done -- `continue` picks up here)"
+                    )
+            except Exception:
+                pass
             console.print(
                 f"{identity_line}\n"
                 f"workspace_root={workspace.workspace_root}\n"
@@ -1950,6 +1965,7 @@ async def _run_interactive_impl(
                 f"model={public_model_name(state.selected_model)}  route={PUBLIC_PROVIDER_NAME}"
                 f"{escape(route_lines)}"
                 f"{ledger_line}"
+                f"{escape(resume_line)}"
             )
             continue
         if _ci_equals(text, "/routes") or _ci_startswith(text, "/routes "):

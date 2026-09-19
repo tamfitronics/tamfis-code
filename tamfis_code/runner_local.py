@@ -4691,6 +4691,72 @@ def _has_active_prior_plan(session_id: int, objective: str = "") -> bool:
     return False
 
 
+def _resume_snapshot_for_turn(prior_state: Any, objective: str, resume_requested: bool) -> Any:
+    """The interrupted task's plan-and-progress state, when this turn is a
+    resume of it -- else None (a new task starts clean, as before).
+
+    Gated on the SAME "is this the same task" test the plan banner already
+    uses (_has_active_prior_plan), so a reused session never drags an unrelated
+    task's half-finished plan into a new one.
+    """
+    if not resume_requested:
+        return None
+    try:
+        from .runtime.resume import load_resume_snapshot
+
+        prior_session_id = int(getattr(prior_state, "session_id", 0) or 0)
+        if not prior_session_id or not _has_active_prior_plan(prior_session_id, objective):
+            return None
+        return load_resume_snapshot(prior_session_id)
+    except Exception:
+        return None
+
+
+_BARE_CONTINUE_MAX_WORDS = 5
+
+
+def _is_bare_continue(text: str) -> bool:
+    """A resume with nothing new in it ("continue", "please resume", "keep
+    going"). Such a turn adds no instruction, so re-planning would only redo
+    work the saved plan already records. Anything with digits or more words
+    ("proceed with 1, 2 and 3", "continue, but also...") is a real instruction
+    and is planned as before."""
+    stripped = (text or "").strip()
+    return (
+        _is_resume_request(stripped)
+        and len(stripped.split()) <= _BARE_CONTINUE_MAX_WORDS
+        and not re.search(r"\d", stripped)
+    )
+
+
+def _resume_plan_message_content(plan: Any) -> str:
+    """The plan handed to the model on a resume: what is DONE (with its
+    evidence), what is next, and what remains -- so it continues instead of
+    re-deriving where the task stands."""
+    first_open = next(
+        (step.index for step in plan.steps if step.status != "completed"), None,
+    )
+    lines = [
+        "TASK PLAN (RESUMED -- steps marked ✓ are already DONE and verified: do NOT redo "
+        "them or re-inspect the files they covered; continue at ▶):",
+    ]
+    for step in plan.steps:
+        if step.status == "completed":
+            marker = "✓"
+        elif step.index == first_open:
+            marker = "▶"
+        else:
+            marker = "·"
+        lines.append(f"{marker} {step.index}. {step.name}")
+        if step.status == "completed" and step.evidence:
+            lines.append(f"     evidence: {'; '.join(str(e) for e in step.evidence[:2])[:200]}")
+    if plan.assumptions:
+        lines.append("Assumptions: " + "; ".join(plan.assumptions))
+    if plan.risks:
+        lines.append("Risks: " + "; ".join(plan.risks))
+    return "\n".join(lines)
+
+
 def _plan_message_content(plan: Any, *, heading: str) -> str:
     lines = [heading]
     lines += [f"{step.index}. {step.name}" for step in plan.steps]
@@ -5806,7 +5872,19 @@ async def _run_local_agent_turn_impl(
     # which would otherwise make _has_active_prior_plan see this turn's own
     # brand-new plan and wrongly call it "already active."
     _prior_plan_was_active = _has_active_prior_plan(session_id, objective)
-    orchestration = orchestrator.begin(objective=objective, messages=messages, read_only=read_only)
+    # A resume CONTINUES the interrupted task: begin() restores its plan (every
+    # step keeps its status) and its durable task record instead of resetting
+    # them, which is what made a resumed task be re-evaluated from scratch.
+    resume_snapshot = _resume_snapshot_for_turn(prior_state, objective, resume_requested)
+    orchestration = orchestrator.begin(
+        objective=objective, messages=messages, read_only=read_only,
+        restore=resume_snapshot,
+    )
+    if getattr(orchestration, "plan_restored", False) and resume_snapshot is not None:
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": resume_snapshot.banner()},
+        })
     task_profile = orchestration.profile
     turn_read_only = read_only or getattr(task_profile.task_type, "value", "") in {
         "inspect", "audit", "plan",
@@ -6210,7 +6288,27 @@ async def _run_local_agent_turn_impl(
     # Repair / Validate / Report" text for a one-line typo fix and a
     # full-stack audit alike. A failure here (bad JSON, provider error)
     # silently keeps the template; the turn is never blocked on this.
-    if should_plan(task_profile, objective):
+    if (
+        getattr(orchestration, "plan_restored", False)
+        and orchestrator.run is not None
+        and orchestrator.run.plan is not None
+        and _is_bare_continue(incoming_objective)
+    ):
+        # Resuming with nothing new to add: the saved plan already says what is
+        # done and what is next. Do NOT walk the repository again and ask the
+        # model for a brand-new plan -- that re-evaluation, on every "continue",
+        # is exactly what made resuming feel like starting over.
+        restored_plan = orchestrator.run.plan
+        orchestrator.run.reasoning_plan = True
+        working_messages.insert(
+            working_messages.index(scope_message) + 1,
+            {"role": "system", "content": _resume_plan_message_content(restored_plan)},
+        )
+        renderer.handle_event({
+            "event_type": "plan_created",
+            "payload": _plan_created_payload(restored_plan, title="Plan", continuation=True),
+        })
+    elif should_plan(task_profile, objective):
         # 2026-09-17 (cross-session plan leak, owner report): scope_roots
         # intentionally contains the WHOLE temp dir -- that's a tool-
         # authority boundary (throwaway code needs /tmp), but feeding it to
