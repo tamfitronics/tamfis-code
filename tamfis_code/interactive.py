@@ -852,6 +852,29 @@ def _title_seed_objective(state: Any) -> str:
     return str(state.conversation_summary or "").strip()[:400]
 
 
+def expand_collapsed_or_end_of_line(event: Any, console: Any) -> None:
+    """Idle-prompt Ctrl+E.
+
+    render.py collapses a long message behind "N more chars -- press Ctrl+E to
+    show full message". Mid-task that key is bound in live_input.py, but the
+    hint stays in scrollback after the turn ends and the idle prompt had no
+    binding at all, so the hint pointed at a key that did nothing. With nothing
+    collapsed, Ctrl+E keeps its normal readline meaning (jump to end of line)
+    instead of being swallowed.
+    """
+    from prompt_toolkit.application import run_in_terminal
+
+    from .render import COLLAPSED_MESSAGES, expand_next_collapsed_message
+
+    if not COLLAPSED_MESSAGES.pending():
+        buffer = event.current_buffer
+        buffer.cursor_position += buffer.document.get_end_of_line_position()
+        return
+    # run_in_terminal suspends the prompt, prints the full message into
+    # scrollback like any other output, then redraws the composer.
+    run_in_terminal(lambda: expand_next_collapsed_message(console))
+
+
 def session_title_report(previous_title: str, current_title: str, model_name: str = "") -> str:
     """The rich-markup line the title command prints after a successful
     (re)generation. Extracted so it is unit-testable: the old inline version
@@ -862,9 +885,13 @@ def session_title_report(previous_title: str, current_title: str, model_name: st
     Every dynamic value is escaped -- a model- or user-chosen title may contain
     brackets (markdown, code, "[beta]") and would otherwise crash the same way.
     """
+    from .public_identity import public_model_name
+
     new_title = escape(str(current_title or ""))
+    # The recorded model is the catalog id that answered -- a deployment detail,
+    # so the report shows its public tier name instead.
     model_note = (
-        f" [dim]({escape(str(model_name))})[/dim]" if model_name else ""
+        f" [dim]({escape(public_model_name(model_name))})[/dim]" if model_name else ""
     )
     if previous_title and previous_title == current_title:
         detail = " [dim](unchanged -- that title already described this session)[/dim]"
@@ -1253,6 +1280,10 @@ async def _run_interactive_impl(
         paste_counter += 1
         pending_pastes[placeholder] = normalized
         event.current_buffer.insert_text(placeholder)
+
+    @bindings.add("c-e")
+    def _expand_collapsed_message(event) -> None:
+        expand_collapsed_or_end_of_line(event, console)
 
     def _prompt_message() -> HTML:
         # Keep the editable line clean, like Codex/Claude Code: mode and
@@ -1792,10 +1823,11 @@ async def _run_interactive_impl(
                 ))
             else:
                 reason = state_after.title_fallback_reason or "unknown"
-                routes = ", ".join(local_state.title_route_preference()) or "the configured providers"
+                tried = len(local_state.title_route_preference())
                 print_error(
                     console,
-                    f"Could not generate a session title ({reason}). Tried: {routes}. "
+                    f"Could not generate a session title ({reason}) after trying "
+                    f"{tried} route{'s' if tried != 1 else ''}. "
                     "Set one yourself with \"/regenerate-title <name>\"; it will retry on the next turn.",
                 )
             continue
@@ -1883,33 +1915,7 @@ async def _run_interactive_impl(
             # debug diagnostic scrolling past.
             route_lines = ""
             try:
-                diag = local_state.route_diagnostics(workspace.session_id)
-                current = diag.get("current") or {}
-                if current.get("provider"):
-                    route_lines += (
-                        f"\nroute={current.get('provider')}"
-                        + (f"/{current.get('model')}" if current.get("model") else "")
-                        + (f"  (was {current.get('from_provider')})"
-                           if current.get("from_provider")
-                           and current.get("from_provider") != current.get("provider") else "")
-                    )
-                last_exhaustion = diag.get("last_exhaustion") or {}
-                if last_exhaustion:
-                    route_lines += (
-                        f"\nexhausted={last_exhaustion.get('provider')}"
-                        f"  at={str(last_exhaustion.get('at') or '')[:19]}"
-                        f"  reason={str(last_exhaustion.get('reason') or '')[:160]}"
-                    )
-                for event in diag.get("failovers") or []:
-                    route_lines += (
-                        f"\nfailover={event.get('from_provider') or '?'} -> "
-                        f"{event.get('provider')}/{event.get('model')}"
-                        f"  at={str(event.get('at') or '')[:19]}"
-                        f"  reason={str(event.get('reason') or '')[:120]}"
-                    )
-                cooling = diag.get("cooling") or []
-                if cooling:
-                    route_lines += f"\ncooling={', '.join(cooling)}"
+                route_lines = local_state.public_route_status_lines(workspace.session_id)
             except Exception:
                 pass
 
@@ -1953,7 +1959,13 @@ async def _run_interactive_impl(
             # each one held it. The stored events answer "what route am I on";
             # the complaint they answer here is "why is this so slow / why did
             # it keep switching" -- which needs durations, not just names.
-            history = local_state.route_history(workspace.session_id)
+            # Every backend is branded ("TamfisGPT", "TamfisGPT (alt 2)", ...):
+            # the timeline stays readable without naming a provider or model.
+            from .public_identity import RouteLabeler
+
+            label = RouteLabeler()
+            report = local_state.public_route_report(workspace.session_id, label)
+            history = report.get("events") or []
             if not history:
                 console.print(
                     "[dim]No route recorded for this session yet -- run a task first.[/dim]"
@@ -1978,14 +1990,13 @@ async def _run_interactive_impl(
                     str(event.get("reason") or "")[:120],
                 )
             console.print(table)
-            totals = local_state.route_hold_totals(workspace.session_id)
+            totals = report.get("hold_totals") or []
             if totals:
                 console.print("[dim]held per route: " + "  ·  ".join(
-                    f"{provider} {seconds:.0f}s ({count})" for provider, seconds, count in totals
+                    f"{entry['provider']} {entry['held_seconds']:.0f}s ({entry['turns']})"
+                    for entry in sorted(totals, key=lambda item: item["held_seconds"], reverse=True)
                 ) + "[/dim]")
-            last_exhaustion = (local_state.route_diagnostics(workspace.session_id) or {}).get(
-                "last_exhaustion"
-            )
+            last_exhaustion = report.get("last_exhaustion")
             if last_exhaustion:
                 console.print(
                     "[yellow]Last account-level failure:[/yellow] "
@@ -1995,12 +2006,12 @@ async def _run_interactive_impl(
                         f"{str(last_exhaustion.get('reason') or '')[:200]}"
                     )
                 )
-            latency_lines = local_state.route_latency_lines(workspace.session_id)
+            latency_lines = local_state.route_latency_lines(workspace.session_id, label)
             if latency_lines:
                 console.print("[dim]response time per route (slowest first):[/dim]")
                 for line in latency_lines:
-                    console.print(f"  {line}")
-            cooling = local_state.cooling_route_names()
+                    console.print(f"  {escape(line)}")
+            cooling = report.get("cooling") or []
             if cooling:
                 console.print(f"[yellow]Cooling down (recent failures):[/yellow] {', '.join(cooling)}")
             console.print("[dim]/routes --json for the machine-readable report.[/dim]")

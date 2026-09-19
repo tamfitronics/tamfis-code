@@ -108,8 +108,8 @@ class RouteDiagnosticsTests(RouteEventFixture):
         self.assertEqual(
             state_module.route_status_line(1, include_current=False), "",
         )
-        # /status still wants the route itself.
-        self.assertEqual(state_module.route_status_line(1), "nvidia/nim-1")
+        # /status still wants the route itself -- in product vocabulary.
+        self.assertEqual(state_module.route_status_line(1), "TamfisGPT")
 
     def test_the_footer_line_reports_failover_and_exhaustion(self):
         state_module.save_session_state(1, workspace_root="/home")
@@ -120,9 +120,10 @@ class RouteDiagnosticsTests(RouteEventFixture):
             previous_provider="nvidia", reason="402", kind="failover",
         )
         line = state_module.route_status_line(1, include_current=False)
-        self.assertIn("nvidia → openrouter/owl", line)
         self.assertIn("1 failover", line)
         self.assertIn("exhausted", line)
+        for backend in ("nvidia", "openrouter", "owl", "nim-1"):
+            self.assertNotIn(backend, line.lower())
 
     def test_a_session_with_no_route_record_is_empty(self):
         state_module.save_session_state(9, workspace_root="/home")
@@ -264,12 +265,19 @@ class RouteReportJsonTests(RouteEventFixture):
             providers_module._PROVIDER_LATENCY.update(previous)
 
         self.assertEqual(report["session_id"], 1)
-        self.assertEqual(report["current"]["provider"], "nvidia")
+        # Branded: first route in the timeline is "TamfisGPT", the next
+        # distinct backend "TamfisGPT (alt 2)" -- no vendor name in the export.
+        self.assertEqual(report["current"]["provider"], "TamfisGPT (alt 2)")
         self.assertEqual(len(report["events"]), 3)
-        self.assertEqual(report["last_exhaustion"]["provider"], "tamfisgpt-ultra")
+        self.assertEqual(report["last_exhaustion"]["provider"], "TamfisGPT")
         held_providers = {entry["provider"] for entry in report["hold_totals"]}
-        self.assertEqual(held_providers, {"tamfisgpt-ultra", "nvidia"})
-        self.assertEqual(report["latency"]["nvidia"]["p50"], 30.0)
+        self.assertEqual(held_providers, {"TamfisGPT", "TamfisGPT (alt 2)"})
+        self.assertEqual(report["latency"]["TamfisGPT (alt 2)"]["p50"], 30.0)
+        blob = json.dumps(report)
+        # Case-sensitive on purpose: "TamfisGPT-Ultra" is the PUBLIC tier name
+        # the raw model id was mapped to, not a leak of the raw "tamfisgpt-ultra".
+        for backend in ("nvidia", "nim-1", "tamfisgpt-ultra"):
+            self.assertNotIn(backend, blob)
         # Every event carries the duration it held the task, for charting.
         self.assertIn("held_seconds", report["events"][0])
 
@@ -351,8 +359,11 @@ class FooterShowsRouteExceptionsTests(RouteEventFixture):
         bar = self._bar(1)
         self.assertIn("⟳", bar)
         self.assertIn("failover", bar)
-        self.assertIn("nvidia→openrouter", bar)
+        self.assertIn("rerouted", bar)
         self.assertIn("credits", bar)
+        # Owner ruling 2026-09-19: the footer must never name a backend.
+        for backend in ("nvidia", "openrouter", "owl", "nim-1"):
+            self.assertNotIn(backend, bar.lower())
         # The footer shares one terminal row with the title/mode/agents, so the
         # note is short by construction; the full wording stays in /status.
         note = state_module.route_status_compact(1)
@@ -388,6 +399,77 @@ class StatusBlockTests(RouteEventFixture):
         self.assertIn("route=nvidia", rendered)
         self.assertIn("exhausted=tamfisgpt-ultra", rendered)
         self.assertIn("failover=tamfisgpt-ultra -> nvidia", rendered)
+
+
+class FooterNeverShowsCoolingTests(RouteEventFixture):
+    """Cooling routes must never reach a user-visible footer/status note.
+
+    Live-reported: "⟳ · cooling: nvidia,ollama_cloud⠇" sitting in the footer
+    of a session that was working fine. A failed request briefly opens a
+    provider's 30s health circuit as part of NORMAL self-healing, so the
+    "cooling" label fires constantly, is not actionable, and steals footer
+    width from the title and mode. It belongs in /routes only.
+    """
+
+    def _open_circuits(self, providers_providers_module, names):
+        import time as time_module
+
+        for name in names:
+            providers_providers_module._ROUTE_HEALTH[(name, "*")] = (
+                providers_providers_module.RouteHealth(
+                    circuit_open_until=time_module.monotonic() + 300,
+                )
+            )
+
+    def test_the_footer_note_ignores_cooling_routes_entirely(self):
+        from tamfis_code import providers as providers_module
+
+        state_module.save_session_state(21, workspace_root="/home")
+        self._open_circuits(providers_module, ("nvidia", "ollama_cloud"))
+        try:
+            self.assertEqual(state_module.route_status_compact(21), "")
+            self.assertEqual(
+                state_module.route_status_line(21, include_current=False), "",
+            )
+            # /status's own line also stays free of the cooling noise.
+            self.assertNotIn("cooling", state_module.route_status_line(21))
+        finally:
+            providers_module._ROUTE_HEALTH.clear()
+
+    def test_cooling_does_not_dilute_a_real_failover_note(self):
+        from tamfis_code import providers as providers_module
+
+        state_module.save_session_state(22, workspace_root="/home")
+        state_module.record_route_event(22, provider="nvidia", model="nim-1")
+        state_module.record_route_event(
+            22, provider="openrouter", model="owl",
+            previous_provider="nvidia", reason="402", kind="failover",
+        )
+        self._open_circuits(providers_module, ("ollama_cloud",))
+        try:
+            note = state_module.route_status_compact(22)
+            self.assertIn("rerouted", note)
+            self.assertIn("1 failover", note)
+            self.assertNotIn("cooling", note)
+            self.assertNotIn("nvidia", note.lower())
+            self.assertNotIn("openrouter", note.lower())
+        finally:
+            providers_module._ROUTE_HEALTH.clear()
+
+    def test_routes_still_reports_cooling(self):
+        """The diagnostics surface keeps the detail; only the footer drops it."""
+        from tamfis_code import providers as providers_module
+
+        state_module.save_session_state(23, workspace_root="/home")
+        self._open_circuits(providers_module, ("nvidia",))
+        try:
+            diag = state_module.route_diagnostics(23)
+            self.assertIn("nvidia", diag["cooling"])
+            self.assertIn(
+                "nvidia", state_module.cooling_route_names(),
+            )
+        finally:
+            providers_module._ROUTE_HEALTH.clear()
 
 
 class SessionLatencyPersistenceTests(RouteEventFixture):
@@ -495,9 +577,10 @@ class SessionLatencyPersistenceTests(RouteEventFixture):
         payload = json.loads(state_module.route_report_json(5))
         self.assertEqual(payload["session_id"], 5)
         self.assertEqual(payload["latency_source"], "session")
-        self.assertEqual(payload["latency"]["nvidia"]["max"], 13.0)
-        self.assertEqual(payload["latency"]["nvidia"]["failures"], 1)
-        self.assertEqual(payload["current"]["provider"], "nvidia")
+        self.assertEqual(payload["latency"]["TamfisGPT"]["max"], 13.0)
+        self.assertEqual(payload["latency"]["TamfisGPT"]["failures"], 1)
+        self.assertEqual(payload["current"]["provider"], "TamfisGPT")
+        self.assertNotIn("nvidia", state_module.route_report_json(5).lower())
         # sorted keys + indented, so a diff of two exports is readable.
         self.assertIn('\n  "latency"', state_module.route_report_json(5))
 
@@ -526,3 +609,65 @@ class SessionLatencyPersistenceTests(RouteEventFixture):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+class PublicRouteSurfaceTests(RouteEventFixture):
+    """/status and /routes go through the same vendor-free branding as the
+    footer: no provider or catalog model id ever reaches the user."""
+
+    def _failed_over_session(self):
+        state_module.save_session_state(31, workspace_root="/home")
+        state_module.record_route_event(31, provider="nvidia", model="nvidia/nemotron-3-super-120b-a12b")
+        state_module.record_route_error(
+            31, provider="nvidia",
+            error="Error code: 429 - nvidia weekly usage limit, ollama_cloud also cooling",
+        )
+        state_module.record_route_event(
+            31, provider="ollama_cloud", model="kimi-k3:cloud",
+            previous_provider="nvidia", reason="429 from nvidia", kind="failover",
+        )
+        state_module.record_route_event(
+            31, provider="hf", model="Qwen/Qwen3.6-35B-A3B",
+            previous_provider="ollama_cloud", reason="quota", kind="failover",
+        )
+
+    def test_status_route_block_names_no_backend(self):
+        self._failed_over_session()
+        block = state_module.public_route_status_lines(31)
+        self.assertIn("route=TamfisGPT (alt 3)", block)
+        self.assertIn("failover=TamfisGPT -> TamfisGPT (alt 2)", block)
+        for backend in ("nvidia", "ollama", "hf", "qwen", "kimi", "nemotron"):
+            self.assertNotIn(backend, block.lower())
+
+    def test_report_labels_follow_the_order_the_task_moved(self):
+        self._failed_over_session()
+        report = state_module.public_route_report(31)
+        self.assertEqual(
+            [entry["provider"] for entry in report["hold_totals"]],
+            ["TamfisGPT", "TamfisGPT (alt 2)", "TamfisGPT (alt 3)"],
+        )
+        blob = str(report).lower()
+        for backend in ("nvidia", "ollama", "'hf'", "qwen", "kimi", "nemotron"):
+            self.assertNotIn(backend, blob)
+
+    def test_the_same_backend_always_gets_the_same_label(self):
+        from tamfis_code.public_identity import RouteLabeler
+
+        label = RouteLabeler()
+        self.assertEqual(label("nvidia"), "TamfisGPT")
+        self.assertEqual(label("Ollama_Cloud"), "TamfisGPT (alt 2)")
+        self.assertEqual(label("NVIDIA"), "TamfisGPT")
+        self.assertEqual(label(""), "")
+
+    def test_the_footer_note_after_a_double_failover_is_vendor_free(self):
+        self._failed_over_session()
+        note = state_module.route_status_compact(31)
+        self.assertEqual(note, "⟳ rerouted · credits · 2 failovers")
+        self.assertLessEqual(len(note), 56)
+
+    def test_an_exhausted_route_with_no_failover_says_the_route_is_down(self):
+        state_module.save_session_state(32, workspace_root="/home")
+        state_module.record_route_error(32, provider="nvidia", error="402 credits")
+        note = state_module.route_status_compact(32)
+        self.assertTrue(note.startswith("⟳ route down"))
+        self.assertNotIn("nvidia", note.lower())

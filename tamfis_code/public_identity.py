@@ -252,6 +252,32 @@ def _brand_route_sequence(items: Any) -> list[str]:
     return branded
 
 
+class RouteLabeler:
+    """Vendor-free labels for the routes named in ONE report.
+
+    A route timeline is only readable if two different backends stay visibly
+    different, so this hands out "TamfisGPT", "TamfisGPT (alt 2)", ... in
+    first-seen order and always returns the same label for the same raw value
+    (case-insensitively). One instance per report/command keeps every table,
+    total and JSON field in that report consistent with each other; no real
+    provider name ever comes out.
+    """
+
+    def __init__(self) -> None:
+        self._labels: dict[str, str] = {}
+
+    def __call__(self, raw: Any) -> str:
+        key = str(getattr(raw, "value", raw) or "").strip().lower()
+        if not key:
+            return ""
+        if key not in self._labels:
+            self._labels[key] = (
+                PUBLIC_PROVIDER_NAME if not self._labels
+                else f"{PUBLIC_PROVIDER_NAME} (alt {len(self._labels) + 1})"
+            )
+        return self._labels[key]
+
+
 def redact_routing_text(value: Any) -> str:
     """Redact backend names from internal status/error text before display.
 

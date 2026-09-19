@@ -1067,3 +1067,144 @@ class StreamRendererTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class CollapsedMessageTests(unittest.TestCase):
+    """The "N more chars -- press Ctrl+E to show full message" contract.
+
+    Live-reported: the collapse UI did not work. Two causes: (1) the queue lived
+    on a per-turn renderer, so once the turn ended the hint in scrollback led
+    nowhere (and the idle prompt had no Ctrl+E binding at all); (2) entries were
+    keyed by list position, which shifted whenever the list was pruned.
+    """
+
+    def setUp(self):
+        from tamfis_code.render import COLLAPSED_MESSAGES
+
+        COLLAPSED_MESSAGES.clear()
+        self.addCleanup(COLLAPSED_MESSAGES.clear)
+
+    def _long(self, tag="A", size=1200):
+        return f"{tag}-start " + ("lorem ipsum " * size)
+
+    def test_a_long_assistant_message_prints_a_hint_and_expands_in_full(self):
+        from tamfis_code.render import _MESSAGE_COLLAPSE_THRESHOLD
+
+        console = _console()
+        renderer = StreamRenderer(console)
+        body = self._long()
+        renderer._collapse_or_print_assistant(body)
+        shown = console.file.getvalue()
+        self.assertIn("more chars", shown)
+        self.assertIn("Ctrl+E", shown)
+        self.assertEqual(renderer._collapsed.pending(), 1)
+
+        before = len(shown)
+        self.assertTrue(renderer.expand_next_collapsed_message())
+        expanded = console.file.getvalue()[before:]
+        self.assertIn("Assistant (full)", expanded)
+        self.assertIn("show less", expanded)
+        # Content past the collapse point is only present after expanding.
+        self.assertGreater(len(expanded), _MESSAGE_COLLAPSE_THRESHOLD)
+        self.assertEqual(renderer._collapsed.pending(), 0)
+
+    def test_a_short_message_is_never_collapsed(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer._collapse_or_print_assistant("short answer")
+        self.assertNotIn("more chars", console.file.getvalue())
+        self.assertEqual(renderer._collapsed.pending(), 0)
+        self.assertFalse(renderer.expand_next_collapsed_message())
+
+    def test_a_message_collapsed_in_an_earlier_turn_still_expands_afterwards(self):
+        """The reported bug: the renderer is rebuilt every turn, so a per-
+        renderer queue was gone by the time anyone pressed Ctrl+E."""
+        from tamfis_code.render import expand_next_collapsed_message
+
+        first = StreamRenderer(_console())
+        first._collapse_or_print_assistant(self._long("FIRST"))
+        first.conclude("completed")  # turn ends -> _forget_collapsed()
+
+        # Idle prompt: no renderer of its own, just a console.
+        idle_console = _console()
+        self.assertTrue(expand_next_collapsed_message(idle_console))
+        self.assertIn("FIRST-start", idle_console.file.getvalue())
+
+    def test_repeated_expands_walk_back_newest_first_and_never_repeat(self):
+        from tamfis_code.render import expand_next_collapsed_message
+
+        renderer = StreamRenderer(_console())
+        for tag in ("ONE", "TWO", "THREE"):
+            renderer._collapse_or_print_assistant(self._long(tag))
+        seen = []
+        for _ in range(3):
+            console = _console()
+            self.assertTrue(expand_next_collapsed_message(console))
+            out = console.file.getvalue()
+            seen.append(next(tag for tag in ("ONE", "TWO", "THREE") if f"{tag}-start" in out))
+        self.assertEqual(seen, ["THREE", "TWO", "ONE"])
+        self.assertFalse(expand_next_collapsed_message(_console()))
+
+    def test_pruning_never_resurrects_an_expanded_message_or_skips_a_pending_one(self):
+        """The position-keyed scheme broke here: pruning shifted the indexes."""
+        from tamfis_code.render import expand_next_collapsed_message
+
+        renderer = StreamRenderer(_console())
+        renderer._collapse_or_print_assistant(self._long("OLD"))
+        renderer._collapse_or_print_assistant(self._long("MID"))
+        console = _console()
+        expand_next_collapsed_message(console)  # MID expanded
+        self.assertIn("MID-start", console.file.getvalue())
+        renderer.conclude("completed")  # prune: MID is dropped, OLD kept
+
+        renderer2 = StreamRenderer(_console())
+        renderer2._collapse_or_print_assistant(self._long("NEW"))
+        order = []
+        for _ in range(2):
+            console = _console()
+            expand_next_collapsed_message(console)
+            out = console.file.getvalue()
+            order.append(next(tag for tag in ("OLD", "MID", "NEW") if f"{tag}-start" in out))
+        self.assertEqual(order, ["NEW", "OLD"])
+        self.assertFalse(expand_next_collapsed_message(_console()))
+
+    def test_the_queue_is_bounded(self):
+        from tamfis_code.render import COLLAPSED_MESSAGES, _COLLAPSED_QUEUE_RETENTION
+
+        renderer = StreamRenderer(_console())
+        for index in range(_COLLAPSED_QUEUE_RETENTION * 5):
+            renderer._collapse_or_print_assistant(self._long(f"M{index}", size=200))
+        self.assertLessEqual(len(COLLAPSED_MESSAGES._items), _COLLAPSED_QUEUE_RETENTION * 2)
+        renderer.conclude("completed")
+        self.assertLessEqual(COLLAPSED_MESSAGES.pending(), _COLLAPSED_QUEUE_RETENTION)
+
+    def test_idle_ctrl_e_expands_a_pending_message(self):
+        from unittest.mock import MagicMock, patch
+
+        from tamfis_code.interactive import expand_collapsed_or_end_of_line
+
+        StreamRenderer(_console())._collapse_or_print_assistant(self._long("IDLE"))
+        console = _console()
+        event = MagicMock()
+        # run_in_terminal needs a live prompt_toolkit app; run its callable inline.
+        with patch("prompt_toolkit.application.run_in_terminal", side_effect=lambda fn: fn()):
+            expand_collapsed_or_end_of_line(event, console)
+        self.assertIn("IDLE-start", console.file.getvalue())
+        event.current_buffer.assert_not_called()
+
+    def test_idle_ctrl_e_with_nothing_collapsed_keeps_end_of_line(self):
+        from prompt_toolkit.buffer import Buffer
+        from prompt_toolkit.document import Document
+        from unittest.mock import MagicMock
+
+        from tamfis_code.interactive import expand_collapsed_or_end_of_line
+
+        buffer = Buffer()
+        buffer.document = Document("hello world", cursor_position=0)
+        event = MagicMock()
+        event.current_buffer = buffer
+        console = _console()
+        expand_collapsed_or_end_of_line(event, console)
+        self.assertEqual(buffer.cursor_position, len("hello world"))
+        self.assertEqual(console.file.getvalue(), "")

@@ -1648,6 +1648,11 @@ def build_vision_content_blocks(paths: list[str]) -> list[dict[str, Any]]:
 
 def _same_route_reconnectable(manager: Any, exc: Exception) -> bool:
     """Retry transient transport/capacity faults, never account failures."""
+    # A streaming source that KNOWS the failure class (e.g. the injected
+    # stream in tests, or a wrapper that already decided) can mark the error
+    # directly; this beats classification and keeps the decision in one place.
+    if getattr(exc, "same_route_reconnectable", None) is False:
+        return False
     if not hasattr(manager, "is_retryable_provider_error"):
         return False
     if not manager.is_retryable_provider_error(exc):

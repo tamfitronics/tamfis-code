@@ -144,6 +144,32 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         self.assertEqual(title, "Fix Image & Video Workspace")
         self.assertNotEqual(title, objective[:len(title)])  # not a truncation
 
+    def test_titles_only_ever_call_free_nim_and_never_fall_back_to_paid_routes(self):
+        """Owner ruling 2026-09-19: an auto-title must not spend Ollama Cloud
+        or Hugging Face credit. Every attempt is pinned to NVIDIA NIM, names an
+        explicit NIM model, and disables the machinery's cross-provider
+        fallback -- so a failure moves to the next NIM model, never off NIM."""
+        from tamfis_code.providers import ProviderType
+
+        state_module.save_session_state(1, workspace_root="/a")
+        calls = self._upgrade(ConnectionError("boom"))
+        self.assertEqual(len(calls), state_module._TITLE_MAX_MACHINERY_ATTEMPTS)
+        for call in calls:
+            self.assertEqual(call["provider"], ProviderType.NVIDIA)
+            self.assertIs(call["allow_fallback"], False)
+            self.assertIn(call["model"], state_module._TITLE_NIM_MODELS)
+        # ...and each retry walks to a DIFFERENT free model.
+        self.assertEqual(
+            [call["model"] for call in calls],
+            list(state_module._TITLE_NIM_MODELS)[: len(calls)],
+        )
+
+    def test_no_metered_provider_is_reachable_from_the_title_path(self):
+        joined = " ".join(state_module._TITLE_NIM_MODELS).lower()
+        for metered in ("ollama", "huggingface", "hf.co", "openrouter", ":cloud"):
+            self.assertNotIn(metered, joined)
+        self.assertFalse(hasattr(state_module, "_TITLE_PROVIDER_PREFERENCE"))
+
     def test_provenance_is_persisted_on_success(self):
         state_module.save_session_state(1, workspace_root="/a")
         self._upgrade("Fix flaky auth test")
@@ -258,19 +284,36 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
 
 
 class DisplayFallbackTests(_StateDirFixture, unittest.TestCase):
-    def test_display_falls_back_to_a_transient_activity_label_not_a_title(self):
-        """Before the LLM title lands, the resume picker shows a live
-        activity snapshot -- never persisted as session_title."""
+    def test_display_never_shows_the_prompt_as_a_mechanical_title(self):
+        """Owner ruling 2026-09-19: no mechanical title anywhere, not even a
+        display fallback. Before the LLM title lands the session is the neutral
+        "Session N" -- the first words of the request must never stand in."""
         state_module.save_session_state(
             1, workspace_root="/a",
             active_task={"objective": "Fix the flaky auth test", "task_id": "t1"},
         )
         self.assertEqual(state_module.get_session_state(1).session_title, "")
-        self.assertEqual(
-            state_module.session_display_title(1), "Fix the flaky auth test",
+        self.assertEqual(state_module.session_display_title(1), "Session 1")
+
+    def test_display_shows_the_llm_title_once_it_exists(self):
+        state_module.save_session_state(
+            1, workspace_root="/a",
+            active_task={"objective": "Fix the flaky auth test", "task_id": "t1"},
         )
-        # ...and the fallback is transient: still no persisted title.
-        self.assertEqual(state_module.get_session_state(1).session_title, "")
+        state = state_module.get_session_state(1)
+        state.session_title = "Fix Flaky Auth Test"
+        state_module.put_session_state(state)
+        self.assertEqual(state_module.session_display_title(1), "Fix Flaky Auth Test")
+
+    def test_the_activity_label_still_describes_what_the_session_is_doing(self):
+        """best_effort_session_label remains for the resume picker's DETAIL
+        line ("what is it doing"); it is just never the session's NAME."""
+        state_module.save_session_state(
+            1, workspace_root="/a",
+            active_task={"objective": "Fix the flaky auth test", "task_id": "t1"},
+        )
+        label = state_module.best_effort_session_label(state_module.get_session_state(1))
+        self.assertEqual(label, "Fix the flaky auth test")
 
     def test_unknown_session_gets_the_generic_label(self):
         self.assertEqual(state_module.session_display_title(999), "Session 999")

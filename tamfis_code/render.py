@@ -213,6 +213,81 @@ _MESSAGE_COLLAPSE_THRESHOLD = 500
 _COLLAPSED_QUEUE_RETENTION = 8
 
 
+class CollapsedMessageStore:
+    """Long messages that were shown collapsed and can still be expanded.
+
+    Process-wide on purpose (see COLLAPSED_MESSAGES): the REPL builds a NEW
+    StreamRenderer for every turn, so a queue owned by the renderer died with
+    its turn -- the "press Ctrl+E to show full message" hint sat in scrollback
+    and the idle prompt, which has no renderer of its own, had nothing to
+    expand. Entries carry their own `expanded` flag; the old scheme keyed them
+    by list position, which shifted whenever the list was pruned, so an
+    already-expanded message could come back or a different one be skipped.
+    """
+
+    def __init__(self, retention: int = _COLLAPSED_QUEUE_RETENTION) -> None:
+        self._retention = retention
+        self._items: list[dict[str, Any]] = []
+
+    def add(self, kind: str, content: str) -> None:
+        self._items.append({"kind": kind, "content": content, "expanded": False})
+        # Hard cap on every add, not only at turn end: a single long turn can
+        # print many collapsed messages, and each holds a full body.
+        if len(self._items) > self._retention * 2:
+            self.prune()
+
+    def prune(self) -> None:
+        """Drop fully-shown entries and keep only the newest few unexpanded ones."""
+        self._items = [item for item in self._items if not item["expanded"]][-self._retention:]
+
+    def pending(self) -> int:
+        return sum(1 for item in self._items if not item["expanded"])
+
+    def take_next(self) -> Optional[tuple[str, str]]:
+        """(kind, full_content) of the newest still-collapsed message, marking
+        it expanded; None when nothing is waiting."""
+        for item in reversed(self._items):
+            if not item["expanded"]:
+                item["expanded"] = True
+                return item["kind"], item["content"]
+        return None
+
+    def clear(self) -> None:
+        self._items = []
+
+
+COLLAPSED_MESSAGES = CollapsedMessageStore()
+
+
+def expand_next_collapsed_message(console: Any, store: Optional[CollapsedMessageStore] = None) -> bool:
+    """Print the newest still-collapsed message in full to `console`.
+
+    Shared by the mid-task Ctrl+E binding (live_input.py, via the renderer) and
+    the idle-prompt binding (interactive.py). Returns False, printing nothing,
+    when there is nothing to expand so the caller can keep the key's normal
+    behaviour.
+    """
+    taken = (store or COLLAPSED_MESSAGES).take_next()
+    if taken is None:
+        return False
+    kind, content = taken
+    console.print()
+    if kind == "assistant":
+        console.print(Panel(
+            Markdown(content),
+            title="Assistant (full)",
+            border_style="cyan",
+            expand=False,
+            padding=(0, 1),
+        ))
+    else:
+        console.print("[bold green]You (full)[/bold green]")
+        console.print(Text(content))
+    console.print("[dim]· show less (message above is the full content)[/dim]")
+    console.print()
+    return True
+
+
 def _current_tip(elapsed: float) -> Optional[str]:
     if elapsed < _TIP_START_AFTER_SECONDS or not _TIPS:
         return None
@@ -586,8 +661,9 @@ class StreamRenderer:
         # walks back through older collapsed messages instead of reprinting
         # the same one. LIFO matches user expectation: expand what you just
         # read, then keep going back.
-        self._collapsed_messages: list[tuple[str, str]] = []  # (kind, full_content), newest last
-        self._expanded_message_keys: set[str] = set()
+        # The queue itself is the process-wide COLLAPSED_MESSAGES store, so it
+        # outlives this per-turn renderer.
+        self._collapsed = COLLAPSED_MESSAGES
 
         # Live task-visibility status line -- gated on the console actually
         # being a TTY so redirected/piped output (`tamfis-code agent "..." >
@@ -1260,7 +1336,7 @@ class StreamRenderer:
     def _collapse_or_print_assistant(self, rendered_markdown: str) -> None:
         """Print a finished assistant message, collapsing it behind a
         'show more' hint when it exceeds the threshold. The full content is
-        remembered on _collapsed_messages so Ctrl+E (live_input.py) can
+        remembered in COLLAPSED_MESSAGES so Ctrl+E (live_input.py / the idle prompt) can
         re-render it in full on demand -- a real expand action, not a dead
         hyperlink (terminal links cannot call back into this process)."""
         if len(rendered_markdown) > _MESSAGE_COLLAPSE_THRESHOLD:
@@ -1273,7 +1349,7 @@ class StreamRenderer:
                 padding=(0, 1),
             ))
             remaining = len(rendered_markdown) - _MESSAGE_COLLAPSE_THRESHOLD
-            self._collapsed_messages.append(("assistant", rendered_markdown))
+            self._collapsed.add("assistant", rendered_markdown)
             self.console.print(
                 f"[dim]· {remaining:,} more chars — press Ctrl+E to show full message[/dim]"
             )
@@ -1296,49 +1372,16 @@ class StreamRenderer:
         most recent few, so a long session cannot accumulate an unbounded
         history of full message bodies in memory.
         """
-        kept = self._collapsed_messages[-_COLLAPSED_QUEUE_RETENTION:]
-        offset = len(self._collapsed_messages) - len(kept)
-        fresh = []
-        for offset_i, (kind, content) in enumerate(kept):
-            index = offset + offset_i
-            key = f"{index}:{len(content)}:{content[:64]}"
-            if key not in self._expanded_message_keys:
-                fresh.append((kind, content))
-        self._collapsed_messages = fresh
+        self._collapsed.prune()
 
     def expand_next_collapsed_message(self) -> bool:
         """Re-render the newest still-collapsed message in full (Ctrl+E).
 
         Returns True when something was expanded so the keybinding can give
-        feedback on an empty queue. Already-expanded entries stay in the
-        list (marked) so repeat presses walk back through older messages;
-        the list itself is trimmed in _forget_collapsed when its turn ends.
+        feedback on an empty queue. Repeat presses walk back through older
+        messages; the queue is trimmed in _forget_collapsed when the turn ends.
         """
-        while self._collapsed_messages:
-            # Newest first; find the newest entry not yet expanded.
-            for index in range(len(self._collapsed_messages) - 1, -1, -1):
-                kind, content = self._collapsed_messages[index]
-                key = f"{index}:{len(content)}:{content[:64]}"
-                if key in self._expanded_message_keys:
-                    continue
-                self._expanded_message_keys.add(key)
-                self.console.print()
-                if kind == "assistant":
-                    self.console.print(Panel(
-                        Markdown(content),
-                        title="Assistant (full)",
-                        border_style="cyan",
-                        expand=False,
-                        padding=(0, 1),
-                    ))
-                else:
-                    self.console.print("[bold green]You (full)[/bold green]")
-                    self.console.print(Text(content))
-                self.console.print("[dim]· show less (message above is the full content)[/dim]")
-                self.console.print()
-                return True
-            return False
-        return False
+        return expand_next_collapsed_message(self.console, self._collapsed)
 
     def _close_assistant(self) -> None:
         if self._assistant_open:
@@ -1425,7 +1468,7 @@ class StreamRenderer:
                     shown = content[:_MESSAGE_COLLAPSE_THRESHOLD]
                     self.console.print(Text(shown), end="")
                     remaining = len(content) - _MESSAGE_COLLAPSE_THRESHOLD
-                    self._collapsed_messages.append(("user", content))
+                    self._collapsed.add("user", content)
                     self.console.print(
                         f"\n[dim]· {remaining:,} more chars — press Ctrl+E to show full message[/dim]"
                     )

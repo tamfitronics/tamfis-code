@@ -53,16 +53,30 @@ _TITLE_ATTEMPT_TIMEOUT_SECONDS = 20
 # Bounded redraws when a route answers with an empty stream (no exception
 # raised, so the machinery itself has nothing to fall back from).
 _TITLE_MAX_MACHINERY_ATTEMPTS = 3
-# Preferred routes for the title call, tried in order through the full
-# machinery (so route health, key rotation, and cross-provider fallback
-# all still apply within each attempt). Live-probed 2026-09 against the
-# real title prompt: OpenRouter returned a correct semantic title, HF's
-# Qwen route returned content=None (an EMPTY stream with HTTP 200 --
-# which the machinery correctly treats as success and therefore never
-# falls back from), NVIDIA NIM timed out, Ollama Cloud was 429'd.
-# OpenRouter first because titles are worth the one route that verifiably
-# answers; a provider not in clients is simply skipped.
-_TITLE_PROVIDER_PREFERENCE = ("openrouter", "grok", "nvidia", "hf", "ollama_cloud")
+# Title routes: NVIDIA NIM ONLY, walked model by model. Owner ruling
+# 2026-09-19: an auto-title is a background nicety and must never spend
+# Ollama Cloud, Hugging Face, or any other metered credit -- NIM is the free,
+# tool-calling tier, and every model below is answered by it. The call pins
+# ProviderType.NVIDIA with allow_fallback=False, so the machinery's
+# cross-provider fallback cannot wander off to a paid route; NIM key rotation
+# (several free accounts) still applies inside that one provider.
+#
+# Live-probed 2026-09-19 against integrate.api.nvidia.com with the real title
+# prompt, one request at a time (native tool_calls confirmed on each):
+#   nemotron-3-ultra-550b-a55b   1.2s  clean title
+#   nemotron-3-super-120b-a12b   4.4s  answers (reasoning_effort=low keeps the
+#                                      chain-of-thought out of the content)
+#   nemotron-3.5-lightning-30b   17s   answers, slow -- last resort
+# Not usable right now, so deliberately absent: qwen3-coder-480b and
+# qwen2.5-coder-32b (410 Gone, end-of-life), devstral / codestral-22b /
+# nemotron-nano-3 / granite-34b-code (404, listed but not deployed),
+# deepseek-v4-flash-0731 (~60s, longer than the whole title budget),
+# kimi-k3 / glm-5.3(-flash) / gpt-oss-20b (timed out).
+_TITLE_NIM_MODELS = (
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "nvidia/nemotron-3-super-120b-a12b",
+    "nvidia/nemotron-3.5-lightning-30b-a3b",
+)
 
 STATE_PATH = CONFIG_DIR / "state.json"
 _VOLATILE_STATE: dict[tuple[str, int], "SessionState"] = {}
@@ -1131,7 +1145,7 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     from datetime import datetime, timezone
     state.title_generated_at = datetime.now(timezone.utc).isoformat()
     put_session_state(state)
-    print(f"[title] accepted {title!r} via {model_used or 'unknown'}", file=sys.stderr)
+    print(f"[title] accepted {title!r}", file=sys.stderr)
 
 
 # --------------------------------------------------------------------------
@@ -1394,8 +1408,8 @@ async def _generate_session_title(
     messages: list, route_offset: int = 0,
 ) -> tuple[str, str, str]:
     """Generate a session title via the providers system's OWN routing
-    machinery (ProviderManager.chat_completion with AUTO + built-in
-    cross-provider fallback).
+    machinery (ProviderManager.chat_completion pinned to NVIDIA NIM, walking
+    _TITLE_NIM_MODELS -- free routes only, no cross-provider fallback).
 
     The previous implementation hand-rolled a per-provider loop calling
     each client directly -- bypassing route-health circuits, key rotation,
@@ -1430,31 +1444,32 @@ async def _generate_session_title(
         print(f"[title] ProviderManager construction failed, title not generated: {exc}", file=sys.stderr)
         return "", "", "routing_failure"
 
-    # Resolve the preferred provider order through the ProviderType enum;
-    # unknown names are skipped, unavailable clients fall through inside
-    # chat_completion's own machinery (health circuits, key rotation,
-    # cross-provider fallback all still apply per attempt).
-    available = {pt.value: pt for pt in ProviderType}
-    preferred = [
-        available[name] for name in _TITLE_PROVIDER_PREFERENCE if name in available
-    ] or [ProviderType.AUTO]
+    # NIM only, one model per attempt (see _TITLE_NIM_MODELS). Pinning
+    # ProviderType.NVIDIA with allow_fallback=False is what keeps a title from
+    # ever spending Ollama Cloud / Hugging Face / OpenRouter credit: a failed
+    # attempt moves to the NEXT free NIM model here, never to another provider.
+    # Key rotation across the configured NIM accounts still happens inside
+    # chat_completion.
+    provider = ProviderType.NVIDIA
+    models = list(_TITLE_NIM_MODELS)
 
     last_reason = "empty_response"
     model_used = ""
     content = ""
     for attempt in range(1, _TITLE_MAX_MACHINERY_ATTEMPTS + 1):
-        provider = preferred[(attempt - 1 + max(0, route_offset)) % len(preferred)]
+        model = models[(attempt - 1 + max(0, route_offset)) % len(models)]
         chunks: list[str] = []
         # Per-attempt try, not one try around the whole loop. Live-measured
         # 2026-09-19: a single route raising (dead socket, 429, SDK error)
-        # aborted EVERY remaining preferred route and returned
-        # provider_error with no title, while the very next route answered
-        # fine -- exactly the "one bad provider decides the session stays
-        # unnamed" failure this ordering exists to avoid.
+        # aborted EVERY remaining route and returned provider_error with no
+        # title, while the very next route answered fine -- exactly the "one
+        # bad model decides the session stays unnamed" failure this rotation
+        # exists to avoid.
         try:
             async for chunk in manager.chat_completion(
                 provider,
                 messages,
+                model=model,
                 stream=False,
                 temperature=0.3,
                 # Generous on purpose: reasoning models can burn tokens
@@ -1466,33 +1481,33 @@ async def _generate_session_title(
                 # emit the title.
                 max_tokens=600,
                 reasoning_effort="low",
-                # Cap EACH route attempt at 30s so the machinery's
-                # cross-provider fallback actually fits inside
-                # TITLE_UPGRADE_TIMEOUT_SECONDS.
+                allow_fallback=False,
+                # Cap EACH route attempt at 20s so every NIM model gets a
+                # turn inside TITLE_UPGRADE_TIMEOUT_SECONDS.
                 timeout=_TITLE_ATTEMPT_TIMEOUT_SECONDS,
             ):
                 chunks.append(str(chunk or ""))
         except Exception as exc:
             last_reason = "provider_error"
             print(
-                f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS} via "
-                f"{provider.value} failed ({type(exc).__name__}: {str(exc)[:120]}), "
+                f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS} "
+                f"failed ({type(exc).__name__}: {_redacted(str(exc))[:120]}), "
                 "trying next preferred route",
                 file=sys.stderr,
             )
             continue
         content = "".join(chunks).strip()
         if content:
-            # Report the route that ACTUALLY answered, not a generic
-            # "auto": the provenance field is what /regenerate-title and
-            # session_title_diagnostics show, and "which model named this
-            # session" is exactly the question a bad title raises.
-            model_used = provider.value
+            # Report the model that ACTUALLY answered: the provenance field is
+            # what /regenerate-title and session_title_diagnostics show, and
+            # "which model named this session" is exactly the question a bad
+            # title raises.
+            model_used = model
             break
         last_reason = "empty_response"
         print(
-            f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS} via "
-            f"{provider.value}: empty response, trying next preferred route",
+            f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS}: "
+            "empty response, trying next preferred route",
             file=sys.stderr,
         )
 
@@ -1714,6 +1729,13 @@ _TRIVIAL_ACTIVITY_LABELS = frozenset({
 })
 
 
+def _redacted(text: str) -> str:
+    """Backend names out of a diagnostic line that lands on a user's terminal."""
+    from .public_identity import redact_routing_text
+
+    return redact_routing_text(text)
+
+
 def _one_line_label(text: str) -> str:
     """Collapse a multi-line seed onto one display line, hard-capped.
     Pure display hygiene -- no word selection, no title semantics."""
@@ -1725,14 +1747,20 @@ def _one_line_label(text: str) -> str:
 
 def session_display_title(session_id: int) -> str:
     """Stable display name for a session, for the resume picker, the
-    `sessions` listing, and the persistent footer. Prefers the persisted
-    session_title (set once, from the first completed turn); before that
-    exists, falls back to best_effort_session_label's live snapshot of
-    current activity, and only when even that is empty (a session with
-    nothing recorded yet) to a generic "Session N" label.
+    `sessions` listing, and the persistent footer.
+
+    The name is the LLM-written session_title (or the user's own rename) and
+    nothing else. Owner ruling 2026-09-19: NO mechanical title anywhere, not
+    even as a display fallback -- the old fallback showed the first ~60
+    characters of the prompt in the footer, which is exactly the "first few
+    words of the request" label the LLM title exists to replace. Until the LLM
+    title lands (it is generated when the first turn completes, and retried on
+    every later turn if the routes were down) the session shows the neutral
+    "Session N". What the session is doing right now is a different question,
+    answered by best_effort_session_label for the resume picker's DETAIL line.
     """
     state = get_session_state(session_id)
-    return state.session_title or best_effort_session_label(state) or f"Session {session_id}"
+    return state.session_title or f"Session {session_id}"
 
 
 def session_has_recorded_activity(state: SessionState) -> bool:
@@ -1790,10 +1818,10 @@ def is_substantive_objective(text: str) -> bool:
 
 
 def title_route_preference() -> list[str]:
-    """The provider routes a title attempt walks, in order -- surfaced in the
-    failure message so a failed /regenerate-title names what it tried instead
-    of reporting an opaque reason."""
-    return list(_TITLE_PROVIDER_PREFERENCE)
+    """The NIM models a title attempt walks, in order. Internal provenance
+    only: callers that show a user something must count them or brand them
+    (see public_identity), never print these ids."""
+    return list(_TITLE_NIM_MODELS)
 
 
 def request_session_title_regeneration(session_id: int) -> bool:
@@ -1970,41 +1998,35 @@ def cooling_route_names() -> list[str]:
 def route_status_line(
     session_id: int, *, include_current: bool = True, max_chars: int = 0,
 ) -> str:
-    """One compact route line: which route is live plus how it got there, e.g.
-    "tamfisgpt-ultra → nvidia/nim-1 · 1 failover · tamfisgpt-ultra exhausted
-    (credits/quota)".
+    """One compact route line in product vocabulary, e.g.
+    "TamfisGPT · 1 failover · route exhausted (credits/quota)".
+
+    Provider and model names are deployment details and never appear here
+    (owner ruling 2026-09-19: a footer reading "nvidia→ollama_cloud · 2
+    failovers" exposed the backends). What the user needs is that the route
+    changed, how often, and whether one ran out of credit -- the per-route
+    detail is in /routes, which brands each backend as "TamfisGPT (alt N)".
 
     The persistent footer already names the current model, so it passes
-    `include_current=False` and gets ONLY the exceptions -- a failover, an
-    exhausted route, or routes cooling down -- which is the information that
-    was previously invisible outside --debug.
+    `include_current=False` and gets ONLY the durable exceptions -- a
+    failover or an exhausted route. (Transient provider circuits cooling down
+    are /routes material, not footer material -- see route_status_compact.)
     """
+    from .public_identity import PUBLIC_PROVIDER_NAME
+
     diag = route_diagnostics(session_id)
     current = diag.get("current") or {}
-    provider = str(current.get("provider") or "")
     count = len(diag.get("failovers") or [])
     last_exhaustion = diag.get("last_exhaustion") or {}
-    cooling = diag.get("cooling") or []
-    if not provider and not last_exhaustion:
+    if not current.get("provider") and not last_exhaustion:
         return ""
-    if not include_current and not count and not last_exhaustion and not cooling:
+    if not include_current and not count and not last_exhaustion:
         return ""
-    label = f"{provider}/{current.get('model')}" if provider and current.get("model") else provider
-    if not label and last_exhaustion:
-        label = str(last_exhaustion.get("provider") or "")
-    previous = str(current.get("from_provider") or "")
-    if previous and provider and previous != provider:
-        label = f"{previous} → {label}"
+    label = PUBLIC_PROVIDER_NAME
     if count:
         label += f" · {count} failover{'s' if count != 1 else ''}"
     if last_exhaustion:
-        exhausted_by = str(last_exhaustion.get("provider") or "")
-        label += (
-            f" · {exhausted_by} exhausted (credits/quota)" if exhausted_by
-            else " · credits/quota exhausted"
-        )
-    if cooling:
-        label += f" · cooling: {', '.join(cooling)}"
+        label += " · route exhausted (credits/quota)"
     # The footer shares one terminal line with the session title, mode, and
     # agents, and a long note wraps and squeezes them out (live-observed in a
     # pty at 80 columns). The footer asks for the short form; /status, which
@@ -2185,12 +2207,102 @@ def route_report(session_id: int) -> dict:
     }
 
 
+def public_route_event(event: dict, label: Any) -> dict:
+    """One stored route event in product vocabulary: providers become
+    RouteLabeler labels, model ids become public tier names, and free text
+    (a provider's own error message) has backend names redacted."""
+    from .public_identity import public_model_name, redact_routing_text
+
+    branded = dict(event)
+    # from_provider first: it is the EARLIER route, so labels are handed out in
+    # the order the task actually moved through them.
+    for key in ("from_provider", "provider"):
+        if branded.get(key):
+            branded[key] = label(branded[key])
+    for key in ("model", "from_model"):
+        if branded.get(key):
+            branded[key] = public_model_name(branded[key])
+    if branded.get("reason"):
+        branded["reason"] = redact_routing_text(branded["reason"])
+    return branded
+
+
+def public_route_report(session_id: int, label: Any = None) -> dict:
+    """route_report with every backend name branded -- what a user may see.
+
+    Labels are assigned in timeline order (oldest event first) so the first
+    route is "TamfisGPT" and each further distinct backend "TamfisGPT (alt N)",
+    consistently across events, totals, latency and cooling.
+    """
+    from .public_identity import RouteLabeler
+
+    label = label or RouteLabeler()
+    report = route_report(session_id)
+    events = [public_route_event(event, label) for event in report.get("events") or []]
+    report["events"] = events
+    report["failovers"] = [
+        public_route_event(event, label) for event in report.get("failovers") or []
+    ]
+    for key in ("current", "last_exhaustion"):
+        if report.get(key):
+            report[key] = public_route_event(report[key], label)
+    report["hold_totals"] = [
+        {**entry, "provider": label(entry.get("provider"))}
+        for entry in report.get("hold_totals") or []
+    ]
+    # Distinct raw providers can collapse onto one label only if they were the
+    # same provider, so merging by label never mixes two backends.
+    merged: dict[str, dict] = {}
+    for entry in report["hold_totals"]:
+        into = merged.setdefault(
+            entry["provider"], {"provider": entry["provider"], "held_seconds": 0.0, "turns": 0},
+        )
+        into["held_seconds"] = round(into["held_seconds"] + float(entry.get("held_seconds") or 0), 1)
+        into["turns"] += int(entry.get("turns") or 0)
+    report["hold_totals"] = list(merged.values())
+    report["latency"] = {
+        label(provider): values for provider, values in (report.get("latency") or {}).items()
+    }
+    report["cooling"] = [label(name) for name in report.get("cooling") or []]
+    return report
+
+
 def route_report_json(session_id: int) -> str:
-    """`/routes --json`: the route report as formatted JSON for charting."""
-    return json.dumps(route_report(session_id), indent=2, sort_keys=True)
+    """`/routes --json`: the route report as formatted JSON for charting.
+    Branded (public_route_report) -- this is user-facing output."""
+    return json.dumps(public_route_report(session_id), indent=2, sort_keys=True)
 
 
-def route_latency_lines(session_id: int) -> list[str]:
+def public_route_status_lines(session_id: int) -> str:
+    """The route section of /status, in product vocabulary (leading newline
+    per line, ready to append to the status block; empty when nothing is
+    recorded). Same persisted record as the footer and /routes."""
+    report = public_route_report(session_id)
+    lines = ""
+    current = report.get("current") or {}
+    if current.get("provider"):
+        lines += f"\nroute={current['provider']}"
+        if current.get("from_provider") and current["from_provider"] != current["provider"]:
+            lines += f"  (was {current['from_provider']})"
+    last_exhaustion = report.get("last_exhaustion") or {}
+    if last_exhaustion:
+        lines += (
+            f"\nexhausted={last_exhaustion.get('provider')}"
+            f"  at={str(last_exhaustion.get('at') or '')[:19]}"
+            f"  reason={str(last_exhaustion.get('reason') or '')[:160]}"
+        )
+    for event in report.get("failovers") or []:
+        lines += (
+            f"\nfailover={event.get('from_provider') or '?'} -> {event.get('provider')}"
+            f"  at={str(event.get('at') or '')[:19]}"
+            f"  reason={str(event.get('reason') or '')[:120]}"
+        )
+    if report.get("cooling"):
+        lines += f"\ncooling={', '.join(report['cooling'])}"
+    return lines
+
+
+def route_latency_lines(session_id: int, label: Any = None) -> list[str]:
     """Human lines for /routes: per-provider p50/p95 response time.
 
     Ordered slowest-p95 first, because the question this answers is "which
@@ -2207,7 +2319,8 @@ def route_latency_lines(session_id: int) -> list[str]:
         failures = int(values.get("failures", 0) or 0)
         failed_note = f", {failures} failed" if failures else ""
         lines.append(
-            f"{provider}: p50 {values.get('p50', 0):.1f}s  p95 {values.get('p95', 0):.1f}s  "
+            f"{label(provider) if label else provider}: "
+            f"p50 {values.get('p50', 0):.1f}s  p95 {values.get('p95', 0):.1f}s  "
             f"max {values.get('max', 0):.1f}s  (n={int(values.get('samples', 0))}{failed_note})"
         )
     if lines and source == "process":
@@ -2218,42 +2331,43 @@ def route_latency_lines(session_id: int) -> list[str]:
 
 
 def route_status_compact(session_id: int, max_chars: int = 56) -> str:
-    """The FOOTER form of the route note: only what changed and why, small
-    enough to sit beside the session title and mode without being clipped by
-    an 80-column terminal ("⟳ nvidia→openrouter · 1 failover · credits").
+    """The FOOTER form of the route note: only THAT the route changed and why,
+    small enough to sit beside the session title and mode without being
+    clipped by an 80-column terminal ("⟳ rerouted · credits · 2 failovers").
 
     Empty when this session has nothing exceptional to report, so a healthy
-    turn's footer is unchanged.
+    turn's footer is unchanged. Never names a provider or model: those are
+    deployment details (a footer reading "⟳ nvidia→ollama_cloud · 2
+    failovers" was live-reported as exposing the backends).
     """
     diag = route_diagnostics(session_id)
     failovers = diag.get("failovers") or []
     last_exhaustion = diag.get("last_exhaustion") or {}
-    cooling = diag.get("cooling") or []
-    if failovers:
-        latest = failovers[-1]
-        source = str(latest.get("from_provider") or "")
-        target = str(latest.get("provider") or "")
-        label = f"{source}→{target}" if source and target else (target or source)
-    elif last_exhaustion:
-        label = str(last_exhaustion.get("provider") or "")
-    else:
-        label = ""
-    if not label and not cooling:
+    # Cooling routes are deliberately NOT surfaced here. A failed request
+    # briefly opens a provider's 30s health circuit as part of NORMAL
+    # self-healing, so "cooling" fires constantly (e.g. nvidia + ollama_cloud
+    # on a busy day), tells the user nothing they can act on, and sits in the
+    # footer eating width from the title and mode -- live-reported as
+    # "⟳ · cooling: nvidia,ollama_cloud⠇" on a session that was working fine.
+    # The failure it describes is either transient (routing already healed) or
+    # durable (an exhaustion/failover, which IS shown). Full cooling detail
+    # stays in /routes, which owns a whole screen.
+    if not failovers and not last_exhaustion:
         return ""
+    # A failover means the task really did move to another route; an
+    # exhaustion with no failover means the route is down and nothing took over.
+    label = "rerouted" if failovers else "route down"
     # Budget-aware suffix order: the REASON outranks the count, because
     # "the route ran out of credits" is what explains a behaviour change and
     # the count is only trivia. Each extra is added only while it still fits,
-    # so a long provider name drops the count rather than the reason (the
-    # earlier blind truncation turned "· credits" into "· cre…" on an 80-column
-    # terminal -- the one word that mattered, unreadable).
+    # so dropping the count never turns "· credits" into "· cre…" on an
+    # 80-column terminal -- the one word that mattered, unreadable.
     extras = []
     if last_exhaustion:
         extras.append("credits")
-    if cooling:
-        extras.append("cooling: " + ",".join(cooling[:2]))
     if failovers:
         extras.append(f"{len(failovers)} failover{'s' if len(failovers) != 1 else ''}")
-    note = f"⟳ {label}" if label else "⟳"
+    note = f"⟳ {label}"
     for extra in extras:
         candidate = f"{note} · {extra}"
         if not max_chars or len(candidate) <= max_chars:
