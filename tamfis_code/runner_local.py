@@ -1969,6 +1969,86 @@ def _requested_fallback_choice(
     return None
 
 
+# NIM is the anchor route (owner ruling 2026-09-19): when a route fails, other
+# providers (Ollama Cloud, HF, OpenRouter, Grok) are tried only while they have
+# credit -- i.e. their health circuit is closed; a provider that just answered
+# 429 / 503 / 403 / 402 is parked, never retried "anyway". When no alternative
+# can answer, the task goes back to NIM and keeps trying (rotating NIM models
+# and keys) until a 200 arrives, instead of handing the user a raw 429 / 503.
+_NIM_RETRY_SECONDS_DEFAULT = 600.0
+_NIM_RETRY_MAX_DELAY_SECONDS = 30.0
+# A NIM attempt that fails deterministically (bad key, 403/404 entitlement)
+# will not start working by waiting, so a few of those end the loop.
+_NIM_DETERMINISTIC_FAILURE_LIMIT = 3
+_NIM_DETERMINISTIC_STATUSES = frozenset({400, 401, 402, 403, 404})
+
+
+def _nim_retry_budget_seconds() -> float:
+    """How long a task may keep going back to NIM before it is checkpointed.
+    TAMFIS_CODE_NIM_RETRY_SECONDS overrides; 0 disables the NIM retry loop."""
+    raw = os.environ.get("TAMFIS_CODE_NIM_RETRY_SECONDS", "").strip()
+    if not raw:
+        return _NIM_RETRY_SECONDS_DEFAULT
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return _NIM_RETRY_SECONDS_DEFAULT
+
+
+def _nim_retry_delay(attempt: int) -> float:
+    """Exponential backoff with jitter: 2s, 4s, 8s ... capped at 30s."""
+    base = min(_NIM_RETRY_MAX_DELAY_SECONDS, 2.0 * (2 ** max(0, attempt - 1)))
+    return base + random.uniform(0.0, 1.0)
+
+
+def _nim_anchor_available(manager: Any) -> bool:
+    """Whether NVIDIA NIM is configured with a usable client on this manager."""
+    providers = getattr(manager, "PROVIDERS", None) or {}
+    if ProviderType.NVIDIA not in providers:
+        return False
+    try:
+        return manager.get_client(ProviderType.NVIDIA) is not None
+    except Exception:
+        return False
+
+
+def _nim_retry_model(config: Any, attempt: int) -> Optional[str]:
+    """The NIM model for retry attempt `attempt` (1-based) when normal route
+    selection has none because every NIM model is inside its short health
+    cooldown. A cooldown is a latency heuristic, not proof a model is dead, and
+    the whole point of the retry loop is to keep going until a 200 -- so rotate
+    through the configured models in order (default first) instead of giving up.
+    """
+    models = list(dict.fromkeys(filter(None, [
+        getattr(config, "default_model", None),
+        *(getattr(config, "models", ()) or ()),
+    ])))
+    return str(models[(max(1, attempt) - 1) % len(models)]) if models else None
+
+
+def _public_failure_detail(manager: Any, error: Exception) -> str:
+    """The reason a task stopped, in words a user should see.
+
+    A raw provider error carries the vendor's status code, its dashboard URL
+    and account identifiers ("Error code: 429 ... upgrade at ollama.com ...").
+    Rate limits, capacity errors, and credit exhaustion are plain-language
+    states; anything else is shown with backend names redacted.
+    """
+    from .public_identity import redact_routing_text
+
+    status = None
+    try:
+        status = manager.provider_error_status(error)
+    except Exception:
+        status = None
+    if status in {429, 500, 502, 503, 504}:
+        return "every route is busy right now (rate-limited or at capacity)"
+    if status in {401, 402, 403}:
+        return "no route with available credit could take the request"
+    text = " ".join((str(error).strip() or type(error).__name__).split())
+    return redact_routing_text(text)[:300]
+
+
 def _fallback_candidates_for_turn(
     manager: Any,
     current: ProviderType,
@@ -5673,6 +5753,13 @@ async def _run_local_agent_turn_impl(
         added_context = "\n".join(r.message for r in prompt_hook_results if r.message)
         if added_context:
             objective = f"{objective}\n\nAdditional context from hook: {added_context}"
+    # Name the session NOW, in the background, from what the user just asked --
+    # not after the turn completes (a long or stuck first task would otherwise
+    # sit as "Session N" for as long as it runs). Never blocks the turn.
+    local_state.start_session_title_in_background(
+        session_id,
+        incoming_objective if local_state.is_substantive_objective(incoming_objective) else objective,
+    )
     _turn_budget_config = effective_config
     orchestrator = AgentOrchestrator(
         session_id=session_id, workspace_root=workspace_root, emit=renderer.handle_event,
@@ -7245,6 +7332,13 @@ async def _run_local_agent_turn_impl(
                     task_profile,
                     allow_premium_primary=allow_premium_primary,
                 )
+                # Owner ruling 2026-09-19: a provider that just answered
+                # 429 / 503 / 403 / 402 is out of credit or capacity and is NOT
+                # retried "anyway" -- the task goes back to NIM instead (the
+                # retry loop below). Only when NIM is not configured at all is
+                # there nothing to go back to, and the older cooling re-ask
+                # applies.
+                nim_anchor = _nim_anchor_available(manager) and _nim_retry_budget_seconds() > 0
                 if not candidates:
                     # Nothing healthy was available -- but "not healthy" here
                     # means a route is COOLING DOWN after a recent failure, not
@@ -7253,10 +7347,10 @@ async def _run_local_agent_turn_impl(
                     # configured alternative is merely resting: live-reported
                     # 2026-09-19, a 35-minute run stopped with "type `continue`
                     # to resume" on a TamfisGPT 402 with NVIDIA NIM configured
-                    # and unused. Re-ask including cooling routes, so the turn
-                    # continues on one of them the same way it would have
-                    # before the circuit opened.
-                    cooling = _fallback_candidates_for_turn(
+                    # and unused. Without a NIM anchor, re-ask including
+                    # cooling routes, so the turn continues on one of them the
+                    # same way it would have before the circuit opened.
+                    cooling = [] if nim_anchor else _fallback_candidates_for_turn(
                         manager,
                         failed_provider,
                         task_profile,
@@ -7276,113 +7370,159 @@ async def _run_local_agent_turn_impl(
                                 ),
                             },
                         })
-                for candidate in candidates:
-                    candidate_client = manager.get_client(candidate)
-                    candidate_config = manager.PROVIDERS.get(candidate)
-                    if candidate_client is None or candidate_config is None:
-                        continue
-                    candidate_model = _select_public_group_model(
-                        manager, candidate, candidate_config, task_profile, model,
-                        requires_vision=bool(image_content_blocks),
-                    )
-                    if candidate_model is None:
-                        continue
-                    if (
-                        failed_provider == ProviderType.OLLAMA_CLOUD
-                        and premium_choices
-                        and candidate == premium_choices[0][0]
-                    ):
-                        candidate_model = premium_choices[0][1]
-                    status = manager.provider_error_status(last_error) if hasattr(manager, "provider_error_status") else None
-                    reason = f"HTTP {status}" if status is not None else str(last_error)
-                    # A real repair attempt, tracked at the point it's actually
-                    # tried -- not just retroactively labelled once every
-                    # candidate has already been exhausted. Before this,
-                    # repair_attempts/AgentPhase.REPAIR never reflected this
-                    # fallback chain at all, even when it succeeded.
-                    orchestrator.mark_repair(f"Falling back from {failed_provider.value} to {candidate.value} ({reason})", provider_switch=True)
-                    renderer.handle_event({
-                        "event_type": "diagnostics",
-                        "payload": {
-                            "content": _public_model_fallback_message(
-                                failed_model, candidate_model, reason,
+                nim_retry_deadline = time.monotonic() + _nim_retry_budget_seconds()
+                nim_retry_attempt = 0
+                nim_deterministic_failures = 0
+                while True:
+                    error_before_pass = last_error
+                    for candidate in candidates:
+                        candidate_client = manager.get_client(candidate)
+                        candidate_config = manager.PROVIDERS.get(candidate)
+                        if candidate_client is None or candidate_config is None:
+                            continue
+                        candidate_model = _select_public_group_model(
+                            manager, candidate, candidate_config, task_profile, model,
+                            requires_vision=bool(image_content_blocks),
+                        )
+                        if (
+                            candidate_model is None
+                            and candidate == ProviderType.NVIDIA
+                            and nim_retry_attempt > 0
+                        ):
+                            candidate_model = _nim_retry_model(candidate_config, nim_retry_attempt)
+                        if candidate_model is None:
+                            continue
+                        if (
+                            failed_provider == ProviderType.OLLAMA_CLOUD
+                            and premium_choices
+                            and candidate == premium_choices[0][0]
+                        ):
+                            candidate_model = premium_choices[0][1]
+                        status = manager.provider_error_status(last_error) if hasattr(manager, "provider_error_status") else None
+                        reason = f"HTTP {status}" if status is not None else str(last_error)
+                        # A real repair attempt, tracked at the point it's actually
+                        # tried -- not just retroactively labelled once every
+                        # candidate has already been exhausted. Before this,
+                        # repair_attempts/AgentPhase.REPAIR never reflected this
+                        # fallback chain at all, even when it succeeded.
+                        orchestrator.mark_repair(f"Falling back from {failed_provider.value} to {candidate.value} ({reason})", provider_switch=True)
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": _public_model_fallback_message(
+                                    failed_model, candidate_model, reason,
+                                )
+                            },
+                        })
+                        renderer.handle_event({
+                            "event_type": "model_selected",
+                            "payload": {
+                                "provider": candidate.value,
+                                "model": candidate_model,
+                                "reason": "automatic provider fallback",
+                            },
+                        })
+                        if hasattr(manager, "record_fallback"):
+                            manager.record_fallback(failed_provider)
+                        if hasattr(manager, "record_route_attempt"):
+                            manager.record_route_attempt(candidate, candidate_model)
+                        try:
+                            checkpoint_partial_parts.clear()
+                            if interrupted_partial:
+                                checkpoint_partial_parts.append(interrupted_partial)
+                            last_checkpoint_at = 0.0
+                            content, tool_calls, finish_reason = await _stream_completion_with_reconnect(
+                                manager,
+                                candidate_client,
+                                provider=candidate,
+                                model=candidate_model,
+                                messages=(
+                                    _messages_with_vision_content(working_messages, vision_message_index, image_content_blocks)
+                                    if _model_supports_vision(
+                                        manager, candidate_config, candidate_model,
+                                    ) else working_messages
+                                ),
+                                tools=tools if getattr(candidate_config, "tool_calling", True) else [],
+                                renderer=renderer,
+                                reasoning_effort=_reasoning_effort(candidate, candidate_model, task_profile),
+                                progress_callback=_remember_stream_delta,
+                                initial_partial=interrupted_partial,
+                                session_id=session_id,
                             )
-                        },
-                    })
-                    renderer.handle_event({
-                        "event_type": "model_selected",
-                        "payload": {
-                            "provider": candidate.value,
-                            "model": candidate_model,
-                            "reason": "automatic provider fallback",
-                        },
-                    })
-                    if hasattr(manager, "record_fallback"):
-                        manager.record_fallback(failed_provider)
-                    if hasattr(manager, "record_route_attempt"):
-                        manager.record_route_attempt(candidate, candidate_model)
-                    try:
-                        checkpoint_partial_parts.clear()
-                        if interrupted_partial:
-                            checkpoint_partial_parts.append(interrupted_partial)
-                        last_checkpoint_at = 0.0
-                        content, tool_calls, finish_reason = await _stream_completion_with_reconnect(
-                            manager,
-                            candidate_client,
-                            provider=candidate,
-                            model=candidate_model,
-                            messages=(
-                                _messages_with_vision_content(working_messages, vision_message_index, image_content_blocks)
-                                if _model_supports_vision(
-                                    manager, candidate_config, candidate_model,
-                                ) else working_messages
-                            ),
-                            tools=tools if getattr(candidate_config, "tool_calling", True) else [],
-                            renderer=renderer,
-                            reasoning_effort=_reasoning_effort(candidate, candidate_model, task_profile),
-                            progress_callback=_remember_stream_delta,
-                            initial_partial=interrupted_partial,
-                            session_id=session_id,
-                        )
-                        _persist_turn_checkpoint(
-                            partial_assistant=content,
-                            status="running",
-                        )
-                    except Exception as candidate_exc:
-                        last_error = (
-                            candidate_exc.cause
-                            if isinstance(candidate_exc, _InterruptedCompletion)
-                            else candidate_exc
-                        )
-                        if isinstance(candidate_exc, _InterruptedCompletion):
-                            interrupted_partial = candidate_exc.partial
-                        if hasattr(manager, "record_route_failure"):
-                            manager.record_route_failure(
-                                candidate,
-                                candidate_model,
-                                last_error,
-                                stream=True,
-                                tool_call=bool(tools),
+                            _persist_turn_checkpoint(
+                                partial_assistant=content,
+                                status="running",
                             )
-                        failed_provider = candidate
-                        failed_model = candidate_model
-                        if not manager.is_retryable_provider_error(last_error):
-                            break
-                        continue
-                    if hasattr(manager, "record_route_success"):
-                        manager.record_route_success(candidate, candidate_model)
-                    resolved_provider = candidate
-                    config = candidate_config
-                    client = candidate_client
-                    resolved_model = candidate_model
-                    orchestrator.record_route(
-                        provider=resolved_provider.value,
-                        model=resolved_model,
-                        reason="automatic provider fallback",
-                        fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
-                    )
-                    fallback_succeeded = True
-                    break
+                        except Exception as candidate_exc:
+                            last_error = (
+                                candidate_exc.cause
+                                if isinstance(candidate_exc, _InterruptedCompletion)
+                                else candidate_exc
+                            )
+                            if isinstance(candidate_exc, _InterruptedCompletion):
+                                interrupted_partial = candidate_exc.partial
+                            if hasattr(manager, "record_route_failure"):
+                                manager.record_route_failure(
+                                    candidate,
+                                    candidate_model,
+                                    last_error,
+                                    stream=True,
+                                    tool_call=bool(tools),
+                                )
+                            failed_provider = candidate
+                            failed_model = candidate_model
+                            if not manager.is_retryable_provider_error(last_error):
+                                break
+                            continue
+                        if hasattr(manager, "record_route_success"):
+                            manager.record_route_success(candidate, candidate_model)
+                        resolved_provider = candidate
+                        config = candidate_config
+                        client = candidate_client
+                        resolved_model = candidate_model
+                        orchestrator.record_route(
+                            provider=resolved_provider.value,
+                            model=resolved_model,
+                            reason="automatic provider fallback",
+                            fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+                        )
+                        fallback_succeeded = True
+                        break
+                    if fallback_succeeded:
+                        break
+                    # Back to NIM (owner ruling 2026-09-19): every alternative
+                    # that had credit has been tried and failed, or none had
+                    # credit. Keep going back to NIM -- rotating its models and
+                    # keys through the normal route selection -- until a 200
+                    # arrives, rather than surfacing a 429 / 503 to the user.
+                    # Bounded by TAMFIS_CODE_NIM_RETRY_SECONDS (default 600s),
+                    # and Esc still cancels the sleep.
+                    if not nim_anchor or time.monotonic() >= nim_retry_deadline:
+                        break
+                    if not manager.is_retryable_provider_error(last_error):
+                        break
+                    if candidates == [ProviderType.NVIDIA]:
+                        if last_error is error_before_pass:
+                            break  # no NIM model could even be selected
+                        if manager.provider_error_status(last_error) in _NIM_DETERMINISTIC_STATUSES:
+                            nim_deterministic_failures += 1
+                            if nim_deterministic_failures >= _NIM_DETERMINISTIC_FAILURE_LIMIT:
+                                break
+                        else:
+                            nim_deterministic_failures = 0
+                    nim_retry_attempt += 1
+                    if nim_retry_attempt == 1:
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    "◆ Every route is busy right now; retrying "
+                                    "automatically until one answers (Esc to stop)…"
+                                ),
+                            },
+                        })
+                    await asyncio.sleep(_nim_retry_delay(nim_retry_attempt))
+                    candidates = [ProviderType.NVIDIA]
             if not fallback_succeeded:
                 # Candidate health is dynamic. The list used by the loop
                 # above was a snapshot taken before potentially lengthy
@@ -7446,7 +7586,7 @@ async def _run_local_agent_turn_impl(
                     continue
                 if not can_fallback:
                     orchestrator.mark_repair(f"Provider/tool round failed, no fallback available: {last_error}")
-                detail = str(last_error).strip() or type(last_error).__name__
+                detail = _public_failure_detail(manager, last_error)
                 message = (
                     f"{public_model_name(failed_model)} streaming failed: {detail}. "
                     "The exact turn and partial response were checkpointed; type `continue` to resume "

@@ -613,19 +613,24 @@ class ListResumableLocalSessionsTests(unittest.TestCase):
             5, objective="Fix the flaky auth test", answer="Done.",
         )
         infos = list_resumable_local_sessions()
-        self.assertEqual(infos[0].title, "Fix the flaky auth test")
+        # Owner ruling 2026-09-19: no mechanical title anywhere. The NAME stays
+        # "Session 5" until the LLM writes one; the request is shown as the
+        # picker's separate DESCRIPTION line, so the row is still recognisable.
+        self.assertEqual(infos[0].title, "Session 5")
+        self.assertEqual(infos[0].description, "Fix the flaky auth test")
 
     def test_title_falls_back_to_live_activity_before_session_title_is_set(self):
         # A session mid-task (or interrupted before its first turn ever
         # completed) has no session_title yet, but its active_task
-        # objective is already known -- the picker must show that, not a
-        # bare "Session 5" indistinguishable from every other such session.
+        # objective is already known -- the picker shows that as the
+        # description next to the neutral name, never AS the name.
         state_module.save_session_state(
             5, workspace_root="/a",
             active_task={"objective": "Fix intelligent routing pipeline"},
         )
         infos = list_resumable_local_sessions()
-        self.assertEqual(infos[0].title, "Fix intelligent routing pipeline")
+        self.assertEqual(infos[0].title, "Session 5")
+        self.assertEqual(infos[0].description, "Fix intelligent routing pipeline")
 
 
 class ResolveSwarmSubtaskWorkspaceTests(unittest.TestCase):

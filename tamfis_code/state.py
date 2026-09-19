@@ -40,43 +40,59 @@ from .config import CONFIG_DIR
 # this only AFTER the turn's result is already persisted.
 # Live-measured 2026-09-19: 150s was too generous for something the user is
 # watching -- a slow route chain made /regenerate-title look hung and made an
-# automatic retitle drag on after the answer was already delivered. Three
-# attempts of 20s fit exactly inside this wall, and the fast route
-# (OpenRouter) answers a title in 2-6s, so the budget is only spent when the
-# preferred routes are genuinely unhealthy.
-TITLE_UPGRADE_TIMEOUT_SECONDS = 60
+# automatic retitle drag on after the answer was already delivered. The wall
+# now fits the whole NIM chain's worst case (12 + 12 + 20 + 20 + 20 = 84s, see
+# _TITLE_MODEL_TIMEOUT_SECONDS), but a healthy chain answers in seconds: the
+# budget is only spent when kimi-k3 / glm-5.3 stall and the nemotrons must
+# take over.
+TITLE_UPGRADE_TIMEOUT_SECONDS = 90
 # Per-attempt cap forwarded to the OpenAI SDK (chat_completion forwards
 # **kwargs into create()): the manager's clients are built with a 120s
 # timeout, so ONE cold provider attempt used to consume the entire title
 # budget before the machinery could fall back to a healthy route.
 _TITLE_ATTEMPT_TIMEOUT_SECONDS = 20
-# Bounded redraws when a route answers with an empty stream (no exception
-# raised, so the machinery itself has nothing to fall back from).
-_TITLE_MAX_MACHINERY_ATTEMPTS = 3
-# Title routes: NVIDIA NIM ONLY, walked model by model. Owner ruling
-# 2026-09-19: an auto-title is a background nicety and must never spend
-# Ollama Cloud, Hugging Face, or any other metered credit -- NIM is the free,
-# tool-calling tier, and every model below is answered by it. The call pins
+# Title routes: NVIDIA NIM ONLY, walked model by model, best first, failing
+# open to the next. Owner ruling 2026-09-19: an auto-title is a background
+# nicety and must never spend Ollama Cloud, Hugging Face, or any other metered
+# credit -- NIM is the free, tool-calling tier. The call pins
 # ProviderType.NVIDIA with allow_fallback=False, so the machinery's
 # cross-provider fallback cannot wander off to a paid route; NIM key rotation
 # (several free accounts) still applies inside that one provider.
 #
+# kimi-k3 and glm-5.3 lead on purpose (owner ruling: they are the best NIM
+# models and stay in the pool). They are also the two that time out on NIM's
+# free tier, so each gets a SHORT per-attempt cap (_TITLE_MODEL_TIMEOUT_SECONDS)
+# and the loop skips any model whose per-model health circuit is open
+# (ProviderManager.route_is_healthy): one failure parks that model for 30s
+# (300s for a 404/410) without cooling NIM as a whole, so the next title goes
+# straight to a model that answers instead of paying the timeout again.
+#
 # Live-probed 2026-09-19 against integrate.api.nvidia.com with the real title
-# prompt, one request at a time (native tool_calls confirmed on each):
+# prompt, one request at a time (native tool_calls confirmed on the nemotrons):
 #   nemotron-3-ultra-550b-a55b   1.2s  clean title
 #   nemotron-3-super-120b-a12b   4.4s  answers (reasoning_effort=low keeps the
 #                                      chain-of-thought out of the content)
 #   nemotron-3.5-lightning-30b   17s   answers, slow -- last resort
+#   kimi-k3, glm-5.3             timed out at 40-90s in every probe today
 # Not usable right now, so deliberately absent: qwen3-coder-480b and
 # qwen2.5-coder-32b (410 Gone, end-of-life), devstral / codestral-22b /
 # nemotron-nano-3 / granite-34b-code (404, listed but not deployed),
-# deepseek-v4-flash-0731 (~60s, longer than the whole title budget),
-# kimi-k3 / glm-5.3(-flash) / gpt-oss-20b (timed out).
+# deepseek-v4-flash-0731 (~60s, longer than the whole title budget).
 _TITLE_NIM_MODELS = (
+    "moonshotai/kimi-k3",
+    "z-ai/glm-5.3",
     "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3-super-120b-a12b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
 )
+# Bounded redraws: one attempt per model in the chain.
+_TITLE_MAX_MACHINERY_ATTEMPTS = len(_TITLE_NIM_MODELS)
+# Short cap for the two strongest-but-slow models so a stall costs seconds, not
+# the whole title budget.
+_TITLE_MODEL_TIMEOUT_SECONDS = {
+    "moonshotai/kimi-k3": 12,
+    "z-ai/glm-5.3": 12,
+}
 
 STATE_PATH = CONFIG_DIR / "state.json"
 _VOLATILE_STATE: dict[tuple[str, int], "SessionState"] = {}
@@ -1075,6 +1091,60 @@ def _is_substantive_objective(text: str) -> bool:
     return len(content_words) >= 2
 
 
+# Session titles being written right now, keyed by session id (see
+# start_session_title_in_background). Holding the task here also keeps it from
+# being garbage-collected while it runs.
+_TITLE_INFLIGHT: dict[int, "asyncio.Task[None]"] = {}
+
+
+def start_session_title_in_background(session_id: int, objective: str) -> bool:
+    """Begin the LLM session title NOW, alongside the turn, without blocking it.
+
+    Live-reported 2026-09-19 ("Session 1380884488 not title"): with the
+    mechanical title gone, a session only got its LLM title once a turn
+    COMPLETED, so a long or stuck first task stayed a bare "Session N" for as
+    long as it ran. The title needs only the user's request, which is known the
+    moment the turn starts, so it is requested then. If it fails,
+    upgrade_session_title_with_ai's end-of-turn call still retries.
+
+    Returns True when a title task was started. Needs a running event loop; with
+    none (a sync caller) it does nothing. Skips swarm children, user-named
+    sessions, sessions that already have a title or an attempt in flight, and
+    requests too thin to title ("continue").
+    """
+    if not objective or not _is_substantive_objective(objective):
+        return False
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        return False
+    existing = _TITLE_INFLIGHT.get(session_id)
+    if existing is not None and not existing.done():
+        return False
+    try:
+        state = get_session_state(session_id)
+    except Exception:
+        return False
+    if (
+        getattr(state, "is_swarm_child", False)
+        or state.title_source == "user"
+        or state.session_title
+        or state.ai_title_attempted
+    ):
+        return False
+    task = loop.create_task(upgrade_session_title_with_ai(session_id, objective))
+    _TITLE_INFLIGHT[session_id] = task
+
+    def _done(finished: "asyncio.Task[None]") -> None:
+        if _TITLE_INFLIGHT.get(session_id) is finished:
+            _TITLE_INFLIGHT.pop(session_id, None)
+        if not finished.cancelled():
+            finished.exception()  # consume: a title must never surface as an unhandled task error
+
+    task.add_done_callback(_done)
+    return True
+
+
 async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None:
     """The ONLY title writer: generate a short, semantic session title
     from the objective with an LLM via the providers system (main +
@@ -1099,6 +1169,14 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     """
     if not objective or not objective.strip():
         return
+    # A title already being written in the background (start_session_title_in_
+    # background, kicked off when the turn STARTED): wait for THAT one instead
+    # of returning at once. Returning would let a short-lived process exit and
+    # cancel it mid-flight, and starting a second would spend a second NIM call.
+    inflight = _TITLE_INFLIGHT.get(session_id)
+    if inflight is not None and inflight is not asyncio.current_task() and not inflight.done():
+        await asyncio.wait({inflight}, timeout=TITLE_UPGRADE_TIMEOUT_SECONDS + 5)
+        return
     state = get_session_state(session_id)
     if state.ai_title_attempted:
         return
@@ -1111,6 +1189,27 @@ async def upgrade_session_title_with_ai(session_id: int, objective: str) -> None
     state.ai_title_attempted = True
     put_session_state(state)
 
+    settled = False
+    try:
+        await _upgrade_session_title_attempt(session_id, objective)
+        settled = True
+    finally:
+        if not settled:
+            # Cancelled (Esc, process exit) or crashed mid-attempt: the one-shot
+            # budget must not stay burned, or this session would never be
+            # titled at all.
+            try:
+                state = get_session_state(session_id)
+                if not state.session_title:
+                    state.ai_title_attempted = False
+                    put_session_state(state)
+            except Exception:
+                pass
+
+
+async def _upgrade_session_title_attempt(session_id: int, objective: str) -> None:
+    """The LLM call, validation and persistence half of
+    upgrade_session_title_with_ai (which owns the guards and the budget flag)."""
     try:
         title, model_used, failure_reason = await asyncio.wait_for(
             _generate_and_validate_title(session_id, objective),
@@ -1451,13 +1550,26 @@ async def _generate_session_title(
     # Key rotation across the configured NIM accounts still happens inside
     # chat_completion.
     provider = ProviderType.NVIDIA
-    models = list(_TITLE_NIM_MODELS)
+    shift = max(0, route_offset) % len(_TITLE_NIM_MODELS)
+    order = list(_TITLE_NIM_MODELS[shift:] + _TITLE_NIM_MODELS[:shift])
+
+    def _healthy(model: str) -> bool:
+        try:
+            return bool(manager.route_is_healthy(provider, model))
+        except Exception:
+            return True
+
+    # Skip models parked by their own health circuit (a model that just timed
+    # out). If EVERY model is parked, try them all anyway: a circuit is a
+    # latency heuristic, not proof the route is dead, and no title at all is
+    # worse than a slow one.
+    models = [model for model in order if _healthy(model)] or order
+    total_attempts = len(models)
 
     last_reason = "empty_response"
     model_used = ""
     content = ""
-    for attempt in range(1, _TITLE_MAX_MACHINERY_ATTEMPTS + 1):
-        model = models[(attempt - 1 + max(0, route_offset)) % len(models)]
+    for attempt, model in enumerate(models, start=1):
         chunks: list[str] = []
         # Per-attempt try, not one try around the whole loop. Live-measured
         # 2026-09-19: a single route raising (dead socket, 429, SDK error)
@@ -1482,15 +1594,18 @@ async def _generate_session_title(
                 max_tokens=600,
                 reasoning_effort="low",
                 allow_fallback=False,
-                # Cap EACH route attempt at 20s so every NIM model gets a
-                # turn inside TITLE_UPGRADE_TIMEOUT_SECONDS.
-                timeout=_TITLE_ATTEMPT_TIMEOUT_SECONDS,
+                # Cap EACH route attempt (shorter for the slow strong models)
+                # so every NIM model gets a turn inside
+                # TITLE_UPGRADE_TIMEOUT_SECONDS.
+                timeout=_TITLE_MODEL_TIMEOUT_SECONDS.get(
+                    model, _TITLE_ATTEMPT_TIMEOUT_SECONDS,
+                ),
             ):
                 chunks.append(str(chunk or ""))
         except Exception as exc:
             last_reason = "provider_error"
             print(
-                f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS} "
+                f"[title] attempt {attempt}/{total_attempts} "
                 f"failed ({type(exc).__name__}: {_redacted(str(exc))[:120]}), "
                 "trying next preferred route",
                 file=sys.stderr,
@@ -1506,14 +1621,14 @@ async def _generate_session_title(
             break
         last_reason = "empty_response"
         print(
-            f"[title] attempt {attempt}/{_TITLE_MAX_MACHINERY_ATTEMPTS}: "
+            f"[title] attempt {attempt}/{total_attempts}: "
             "empty response, trying next preferred route",
             file=sys.stderr,
         )
 
     if not content:
         print(
-            f"[title] no title after {_TITLE_MAX_MACHINERY_ATTEMPTS} preferred "
+            f"[title] no title after {total_attempts} preferred "
             f"routes ({last_reason})",
             file=sys.stderr,
         )

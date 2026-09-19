@@ -164,6 +164,92 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
             list(state_module._TITLE_NIM_MODELS)[: len(calls)],
         )
 
+    def test_kimi_k3_and_glm_5_3_lead_the_chain_and_the_nemotrons_back_them_up(self):
+        """Owner ruling 2026-09-19: kimi-k3 and glm-5.3 are the best NIM models
+        and stay in the title pool; the three nemotron models are the fail-open
+        tail."""
+        self.assertEqual(
+            list(state_module._TITLE_NIM_MODELS),
+            [
+                "moonshotai/kimi-k3",
+                "z-ai/glm-5.3",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
+            ],
+        )
+
+    def test_a_stalled_kimi_fails_open_to_glm_then_the_nemotrons(self):
+        """First two routes raise (timeout-shaped), the third answers: the
+        title lands from nemotron-ultra, and every attempt stayed on NIM."""
+        state_module.save_session_state(1, workspace_root="/a")
+        seen = []
+
+        async def flaky(provider, messages, **kwargs):
+            seen.append(kwargs["model"])
+            if kwargs["model"] in ("moonshotai/kimi-k3", "z-ai/glm-5.3"):
+                raise TimeoutError("Request timed out.")
+            yield "Fix Flaky Auth Test"
+
+        manager = MagicMock()
+        manager.chat_completion = flaky
+        manager.route_is_healthy = lambda provider, model: True
+        with patch("tamfis_code.providers.ProviderManager", return_value=manager):
+            asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(
+            seen,
+            ["moonshotai/kimi-k3", "z-ai/glm-5.3", "nvidia/nemotron-3-ultra-550b-a55b"],
+        )
+        state = state_module.get_session_state(1)
+        self.assertEqual(state.session_title, "Fix Flaky Auth Test")
+        self.assertEqual(state.title_model, "nvidia/nemotron-3-ultra-550b-a55b")
+
+    def test_a_model_parked_by_its_health_circuit_is_skipped_not_retried(self):
+        """One timeout parks kimi-k3 for 30s (providers.record_route_failure_for);
+        the next title must go straight to a model that answers instead of
+        paying that timeout again."""
+        state_module.save_session_state(1, workspace_root="/a")
+        seen = []
+
+        async def ok(provider, messages, **kwargs):
+            seen.append(kwargs["model"])
+            yield "Fix Flaky Auth Test"
+
+        manager = MagicMock()
+        manager.chat_completion = ok
+        manager.route_is_healthy = lambda provider, model: model != "moonshotai/kimi-k3"
+        with patch("tamfis_code.providers.ProviderManager", return_value=manager):
+            asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(seen, ["z-ai/glm-5.3"])
+
+    def test_when_every_model_is_parked_they_are_all_still_tried(self):
+        """A circuit is a latency heuristic, not proof a route is dead: no title
+        at all is worse than a slow one."""
+        state_module.save_session_state(1, workspace_root="/a")
+        seen = []
+
+        async def ok(provider, messages, **kwargs):
+            seen.append(kwargs["model"])
+            yield "Fix Flaky Auth Test"
+
+        manager = MagicMock()
+        manager.chat_completion = ok
+        manager.route_is_healthy = lambda provider, model: False
+        with patch("tamfis_code.providers.ProviderManager", return_value=manager):
+            asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
+        self.assertEqual(seen, ["moonshotai/kimi-k3"])
+        self.assertEqual(state_module.get_session_state(1).session_title, "Fix Flaky Auth Test")
+
+    def test_the_two_slow_strong_models_get_a_short_cap_the_nemotrons_a_longer_one(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        calls = self._upgrade(ConnectionError("boom"))
+        caps = {call["model"]: call["timeout"] for call in calls}
+        self.assertEqual(caps["moonshotai/kimi-k3"], 12)
+        self.assertEqual(caps["z-ai/glm-5.3"], 12)
+        self.assertEqual(caps["nvidia/nemotron-3-ultra-550b-a55b"], state_module._TITLE_ATTEMPT_TIMEOUT_SECONDS)
+        # The worst case (every model stalls to its cap) still fits the wall.
+        self.assertLessEqual(sum(caps.values()), state_module.TITLE_UPGRADE_TIMEOUT_SECONDS)
+
     def test_no_metered_provider_is_reachable_from_the_title_path(self):
         joined = " ".join(state_module._TITLE_NIM_MODELS).lower()
         for metered in ("ollama", "huggingface", "hf.co", "openrouter", ":cloud"):
@@ -755,3 +841,216 @@ class TitleCommandReportSurvivesRichMarkup(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class BackgroundTitleTests(_StateDirFixture, unittest.TestCase):
+    """Live-reported 2026-09-19 ("Session 1380884488 not title"): the LLM title
+    only started once a turn COMPLETED, so a long or stuck first task stayed a
+    bare "Session N". The title needs only the request, so it starts with the
+    turn -- in the background, never blocking it."""
+
+    OBJECTIVE = "read and implement the prompt in the website redesign docx"
+
+    def _fake(self, title="Implement Website Redesign Prompt", delay=0.0):
+        calls = []
+
+        async def chat(provider, messages, **kwargs):
+            calls.append(kwargs.get("model"))
+            if delay:
+                await asyncio.sleep(delay)
+            yield title
+
+        manager = MagicMock()
+        manager.chat_completion = chat
+        manager.route_is_healthy = lambda provider, model: True
+        return patch("tamfis_code.providers.ProviderManager", return_value=manager), calls
+
+    def test_the_title_lands_while_the_turn_is_still_running(self):
+        state_module.save_session_state(7, workspace_root="/a")
+        patcher, calls = self._fake()
+
+        async def scenario():
+            started = state_module.start_session_title_in_background(7, self.OBJECTIVE)
+            # The "turn" is still running -- it never completes here. Yield so
+            # the background task can run.
+            for _ in range(20):
+                await asyncio.sleep(0)
+                if state_module.get_session_state(7).session_title:
+                    break
+            return started
+
+        with patcher:
+            started = asyncio.run(scenario())
+        self.assertTrue(started)
+        state = state_module.get_session_state(7)
+        self.assertEqual(state.session_title, "Implement Website Redesign Prompt")
+        self.assertEqual(state.title_source, "llm")
+        self.assertEqual(state_module.session_display_title(7), "Implement Website Redesign Prompt")
+
+    def test_it_does_not_block_the_caller(self):
+        state_module.save_session_state(7, workspace_root="/a")
+        patcher, _calls = self._fake(delay=0.3)
+
+        async def scenario():
+            import time
+
+            t0 = time.monotonic()
+            state_module.start_session_title_in_background(7, self.OBJECTIVE)
+            elapsed = time.monotonic() - t0
+            await asyncio.wait(list(state_module._TITLE_INFLIGHT.values()))
+            return elapsed
+
+        with patcher:
+            elapsed = asyncio.run(scenario())
+        self.assertLess(elapsed, 0.1)
+
+    def test_without_a_running_loop_it_does_nothing(self):
+        state_module.save_session_state(7, workspace_root="/a")
+        self.assertFalse(state_module.start_session_title_in_background(7, self.OBJECTIVE))
+
+    def test_it_skips_sessions_that_should_not_be_titled(self):
+        cases = {
+            "user-named": lambda st: (setattr(st, "session_title", "Mine"), setattr(st, "title_source", "user")),
+            "already titled": lambda st: setattr(st, "session_title", "Existing Title"),
+            "already attempted": lambda st: setattr(st, "ai_title_attempted", True),
+            "swarm child": lambda st: setattr(st, "is_swarm_child", True),
+        }
+        for name, mutate in cases.items():
+            with self.subTest(case=name):
+                state_module.save_session_state(8, workspace_root="/a")
+                state = state_module.get_session_state(8)
+                mutate(state)
+                state_module.put_session_state(state)
+                patcher, calls = self._fake()
+
+                async def scenario():
+                    return state_module.start_session_title_in_background(8, self.OBJECTIVE)
+
+                with patcher:
+                    self.assertFalse(asyncio.run(scenario()))
+                self.assertEqual(calls, [])
+
+    def test_a_thin_request_does_not_start_a_title(self):
+        state_module.save_session_state(7, workspace_root="/a")
+        patcher, calls = self._fake()
+
+        async def scenario():
+            return state_module.start_session_title_in_background(7, "continue")
+
+        with patcher:
+            self.assertFalse(asyncio.run(scenario()))
+        self.assertEqual(calls, [])
+
+    def test_the_end_of_turn_call_joins_the_inflight_title_instead_of_duplicating_it(self):
+        state_module.save_session_state(7, workspace_root="/a")
+        patcher, calls = self._fake(delay=0.2)
+
+        async def scenario():
+            state_module.start_session_title_in_background(7, self.OBJECTIVE)
+            # what run_local_agent_turn does when the turn completes
+            await state_module.upgrade_session_title_with_ai(7, self.OBJECTIVE)
+
+        with patcher:
+            asyncio.run(scenario())
+        self.assertEqual(len(calls), 1)  # one NIM call, not two
+        self.assertEqual(
+            state_module.get_session_state(7).session_title, "Implement Website Redesign Prompt",
+        )
+
+    def test_a_cancelled_title_does_not_burn_the_one_shot_budget(self):
+        """A short-lived process can exit mid-title. If the attempted flag stayed
+        set, that session would never be titled at all."""
+        state_module.save_session_state(7, workspace_root="/a")
+        patcher, _calls = self._fake(delay=5)
+
+        async def scenario():
+            state_module.start_session_title_in_background(7, self.OBJECTIVE)
+            task = state_module._TITLE_INFLIGHT[7]
+            await asyncio.sleep(0.05)
+            self.assertTrue(state_module.get_session_state(7).ai_title_attempted)
+            task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await task
+
+        with patcher:
+            asyncio.run(scenario())
+        state = state_module.get_session_state(7)
+        self.assertFalse(state.ai_title_attempted)
+        self.assertEqual(state.session_title, "")
+
+    def test_a_failed_background_attempt_is_retried_by_the_end_of_turn_call(self):
+        state_module.save_session_state(7, workspace_root="/a")
+        attempts = []
+
+        async def flaky(provider, messages, **kwargs):
+            attempts.append(kwargs["model"])
+            if len(attempts) <= len(state_module._TITLE_NIM_MODELS):
+                raise ConnectionError("nim down")
+            yield "Implement Website Redesign Prompt"
+
+        manager = MagicMock()
+        manager.chat_completion = flaky
+        manager.route_is_healthy = lambda provider, model: True
+
+        async def scenario():
+            state_module.start_session_title_in_background(7, self.OBJECTIVE)
+            await asyncio.wait(list(state_module._TITLE_INFLIGHT.values()))
+            self.assertEqual(state_module.get_session_state(7).session_title, "")
+            self.assertFalse(state_module.get_session_state(7).ai_title_attempted)
+            await state_module.upgrade_session_title_with_ai(7, self.OBJECTIVE)
+
+        with patch("tamfis_code.providers.ProviderManager", return_value=manager):
+            asyncio.run(scenario())
+        self.assertEqual(
+            state_module.get_session_state(7).session_title, "Implement Website Redesign Prompt",
+        )
+
+
+class RunnerStartsTheTitleWithTheTurnTests(unittest.TestCase):
+    def test_a_turn_requests_its_title_before_it_finishes(self):
+        """run_local_agent_turn must call start_session_title_in_background with
+        what the user typed, at the START of the turn."""
+        import sys
+        from pathlib import Path as _Path
+
+        sys.path.insert(0, str(_Path(__file__).parent))
+        import test_provider_failover as harness  # noqa: PLC0415
+        from io import StringIO
+
+        from rich.console import Console
+        from test_reasoning_plan import _RecordingRenderer
+
+        from tamfis_code.providers import ProviderType
+        from tamfis_code.runner_local import run_local_agent_turn
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        originals = (state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH)
+        base = Path(tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        state_module._LOCK_PATH = base / ".config" / ".state.lock"
+        state_module._STATE_CACHE = None
+        self.addCleanup(lambda: (
+            setattr(state_module, "CONFIG_DIR", originals[0]),
+            setattr(state_module, "STATE_PATH", originals[1]),
+            setattr(state_module, "_LOCK_PATH", originals[2]),
+            setattr(state_module, "_STATE_CACHE", None),
+        ))
+        state_module.save_session_state(9, workspace_root="/tmp")
+        manager = harness._NimFlakyManager(nim_failures=0)
+        started = []
+        with harness._wire_stream(manager), patch(
+            "tamfis_code.state.start_session_title_in_background",
+            side_effect=lambda sid, obj: started.append((sid, obj)) or True,
+        ), patch("tamfis_code.state.upgrade_session_title_with_ai", new=__import__("unittest.mock", fromlist=["AsyncMock"]).AsyncMock()):
+            asyncio.run(run_local_agent_turn(
+                manager, ProviderType.NVIDIA, None,
+                [{"role": "user", "content": "read and implement the redesign prompt"}],
+                Console(file=StringIO(), no_color=True, width=200), _RecordingRenderer(),
+                workspace_root="/tmp", session_id=9, approval_policy="auto", interactive=False,
+            ))
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0][0], 9)
+        self.assertIn("read and implement the redesign prompt", started[0][1])

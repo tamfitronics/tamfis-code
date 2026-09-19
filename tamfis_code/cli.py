@@ -242,9 +242,14 @@ def _print_resumable_session_hint(console: Console, workspace_root: Path, *, exc
         return
     latest = max(candidates, key=lambda sid: local_state.get_session_state(sid).updated_at or "")
     title = local_state.session_display_title(latest)
+    # A session the LLM has not named yet is just "Session N"; say what it was
+    # doing NEXT to that name (never AS the name) so it is still recognisable.
+    latest_state = local_state.get_session_state(latest)
+    activity = "" if latest_state.session_title else local_state.best_effort_session_label(latest_state)
+    activity_note = f" (last: {escape(activity)})" if activity else ""
     console.print(
         f"[dim]Starting a new session. Run `tamfis-code resume {latest}` to continue "
-        f'"{title}" instead.[/dim]'
+        f'"{escape(title)}"{activity_note} instead.[/dim]'
     )
 
 

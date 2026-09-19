@@ -410,6 +410,27 @@ def _increment(mapping: Dict[str, int], key: str) -> None:
     mapping[key] = mapping.get(key, 0) + 1
 
 
+CREDIT_EXHAUSTED_COOLDOWN_SECONDS = 900.0
+_CREDIT_EXHAUSTION_MARKERS = (
+    "depleted", "out of credits", "insufficient credits", "included credits",
+    "pre-paid credits", "prepaid", "credit balance", "payment required",
+    "weekly usage limit", "usage limit", "spending limit", "monthly limit",
+    "purchase more credits", "used all available credits", "quota exceeded",
+    "exceeded your current quota",
+)
+
+
+def _is_credit_exhaustion(status: Optional[int], exc: Exception) -> bool:
+    """True when a provider failure means the ACCOUNT has no credit/allowance
+    (as opposed to a transient rate limit or a 5xx)."""
+    if status == 402:
+        return True
+    if status not in {403, 429}:
+        return False
+    text = str(exc).lower()
+    return any(marker in text for marker in _CREDIT_EXHAUSTION_MARKERS)
+
+
 def record_route_failure_for(
     provider: ProviderType,
     model: str,
@@ -438,6 +459,13 @@ def record_route_failure_for(
             status = None
     deterministic = status in {400, 401, 402, 403, 404}
     cooldown = 300.0 if deterministic else 30.0
+    # A provider that is OUT OF CREDIT (402, a 403 credit/limit wall, or a
+    # weekly-usage-limit 429) is not "briefly busy": retrying it every 30s just
+    # burns turns on a route that cannot answer. Park it for 15 minutes so the
+    # task uses NIM (which is free) and only returns once credit could be back.
+    # NIM itself is exempt -- its 429s are rate limits that clear in seconds.
+    if provider != ProviderType.NVIDIA and _is_credit_exhaustion(status, exc):
+        cooldown = max(cooldown, CREDIT_EXHAUSTED_COOLDOWN_SECONDS)
     now = time.monotonic()
     with _HEALTH_LOCK:
         state = _ROUTE_HEALTH.setdefault((provider.value, model or "*"), RouteHealth())
