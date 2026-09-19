@@ -166,6 +166,96 @@ EXCLUDED_DIR_NAMES = {
 }
 MAX_LIST_DIRECTORY_ENTRIES = 500
 MAX_SEARCH_RESULTS = 200
+# How many matches may be RETURNED in one tool result before the remainder is
+# handed over as a continuation offset. Small enough to keep a broad query from
+# filling the context window, large enough that most real searches finish in one
+# page. An explicit max_results may override it, up to MAX_SEARCH_RESULTS.
+SEARCH_PAGE_RESULTS = 80
+# How many matches are COLLECTED before paging: paging is useless if the pool
+# stops at the page size. 2,000 matches at <=500 characters each is bounded
+# (~1 MB worst case) and far past what any interactive search needs.
+_SEARCH_POOL_LIMIT = 2000
+
+
+def _sorted_search_matches(matches: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Put matches in a stable order (path, then line) so paging offsets mean
+    the same thing on every call.
+
+    ripgrep walks the tree in parallel and emits files in whatever order the
+    workers finish, so an unsorted pool differs between two identical
+    invocations -- and offset paging over it repeats some matches while
+    silently skipping others. Sorting ≤2,000 entries is free next to the
+    search itself. The trailing pool/error marker is left exactly where it is;
+    the paging call site re-attaches it.
+    """
+    marker = matches[-1] if matches and matches[-1].get("truncated") else None
+    body = matches[:-1] if marker is not None else list(matches)
+    if any("error" in entry for entry in body):
+        return list(matches)
+    try:
+        body.sort(key=lambda entry: (str(entry.get("file", "")), int(entry.get("line", 0))))
+    except (TypeError, ValueError):
+        return list(matches)
+    return [*body, marker] if marker is not None else body
+
+
+def _page_search_matches(
+    matches: List[Dict[str, Any]],
+    *,
+    offset: Optional[int] = None,
+    max_results: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Slice search matches into one page plus a continuation pointer.
+
+    Mirrors read_file's paging contract so the agent has ONE mental model for
+    "there is more, here is how to get it": the payload ends with a
+    `pagination` entry carrying `showing`, `total`, and `next_offset` (None on
+    the last page).
+
+    Callers must pass a DETERMINISTICALLY ordered list: an offset is only
+    meaningful if both calls see the same order. `_search_code_matches` sorts
+    its matches for exactly this reason -- ripgrep walks the tree in parallel,
+    so two identical invocations could otherwise page over different
+    orderings, repeating some matches while skipping others (caught by
+    test_one_page_plus_a_continuation_pointer).
+    """
+    total = len(matches)
+    try:
+        page_size = int(max_results) if max_results is not None else SEARCH_PAGE_RESULTS
+    except (TypeError, ValueError):
+        page_size = SEARCH_PAGE_RESULTS
+    page_size = max(1, min(MAX_SEARCH_RESULTS, page_size))
+    try:
+        start = max(0, int(offset) - 1) if offset is not None else 0
+    except (TypeError, ValueError):
+        start = 0
+    paged_request = offset is not None or max_results is not None
+    if not total:
+        return matches
+    if start >= total:
+        return [{
+            "note": (
+                f"[offset={start + 1} is past the end: {total} match(es) found. "
+                f"Re-run without offset to see them from the start.]"
+            ),
+        }]
+    page = matches[start:start + page_size]
+    end = start + len(page)
+    if end >= total and not paged_request and total <= page_size:
+        return matches
+    entry: Dict[str, Any] = {
+        "showing": f"{start + 1}-{end}",
+        "total": total,
+        "next_offset": end + 1 if end < total else None,
+    }
+    if end < total:
+        entry["note"] = (
+            f"Showing matches {start + 1}-{end} of {total}. Continue with "
+            f"offset={end + 1}, max_results={page_size} (same query) for the rest."
+        )
+    else:
+        entry["note"] = f"Showing matches {start + 1}-{end} of {total} (end of results)."
+    return [*page, {"pagination": entry}]
 # Files larger than this are skipped by search_code -- a single huge
 # (often generated/minified) file can otherwise dominate the whole result
 # set with one or two enormous match lines.
@@ -622,14 +712,29 @@ class MCPServer:
                 "pattern, and prefer find_references instead when you already have an exact "
                 "symbol name and want every definition and call site. `file_pattern` is a glob "
                 "(e.g. '*.py') to narrow which files are searched. Common noise directories "
-                "(.git, node_modules, __pycache__, and similar) are always excluded."
+                "(.git, node_modules, __pycache__, and similar) are always excluded. Results "
+                "are PAGED: when a result ends with a `pagination` entry, its `next_offset` "
+                "means there are more matches -- call again with that offset and the same "
+                "query instead of re-running a broader or differently-worded search."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {"type": "string", "description": "Search pattern"},
                     "path": {"type": "string", "description": "Search directory"},
-                    "file_pattern": {"type": "string", "description": "File pattern to match"}
+                    "file_pattern": {"type": "string", "description": "File pattern to match"},
+                    "offset": {
+                        "type": "integer", "minimum": 1,
+                        "description": (
+                            "Optional 1-based first match to return; continue with the "
+                            "`next_offset` from a previous result."
+                        ),
+                    },
+                    "max_results": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": MAX_SEARCH_RESULTS,
+                        "description": "Optional matches per page (default 80, maximum 200)",
+                    },
                 },
                 "required": ["query"]
             },
@@ -1646,7 +1751,36 @@ class MCPServer:
             })
         return results
 
-    async def _search_code(self, query: str, path: str = ".", file_pattern: str = None) -> List[Dict[str, Any]]:
+    async def _search_code(
+        self, query: str, path: str = ".", file_pattern: str = None,
+        offset: Optional[int] = None, max_results: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Search for `query`, returning ONE PAGE of matches.
+
+        A broad query in a large repository produces far more matches than a
+        model can use (and more than one tool result should carry), so the
+        result is paged exactly like read_file: the page is followed by a
+        `pagination` entry naming the range, the total, and the `next_offset`
+        to continue from -- rather than only telling the model to narrow the
+        query, which throws away the fact that the answer is ON match 120.
+        """
+        matches = await self._search_code_matches(query, path, file_pattern)
+        if matches and isinstance(matches[0], dict) and matches[0].get("error"):
+            return matches
+        # The "the pool itself stopped here" marker describes the search, not
+        # one of its matches: keep it out of the paging arithmetic (it must not
+        # be counted as a match or pushed onto a later page) and re-attach it
+        # to every page.
+        pool_marker = None
+        if matches and isinstance(matches[-1], dict) and matches[-1].get("truncated"):
+            pool_marker = matches[-1]
+            matches = matches[:-1]
+        page = _page_search_matches(matches, offset=offset, max_results=max_results)
+        return [*page, pool_marker] if pool_marker is not None else page
+
+    async def _search_code_matches(
+        self, query: str, path: str = ".", file_pattern: str = None,
+    ) -> List[Dict[str, Any]]:
         try:
             resolved_path = self._resolve_in_workspace(path)
         except PermissionError as exc:
@@ -1690,7 +1824,7 @@ class MCPServer:
             for line in stdout.split('\n'):
                 if not line.strip():
                     continue
-                if len(matches) >= MAX_SEARCH_RESULTS:
+                if len(matches) >= _SEARCH_POOL_LIMIT:
                     break
                 try:
                     data = json.loads(line)
@@ -1706,16 +1840,15 @@ class MCPServer:
                 except json.JSONDecodeError:
                     continue
 
-            if len(matches) >= MAX_SEARCH_RESULTS:
+            if len(matches) >= _SEARCH_POOL_LIMIT:
                 matches.append({
                     "truncated": True,
-                    "note": f"Showing the first {MAX_SEARCH_RESULTS} matches; the search "
-                            "produced more. Narrow the query (more specific pattern, a "
-                            "file_pattern glob, or a deeper path) instead of relying on "
-                            "the full result set.",
+                    "note": f"There are more than {_SEARCH_POOL_LIMIT} matches; the pool "
+                            "stops here. Narrow the query (a more specific pattern, a "
+                            "file_pattern glob, or a deeper path) to see the rest.",
                 })
 
-            return matches
+            return _sorted_search_matches(matches)
         except FileNotFoundError:
             # `rg` is fast and preferred, but it is not part of Python and is
             # absent from some minimal servers and hosted CI images. A
@@ -1734,7 +1867,7 @@ class MCPServer:
         try:
             paths = [root] if root.is_file() else sorted(root.rglob("*"))
             for candidate in paths:
-                if len(matches) >= MAX_SEARCH_RESULTS:
+                if len(matches) >= _SEARCH_POOL_LIMIT:
                     break
                 if not candidate.is_file() or candidate.stat().st_size > MAX_SEARCH_FILE_SIZE_BYTES:
                     continue
@@ -1752,18 +1885,18 @@ class MCPServer:
                             if len(content) > MAX_SEARCH_MATCH_CHARS:
                                 content = content[:MAX_SEARCH_MATCH_CHARS] + f"...[{len(content) - MAX_SEARCH_MATCH_CHARS} chars omitted]"
                             matches.append({"file": str(candidate), "line": line_number, "content": content})
-                            if len(matches) >= MAX_SEARCH_RESULTS:
+                            if len(matches) >= _SEARCH_POOL_LIMIT:
                                 break
                 except (OSError, UnicodeError):
                     continue
         except OSError as exc:
             return [{"error": str(exc)}]
-        if len(matches) >= MAX_SEARCH_RESULTS:
+        if len(matches) >= _SEARCH_POOL_LIMIT:
             matches.append({
                 "truncated": True,
-                "note": f"Showing the first {MAX_SEARCH_RESULTS} matches; narrow the query or path.",
+                "note": f"There are more than {_SEARCH_POOL_LIMIT} matches; narrow the query or path.",
             })
-        return matches
+        return _sorted_search_matches(matches)
 
     async def _find_references(self, symbol: str, path: str = ".") -> Dict[str, Any]:
         """Real cross-file reference resolution: where `symbol` is defined

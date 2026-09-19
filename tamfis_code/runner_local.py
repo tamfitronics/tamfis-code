@@ -1689,6 +1689,7 @@ async def _stream_completion_with_reconnect(
     reasoning_effort: Optional[str] = None,
     progress_callback: Optional[Callable[[str], None]] = None,
     initial_partial: str = "",
+    session_id: Optional[int] = None,
 ) -> tuple[str, list["_StreamedToolCall"], Optional[str]]:
     """Stream a completion and reconnect without losing or duplicating text.
 
@@ -1728,6 +1729,26 @@ async def _stream_completion_with_reconnect(
             if not retrying_partial and progress_callback is not None:
                 progress_callback(delta)
 
+        # Time every real provider round-trip here: this is the single funnel
+        # both the primary attempt and every fallback candidate go through, so
+        # one sample point covers the whole agent loop (the other recorder lives
+        # in ProviderManager.chat_completion, used by plan/title/classifier
+        # calls). /routes turns these into per-provider p50/p95 -- the number
+        # that explains "which route makes turns slow".
+        latency_started = time.monotonic()
+
+        def record_round_trip(*, ok: bool) -> None:
+            seconds = time.monotonic() - latency_started
+            from .providers import record_provider_latency
+            from .state import record_route_latency
+
+            record_provider_latency(provider, seconds, ok=ok)
+            if session_id is not None:
+                # Durable, per-session copy: /routes and `--json` report from
+                # this one so the numbers survive a restart and describe THIS
+                # session rather than every session the process served.
+                record_route_latency(session_id, provider, seconds, ok=ok)
+
         try:
             from .runtime.telemetry import provider_context
             with provider_context(provider.value):
@@ -1741,6 +1762,7 @@ async def _stream_completion_with_reconnect(
                     emit=not retrying_partial,
                     progress_callback=remember_attempt,
                 )
+            record_round_trip(ok=True)
             if retrying_partial:
                 novel = _novel_continuation(durable_partial, content)
                 if novel:
@@ -1754,6 +1776,10 @@ async def _stream_completion_with_reconnect(
             return content, calls, finish_reason
         except Exception as exc:
             last_error = exc
+            try:
+                record_round_trip(ok=False)
+            except Exception:
+                pass
             # Only text that was actually rendered is durable. A failed,
             # internal continuation attempt stays hidden so its incomplete
             # suffix cannot leak or be duplicated by the next reconnect.
@@ -1949,15 +1975,45 @@ def _fallback_candidates_for_turn(
     method = getattr(manager, "fallback_candidates", None)
     if not callable(method):
         return []
+    kwargs = _supported_keyword_arguments(
+        method,
+        {
+            "allow_premium_primary": allow_premium_primary,
+            "include_cooling": include_cooling,
+        },
+    )
     try:
-        return list(method(
-            current, task_profile, allow_premium_primary=allow_premium_primary,
-            include_cooling=include_cooling,
-        ))
+        return list(method(current, task_profile, **kwargs))
     except TypeError:
         # Compatibility with lightweight provider doubles used by older
-        # integrations and tests (they accept neither extra keyword).
+        # integrations and tests, which accept neither extra keyword. Passing
+        # the subset the callable actually declares above means reaching here
+        # is genuinely "this callable takes no keywords" -- rather than a
+        # blanket retry that silently DROPS a real permission (see below).
         return list(method(current, task_profile))
+
+
+def _supported_keyword_arguments(method: Any, wanted: dict[str, Any]) -> dict[str, Any]:
+    """Filter `wanted` down to the keywords `method` actually accepts.
+
+    Dropping the unsupported keyword is fine; dropping a SUPPORTED one is not.
+    The original one-shot retry passed neither keyword when a callable rejected
+    just one of them, which silently turned an allowed premium-primary
+    fallback into a disallowed one -- a real behaviour change hidden behind a
+    compatibility shim (caught by
+    test_fresh_fallback_route_rechecks_current_provider_health_snapshot).
+    """
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):
+        return dict(wanted)
+    accepts_var_keyword = any(
+        parameter.kind is inspect.Parameter.VAR_KEYWORD
+        for parameter in parameters.values()
+    )
+    if accepts_var_keyword:
+        return dict(wanted)
+    return {name: value for name, value in wanted.items() if name in parameters}
 
 
 def _is_resume_request(text: str) -> bool:
@@ -7044,6 +7100,7 @@ async def _run_local_agent_turn_impl(
                 tools=tools_for_round, renderer=renderer,
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model, task_profile),
                 progress_callback=_remember_stream_delta,
+                session_id=session_id,
             )
             # Do not wait for the next tool round/final answer: if the process
             # is interrupted immediately after a provider stream completes,
@@ -7280,6 +7337,7 @@ async def _run_local_agent_turn_impl(
                             reasoning_effort=_reasoning_effort(candidate, candidate_model, task_profile),
                             progress_callback=_remember_stream_delta,
                             initial_partial=interrupted_partial,
+                            session_id=session_id,
                         )
                         _persist_turn_checkpoint(
                             partial_assistant=content,

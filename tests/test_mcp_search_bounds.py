@@ -19,7 +19,9 @@ from tamfis_code.mcp import (
     EXCLUDED_DIR_NAMES,
     MAX_LIST_DIRECTORY_ENTRIES,
     MAX_SEARCH_RESULTS,
+    SEARCH_PAGE_RESULTS,
     MCPServer,
+    _page_search_matches,
 )
 
 
@@ -67,23 +69,67 @@ class ListDirectoryBoundsTests(unittest.TestCase):
             self.assertEqual(len(real_entries), MAX_LIST_DIRECTORY_ENTRIES)
 
 
-class SearchCodeBoundsTests(unittest.TestCase):
-    def test_caps_total_matches_with_truncation_marker(self):
+class SearchCodePagingTests(unittest.TestCase):
+    """A broad query must not dump every match into one tool result, and must
+    not throw away the rest either: it returns ONE page plus the offset that
+    continues it (read_file's contract), so "the answer is on match 120" is
+    reachable instead of only being told to narrow the query."""
+
+    def test_one_page_plus_a_continuation_pointer(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)
-            total = MAX_SEARCH_RESULTS + 40
+            total = SEARCH_PAGE_RESULTS + 40
             for i in range(total):
                 (root / f"module_{i:05d}.py").write_text("NEEDLE_TOKEN = 1\n")
 
             server = MCPServer()
             results = _run(server._search_code("NEEDLE_TOKEN", path=str(root)))
 
-            self.assertLessEqual(len(results), MAX_SEARCH_RESULTS + 1)
-            truncated_marker = next((item for item in results if item.get("truncated")), None)
-            self.assertIsNotNone(truncated_marker)
             real_matches = [item for item in results if "file" in item]
-            self.assertEqual(len(real_matches), MAX_SEARCH_RESULTS)
+            self.assertEqual(len(real_matches), SEARCH_PAGE_RESULTS)
+            self.assertLessEqual(len(results), SEARCH_PAGE_RESULTS + 1)
+            pagination = results[-1]["pagination"]
+            self.assertEqual(pagination["total"], total)
+            self.assertEqual(pagination["next_offset"], SEARCH_PAGE_RESULTS + 1)
+            self.assertIn("offset=", pagination["note"])
 
+            # The continuation really continues: no repeats, and the rest of
+            # the matches arrive with their own end-of-results marker.
+            following = _run(server._search_code(
+                "NEEDLE_TOKEN", path=str(root), offset=pagination["next_offset"],
+            ))
+            following_matches = [item for item in following if "file" in item]
+            self.assertEqual(len(following_matches), total - SEARCH_PAGE_RESULTS)
+            self.assertIsNone(following[-1]["pagination"]["next_offset"])
+            first_page_files = {item["file"] for item in real_matches}
+            self.assertFalse(first_page_files & {item["file"] for item in following_matches})
+
+    def test_an_unpaged_small_result_is_returned_whole(self):
+        """Paging must be invisible for the common case: no pagination entry,
+        no offset needed, exactly what the old behaviour returned."""
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            (root / "only.py").write_text("NEEDLE_TOKEN = 1\n")
+            results = _run(MCPServer()._search_code("NEEDLE_TOKEN", path=str(root)))
+            self.assertEqual(len(results), 1)
+            self.assertIn("file", results[0])
+
+    def test_offset_past_the_end_says_so_instead_of_returning_nothing(self):
+        page = _page_search_matches([{"file": "a.py", "line": 1}], offset=9)
+        self.assertEqual(len(page), 1)
+        self.assertIn("past the end", page[0]["note"])
+
+    def test_an_explicit_max_results_is_honoured_and_capped(self):
+        matches = [{"file": f"f{i}.py", "line": 1} for i in range(30)]
+        page = _page_search_matches(matches, max_results=5)
+        self.assertEqual(len([m for m in page if "file" in m]), 5)
+        self.assertEqual(page[-1]["pagination"]["next_offset"], 6)
+        capped = _page_search_matches(matches, max_results=10_000)
+        self.assertEqual(capped[-1]["pagination"]["total"], 30)
+        self.assertLessEqual(len([m for m in capped if "file" in m]), MAX_SEARCH_RESULTS)
+
+
+class SearchCodeBoundsTests(unittest.TestCase):
     def test_excludes_matches_inside_generated_or_dependency_directories(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)

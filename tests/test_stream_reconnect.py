@@ -215,5 +215,111 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
         self.assertIn("timeout", str(ctx.exception).lower())
 
 
+class ProviderLatencyIsRecordedForTheSessionTests(unittest.TestCase):
+    """The round-trip timing must land on the SESSION, not just in this
+    process: that durable copy is what `/routes` and `--json` report from.
+
+    Asserted at the real funnel (`_stream_completion_with_reconnect`, the one
+    path both the primary attempt and every fallback candidate take) rather
+    than against `record_route_latency` alone -- the wiring is the thing that
+    can silently be missing.
+    """
+
+    def setUp(self):
+        import tempfile
+        from pathlib import Path
+
+        from tamfis_code import state as state_module
+
+        self._state = state_module
+        self._originals = (
+            state_module.CONFIG_DIR, state_module.STATE_PATH, state_module._LOCK_PATH,
+        )
+        self._tmp = tempfile.TemporaryDirectory()
+        base = Path(self._tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = base / ".config" / "state.json"
+        state_module._LOCK_PATH = base / ".config" / ".state.lock"
+        state_module._STATE_CACHE = None
+        from tamfis_code import providers as providers_module
+
+        self._providers = providers_module
+        self._process_snapshot = {
+            k: list(v) for k, v in providers_module._PROVIDER_LATENCY.items()
+        }
+        self._failure_snapshot = dict(providers_module._PROVIDER_LATENCY_FAILURES)
+        providers_module._PROVIDER_LATENCY.clear()
+        providers_module._PROVIDER_LATENCY_FAILURES.clear()
+
+    def tearDown(self):
+        (self._state.CONFIG_DIR, self._state.STATE_PATH, self._state._LOCK_PATH) = (
+            self._originals
+        )
+        self._state._STATE_CACHE = None
+        self._providers._PROVIDER_LATENCY.clear()
+        self._providers._PROVIDER_LATENCY.update(self._process_snapshot)
+        self._providers._PROVIDER_LATENCY_FAILURES.clear()
+        self._providers._PROVIDER_LATENCY_FAILURES.update(self._failure_snapshot)
+        self._tmp.cleanup()
+
+    def _run(self, *, fail: bool, session_id: int | None):
+        async def fake_stream_one_completion(client, **kwargs):
+            if fail:
+                raise ConnectionError("dropped mid-stream")
+            return "answer", [], "stop"
+
+        async def no_sleep(_seconds):
+            return None
+
+        async def run():
+            with patch(
+                "tamfis_code.runner_local._stream_one_completion",
+                side_effect=fake_stream_one_completion,
+            ), patch("asyncio.sleep", side_effect=no_sleep):
+                return await _stream_completion_with_reconnect(
+                    _FakeManager(), client=object(),
+                    provider=ProviderType.NVIDIA, model="test-model",
+                    messages=[{"role": "user", "content": "hi"}], tools=[],
+                    renderer=_EventCollectingRenderer(debug=False),
+                    session_id=session_id,
+                )
+
+        try:
+            asyncio.run(run())
+        except Exception:
+            # A failed attempt is the point of the `fail=True` case: the
+            # sample must still be recorded, and the error must still surface.
+            if not fail:
+                raise
+
+    def test_a_successful_round_trip_records_a_session_sample(self):
+        self._state.save_session_state(11, workspace_root="/home")
+        self._run(fail=False, session_id=11)
+        stats, source = self._state.route_latency_stats(11)
+        self.assertEqual(source, "session")
+        self.assertEqual(stats["nvidia"]["samples"], 1)
+        self.assertGreaterEqual(stats["nvidia"]["max"], 0.0)
+
+    def test_a_failed_round_trip_is_recorded_and_counted_as_failed(self):
+        self._state.save_session_state(12, workspace_root="/home")
+        self._run(fail=True, session_id=12)
+        stats, _ = self._state.route_latency_stats(12)
+        samples = stats["nvidia"]["samples"]
+        self.assertGreaterEqual(samples, 1)
+        # Every attempt failed, so every sample is flagged: this is what stops
+        # an instantly-failing route from presenting a deceptively fast p50.
+        self.assertEqual(stats["nvidia"]["failures"], samples)
+
+    def test_no_session_id_leaves_the_durable_state_untouched(self):
+        self._state.save_session_state(13, workspace_root="/home")
+        self._run(fail=False, session_id=None)
+        self.assertEqual(self._state.get_session_state(13).route_latency, {})
+        # The process-wide registry still saw it (the pre-existing behaviour),
+        # and it carries no failure count for a successful round-trip.
+        process_stats = self._providers.provider_latency_stats()["nvidia"]
+        self.assertEqual(process_stats["samples"], 1)
+        self.assertEqual(process_stats["failures"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -190,6 +190,107 @@ class RouteHistoryWithTimingsTests(RouteEventFixture):
         self.assertIn("/routes", [name for name, _description in SLASH_COMMANDS])
 
 
+class ProviderLatencyPercentilesTests(unittest.TestCase):
+    """Counters say a route is failing; only percentiles say it is slow."""
+
+    def setUp(self):
+        from tamfis_code import providers as providers_module
+
+        self._providers = providers_module
+        self._snapshot = {k: list(v) for k, v in providers_module._PROVIDER_LATENCY.items()}
+        providers_module._PROVIDER_LATENCY.clear()
+
+    def tearDown(self):
+        self._providers._PROVIDER_LATENCY.clear()
+        self._providers._PROVIDER_LATENCY.update(self._snapshot)
+
+    def test_percentiles_reflect_the_samples(self):
+        from tamfis_code.providers import ProviderType
+
+        for value in (2.0, 4.0, 6.0, 8.0, 10.0):
+            self._providers.record_provider_latency(ProviderType.NVIDIA, value)
+        stats = self._providers.provider_latency_stats()["nvidia"]
+        self.assertEqual(stats["samples"], 5)
+        self.assertEqual(stats["p50"], 6.0)
+        self.assertEqual(stats["max"], 10.0)
+
+    def test_a_slow_outlier_shows_up_in_p95(self):
+        from tamfis_code.providers import ProviderType
+
+        for value in (1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 120.0):
+            self._providers.record_provider_latency(ProviderType.NVIDIA, value)
+        stats = self._providers.provider_latency_stats()["nvidia"]
+        self.assertEqual(stats["p50"], 1.0)
+        self.assertGreaterEqual(stats["p95"], 1.0)
+        self.assertEqual(stats["max"], 120.0)
+
+    def test_samples_are_bounded(self):
+        from tamfis_code.providers import ProviderType
+
+        for index in range(self._providers._LATENCY_SAMPLES_PER_ROUTE + 25):
+            self._providers.record_provider_latency(ProviderType.NVIDIA, float(index))
+        self.assertEqual(
+            len(self._providers._PROVIDER_LATENCY["nvidia"]),
+            self._providers._LATENCY_SAMPLES_PER_ROUTE,
+        )
+
+    def test_recording_never_raises_on_junk(self):
+        self._providers.record_provider_latency(None, 1.0)
+        self._providers.record_provider_latency("nvidia", "not-a-number")
+        self._providers.record_provider_latency("nvidia", -5.0)
+
+
+class RouteReportJsonTests(RouteEventFixture):
+    def test_the_json_report_carries_timeline_totals_and_latency(self):
+        import json
+
+        from tamfis_code import providers as providers_module
+        from tamfis_code.providers import ProviderType
+
+        state_module.save_session_state(1, workspace_root="/home")
+        state_module.record_route_event(1, provider="tamfisgpt-ultra", model="ultra")
+        state_module.record_route_error(1, provider="tamfisgpt-ultra", error="402 credits")
+        state_module.record_route_event(
+            1, provider="nvidia", model="nim-1",
+            previous_provider="tamfisgpt-ultra", reason="402", kind="failover",
+        )
+        previous = {k: list(v) for k, v in providers_module._PROVIDER_LATENCY.items()}
+        providers_module._PROVIDER_LATENCY.clear()
+        try:
+            providers_module.record_provider_latency(ProviderType.NVIDIA, 30.0)
+            report = json.loads(state_module.route_report_json(1))
+        finally:
+            providers_module._PROVIDER_LATENCY.clear()
+            providers_module._PROVIDER_LATENCY.update(previous)
+
+        self.assertEqual(report["session_id"], 1)
+        self.assertEqual(report["current"]["provider"], "nvidia")
+        self.assertEqual(len(report["events"]), 3)
+        self.assertEqual(report["last_exhaustion"]["provider"], "tamfisgpt-ultra")
+        held_providers = {entry["provider"] for entry in report["hold_totals"]}
+        self.assertEqual(held_providers, {"tamfisgpt-ultra", "nvidia"})
+        self.assertEqual(report["latency"]["nvidia"]["p50"], 30.0)
+        # Every event carries the duration it held the task, for charting.
+        self.assertIn("held_seconds", report["events"][0])
+
+    def test_latency_lines_put_the_slowest_route_first(self):
+        from tamfis_code import providers as providers_module
+        from tamfis_code.providers import ProviderType
+
+        previous = {k: list(v) for k, v in providers_module._PROVIDER_LATENCY.items()}
+        providers_module._PROVIDER_LATENCY.clear()
+        try:
+            providers_module.record_provider_latency(ProviderType.NVIDIA, 3.0)
+            providers_module.record_provider_latency(ProviderType.TIER_IV, 95.0)
+            lines = state_module.route_latency_lines(1)
+        finally:
+            providers_module._PROVIDER_LATENCY.clear()
+            providers_module._PROVIDER_LATENCY.update(previous)
+        self.assertTrue(lines)
+        self.assertIn("tier_iv", lines[0])
+        self.assertIn("p95 95.0s", lines[0])
+
+
 class OrchestratorRecordsRouteChangesTests(RouteEventFixture):
     """record_route is the single authoritative route-change hook -- it must
     feed the same persisted history the UI reads."""
@@ -287,6 +388,140 @@ class StatusBlockTests(RouteEventFixture):
         self.assertIn("route=nvidia", rendered)
         self.assertIn("exhausted=tamfisgpt-ultra", rendered)
         self.assertIn("failover=tamfisgpt-ultra -> nvidia", rendered)
+
+
+class SessionLatencyPersistenceTests(RouteEventFixture):
+    """Per-provider percentiles must belong to the SESSION and survive a
+    restart. The in-process registry cannot do either: it is empty in a new
+    process (so `/routes --json` has nothing to chart) and it mixes every
+    session the process served (so a chart of "this session" would be wrong).
+    """
+
+    def setUp(self):
+        super().setUp()
+        from tamfis_code import providers as providers_module
+
+        self._providers = providers_module
+        self._process_snapshot = {
+            k: list(v) for k, v in providers_module._PROVIDER_LATENCY.items()
+        }
+        self._failure_snapshot = dict(providers_module._PROVIDER_LATENCY_FAILURES)
+        providers_module._PROVIDER_LATENCY.clear()
+        providers_module._PROVIDER_LATENCY_FAILURES.clear()
+
+    def tearDown(self):
+        self._providers._PROVIDER_LATENCY.clear()
+        self._providers._PROVIDER_LATENCY.update(self._process_snapshot)
+        self._providers._PROVIDER_LATENCY_FAILURES.clear()
+        self._providers._PROVIDER_LATENCY_FAILURES.update(self._failure_snapshot)
+        super().tearDown()
+
+    def test_failed_attempts_are_counted_next_to_the_timings(self):
+        state_module.save_session_state(9, workspace_root="/home")
+        state_module.record_route_latency(9, "nvidia", 0.02)
+        state_module.record_route_latency(9, "nvidia", 0.03, ok=False)
+        state_module.record_route_latency(9, "nvidia", 0.04, ok=False)
+        stats, _ = state_module.route_latency_stats(9)
+        self.assertEqual(stats["nvidia"]["samples"], 3)
+        self.assertEqual(stats["nvidia"]["failures"], 2)
+        # The line says so, so an instantly-failing route is not read as fast.
+        line = state_module.route_latency_lines(9)[0]
+        self.assertIn("2 failed", line)
+
+    def test_samples_are_percentiles_and_survive_a_restart(self):
+        state_module.save_session_state(7, workspace_root="/home")
+        for value in (2.0, 4.0, 6.0, 8.0, 10.0):
+            state_module.record_route_latency(7, "nvidia", value)
+        stats, source = state_module.route_latency_stats(7)
+        self.assertEqual(source, "session")
+        self.assertEqual(stats["nvidia"]["samples"], 5)
+        self.assertEqual(stats["nvidia"]["p50"], 6.0)
+        self.assertEqual(stats["nvidia"]["max"], 10.0)
+
+        # A restart is a fresh process with an empty registry and a re-read
+        # state.json -- exactly what the durable copy exists for.
+        state_module._STATE_CACHE = None
+        self._providers._PROVIDER_LATENCY.clear()
+        stats, source = state_module.route_latency_stats(7)
+        self.assertEqual(source, "session")
+        self.assertEqual(stats["nvidia"]["samples"], 5)
+        self.assertEqual(stats["nvidia"]["p95"], 10.0)
+
+    def test_sessions_do_not_share_latency(self):
+        state_module.save_session_state(1, workspace_root="/a")
+        state_module.save_session_state(2, workspace_root="/b")
+        state_module.record_route_latency(1, "nvidia", 3.0)
+        state_module.record_route_latency(2, "tier_iv", 90.0)
+
+        session_one, _ = state_module.route_latency_stats(1)
+        session_two, _ = state_module.route_latency_stats(2)
+        self.assertEqual(set(session_one), {"nvidia"})
+        self.assertEqual(set(session_two), {"tier_iv"})
+        self.assertEqual(session_one["nvidia"]["p50"], 3.0)
+
+    def test_process_samples_are_a_labelled_fallback_only(self):
+        state_module.save_session_state(3, workspace_root="/home")
+        self._providers.record_provider_latency("nvidia", 4.0)
+        stats, source = state_module.route_latency_stats(3)
+        self.assertEqual(source, "process")
+        self.assertEqual(stats["nvidia"]["samples"], 1)
+        # ...and the report says so, rather than presenting them as the
+        # session's own numbers.
+        report = state_module.route_report(3)
+        self.assertEqual(report["latency_source"], "process")
+        lines = state_module.route_latency_lines(3)
+        self.assertTrue(any("no samples recorded for this session yet" in line for line in lines))
+
+    def test_a_slow_route_sorts_first_in_the_report(self):
+        state_module.save_session_state(4, workspace_root="/home")
+        for value in (3.0, 3.5, 4.0):
+            state_module.record_route_latency(4, "nvidia", value)
+        state_module.record_route_latency(4, "tier_iv", 95.0)
+        report = state_module.route_report(4)
+        self.assertEqual(report["latency_source"], "session")
+        self.assertEqual(report["latency"]["tier_iv"]["p95"], 95.0)
+        self.assertEqual(report["latency"]["nvidia"]["samples"], 3)
+        lines = state_module.route_latency_lines(4)
+        self.assertIn("tier_iv", lines[0])
+        self.assertIn("p95 95.0s", lines[0])
+
+    def test_the_json_export_is_chartable(self):
+        import json
+
+        state_module.save_session_state(5, workspace_root="/home")
+        state_module.record_route_event(5, provider="nvidia", model="nim-1")
+        state_module.record_route_latency(5, "nvidia", 12.0)
+        state_module.record_route_latency(5, "nvidia", 13.0, ok=False)
+        payload = json.loads(state_module.route_report_json(5))
+        self.assertEqual(payload["session_id"], 5)
+        self.assertEqual(payload["latency_source"], "session")
+        self.assertEqual(payload["latency"]["nvidia"]["max"], 13.0)
+        self.assertEqual(payload["latency"]["nvidia"]["failures"], 1)
+        self.assertEqual(payload["current"]["provider"], "nvidia")
+        # sorted keys + indented, so a diff of two exports is readable.
+        self.assertIn('\n  "latency"', state_module.route_report_json(5))
+
+    def test_samples_stay_bounded_per_provider(self):
+        from tamfis_code.state import ROUTE_LATENCY_SAMPLES_PER_PROVIDER
+
+        state_module.save_session_state(6, workspace_root="/home")
+        for index in range(ROUTE_LATENCY_SAMPLES_PER_PROVIDER + 30):
+            state_module.record_route_latency(6, "nvidia", float(index))
+        self.assertEqual(
+            len(state_module.get_session_state(6).route_latency["nvidia"]),
+            ROUTE_LATENCY_SAMPLES_PER_PROVIDER,
+        )
+        self.assertEqual(
+            state_module.route_latency_stats(6)[0]["nvidia"]["samples"],
+            ROUTE_LATENCY_SAMPLES_PER_PROVIDER,
+        )
+
+    def test_recording_never_raises_on_junk(self):
+        state_module.save_session_state(8, workspace_root="/home")
+        state_module.record_route_latency(8, None, 1.0)
+        state_module.record_route_latency(8, "nvidia", "not-a-number")
+        state_module.record_route_latency(8, "nvidia", -5.0)
+        self.assertEqual(state_module.get_session_state(8).route_latency, {})
 
 
 if __name__ == "__main__":  # pragma: no cover

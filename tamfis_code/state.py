@@ -428,6 +428,16 @@ class SessionState:
     # failed over -- a route switch was visible only as a scrolling-through
     # debug diagnostic. Bounded (see ROUTE_EVENT_LIMIT) because it is durable.
     route_events: list[dict] = field(default_factory=list)
+    # Per-provider response-time samples for THIS session, newest last:
+    # {provider: [seconds, ...]}. The in-process registry in providers.py
+    # cannot answer "why is this session slow" after a restart, and it mixes
+    # every session the process served, so the durable copy is what /routes
+    # reports from (see route_latency_stats).
+    route_latency: dict[str, list[float]] = field(default_factory=dict)
+    # How many of those samples were failed attempts ({provider: count}): a
+    # route failing instantly would otherwise average out looking FASTER than
+    # a healthy one. See providers._PROVIDER_LATENCY_FAILURES.
+    route_latency_failures: dict[str, int] = field(default_factory=dict)
     estimated_context_tokens: int = 0
     # Compact, schema-stable ledger for long-horizon execution.  This is
     # intentionally separate from the conversational turn checkpoint: the
@@ -708,6 +718,28 @@ def _enforce_state_caps(state: SessionState) -> None:
         overflow = len(state.discovered_symbols) - MAX_DISCOVERED_SYMBOL_FILES
         for key in list(state.discovered_symbols)[:overflow]:
             del state.discovered_symbols[key]
+    # Tolerant on read: a hand-edited or older row could carry anything here,
+    # and a malformed value must never be able to break every state save.
+    latency = state.route_latency if isinstance(state.route_latency, dict) else {}
+    cleaned: dict[str, list[float]] = {}
+    for provider, samples in latency.items():
+        if not isinstance(samples, (list, tuple)):
+            continue
+        cleaned[str(provider)] = list(samples)[-ROUTE_LATENCY_SAMPLES_PER_PROVIDER:]
+    if len(cleaned) > ROUTE_LATENCY_PROVIDER_LIMIT:
+        kept = set(cleaned)[-ROUTE_LATENCY_PROVIDER_LIMIT:]
+        cleaned = {name: values for name, values in cleaned.items() if name in kept}
+    state.route_latency = cleaned
+    failures = (
+        state.route_latency_failures
+        if isinstance(state.route_latency_failures, dict) else {}
+    )
+    state.route_latency_failures = {
+        str(name): int(count)
+        for name, count in failures.items()
+        if isinstance(count, (int, float)) and not isinstance(count, bool)
+        and str(name) in cleaned
+    }
 
 
 def _prune_stale_sessions(data: dict[str, Any], *, keep_session_id: int) -> None:
@@ -1784,6 +1816,14 @@ def request_session_title_regeneration(session_id: int) -> bool:
 
 ROUTE_EVENT_LIMIT = 20
 
+# Per-session response-time samples, so /routes (and `--json`) can still show
+# which route was slow after a restart -- and can chart ONE session's timings
+# instead of whatever this process happened to call. Bounded on both axes for
+# the same reason every other durable list here is (see _enforce_state_caps):
+# state.json is re-serialized on every event of a long session.
+ROUTE_LATENCY_SAMPLES_PER_PROVIDER = 50
+ROUTE_LATENCY_PROVIDER_LIMIT = 12
+
 
 # Errors that mean "this ACCOUNT cannot serve the request" rather than "this
 # request is bad": the route is dead until credits/quota/billing are fixed, so
@@ -2045,6 +2085,136 @@ def _parse_route_timestamp(value: Any) -> Optional[datetime]:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=timezone.utc)
     return parsed
+
+
+def record_route_latency(
+    session_id: int, provider: Any, seconds: float, *, ok: bool = True,
+) -> None:
+    """Persist one provider round-trip against THIS session. Never raises:
+    latency bookkeeping must not be able to fail a task.
+
+    A failed attempt is recorded too (its duration is often the symptom -- a
+    route that hangs until the first-byte timeout contributes that full
+    timeout), and counted in `route_latency_failures` so a fast p50 caused by
+    instant failures can never be mistaken for a healthy route.
+    """
+    try:
+        name = str(getattr(provider, "value", provider) or "")
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if not name or value < 0:
+        return
+    try:
+        state = get_session_state(session_id)
+        samples = state.route_latency if isinstance(state.route_latency, dict) else {}
+        state.route_latency = samples
+        samples[name] = list(samples.get(name) or []) + [round(value, 3)]
+        if len(samples[name]) > ROUTE_LATENCY_SAMPLES_PER_PROVIDER:
+            samples[name] = samples[name][-ROUTE_LATENCY_SAMPLES_PER_PROVIDER:]
+        if not ok:
+            failures = (
+                state.route_latency_failures
+                if isinstance(state.route_latency_failures, dict) else {}
+            )
+            state.route_latency_failures = failures
+            failures[name] = int(failures.get(name) or 0) + 1
+        put_session_state(state)
+    except Exception:
+        return
+
+
+def route_latency_stats(session_id: int) -> tuple[dict, str]:
+    """(percentiles, source) for /routes and `--json`.
+
+    Prefers this session's own persisted samples -- that is what "how slow has
+    THIS session been, and on which route" means, and it survives a restart.
+    Falls back to the current process's registry (source "process") for the
+    calls that have no session to attribute themselves to, such as the plan /
+    title / classifier requests, so the panel is not simply blank early on.
+    """
+    from .providers import latency_stats_from_samples, provider_latency_stats
+
+    try:
+        state = get_session_state(session_id)
+        samples = state.route_latency if isinstance(state.route_latency, dict) else {}
+        failures = (
+            state.route_latency_failures
+            if isinstance(state.route_latency_failures, dict) else {}
+        )
+    except Exception:
+        samples, failures = {}, {}
+    stats = latency_stats_from_samples(samples, failures)
+    if stats:
+        return stats, "session"
+    try:
+        process_stats = provider_latency_stats()
+    except Exception:
+        process_stats = {}
+    return process_stats, ("process" if process_stats else "none")
+
+
+def route_report(session_id: int) -> dict:
+    """Everything known about this session's routing, as plain data.
+
+    One structure for both the /routes table and `--json` (so a chart is drawn
+    from the same numbers the table shows): what route is live, the timeline
+    with how long each held the task, per-provider totals, per-provider latency
+    percentiles, the last account-level failure, and any routes cooling down.
+    """
+    diag = route_diagnostics(session_id)
+    history = route_history(session_id)
+    latency, latency_source = route_latency_stats(session_id)
+    return {
+        "session_id": session_id,
+        "current": diag.get("current"),
+        "events": history,
+        "failovers": diag.get("failovers") or [],
+        "last_exhaustion": diag.get("last_exhaustion"),
+        "cooling": diag.get("cooling") or [],
+        "hold_totals": [
+            {"provider": provider, "held_seconds": round(seconds, 1), "turns": turns}
+            for provider, seconds, turns in route_hold_totals(session_id)
+        ],
+        # latency_source is "session" when these numbers come from the samples
+        # this session recorded (the usual case), "process" when they are this
+        # process's registry because the session has none yet, "none" when
+        # neither exists -- so a chart never silently mixes the two.
+        "latency": latency,
+        "latency_source": latency_source,
+    }
+
+
+def route_report_json(session_id: int) -> str:
+    """`/routes --json`: the route report as formatted JSON for charting."""
+    return json.dumps(route_report(session_id), indent=2, sort_keys=True)
+
+
+def route_latency_lines(session_id: int) -> list[str]:
+    """Human lines for /routes: per-provider p50/p95 response time.
+
+    Ordered slowest-p95 first, because the question this answers is "which
+    route is making turns slow" -- the top line is the answer. Totals (held
+    per route) can blame a route for time it spent waiting on a slow provider;
+    these percentiles are what separate "this route is broken" from "this
+    route is slow but working".
+    """
+    stats, source = route_latency_stats(session_id)
+    lines = []
+    for provider, values in sorted(
+        stats.items(), key=lambda item: item[1].get("p95", 0), reverse=True,
+    ):
+        failures = int(values.get("failures", 0) or 0)
+        failed_note = f", {failures} failed" if failures else ""
+        lines.append(
+            f"{provider}: p50 {values.get('p50', 0):.1f}s  p95 {values.get('p95', 0):.1f}s  "
+            f"max {values.get('max', 0):.1f}s  (n={int(values.get('samples', 0))}{failed_note})"
+        )
+    if lines and source == "process":
+        # Say so: these are not this session's numbers, and pretending they are
+        # would make a chart of "this session" quietly wrong.
+        lines.append("(no samples recorded for this session yet -- showing this process's)")
+    return lines
 
 
 def route_status_compact(session_id: int, max_chars: int = 56) -> str:

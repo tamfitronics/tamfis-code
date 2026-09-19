@@ -30,7 +30,9 @@ import time
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, AsyncIterator, Dict, List, Optional
+from typing import (
+    TYPE_CHECKING, Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence,
+)
 
 from openai import AsyncOpenAI
 
@@ -314,6 +316,94 @@ except (TypeError, ValueError):
 _HEALTH_LOCK = threading.RLock()
 _ROUTE_HEALTH: Dict[tuple[str, str], RouteHealth] = {}
 _ROUTING_TELEMETRY = RoutingTelemetry()
+
+# Per-provider response-time samples, newest last, bounded per route. Counters
+# alone (RoutingTelemetry above) can say a route is FAILING but not that it is
+# SLOW, which is the difference between "this provider is broken" and "this
+# provider works but makes every turn take three minutes" -- the question
+# /routes has to answer to explain sluggishness. 50 samples is enough for a
+# stable p50/p95 without holding unbounded history in a process that can run
+# for days.
+_LATENCY_SAMPLES_PER_ROUTE = 50
+_PROVIDER_LATENCY: Dict[str, list[float]] = {}
+# How many of those samples were failures. A failed attempt's duration is kept
+# in the sample list on purpose -- a route that hangs until its first-byte
+# timeout IS slow, and that 45s is the whole complaint. But a route that fails
+# INSTANTLY (dead credentials, 402, refused connection) contributes a ~0s
+# sample, which would otherwise make a broken route the fastest-looking one;
+# this counter is what lets a reader tell "fast p50" from "fast failures".
+_PROVIDER_LATENCY_FAILURES: Dict[str, int] = {}
+
+
+def record_provider_latency(provider: Any, seconds: float, *, ok: bool = True) -> None:
+    """Record one provider round-trip. Best-effort and never raises: latency
+    bookkeeping must not be able to fail a request."""
+    try:
+        name = str(getattr(provider, "value", provider) or "")
+        value = float(seconds)
+    except (TypeError, ValueError):
+        return
+    if not name or value < 0:
+        return
+    with _HEALTH_LOCK:
+        samples = _PROVIDER_LATENCY.setdefault(name, [])
+        samples.append(round(value, 3))
+        if len(samples) > _LATENCY_SAMPLES_PER_ROUTE:
+            del samples[: len(samples) - _LATENCY_SAMPLES_PER_ROUTE]
+        if not ok:
+            _PROVIDER_LATENCY_FAILURES[name] = _PROVIDER_LATENCY_FAILURES.get(name, 0) + 1
+
+
+def latency_stats_from_samples(
+    samples_by_provider: Mapping[str, Sequence[float]],
+    failures_by_provider: Optional[Mapping[str, int]] = None,
+) -> Dict[str, Dict[str, float]]:
+    """Per-provider latency percentiles: {provider: {samples, p50, p95, max, min}}.
+
+    p50 is what a typical turn costs on that route; p95 is what the worst
+    one-in-twenty costs -- the number that explains "some turns take minutes".
+
+    This is the ONE percentile implementation. Both the process-wide registry
+    below and the per-session samples persisted in state.json go through it, so
+    /routes and `/routes --json` can never disagree about what p50/p95 mean.
+    """
+
+    def _percentile(ordered: list[float], fraction: float) -> float:
+        if not ordered:
+            return 0.0
+        index = min(len(ordered) - 1, max(0, int(round(fraction * (len(ordered) - 1)))))
+        return ordered[index]
+
+    stats: Dict[str, Dict[str, float]] = {}
+    for name, samples in (samples_by_provider or {}).items():
+        ordered = sorted(
+            float(value) for value in (samples or [])
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            and float(value) >= 0
+        )
+        if not ordered:
+            continue
+        try:
+            failures = int((failures_by_provider or {}).get(str(name), 0) or 0)
+        except (TypeError, ValueError):
+            failures = 0
+        stats[str(name)] = {
+            "samples": len(ordered),
+            "failures": max(0, failures),
+            "p50": round(_percentile(ordered, 0.50), 2),
+            "p95": round(_percentile(ordered, 0.95), 2),
+            "max": round(ordered[-1], 2),
+            "min": round(ordered[0], 2),
+        }
+    return stats
+
+
+def provider_latency_stats() -> Dict[str, Dict[str, float]]:
+    """Percentiles over this process's recent samples (all routes it called)."""
+    with _HEALTH_LOCK:
+        snapshot = {name: list(samples) for name, samples in _PROVIDER_LATENCY.items()}
+        failures = dict(_PROVIDER_LATENCY_FAILURES)
+    return latency_stats_from_samples(snapshot, failures)
 
 
 def _increment(mapping: Dict[str, int], key: str) -> None:
@@ -1995,6 +2085,9 @@ class ProviderManager:
             request_kwargs["extra_body"] = extra_body
 
         self.record_route_attempt(resolved, selected_model)
+        # Response-time sample for /routes: counters can show a route failing,
+        # only a percentile can show it is slow.
+        _latency_started = time.monotonic()
         from .runtime.telemetry import record_usage, span
         try:
             with span(
@@ -2073,6 +2166,7 @@ class ProviderManager:
                             "Provider streamed no content (empty response)"
                         )
                     self.record_route_success(resolved, selected_model)
+                    record_provider_latency(resolved, time.monotonic() - _latency_started)
                     return
 
                 if response.choices:
@@ -2086,9 +2180,11 @@ class ProviderManager:
                                  reasoning_tokens=getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None),
                                  cached_input_tokens=getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None))
                 self.record_route_success(resolved, selected_model)
+                record_provider_latency(resolved, time.monotonic() - _latency_started)
                 return
 
         except Exception as exc:
+            record_provider_latency(resolved, time.monotonic() - _latency_started, ok=False)
             # Rotate to the next configured NVIDIA NIM key before ever
             # falling back to a different provider entirely -- one account
             # hitting its rate/weekly-usage limit shouldn't give up NIM's

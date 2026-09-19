@@ -283,7 +283,11 @@ Not yet implemented in this pass: /notifications.
 SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/help", "show this help"),
     ("/status", "show session/workspace/approval status"),
-    ("/routes", "show the provider route timeline with how long each one held the task"),
+    (
+        "/routes",
+        "show the provider route timeline, how long each route held the task, and "
+        "per-route response-time percentiles (/routes --json to export them)",
+    ),
     ("/usage", "show your TamfisGPT credit balance (day/week/month)"),
     ("/context", "show cached repository/task context"),
     ("/reports", "show the repository report index"),
@@ -1938,7 +1942,13 @@ async def _run_interactive_impl(
                 f"{ledger_line}"
             )
             continue
-        if _ci_equals(text, "/routes"):
+        if _ci_equals(text, "/routes") or _ci_startswith(text, "/routes "):
+            routes_arg = text[len("/routes"):].strip().lower()
+            if routes_arg in {"--json", "json"}:
+                # Machine-readable form of the same report, for charting route
+                # timings/latency over a session without scraping the table.
+                console.print_json(local_state.route_report_json(workspace.session_id))
+                continue
             # Which provider actually ran this session, in order, and how long
             # each one held it. The stored events answer "what route am I on";
             # the complaint they answer here is "why is this so slow / why did
@@ -1985,9 +1995,15 @@ async def _run_interactive_impl(
                         f"{str(last_exhaustion.get('reason') or '')[:200]}"
                     )
                 )
+            latency_lines = local_state.route_latency_lines(workspace.session_id)
+            if latency_lines:
+                console.print("[dim]response time per route (slowest first):[/dim]")
+                for line in latency_lines:
+                    console.print(f"  {line}")
             cooling = local_state.cooling_route_names()
             if cooling:
                 console.print(f"[yellow]Cooling down (recent failures):[/yellow] {', '.join(cooling)}")
+            console.print("[dim]/routes --json for the machine-readable report.[/dim]")
             continue
         if _ci_equals(text, "/usage"):
             # Real per-feature credit balance from the SAME ledger the
