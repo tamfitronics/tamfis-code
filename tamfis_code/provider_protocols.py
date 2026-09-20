@@ -39,19 +39,28 @@ def normalize_tool_call(
 
     matched = ""
     lowered = raw.casefold()
-    for candidate in sorted(names, key=len, reverse=True):
+    # Reasoning models sometimes narrate a correction in the header, e.g.
+    # ``write_file? Actually read_file``. Prefer the LAST boundary-safe
+    # registered name: it is the model's final protocol intent, while the
+    # earlier name is usually discarded internal scratch text.
+    matches: list[tuple[int, int, str]] = []
+    for candidate in names:
         candidate_lower = candidate.casefold()
-        start = lowered.find(candidate_lower)
-        if start < 0:
-            continue
-        before = raw[start - 1] if start else ""
-        end = start + len(candidate)
-        after = raw[end:end + 1]
-        if (not before or not (before.isalnum() or before == "_")) and (
-            not after or not (after.isalnum() or after == "_")
-        ):
-            matched = candidate
-            break
+        search_from = 0
+        while True:
+            start = lowered.find(candidate_lower, search_from)
+            if start < 0:
+                break
+            before = raw[start - 1] if start else ""
+            end = start + len(candidate)
+            after = raw[end:end + 1]
+            if (not before or not (before.isalnum() or before == "_")) and (
+                not after or not (after.isalnum() or after == "_")
+            ):
+                matches.append((start, len(candidate), candidate))
+            search_from = start + 1
+    if matches:
+        matched = max(matches, key=lambda item: (item[0], item[1]))[2]
 
     if not matched:
         # Even without an allow-list, strip the well-known internal channel

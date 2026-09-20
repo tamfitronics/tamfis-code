@@ -39,6 +39,15 @@ def test_channel_markup_is_removed_from_a_registered_tool_name():
     assert json.loads(arguments) == {"query": "gemma4"}
 
 
+def test_header_correction_prefers_the_final_registered_tool_name():
+    name, arguments = normalize_tool_call(
+        "to=functions.read_file <|constrain|>write_file? Actually read_file.<|end|>",
+        "",
+        allowed_names={"read_file", "write_file"},
+    )
+    assert name == "read_file"
+
+
 def test_unknown_channel_markup_is_not_authorized_as_a_tool():
     name, arguments = normalize_tool_call(
         "unknown_tool<|Channel|>Commentary({\"x\":1})",
@@ -47,6 +56,14 @@ def test_unknown_channel_markup_is_not_authorized_as_a_tool():
     )
     assert name.startswith("unknown_tool")
     assert arguments == ""
+
+
+def test_malformed_provider_header_is_retryable():
+    from tamfis_code.providers import ProviderManager
+
+    assert ProviderManager.is_retryable_provider_error(
+        RuntimeError("unexpected tokens remaining in message header: to=functions.read_file")
+    )
 
 
 def test_single_tool_call_provider_error_is_detected_narrowly():

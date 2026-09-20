@@ -1960,6 +1960,15 @@ class ProviderManager:
             "system message must be at the beginning",
             "session usage limit",
             "weekly usage limit",
+            # Reasoning-model channel/header corruption (for example
+            # `to=functions.read_file <|constrain|>...`) is a provider
+            # protocol failure. Do not expose the parser's internal header
+            # detail as a user task failure; route around the deployment and
+            # retry from the durable checkpoint.
+            "unexpected tokens remaining in message header",
+            "tokens remaining in message header",
+            "<|constrain|>",
+            "to=functions.",
         )
         return any(marker in message for marker in retryable_markers)
 
