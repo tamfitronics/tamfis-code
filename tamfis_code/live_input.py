@@ -43,7 +43,7 @@ _STDOUT_BATCH_INTERVAL_SECONDS = 0.01
 # Keep the composer readable on ultrawide terminals. The input remains
 # left-aligned, but its top/bottom rules stop at the same practical width as
 # the assistant card instead of becoming a wall-to-wall separator.
-_COMPOSER_MAX_WIDTH = 100
+_COMPOSER_MAX_WIDTH = 140
 
 # Claude Code's own bottom-toolbar phrasing for the three MODE_CYCLE stops
 # that actually change what gets auto-approved -- "manual" (/mode's "ask")
@@ -117,7 +117,10 @@ def composer_rule_html() -> str:
     import shutil
 
     terminal_width = shutil.get_terminal_size(fallback=(80, 24)).columns
-    width = min(_COMPOSER_MAX_WIDTH, max(20, terminal_width))
+    # Keep roughly a ten-column margin on each side when the terminal is
+    # ordinary-sized, while allowing wide terminals to use a substantial
+    # readable span instead of collapsing to a 100-column half-width box.
+    width = min(_COMPOSER_MAX_WIDTH, max(20, terminal_width - 20))
     return f"<ansigray>{'─' * width}</ansigray>"
 
 
