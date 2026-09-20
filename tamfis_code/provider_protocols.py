@@ -48,19 +48,36 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
         if message.get("role") == "system"
     ]
 
-    def _provider_safe_message(message: dict[str, Any]) -> dict[str, Any]:
-        """Repair only malformed historical function arguments.
+    def _provider_safe_message(message: dict[str, Any]) -> dict[str, Any] | None:
+        """Repair malformed historical assistant/tool messages at dispatch.
 
-        An interrupted streamed tool call can be checkpointed after its
-        name/id arrive but before its JSON argument string closes. Sending
-        that truncated history verbatim makes every provider reject the
-        conversation before it can continue. The corresponding tool result
-        remains in the transcript, so replace only the malformed arguments
-        with an explicit, valid object and leave the durable checkpoint
-        untouched.
+        An interrupted stream can checkpoint an assistant tool call before
+        any visible text exists. OpenAI-compatible providers disagree about
+        whether ``content: null`` is legal; TamfisGPT's local endpoint
+        rejects both null and empty assistant content. Repair the request
+        copy only, leaving the durable transcript unchanged.
         """
-        if message.get("role") != "assistant" or not message.get("tool_calls"):
+        if message.get("role") != "assistant":
             return message
+
+        content = message.get("content")
+        has_content = (
+            bool(content.strip()) if isinstance(content, str)
+            else bool(content)
+        )
+        if not has_content:
+            if message.get("tool_calls"):
+                message = {**message, "content": "[tool call]"}
+            else:
+                return None
+
+        if not message.get("tool_calls"):
+            return message
+
+        # An interrupted streamed tool call can be checkpointed after its
+        # name/id arrive but before its JSON argument string closes. Sending
+        # that truncated history verbatim makes every provider reject the
+        # conversation before it can continue.
         repaired_calls: list[Any] = []
         changed = False
         for call in message.get("tool_calls") or []:
@@ -106,9 +123,11 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
         return {**message, "tool_calls": repaired_calls} if changed else message
 
     remainder = [
-        _provider_safe_message(message)
+        repaired
         for message in messages
         if message.get("role") != "system"
+        for repaired in [_provider_safe_message(message)]
+        if repaired is not None
     ]
     combined_text = "\n\n".join(text for text in system_texts if text.strip())
     if not combined_text:
