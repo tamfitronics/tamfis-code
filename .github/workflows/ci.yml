@@ -44,7 +44,15 @@ jobs:
       # own commands from each other/the host, not defending against a
       # hostile CI runner).
       - name: Allow unprivileged user namespaces (Ubuntu's AppArmor confinement policy otherwise blocks bwrap's own loopback setup)
-        run: sudo sysctl -w kernel.unprivileged_userns_apparmor_policy=0
+        # Ubuntu 24.04's actual switch is kernel.apparmor_restrict_unprivileged_userns (the
+        # older kernel.unprivileged_userns_apparmor_policy below is accepted but did not lift
+        # the restriction: 3 real-bwrap tests kept failing with "bwrap: loopback: Failed
+        # RTM_NEWADDR: Operation not permitted" on ubuntu-24.04 image 20260907). Set both;
+        # either may be absent on a given image, so neither may fail the step.
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo sysctl -w kernel.unprivileged_userns_apparmor_policy=0 || true
+          sysctl kernel.apparmor_restrict_unprivileged_userns kernel.unprivileged_userns_apparmor_policy || true
       - run: pip install -e ".[dev]"
       - name: Artifact benchmark corpus (provider-independent quality gate)
         run: pytest -q tests/test_artifact_benchmark_corpus.py
