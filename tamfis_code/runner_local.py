@@ -360,6 +360,25 @@ COMPLETION_EVIDENCE_CORRECTION = (
 # gap, not a model one: even a fully capable model only verifies what the
 # harness actually requires before letting it finish.
 MAX_VERIFY_COMMAND_RETRIES = 2
+
+# Files whose content nothing can execute, type-check or lint: a change to ONLY these leaves nothing for
+# the generic "run a verification command" gate to verify. Before this, creating a NOTES.md failed the
+# whole task ("Validation incomplete: files were changed but no execute_command call ever verified the
+# fix") even though the requested work was done. Config (json/yaml/toml), scripts and archives are NOT
+# here: they can break a build, so they stay gated.
+_DOCUMENTATION_SUFFIXES = frozenset({".md", ".markdown", ".mdx", ".txt", ".rst", ".adoc", ".asciidoc"})
+_DOCUMENTATION_NAMES = frozenset({"readme", "license", "licence", "changelog", "notes", "authors", "contributing", "todo"})
+
+
+def _is_documentation_path(path: Any) -> bool:
+    """True for a prose/documentation file (markdown, text, rst...), never for code or config."""
+    try:
+        candidate = Path(str(path))
+    except Exception:
+        return False
+    if candidate.suffix.lower() in _DOCUMENTATION_SUFFIXES:
+        return True
+    return candidate.suffix == "" and candidate.name.lower() in _DOCUMENTATION_NAMES
 VERIFY_COMMAND_CORRECTION = (
     "You changed files in this project, but never successfully ran `{command}` (this "
     "project's real validation command) since the last change. Run `{command}` now via "
@@ -6515,6 +6534,7 @@ async def _run_local_agent_turn_impl(
     consecutive_identical_rounds = 0
     recent_tool_signatures: list[tuple[tuple[str, str], ...]] = []
     any_mutation = False
+    any_code_mutation = False  # a change to something a command could verify (not prose-only)
     rollover_count = 0
     compaction_count = 0
     replanned_after_evidence = False
@@ -8425,7 +8445,7 @@ async def _run_local_agent_turn_impl(
                 continue
 
             if (
-                tools and any_mutation and not validation_commands
+                tools and any_mutation and any_code_mutation and not validation_commands
                 and not any_execute_command_since_mutation
                 and getattr(task_profile.task_type, "value", "") in {"debug", "edit"}
             ):
@@ -8788,7 +8808,7 @@ async def _run_local_agent_turn_impl(
         async def _finish_tool_call(
             tc: Any, arguments: dict[str, Any], envelope: "ToolEnvelope", result: dict[str, Any],
         ) -> Optional[TaskOutcome]:
-            nonlocal any_mutation, any_execute_command_since_mutation, port_conflict_seen
+            nonlocal any_mutation, any_code_mutation, any_execute_command_since_mutation, port_conflict_seen
             result = _normalise_tool_result(tc.name, arguments, result, workspace_root)
             envelope.finish(result=result, success=bool(result.get("success")))
             observation = orchestrator.record_tool(envelope)
@@ -8930,6 +8950,8 @@ async def _run_local_agent_turn_impl(
 
             if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"} and result.get("success"):
                 any_mutation = True
+                if not (tc.name in {"write_file", "edit_file"} and _is_documentation_path(arguments.get("path"))):
+                    any_code_mutation = True  # archives/artifacts and every non-prose file stay gated
                 if tc.name in {"write_file", "edit_file"} and arguments.get("path"):
                     _update_unresolved_edit_paths(
                         unresolved_edit_paths,

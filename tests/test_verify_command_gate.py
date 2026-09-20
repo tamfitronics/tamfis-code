@@ -149,5 +149,74 @@ class VerifyCommandGateTests(_StatePatchMixin, unittest.TestCase):
             self.assertEqual(len(nudges), 2, f"expected exactly MAX_VERIFY_COMMAND_RETRIES nudges, got: {diagnostics}")
 
 
+    def _run_writes(self, tmp: str, writes: list[tuple[str, str]], prompt: str = "fix the bug and add a small file"):
+        """Drive a turn that writes the given (name, content) files then finishes without ever
+        running a command."""
+        rounds = [
+            [_chunk(_delta(tool_calls=[
+                _tool_call_delta(i, call_id=f"call_{i}", name="write_file",
+                                 arguments=json.dumps({"path": str(Path(tmp) / name), "content": content}))
+                for i, (name, content) in enumerate(writes)
+            ]))],
+            [_chunk(_delta(content="Done."))],
+            [_chunk(_delta(content="Done."))],
+            [_chunk(_delta(content="Done."))],
+        ]
+        renderer = _RecordingRenderer()
+        outcome = asyncio.run(run_local_agent_turn(
+            _FakeManager(_FakeClient(rounds)), ProviderType.NVIDIA, None,
+            [{"role": "user", "content": prompt}],
+            self._console(), renderer,
+            workspace_root=tmp, session_id=3, approval_policy="auto", interactive=False,
+        ))
+        nudges = [
+            str(e["payload"].get("content")) for e in renderer.events
+            if e["event_type"] == "diagnostics" and "no execute_command has verified the fix" in str(e["payload"].get("content"))
+        ]
+        return outcome, nudges
+
+    def test_a_documentation_only_change_is_not_failed_for_lack_of_a_verification_command(self):
+        """Owner-reported 2026-09-20: creating a NOTES.md ended as "Task failed: Validation incomplete:
+        files were changed but no execute_command call ever verified the fix" -- nothing can be run to
+        verify prose, so the work is done and the task must not be failed."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outcome, nudges = self._run_writes(tmp, [("NOTES.md", "# Notes\nA tiny CLI.\n")], "add a NOTES.md file summarising the README")
+            self.assertNotEqual(outcome.status, "failed", outcome.error)
+            self.assertEqual(nudges, [], "prose-only changes are never asked to run a verification command")
+
+    def test_a_code_change_is_still_gated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outcome, nudges = self._run_writes(tmp, [("app.py", "x = 1\n")])
+            self.assertEqual(outcome.status, "failed")
+            self.assertEqual(len(nudges), 2)
+
+    def test_a_config_change_is_still_gated(self):
+        """json/yaml/toml can break a build: only prose is exempt."""
+        with tempfile.TemporaryDirectory() as tmp:
+            outcome, nudges = self._run_writes(tmp, [("settings.json", "{}\n")])
+            self.assertEqual(outcome.status, "failed")
+            self.assertEqual(len(nudges), 2)
+
+    def test_docs_plus_code_in_one_turn_is_still_gated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            outcome, nudges = self._run_writes(tmp, [("NOTES.md", "# n\n"), ("app.py", "x = 1\n")])
+            self.assertEqual(outcome.status, "failed")
+            self.assertEqual(len(nudges), 2)
+
+
+class DocumentationPathTests(unittest.TestCase):
+    def test_prose_files_are_documentation(self):
+        from tamfis_code.runner_local import _is_documentation_path
+
+        for name in ("NOTES.md", "docs/guide.rst", "a.txt", "README", "LICENSE", "CHANGELOG", "x.MD", "notes", "d/e.markdown"):
+            self.assertTrue(_is_documentation_path(name), name)
+
+    def test_code_config_and_odd_inputs_are_not(self):
+        from tamfis_code.runner_local import _is_documentation_path
+
+        for name in ("app.py", "package.json", "config.yaml", "pyproject.toml", "build.sh", "src/notes.ts", "Makefile", "", None, 5):
+            self.assertFalse(_is_documentation_path(name), repr(name))
+
+
 if __name__ == "__main__":
     unittest.main()

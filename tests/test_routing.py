@@ -333,9 +333,8 @@ def test_researched_provider_routes_expose_exact_vision_models():
         ProviderType.HF: {
             "Qwen/Qwen3.6-35B-A3B",
             "Qwen/Qwen3.6-27B",
-            "microsoft/Phi-3.5-vision-instruct",
-            "meta-llama/Llama-3.2-11B-Vision-Instruct",
-            "Qwen/Qwen2-VL-7B-Instruct",
+            # Phi-3.5-vision, Llama-3.2-11B-Vision and Qwen2-VL-7B were removed 2026-09-20: no longer in
+            # the HF router's /v1/models catalogue (each was a guaranteed failed hop).
             "moonshotai/Kimi-K2.6",
             "Qwen/Qwen3.8-27B:novita",
         },
@@ -794,3 +793,29 @@ def test_pure_audit_wording_stays_read_only():
 
 def test_explicit_read_only_stays_read_only():
     assert classify_task("review this file read-only, no edits").task_type is TaskType.INSPECT
+
+
+def test_no_configured_model_id_is_one_the_provider_catalogues_dropped():
+    """Ids the providers' own public catalogues no longer list (audited 2026-09-20 against
+    ollama.com/api/tags, openrouter.ai/api/v1/models and router.huggingface.co/v1/models): each was a
+    guaranteed failed attempt before a working model was reached."""
+    dropped = {
+        ProviderType.OLLAMA_CLOUD: {"deepseek-v4-pro:cloud"},
+        ProviderType.OPENROUTER: {"anthropic/claude-3.5-haiku", "mistralai/mistral-7b-instruct:free"},
+        ProviderType.HF: {
+            "meta-llama/Llama-3.2-3B-Instruct", "mistralai/Mistral-7B-Instruct-v0.3",
+            "microsoft/Phi-3.5-vision-instruct", "meta-llama/Llama-3.2-11B-Vision-Instruct",
+            "Qwen/Qwen2-VL-7B-Instruct",
+        },
+    }
+    for provider, ids in dropped.items():
+        config = ProviderManager.PROVIDERS[provider]
+        configured = {config.default_model, *config.models, *(config.vision_models or [])}
+        assert not ids & configured, (provider, ids & configured)
+
+
+def test_hf_keeps_working_vision_models_after_the_cleanup():
+    config = ProviderManager.PROVIDERS[ProviderType.HF]
+    assert config.vision_supported
+    assert {"Qwen/Qwen3.6-35B-A3B", "Qwen/Qwen3.6-27B"} <= set(config.vision_models)
+    assert set(config.vision_models) <= set(config.models)

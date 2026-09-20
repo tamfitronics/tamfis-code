@@ -657,7 +657,6 @@ class ProviderManager:
                 # changing the automatic model for every task.
                 "glm-5.3:cloud",
                 "glm-5.3-flash:cloud",
-                "deepseek-v4-pro:cloud",
                 # Replaces the prior minimax-m2.7:cloud route outright
                 # (2026-08-03): same MiniMax family already routed via
                 # Ollama Cloud, now the latest generation with a 1M-token
@@ -954,8 +953,12 @@ class ProviderManager:
             base_url="https://router.huggingface.co/v1",
             api_key_env="HF_TOKEN",
             # HF Router delegates these official models to its configured
-            # Inference Provider. Prefer the strong Qwen 3.6 coding route;
-            # older small instruct models remain explicit fallbacks only.
+            # Inference Provider. Prefer the strong Qwen 3.6 coding route.
+            # 2026-09-20: the older small instruct/vision models that used to be
+            # "explicit fallbacks" here (Llama-3.2-3B/11B-Vision, Mistral-7B-v0.3,
+            # Phi-3.5-vision, Qwen2-VL-7B) are gone from the router's own /v1/models
+            # catalogue, so each was a guaranteed failed hop; same audit removed
+            # ollama_cloud deepseek-v4-pro:cloud and two OpenRouter ids.
             default_model="Qwen/Qwen3.6-35B-A3B",
             models=[
                 "Qwen/Qwen3.6-35B-A3B",
@@ -963,11 +966,6 @@ class ProviderManager:
                 "Qwen/Qwen3-Coder-480B-A35B-Instruct",
                 "deepseek-ai/DeepSeek-V4-Pro",
                 "deepseek-ai/DeepSeek-V4.1-Flash",
-                "meta-llama/Llama-3.2-3B-Instruct",
-                "mistralai/Mistral-7B-Instruct-v0.3",
-                "microsoft/Phi-3.5-vision-instruct",
-                "meta-llama/Llama-3.2-11B-Vision-Instruct",
-                "Qwen/Qwen2-VL-7B-Instruct",
                 # Confirmed live (real chat-completions call, real 200) on
                 # HF's router -- exact casing matters here: the lowercase
                 # "moonshotai/kimi-k2.6" (NVIDIA's own id casing) 400s with
@@ -991,9 +989,6 @@ class ProviderManager:
             vision_models=[
                 "Qwen/Qwen3.6-35B-A3B",
                 "Qwen/Qwen3.6-27B",
-                "microsoft/Phi-3.5-vision-instruct",
-                "meta-llama/Llama-3.2-11B-Vision-Instruct",
-                "Qwen/Qwen2-VL-7B-Instruct",
                 "moonshotai/Kimi-K2.6",
                 "Qwen/Qwen3.8-27B:novita",
             ],
@@ -1025,13 +1020,11 @@ class ProviderManager:
                 "deepseek/deepseek-v4-flash",
                 "deepseek/deepseek-chat-v3-0324",
                 "anthropic/claude-sonnet-4",
-                "anthropic/claude-3.5-haiku",
                 "openai/gpt-4.1-mini",
                 "openai/gpt-4.1-nano",
                 "openrouter/free",
                 "qwen/qwen3-coder:free",
                 "meta-llama/llama-3.3-70b-instruct:free",
-                "mistralai/mistral-7b-instruct:free",
                 # Confirmed live: present in OpenRouter's real /v1/models
                 # catalog and a real chat-completions call against it
                 # returned a genuine billing (402 insufficient credits)

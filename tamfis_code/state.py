@@ -2448,7 +2448,31 @@ def route_latency_lines(session_id: int, label: Any = None) -> list[str]:
     return lines
 
 
-def route_status_compact(session_id: int, max_chars: int = 56) -> str:
+# The footer note is about what is happening NOW. It used to count every failover the session had
+# EVER recorded and show "credits" forever after one exhaustion, so a long session that had one bad
+# hour kept displaying "⟳ rerouted · credits · 13 failovers" long after routing had healed -- alarming
+# and not actionable. Only events this recent appear in the footer; /status and /routes keep the
+# whole history.
+FOOTER_ROUTE_NOTE_WINDOW_SECONDS = 15 * 60
+
+
+def _recent_route_events(events: list, window_seconds: Optional[float]) -> list:
+    """Events newer than `window_seconds`; all of them when the window is None. An event whose
+    timestamp cannot be read is treated as old rather than shown as if it were current."""
+    if window_seconds is None:
+        return list(events)
+    now = datetime.now(timezone.utc)
+    recent = []
+    for event in events:
+        at = _parse_route_timestamp((event or {}).get("at"))
+        if at is not None and (now - at).total_seconds() <= window_seconds:
+            recent.append(event)
+    return recent
+
+
+def route_status_compact(
+    session_id: int, max_chars: int = 56, window_seconds: Optional[float] = FOOTER_ROUTE_NOTE_WINDOW_SECONDS,
+) -> str:
     """The FOOTER form of the route note: only THAT the route changed and why,
     small enough to sit beside the session title and mode without being
     clipped by an 80-column terminal ("⟳ rerouted · credits · 2 failovers").
@@ -2459,8 +2483,9 @@ def route_status_compact(session_id: int, max_chars: int = 56) -> str:
     failovers" was live-reported as exposing the backends).
     """
     diag = route_diagnostics(session_id)
-    failovers = diag.get("failovers") or []
-    last_exhaustion = diag.get("last_exhaustion") or {}
+    failovers = _recent_route_events(diag.get("failovers") or [], window_seconds)
+    exhausted_recent = _recent_route_events([diag.get("last_exhaustion") or {}], window_seconds)
+    last_exhaustion = exhausted_recent[0] if exhausted_recent and exhausted_recent[0] else {}
     # Cooling routes are deliberately NOT surfaced here. A failed request
     # briefly opens a provider's 30s health circuit as part of NORMAL
     # self-healing, so "cooling" fires constantly (e.g. nvidia + ollama_cloud
