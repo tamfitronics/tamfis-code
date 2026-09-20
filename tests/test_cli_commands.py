@@ -984,8 +984,16 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
         # note silently never ran for the default invocation every
         # ordinary user actually takes -- only `/doctor` in the REPL got
         # the full set. Pins every one of those missing rows now appearing.
+        from tamfis_code.doctor import CheckResult
+
+        # A GitHub runner's PATH has world-writable, non-sticky directories, which the PATH
+        # check rightly FAILs (exit 6) -- pin its result; this test is about which rows run.
+        pinned = patch(
+            "tamfis_code.doctor.check_path_safety",
+            return_value=CheckResult("PATH safety", "PASS", "pinned for this test"),
+        )
         with tempfile.TemporaryDirectory() as tmp:
-            with patch("tamfis_code.cli.RemoteAPIClient") as fake_client:
+            with patch("tamfis_code.cli.RemoteAPIClient") as fake_client, pinned:
                 result = self.runner.invoke(cli, ["--cwd", tmp, "doctor"])
             fake_client.assert_not_called()
         self.assertEqual(result.exit_code, 0, result.output)

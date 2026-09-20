@@ -118,6 +118,18 @@ class DiagnoseSessionTests(unittest.TestCase):
         self.assertEqual(by_name["Active session"].status, "WARNING")
 
 
+def _safe_path_check():
+    """A GitHub runner's PATH has world-writable, non-sticky directories, which the doctor's
+    PATH-safety check rightly FAILs -- so `run_doctor(...)` returned False there and these
+    tests (about remote/standalone behaviour, not PATH) failed on CI. Pin the PATH check's
+    result; test_check_remote_api_false_still_runs_path_safety covers the real check."""
+    from tamfis_code.doctor import CheckResult
+
+    return patch(
+        "tamfis_code.doctor.check_path_safety",
+        return_value=CheckResult("PATH safety", "PASS", "pinned for this test"),
+    )
+
 class DiagnoseLocalProvidersTests(unittest.TestCase):
     """Before this, doctor never looked at the 3 directly-called providers
     (HF/NVIDIA/OpenRouter) that tamfis-code's default local mode
@@ -153,7 +165,8 @@ class DiagnoseLocalProvidersTests(unittest.TestCase):
         console = Console(file=StringIO(), no_color=True, width=200)
         with patch("tamfis_code.doctor.load_credentials", return_value=None), \
              patch("tamfis_code.doctor.get_provider_status", return_value=self._status(configured=True)), \
-             patch("tamfis_code.doctor.RemoteAPIClient") as remote_client:
+             patch("tamfis_code.doctor.RemoteAPIClient") as remote_client, \
+             _safe_path_check():
             result = _run(run_doctor(Config(), console))
 
         self.assertTrue(result)
@@ -176,7 +189,8 @@ class DiagnoseLocalProvidersTests(unittest.TestCase):
         fake_creds = SimpleNamespace(email="user@example.com", user_id=None)
         with patch("tamfis_code.doctor.load_credentials", return_value=fake_creds), \
              patch("tamfis_code.doctor.get_provider_status", return_value=self._status(configured=True)), \
-             patch("tamfis_code.doctor.RemoteAPIClient") as remote_client:
+             patch("tamfis_code.doctor.RemoteAPIClient") as remote_client, \
+             _safe_path_check():
             result = _run(run_doctor(Config(), console, check_remote_api=False))
 
         self.assertTrue(result)

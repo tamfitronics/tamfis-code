@@ -954,6 +954,23 @@ def _report_title(path: Path) -> str:
 
 
 def _discover_project_type(workspace_root: Path) -> dict[str, Any]:
+    """Detect the project type, treating an unreadable directory as "unknown".
+
+    `Path.is_dir()`/`exists()` swallow ENOENT but RAISE PermissionError on EACCES, so one
+    directory the current user cannot read used to crash the whole system-prompt build.
+    Reproduced on a GitHub runner (51 failing tests): the scan of the workspace's SIBLINGS
+    (_detect_sibling_projects) stat()s `<sibling>/wp-content`, and a root-only neighbour such
+    as /tmp/snap-private-tmp raised. It passed on this machine only because it runs as root.
+    Any user whose workspace sits beside a private directory (a shared /home, /tmp, /srv)
+    hit it.
+    """
+    try:
+        return _discover_project_type_unchecked(workspace_root)
+    except OSError:
+        return {"language": "unknown", "package_manager": None}
+
+
+def _discover_project_type_unchecked(workspace_root: Path) -> dict[str, Any]:
     """Detect the primary project type from bounded, local filesystem signals.
 
     The function deliberately inspects only the root and a few conventional
@@ -1165,8 +1182,14 @@ def _detect_sibling_projects(
     before giving up, since the old loop only capped how many *matches* it
     kept, not how many candidates it inspected.
     """
+    def _is_dir(path: Path) -> bool:
+        try:
+            return path.is_dir()
+        except OSError:  # an unreadable neighbour is skipped, not fatal
+            return False
+
     try:
-        children = sorted(p for p in root.iterdir() if p.is_dir())
+        children = sorted(p for p in root.iterdir() if _is_dir(p))
     except OSError:
         return []
     found: list[tuple[str, dict[str, Any]]] = []
