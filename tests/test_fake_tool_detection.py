@@ -77,6 +77,13 @@ class FakeToolCallDetectionTests(unittest.TestCase):
     def test_dangling_tool_call_xml_closing_tags_are_detected(self):
         self.assertTrue(_looks_like_fake_tool_call("</parameter>\n</function>\n</tool_call>"))
 
+    def test_internal_channel_syntax_is_detected_as_a_fake_tool_call(self):
+        self.assertTrue(_looks_like_fake_tool_call("search_code<|channel|>commentary"))
+        self.assertTrue(_looks_like_fake_tool_call("read_file<|channel|>commentary({path: 'x.py'})"))
+
+    def test_internal_channel_detector_does_not_flag_normal_prose(self):
+        self.assertFalse(_looks_like_fake_tool_call("The search_code tool is available for repository inspection."))
+
     def test_tool_call_xml_function_open_tag_is_detected(self):
         self.assertTrue(_looks_like_fake_tool_call('<tool_call><function=execute_command>{"command": "ls"}'))
 

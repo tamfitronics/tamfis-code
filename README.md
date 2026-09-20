@@ -216,6 +216,24 @@ multi-component changes use deeper reasoning, while routine requests retain
 lower latency. Set `TAMFIS_CODE_REASONING_EFFORT=low|medium|high` to pin a
 specific effort level for providers and models that support it.
 
+Standalone routing is economy-first by default. Routine and complex work use
+free/low-cost hosted routes when they support the required tools; paid model
+promotion is disabled unless explicitly enabled. Set
+`TAMFIS_CODE_COST_POLICY=balanced` together with
+`TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK=true` to permit paid promotion during a
+failed complex-task fallback, or set `TAMFIS_CODE_COST_POLICY=quality` when a
+complex task should start on a stronger configured route. Local Ollama models
+are not selected automatically because a slow local endpoint can block the
+interactive agent; Ollama Cloud `:cloud` models retain their configured
+automatic priority and fallback behavior. Local models remain available
+through explicit provider selection.
+
+When a process exits with a recoverable checkpoint, the next bare
+`tamfis-code` launch automatically reopens that session, restores its
+conversation, plan progress, tool evidence, and partial response, queues a
+single internal `continue`, and starts the turn before showing an input prompt.
+It does not resume completed sessions or attach to another live process.
+
 Interrupted model streams remain attached to the same task: clean partial
 text is checkpointed to `.memory`, reconnects use visible 5/15/30-second
 backoff, and continuation output is de-duplicated. If all configured routes

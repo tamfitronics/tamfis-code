@@ -5,6 +5,9 @@ import pytest
 from tamfis_code.provider_protocols import (
     ProviderStreamError,
     normalize_stream_chunk,
+    normalize_tool_call,
+    provider_requires_single_tool_call,
+    single_tool_call_messages,
     system_messages_first,
 )
 
@@ -24,6 +27,45 @@ def test_system_messages_are_merged_to_one_without_breaking_tool_transcript():
     assert [item["role"] for item in normalized[1:]] == ["user", "assistant", "tool", "assistant"]
     assert normalized[2]["tool_calls"][0]["id"] == "call_1"
     assert normalized[3]["tool_call_id"] == "call_1"
+
+
+def test_channel_markup_is_removed_from_a_registered_tool_name():
+    name, arguments = normalize_tool_call(
+        "search_code<|Channel|>Commentary({\"query\":\"gemma4\"})",
+        "",
+        allowed_names={"search_code", "read_file"},
+    )
+    assert name == "search_code"
+    assert json.loads(arguments) == {"query": "gemma4"}
+
+
+def test_unknown_channel_markup_is_not_authorized_as_a_tool():
+    name, arguments = normalize_tool_call(
+        "unknown_tool<|Channel|>Commentary({\"x\":1})",
+        "",
+        allowed_names={"search_code"},
+    )
+    assert name.startswith("unknown_tool")
+    assert arguments == ""
+
+
+def test_single_tool_call_provider_error_is_detected_narrowly():
+    assert provider_requires_single_tool_call("This model only supports single tool-calls at once!")
+    assert not provider_requires_single_tool_call("invalid API key")
+
+
+def test_multi_tool_history_is_split_with_matching_results():
+    calls = [
+        {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+        {"id": "b", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+    ]
+    result = single_tool_call_messages([
+        {"role": "assistant", "content": "", "tool_calls": calls},
+        {"role": "tool", "tool_call_id": "a", "content": "A"},
+        {"role": "tool", "tool_call_id": "b", "content": "B"},
+    ])
+    assert [len(message["tool_calls"]) for message in result if message.get("role") == "assistant"] == [1, 1]
+    assert [message["tool_call_id"] for message in result if message.get("role") == "tool"] == ["a", "b"]
 
 
 def test_system_message_with_list_content_is_flattened_to_text():
@@ -84,6 +126,15 @@ def test_canonical_event_field_preserves_generated_file_payload():
     assert [event.event_type.value for event in events] == ["file_generated"]
     assert events[0].payload["filename"] == "updated-project.zip"
     assert events[0].payload["file_url"] == "/files/serve/abc"
+
+
+def test_openai_tool_delta_strips_channel_marker_before_runner_sees_it():
+    events = normalize_stream_chunk({"choices": [{"delta": {"tool_calls": [{
+        "index": 0,
+        "id": "c1",
+        "function": {"name": "search_code<|channel|>commentary", "arguments": ""},
+    }]}, "finish_reason": None}]})
+    assert events[0].payload["name"] == "search_code"
 
 
 def test_openai_structured_tool_delta_is_normalized():

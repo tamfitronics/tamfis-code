@@ -165,6 +165,7 @@ EXCLUDED_DIR_NAMES = {
     ".turbo", ".cache", "site-packages",
 }
 MAX_LIST_DIRECTORY_ENTRIES = 500
+MAX_LIST_DIRECTORY_DEPTH = 3
 MAX_SEARCH_RESULTS = 200
 # How many matches may be RETURNED in one tool result before the remainder is
 # handed over as a continuation offset. Small enough to keep a broad query from
@@ -684,9 +685,9 @@ class MCPServer:
         self.register_tool(
             name="list_directory",
             description=(
-                "List the immediate children of one directory (not recursive -- subdirectory "
-                "contents are not included; call this again on a specific subdirectory to go "
-                "deeper). Common noise directories (.git, node_modules, __pycache__, and "
+                "List one directory tree. By default depth=1 lists immediate children; "
+                "an optional bounded depth can include nested contents. Common noise directories "
+                "(.git, node_modules, __pycache__, and "
                 "similar) are always excluded. For a broad, unfocused request, list the top "
                 "level once and then act on what it actually returns -- read_file a specific "
                 "file it named, list_directory a specific subdirectory, or use search_code for "
@@ -695,7 +696,15 @@ class MCPServer:
             parameters={
                 "type": "object",
                 "properties": {
-                    "path": {"type": "string", "description": "Directory path"}
+                    "path": {"type": "string", "description": "Directory path"},
+                    "depth": {
+                        "type": "integer", "minimum": 1, "maximum": MAX_LIST_DIRECTORY_DEPTH,
+                        "default": 1,
+                        "description": (
+                            "Optional bounded recursion depth. 1 lists immediate children; "
+                            f"the maximum is {MAX_LIST_DIRECTORY_DEPTH}."
+                        ),
+                    },
                 },
                 "required": ["path"]
             },
@@ -1360,6 +1369,23 @@ class MCPServer:
         state.py's completed_actions); a live object like an asyncio.Event
         in there would break json.dumps on the very next round.
         """
+        # Defense in depth for callers outside runner_local.py: provider
+        # channel markers must never become part of an executable MCP name.
+        # Normalize only to a locally registered tool; an unresolved marked
+        # name is rejected before external MCP dispatch as well.
+        from .provider_protocols import normalize_tool_call
+        canonical_name, _ = normalize_tool_call(
+            name, "", allowed_names=set(self.tools),
+        )
+        if canonical_name in self.tools:
+            name = canonical_name
+        elif "<|" in str(name):
+            return {
+                "error": f"Unknown MCP tool: {name}",
+                "tool": str(name),
+                "success": False,
+            }
+
         if name not in self.tools:
             bridge = None
             owns_bridge = False
@@ -1743,7 +1769,17 @@ class MCPServer:
             )
         return f"✅ Edited '{path}'"
     
-    async def _list_directory(self, path: str = ".") -> List[Dict[str, Any]]:
+    async def _list_directory(
+        self, path: str = ".", depth: int = 1,
+    ) -> List[Dict[str, Any]]:
+        """List a bounded directory tree.
+
+        Older callers omit ``depth`` and retain the original immediate-child
+        behavior. Newer models sometimes include it automatically in a tool
+        call, so accepting it here prevents a schema/handler mismatch from
+        terminating the task. The depth is clamped to a small hard maximum
+        and the total result remains bounded independently.
+        """
         try:
             p = self._resolve_in_workspace(path)
         except PermissionError as exc:
@@ -1752,29 +1788,64 @@ class MCPServer:
             return [{"error": f"Directory '{path}' not found"}]
         if not p.is_dir():
             return [{"error": f"'{path}' is not a directory"}]
+        try:
+            requested_depth = int(depth)
+        except (TypeError, ValueError):
+            return [{"error": "depth must be an integer"}]
+        if requested_depth < 1 or requested_depth > MAX_LIST_DIRECTORY_DEPTH:
+            return [{
+                "error": (
+                    f"depth must be between 1 and {MAX_LIST_DIRECTORY_DEPTH}"
+                )
+            }]
 
-        results = []
+        results: list[Dict[str, Any]] = []
         excluded_count = 0
-        for item in p.iterdir():
-            if item.is_dir() and item.name in EXCLUDED_DIR_NAMES:
-                excluded_count += 1
-                continue
-            results.append({
-                "name": item.name,
-                "path": str(item),
-                "is_file": item.is_file(),
-                "is_dir": item.is_dir(),
-                "size": item.stat().st_size if item.exists() else 0,
-                "modified": item.stat().st_mtime if item.exists() else 0,
-            })
-        results = sorted(results, key=lambda x: x['name'])
-        total = len(results)
-        if total > MAX_LIST_DIRECTORY_ENTRIES:
-            results = results[:MAX_LIST_DIRECTORY_ENTRIES]
+        omitted_count = 0
+
+        def visit(directory: Path, remaining: int) -> None:
+            nonlocal excluded_count, omitted_count
+            try:
+                children = sorted(directory.iterdir(), key=lambda item: item.name)
+            except OSError:
+                return
+            for item in children:
+                try:
+                    is_dir = item.is_dir()
+                    if is_dir and item.name in EXCLUDED_DIR_NAMES:
+                        excluded_count += 1
+                        continue
+                    if len(results) >= MAX_LIST_DIRECTORY_ENTRIES:
+                        omitted_count += 1
+                        continue
+                    entry: Dict[str, Any] = {
+                        "name": item.name,
+                        "path": str(item),
+                        "is_file": item.is_file(),
+                        "is_dir": is_dir,
+                        "size": item.stat().st_size if item.exists() else 0,
+                        "modified": item.stat().st_mtime if item.exists() else 0,
+                    }
+                    if remaining < requested_depth:
+                        entry["depth"] = requested_depth - remaining + 1
+                    results.append(entry)
+                    if is_dir and remaining > 1:
+                        visit(item, remaining - 1)
+                except OSError:
+                    # A disappearing or unreadable child should not invalidate
+                    # the rest of a useful directory listing.
+                    continue
+
+        visit(p, requested_depth)
+        # Recursive traversal is emitted in path order so the result remains
+        # deterministic even when directory iteration order differs by host.
+        results = sorted(results, key=lambda x: str(x.get("path", "")))
+        total = len(results) + omitted_count
+        if omitted_count:
             results.append({
                 "truncated": True,
-                "note": f"{total - MAX_LIST_DIRECTORY_ENTRIES} more entrie(s) omitted "
-                        f"(showing first {MAX_LIST_DIRECTORY_ENTRIES} of {total}). "
+                "note": f"{omitted_count} more entrie(s) omitted "
+                        f"(showing first {len(results)} of {total}). "
                         "Narrow the path or use search_code for a targeted query.",
             })
         if excluded_count:
@@ -2123,6 +2194,19 @@ class MCPServer:
         target = self._resolve_in_workspace(path)
         existed = target.exists()
         result = create_artifact(target, format, content if isinstance(content, dict) else {})
+        # Never report an artifact as complete from the in-memory helper
+        # result alone.  The agent and TamfisGPT both rely on this boundary
+        # as the evidence that a real file exists before presenting a link or
+        # continuing with inspection/archive work.
+        if not target.is_file() or target.stat().st_size <= 0:
+            raise IOError(f"Artifact generation did not produce a readable file: {target}")
+        result = {
+            **(result if isinstance(result, dict) else {}),
+            "success": True,
+            "path": str(target),
+            "size_bytes": target.stat().st_size,
+            "verified": True,
+        }
         if self.session_id is not None:
             from .safety import record_mutation
             record_mutation(

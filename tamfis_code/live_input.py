@@ -736,6 +736,9 @@ class LiveInputListener:
             reserved = len(_note_for_width(self.session_id) or "")
         except Exception:
             reserved = 0
+        # Keep the activity block separate from the headline/tip block.
+        if lines:
+            lines.append("")
         headline = self.renderer.live_input_headline(
             spinner, width=max(30, columns - 2 - (reserved + 2 if reserved else 0)),
         )
@@ -762,7 +765,7 @@ class LiveInputListener:
             # in-flight turn), so this has no click/Ctrl+U handler -- that
             # action stays on the idle toolbar (idle_bottom_toolbar).
             lines.append(
-                f" <ansiyellow>↑ v{_xml_escape(str(pending_update))} available · update when idle</ansiyellow>"
+                f" <ansiyellow>↑ v{_xml_escape(str(pending_update))} available · update when idle · Ctrl+U or /update queues a safe resume</ansiyellow>"
             )
         else:
             tip = _tip_text(self.session_id, self._active_agents)
@@ -870,6 +873,16 @@ class LiveInputListener:
             if not event.current_buffer.text and self._recall_latest_queued(event.current_buffer):
                 return
             event.current_buffer.auto_up(count=1)
+
+        @bindings.add("c-u")
+        def _queue_available_update(event) -> None:
+            # During a live task, updating immediately would abandon the
+            # current provider/tool boundary. Queue the command instead; the
+            # durable checkpoint completes normally, then the idle loop
+            # installs the release and re-execs into the same session.
+            if getattr(self.renderer, "pending_update_version", None):
+                self._enqueue("/update")
+                event.app.invalidate()
 
         @bindings.add("c-b")
         def _background_running_command(event) -> None:
@@ -1149,6 +1162,31 @@ class LiveInputListener:
 
     def _enqueue(self, text: str) -> None:
         text = text.strip()
+        if text.lower() == "/update":
+            pending = getattr(self.renderer, "pending_update_version", None)
+            if not pending:
+                self.renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": "◆ No Tamfis-Code update is currently available."},
+                })
+                if self._active and not self._paused:
+                    self._schedule_prompt()
+                return
+            item = local_state.enqueue_instruction(
+                self.session_id, "/update", classification="update", priority=0,
+            )
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"◆ Update {pending} queued ({item.id}). The current task will finish its "
+                        "checkpoint, then Tamfis-Code will update and resume automatically."
+                    ),
+                },
+            })
+            if self._active and not self._paused:
+                self._schedule_prompt()
+            return
         if not text:
             if self._active and not self._paused:
                 self._schedule_prompt()

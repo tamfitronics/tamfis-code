@@ -17,6 +17,7 @@ from pathlib import Path
 
 from tamfis_code.mcp import (
     EXCLUDED_DIR_NAMES,
+    MAX_LIST_DIRECTORY_DEPTH,
     MAX_LIST_DIRECTORY_ENTRIES,
     MAX_SEARCH_RESULTS,
     SEARCH_PAGE_RESULTS,
@@ -51,6 +52,25 @@ class ListDirectoryBoundsTests(unittest.TestCase):
 
             excluded_marker = next((item for item in results if item.get("excluded")), None)
             self.assertIsNotNone(excluded_marker)
+
+    def test_depth_argument_lists_bounded_nested_children(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            nested = root / "src" / "pkg"
+            nested.mkdir(parents=True)
+            (nested / "module.py").write_text("x = 1")
+
+            server = MCPServer()
+            results = _run(server._list_directory(str(root), depth=3))
+            paths = {item["path"] for item in results if "path" in item}
+            self.assertIn(str(root / "src"), paths)
+            self.assertIn(str(nested), paths)
+            self.assertIn(str(nested / "module.py"), paths)
+
+    def test_depth_is_rejected_above_the_hard_bound(self):
+        with tempfile.TemporaryDirectory() as ws:
+            result = _run(MCPServer()._list_directory(ws, depth=MAX_LIST_DIRECTORY_DEPTH + 1))
+            self.assertIn("depth must be between", result[0]["error"])
 
     def test_caps_entry_count_with_truncation_marker(self):
         with tempfile.TemporaryDirectory() as ws:

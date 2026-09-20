@@ -38,7 +38,7 @@ from typing import (
 # ~1.7s to import -- measured 2026-09-19 -- and used to be paid by EVERY invocation,
 # including `tamfis-code --version` and `--help`, before any client existed.
 
-from .provider_protocols import system_messages_first
+from .provider_protocols import system_messages_first, single_tool_call_messages
 from . import route_stats
 
 
@@ -255,6 +255,42 @@ def _task_needs_paid_tier(task_profile: Optional["TaskProfile"]) -> bool:
     )
 
 
+_COST_POLICIES = frozenset({"economy", "balanced", "quality"})
+
+
+def cost_policy() -> str:
+    """Return the operator's spend policy without making a network call.
+
+    ``economy`` is deliberately the safe default: free/local routes are used
+    first and a paid model is never selected merely because a task is complex.
+    ``balanced`` still starts cheaply but permits a paid route during provider
+    fallback when ``TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK=true``. ``quality``
+    promotes complex work immediately, useful for a task where correctness is
+    worth spending credits. This is environment-based so it applies equally
+    to CLI, background, and resumed processes without adding another provider
+    configuration format.
+    """
+    value = os.environ.get("TAMFIS_CODE_COST_POLICY", "economy").strip().lower()
+    return value if value in _COST_POLICIES else "economy"
+
+
+def _paid_model_allowed(task_profile: Optional["TaskProfile"]) -> bool:
+    """Whether automatic routing may select a paid model for this task."""
+    policy = cost_policy()
+    if policy == "economy":
+        return False
+    if policy == "quality":
+        return _task_needs_paid_tier(task_profile)
+    # Balanced mode is cheap-first. It permits promotion only after the
+    # operator explicitly enables provider fallback; the initial model still
+    # remains free and therefore does not surprise a cash-constrained user.
+    return bool(
+        os.environ.get("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false").strip().lower()
+        in {"1", "true", "yes", "on"}
+        and _task_needs_paid_tier(task_profile)
+    )
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     """Static provider and default-model capabilities."""
@@ -432,6 +468,15 @@ def _increment(mapping: Dict[str, int], key: str) -> None:
 
 
 CREDIT_EXHAUSTED_COOLDOWN_SECONDS = 900.0
+# Weekly/session allowances are not expected to recover in 15 minutes. Park
+# those routes beyond the advertised reset window so every subsequent turn
+# goes directly to the other healthy providers instead of repeatedly probing
+# a known-exhausted Ollama Cloud session.
+USAGE_LIMIT_COOLDOWN_SECONDS = 6 * 60 * 60
+_USAGE_LIMIT_MARKERS = (
+    "weekly usage limit", "weekly limit reached", "session usage",
+    "sessions resume in", "daily usage limit", "monthly usage limit",
+)
 _CREDIT_EXHAUSTION_MARKERS = (
     "depleted", "out of credits", "insufficient credits", "included credits",
     "pre-paid credits", "prepaid", "credit balance", "payment required",
@@ -486,7 +531,11 @@ def record_route_failure_for(
     # task uses NIM (which is free) and only returns once credit could be back.
     # NIM itself is exempt -- its 429s are rate limits that clear in seconds.
     if provider != ProviderType.NVIDIA and _is_credit_exhaustion(status, exc):
-        cooldown = max(cooldown, CREDIT_EXHAUSTED_COOLDOWN_SECONDS)
+        error_text = str(exc).lower()
+        if any(marker in error_text for marker in _USAGE_LIMIT_MARKERS):
+            cooldown = max(cooldown, USAGE_LIMIT_COOLDOWN_SECONDS)
+        else:
+            cooldown = max(cooldown, CREDIT_EXHAUSTED_COOLDOWN_SECONDS)
     # Remember, across runs, a model that did not ANSWER (a timeout or stall, or a
     # server error). Rate limits and credit walls are account-level and are handled
     # above; they say nothing about whether this model is fast.
@@ -1101,7 +1150,17 @@ class ProviderManager:
         return os.environ.get("TAMFIS_CODE_DISABLE_PROVIDER_FALLBACK", "false").strip().lower() != "true"
 
     def paid_fallback_enabled(self) -> bool:
-        return os.environ.get("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false").strip().lower() == "true"
+        """Whether fallback may consume a paid route.
+
+        Explicit opt-in remains the normal switch. Quality policy is the one
+        intentional exception: it is an operator-level declaration that
+        complex work may be promoted automatically. Economy mode never spends
+        merely because a task is difficult.
+        """
+        explicit = os.environ.get(
+            "TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", "false",
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        return explicit or cost_policy() == "quality"
 
     def ollama_cloud_is_premium_primary(self) -> bool:
         """Deprecated compatibility hook; AUTO is always weighted now.
@@ -1113,10 +1172,42 @@ class ProviderManager:
         """
         return False
 
+    def _ollama_allowed_automatically(self) -> bool:
+        """Keep slow local Ollama out of AUTO unless explicitly enabled.
+
+        Explicit ``--provider ollama_cloud`` remains supported. The default
+        endpoint is the local Ollama daemon, where a single response can take
+        two minutes and block an interactive task; that is not a useful
+        automatic fallback when hosted routes are available.
+        """
+        if os.environ.get("TAMFIS_CODE_AUTO_LOCAL_OLLAMA", "false").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            return True
+        config = self.PROVIDERS.get(ProviderType.OLLAMA_CLOUD)
+        if config is None:
+            return False
+        # The local Ollama daemon is also the transport for Ollama Cloud
+        # ``:cloud`` models. Do not mistake 127.0.0.1 for local inference:
+        # preserve the existing Ollama Cloud priority when the selected
+        # automatic model is hosted remotely.
+        selected_models = {
+            str(getattr(config, "default_model", "") or ""),
+            *(str(model) for model in (getattr(config, "models", ()) or ())),
+        }
+        if any(model.endswith(":cloud") or model.endswith("-cloud") for model in selected_models):
+            configured_default = str(getattr(config, "default_model", "") or "")
+            if configured_default.endswith(":cloud") or configured_default.endswith("-cloud"):
+                return True
+        return "ollama.com" in config.base_url.lower()
+
     def _fallback_provider_allowed(self, provider: ProviderType) -> bool:
         # These are the agreed automatic recovery providers. OpenRouter is
         # permitted automatically only where a free route exists, unless paid
-        # fallback is explicitly enabled.
+        # fallback is explicitly enabled. Local Ollama models are explicit-only
+        # by default, while Ollama Cloud models retain their existing priority.
+        if provider == ProviderType.OLLAMA_CLOUD and not self._ollama_allowed_automatically():
+            return False
         if provider in self.AUTO_PROVIDER_WEIGHTS:
             return True
 
@@ -1430,7 +1521,7 @@ class ProviderManager:
                 if self.route_is_healthy(ProviderType.NVIDIA, candidate):
                     return candidate
 
-        if config.free_model and not _task_needs_paid_tier(task_profile):
+        if config.free_model and not _paid_model_allowed(task_profile):
             return config.free_model
         return config.default_model
 
@@ -1615,6 +1706,7 @@ class ProviderManager:
             for provider in self.routing_order
             if provider in self.AUTO_PROVIDER_WEIGHTS
             if allowed_providers is None or provider in allowed_providers
+            if self._fallback_provider_allowed(provider)
             if provider in self.clients and self._has_valid_api_key(provider)
             if self.route_is_healthy(provider, "*")
         ]
@@ -2095,7 +2187,7 @@ class ProviderManager:
 
         request_kwargs: Dict[str, Any] = {
             "model": selected_model,
-            "messages": system_messages_first(messages),
+            "messages": single_tool_call_messages(messages),
             "stream": stream,
             "temperature": temperature,
             "max_tokens": max_tokens,
@@ -2108,6 +2200,12 @@ class ProviderManager:
             request_kwargs["reasoning_effort"] = reasoning_effort
 
         request_kwargs.update(kwargs)
+        if request_kwargs.get("tools"):
+            # The model registry's parallel flag is not universally honored by
+            # hosted OpenAI-compatible routes. Serialize tool-call turns at
+            # the wire boundary so a single-call model cannot reject the
+            # request before Tamfis-Code's fallback chain can run.
+            request_kwargs["parallel_tool_calls"] = False
 
         # Tier IV's OrchestrationContext reads `mode` (data.get("mode", "auto"))
         # to pick a category-vetted, weight-ordered model pool via

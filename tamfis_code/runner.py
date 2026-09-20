@@ -27,6 +27,7 @@ from .render import (
 )
 from . import state as local_state
 from .providers import ProviderManager, ProviderType
+from .provider_protocols import normalize_tool_call
 
 COMMAND_POLL_INTERVAL_SECONDS = 0.2
 TERMINAL_COMMAND_STATUSES = {"completed", "failed", "denied", "cancelled"}
@@ -756,6 +757,62 @@ async def _stream_task(
                 last_assistant_content = str(payload.get("visible_content", ""))
 
             if event_type == "approval_required":
+                # A provider can leak its internal channel protocol into the
+                # tool identifier (for example
+                # ``search_code<|channel|>commentary({...})``). Do not let
+                # that malformed identifier reach the approval UI: it is not
+                # a new dangerous command and prompting for it produces a
+                # confusing approval followed by "Unknown MCP tool".
+                raw_tool_name = str(
+                    payload.get("tool_name") or payload.get("name") or payload.get("tool") or ""
+                )
+                if "<|" in raw_tool_name:
+                    known_tool_names = {
+                        "read_file", "write_file", "edit_file", "list_directory",
+                        "search_code", "find_references", "extract_archive",
+                        "repackage_archive", "create_artifact", "inspect_artifact",
+                        "execute_command", "get_git_info", "read_background_job",
+                        "ask_user_question", "save_memory", "browser", "web_search",
+                    }
+                    canonical_tool_name, _ = normalize_tool_call(
+                        raw_tool_name, allowed_names=known_tool_names,
+                    )
+                    read_only_tool_names = {
+                        "read_file", "search_code", "find_references", "get_git_info",
+                        "list_directory", "inspect_artifact", "read_background_job",
+                    }
+                    command_id = payload.get("command_id")
+                    if canonical_tool_name in known_tool_names and canonical_tool_name != raw_tool_name:
+                        payload = {**payload, "tool_name": canonical_tool_name, "name": canonical_tool_name}
+                        event = {**event, "payload": payload}
+                        if canonical_tool_name in read_only_tool_names:
+                            if command_id is not None:
+                                try:
+                                    await client.approve_command(command_id, "approve_once")
+                                except RemoteAPIError:
+                                    pass
+                            renderer.handle_event({
+                                "event_type": "diagnostics",
+                                "payload": {"content": f"Normalized provider tool name to {canonical_tool_name}; read-only search continued without approval."},
+                            })
+                            continue
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {"content": f"Normalized provider tool name to {canonical_tool_name}; approval details were repaired."},
+                        })
+                    else:
+                        # Unresolved channel markup is protocol-invalid. Fail
+                        # closed without opening an approval prompt.
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {"content": "Rejected an unrecognized provider tool name before approval; nothing was executed."},
+                        })
+                        if command_id is not None:
+                            try:
+                                await client.approve_command(command_id, "deny")
+                            except RemoteAPIError:
+                                pass
+                        continue
                 # Render the full command/cwd/reason/risk card before asking
                 # for a decision. The prompt then stays compact and does not
                 # duplicate a less-informative second approval panel.

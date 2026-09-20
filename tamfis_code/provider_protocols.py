@@ -2,7 +2,132 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
+
+_SINGLE_TOOL_CALL_ERROR_MARKERS = (
+    "only supports single tool-calls",
+    "only supports single tool calls",
+    "single tool-call at once",
+    "single tool call at once",
+)
+
+
+def normalize_tool_call(
+    raw_name: Any,
+    raw_arguments: Any = "",
+    *,
+    allowed_names: set[str] | None = None,
+) -> tuple[str, str]:
+    """Recover a registered tool from provider-injected channel markup.
+
+    Some reasoning endpoints leak their internal message protocol into the
+    function name, for example ``search_code<|Channel|>Commentary({...})``.
+    Treating that string as a tool name reaches MCP as an unknown *dangerous*
+    tool and can incorrectly open an approval prompt. Only names offered in
+    this request are accepted; the surrounding channel text is discarded and
+    an embedded JSON object is recovered when the arguments field is empty.
+    """
+    raw = str(raw_name or "").strip()
+    if isinstance(raw_arguments, dict):
+        arguments = json.dumps(raw_arguments, separators=(",", ":"))
+    else:
+        arguments = str(raw_arguments or "")
+    names = {str(name).strip() for name in (allowed_names or set()) if str(name).strip()}
+    if not raw:
+        return "", arguments
+
+    matched = ""
+    lowered = raw.casefold()
+    for candidate in sorted(names, key=len, reverse=True):
+        candidate_lower = candidate.casefold()
+        start = lowered.find(candidate_lower)
+        if start < 0:
+            continue
+        before = raw[start - 1] if start else ""
+        end = start + len(candidate)
+        after = raw[end:end + 1]
+        if (not before or not (before.isalnum() or before == "_")) and (
+            not after or not (after.isalnum() or after == "_")
+        ):
+            matched = candidate
+            break
+
+    if not matched:
+        # Even without an allow-list, strip the well-known internal channel
+        # suffix so it cannot become part of the executable tool identifier.
+        # The runner still rejects the resulting name unless it was offered.
+        marker_position = raw.find("<|")
+        if allowed_names is None and marker_position > 0:
+            prefix = raw[:marker_position].strip()
+            if re.fullmatch(r"[A-Za-z_][\w.-]*", prefix):
+                matched = prefix
+        if not matched:
+            return raw, arguments
+
+    # A malformed provider may put the JSON call arguments in the name after
+    # a channel/recipient suffix. Prefer the real arguments field when it is
+    # already a JSON object; otherwise recover the balanced parenthesized
+    # object from the contaminated name.
+    if not arguments.strip() or arguments.strip() in {"{}", "null"}:
+        marker = raw.find("(", raw.casefold().find(matched.casefold()) + len(matched))
+        if marker >= 0:
+            candidate_arguments = raw[marker + 1:].strip()
+            if candidate_arguments.endswith(")"):
+                candidate_arguments = candidate_arguments[:-1].rstrip()
+            try:
+                if isinstance(json.loads(candidate_arguments), dict):
+                    arguments = candidate_arguments
+            except (TypeError, ValueError):
+                pass
+    return matched, arguments
+
+
+def provider_requires_single_tool_call(error: Any) -> bool:
+    """Recognize the narrow provider validation error for tool batches."""
+    text = str(error or "").lower()
+    return any(marker in text for marker in _SINGLE_TOOL_CALL_ERROR_MARKERS)
+
+
+def single_tool_call_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Split assistant tool batches into provider-compatible one-call turns.
+
+    Tamfis-Code may execute independent tools concurrently, but not every
+    OpenAI-compatible model accepts the resulting multi-call assistant
+    history. This request-only transformation preserves each call and its
+    matching result without mutating the durable transcript.
+    """
+    normalized = system_messages_first(messages)
+    result: list[dict[str, Any]] = []
+    index = 0
+    while index < len(normalized):
+        message = normalized[index]
+        calls = message.get("tool_calls") if isinstance(message, dict) else None
+        if message.get("role") != "assistant" or not isinstance(calls, list) or len(calls) <= 1:
+            result.append(message)
+            index += 1
+            continue
+
+        results_by_id: dict[str, list[dict[str, Any]]] = {}
+        cursor = index + 1
+        while cursor < len(normalized) and normalized[cursor].get("role") == "tool":
+            tool_message = normalized[cursor]
+            results_by_id.setdefault(str(tool_message.get("tool_call_id") or ""), []).append(tool_message)
+            cursor += 1
+        matched: set[int] = set()
+        for call in calls:
+            if not isinstance(call, dict):
+                continue
+            call_id = str(call.get("id") or "")
+            result.append({**message, "tool_calls": [call]})
+            for tool_message in results_by_id.get(call_id, []):
+                result.append(tool_message)
+                matched.add(id(tool_message))
+        for tool_message in normalized[index + 1:cursor]:
+            if id(tool_message) not in matched:
+                result.append(tool_message)
+        index = cursor
+    return result
 
 
 def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -89,6 +214,17 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                 repaired_calls.append(call)
                 continue
             arguments = function.get("arguments", "")
+            normalized_name, normalized_arguments = normalize_tool_call(
+                function.get("name", ""), arguments,
+            )
+            if normalized_name != function.get("name", "") or normalized_arguments != arguments:
+                function = {
+                    **function,
+                    "name": normalized_name,
+                    "arguments": normalized_arguments,
+                }
+                arguments = normalized_arguments
+                changed = True
             valid = False
             if isinstance(arguments, str):
                 try:
@@ -96,7 +232,10 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
                 except (TypeError, ValueError):
                     valid = False
                 if valid:
-                    repaired_calls.append(call)
+                    repaired_calls.append({
+                        **call,
+                        "function": {**function, "name": normalized_name, "arguments": arguments},
+                    } if changed or not isinstance(function.get("arguments"), str) else call)
                     continue
             elif isinstance(arguments, dict):
                 arguments = json.dumps(arguments, separators=(",", ":"))
@@ -296,11 +435,15 @@ def normalize_stream_chunk(chunk: Any, *, provider: str | None = None, model: st
             events.append(CanonicalEvent(EventType.ASSISTANT_DELTA, {"content": content}, provider, model))
         for tool in _get(delta, "tool_calls", []) or []:
             fn = _get(tool, "function", {})
+            tool_name, tool_arguments = normalize_tool_call(
+                _get(fn, "name", "") or "",
+                _get(fn, "arguments", "") or "",
+            )
             events.append(CanonicalEvent(EventType.TOOL_CALL_DELTA, {
                 "index": int(_get(tool, "index", 0) or 0),
                 "id": _get(tool, "id", "") or "",
-                "name": _get(fn, "name", "") or "",
-                "arguments": _get(fn, "arguments", "") or "",
+                "name": tool_name,
+                "arguments": tool_arguments,
             }, provider, model))
         if _get(choice, "finish_reason"):
             events.append(CanonicalEvent(EventType.DONE, {"reason": _get(choice, "finish_reason")}, provider, model))

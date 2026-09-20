@@ -12,6 +12,7 @@ from tamfis_code.render import (
     BRANDED_PROVIDER_LABEL,
     StreamRenderer,
     _tool_action_label,
+    _normalized_tool_name,
     _tool_result_message,
     print_banner,
     print_resume_plan_status,
@@ -24,6 +25,14 @@ from tamfis_code.interactive import contextualize_short_reply
 
 def _console() -> Console:
     return Console(file=StringIO(), no_color=True, width=200)
+
+
+class ToolNameRenderingTests(unittest.TestCase):
+    def test_channel_marker_is_not_shown_as_part_of_tool_category(self):
+        self.assertEqual(
+            _normalized_tool_name("search_code<|channel|>commentary({\"query\":\"gemma4\"})"),
+            "search_code",
+        )
 
 
 class PrintRecapTests(unittest.TestCase):

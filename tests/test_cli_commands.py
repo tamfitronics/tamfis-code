@@ -13,6 +13,7 @@ from tamfis_code.cli import (
     _apply_pending_update_after_login,
     _explicit_absolute_paths,
     _interactive_entry,
+    _latest_interrupted_local_session,
     _print_bg_hint,
     _print_resumable_session_hint,
     _project_root_for_target,
@@ -171,6 +172,54 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
         _, kwargs = run_interactive.call_args
         started_workspace = run_interactive.call_args.args[2]
         self.assertEqual(started_workspace.session_id, 2)
+
+    def test_bare_launch_recovers_a_checkpoint_even_when_process_lifecycle_says_failed(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(
+                1,
+                workspace_root=str(root),
+                execution_status="failed",
+                turn_checkpoint={
+                    "status": "interrupted",
+                    "objective": "Fix the interrupted task",
+                    "messages": [{"role": "user", "content": "Fix the interrupted task"}],
+                },
+            )
+            run_interactive = AsyncMock()
+            with patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+                asyncio.run(_interactive_entry(Config(), root))
+
+        started_workspace = run_interactive.call_args.args[2]
+        assert started_workspace.session_id == 1
+        assert any(
+            item.get("text") == "continue"
+            for item in state_module.get_session_state(1).queued_user_instructions
+        )
+
+    def test_bare_launch_automatically_resumes_the_latest_interrupted_checkpoint(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(
+                1,
+                workspace_root=str(root),
+                execution_status="interrupted",
+                turn_checkpoint={
+                    "status": "interrupted",
+                    "objective": "Fix the interrupted task",
+                    "messages": [{"role": "user", "content": "Fix the interrupted task"}],
+                },
+            )
+            run_interactive = AsyncMock()
+            with patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+                asyncio.run(_interactive_entry(Config(), root))
+
+        self.assertEqual(_latest_interrupted_local_session(root), 1)
+        run_interactive.assert_awaited_once()
+        started_workspace = run_interactive.call_args.args[2]
+        self.assertEqual(started_workspace.session_id, 1)
+        queued = state_module.get_session_state(1).queued_user_instructions
+        self.assertTrue(any(item.get("text") == "continue" for item in queued))
 
 
 class PrintResumableSessionHintTests(unittest.TestCase):

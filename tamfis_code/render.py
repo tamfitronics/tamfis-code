@@ -382,7 +382,17 @@ _PROMPT_NAME_MARKERS = {"prompt", "prompts", "instruction", "instructions", "sys
 
 
 def _normalized_tool_name(name: str) -> str:
-    return (name or "tool").strip().lower().replace("-", "_").rsplit("/", 1)[-1]
+    """Return the display/risk category name, never provider channel markup.
+
+    This helper is used by status labels before the execution boundary runs;
+    keeping the cleanup here prevents a leaked ``<|channel|>commentary``
+    suffix from appearing as a second, fake tool in approval/output UI.
+    """
+    value = str(name or "tool").strip()
+    marker = value.find("<|")
+    if marker > 0:
+        value = value[:marker].strip()
+    return value.lower().replace("-", "_").rsplit("/", 1)[-1]
 
 
 def _is_read_only_tool(name: str) -> bool:
@@ -1590,7 +1600,15 @@ class StreamRenderer:
             self._flush_assistant(force=True)
             rendered_markdown = self._assistant_buffer.strip()
             if self._box_open:
-                if self._assistant_line_buffer:
+                if rendered_markdown:
+                    # With the interactive prompt-toolkit listener attached,
+                    # assistant output is intentionally buffered so Rich does
+                    # not repaint the input rows.  The old close path only
+                    # printed the border (and an unused line buffer), which
+                    # made the entire Assistant bubble appear empty/hidden.
+                    # Render the buffered Markdown before closing the border.
+                    self.console.print(Markdown(rendered_markdown))
+                elif self._assistant_line_buffer:
                     self._print_box_line(self._assistant_line_buffer)
                     self._assistant_line_buffer = ""
                 self._print_box_bottom()
@@ -1743,10 +1761,12 @@ class StreamRenderer:
                 self._thought_seconds = (self._reasoning_last or self._reasoning_start) - self._reasoning_start
             if not self._assistant_open:
                 self._stop_live()
-                use_box = self._is_tty and self.live_input_listener is not None
-                if use_box:
-                    self._print_box_top(title="Assistant" if not self._assistant_header_shown else None)
-                    self._box_open = True
+                # prompt-toolkit owns the input rows while the listener is
+                # attached.  Do not print a manual border here: the response
+                # is buffered until its natural boundary and then emitted as
+                # one real Assistant panel by _close_assistant().  Printing
+                # only the opening border made that later panel look empty.
+                self._box_open = False
                 self._assistant_header_shown = True
                 self._assistant_open = True
             # Whitespace/reasoning-only provider frames are not a visible
@@ -1861,6 +1881,8 @@ class StreamRenderer:
             if stage == "tool_execution":
                 match = _TOOL_ANNOUNCE_RE.search(content)
                 tool = str(payload.get("tool") or (match.group(1) if match else "tool"))
+                from .provider_protocols import normalize_tool_call
+                tool = normalize_tool_call(tool)[0] or tool
                 call_id = payload.get("tool_call_id")
                 if call_id:
                     self._tool_names_by_call_id[str(call_id)] = tool
@@ -1889,6 +1911,8 @@ class StreamRenderer:
         if event_type == "tool_call_requested":
             self._close_assistant()
             name = str(payload.get("name") or payload.get("tool") or "tool")
+            from .provider_protocols import normalize_tool_call
+            name = normalize_tool_call(name)[0] or name
             args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
             if _normalized_tool_name(name) == "write_todos":
                 # Render the live plan checklist durably, like a status line
@@ -1934,6 +1958,8 @@ class StreamRenderer:
         if event_type == "tool_output":
             self._close_assistant()
             tool = str(payload.get("tool", "tool"))
+            from .provider_protocols import normalize_tool_call
+            tool = normalize_tool_call(tool)[0] or tool
             normalized = _tool_display.normalized_name(tool)
             if normalized == "write_todos":
                 return  # rendered as the live checklist when requested

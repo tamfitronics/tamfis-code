@@ -156,6 +156,52 @@ class StreamTaskApprovalTests(unittest.TestCase):
         self.assertEqual(outcome.status, "completed")
         self.assertEqual(outcome.summary, "done after stall")
 
+    def test_channel_marked_read_only_tool_is_repaired_without_prompt(self):
+        events = [
+            {"task_id": "t1", "event_type": "approval_required", "payload": {
+                "command_id": 101,
+                "tool_name": "search_code<|channel|>commentary({\"query\":\"gemma4\"})",
+                "command": "search_code({\"query\":\"gemma4\"})",
+                "risk_level": "dangerous",
+            }},
+            {"task_id": "t1", "event_type": "ai_task_completed", "payload": {"status": "completed"}},
+        ]
+        client = FakeStreamClient(events)
+        console = Console(file=StringIO(), no_color=True, width=200)
+        renderer = StreamRenderer(console)
+
+        outcome = asyncio.run(_stream_task(
+            client, renderer, console,
+            session_id=1, task_id="t1", approval_policy="ask", interactive=False,
+        ))
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(client.approve_calls, [(101, "approve_once")])
+        self.assertNotIn("Approval required", console.file.getvalue())
+
+    def test_unresolved_channel_marked_tool_is_denied_without_prompt(self):
+        events = [
+            {"task_id": "t1", "event_type": "approval_required", "payload": {
+                "command_id": 102,
+                "tool_name": "not_registered<|channel|>commentary",
+                "command": "not_registered()",
+                "risk_level": "dangerous",
+            }},
+            {"task_id": "t1", "event_type": "ai_task_completed", "payload": {"status": "completed"}},
+        ]
+        client = FakeStreamClient(events)
+        console = Console(file=StringIO(), no_color=True, width=200)
+        renderer = StreamRenderer(console)
+
+        outcome = asyncio.run(_stream_task(
+            client, renderer, console,
+            session_id=1, task_id="t1", approval_policy="ask", interactive=False,
+        ))
+
+        self.assertEqual(outcome.status, "completed")
+        self.assertEqual(client.approve_calls, [(102, "deny")])
+        self.assertNotIn("Approval required", console.file.getvalue())
+
     def test_extracts_command_id_from_top_level_field_and_approves(self):
         events = [
             {"task_id": "t1", "event_type": "approval_required", "payload": {

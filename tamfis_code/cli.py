@@ -218,6 +218,50 @@ def cli(
         _run_async(_interactive_entry(config, workspace_root, provider, model, remote))
 
 
+def _latest_interrupted_local_session(workspace_root: Path) -> Optional[int]:
+    """Return the newest stale local session that has a real checkpoint.
+
+    A bare launch should recover an interrupted turn automatically, but must
+    not attach to a live process or to an ordinary completed conversation.
+    """
+    root = str(workspace_root.resolve())
+    candidates: list[local_state.SessionState] = []
+    for session_id in local_state.all_known_session_ids():
+        state = local_state.get_session_state(session_id)
+        if state.is_swarm_child or local_state.is_session_actively_running(state):
+            continue
+        if state.primary_workspace != root and state.workspace_root != root:
+            continue
+        checkpoint = state.turn_checkpoint or {}
+        if not checkpoint or not checkpoint.get("messages"):
+            continue
+        checkpoint_status = str(checkpoint.get("status") or "").lower()
+        stale_execution = (
+            state.execution_status in {"running", "backgrounded"}
+            and not local_state.is_session_actively_running(state)
+        )
+        # The checkpoint is the durable source of truth. A hard process kill
+        # can update the session lifecycle to ``failed`` or ``cancelled``
+        # after the checkpoint was flushed, so do not require the outer
+        # lifecycle field to say ``interrupted``. Never auto-resume a
+        # completed/cleared checkpoint, but recover any checkpoint explicitly
+        # marked running/interrupted (or a stale session carrying one).
+        recoverable_checkpoint = checkpoint_status in {"running", "interrupted"}
+        if (
+            recoverable_checkpoint
+            and state.execution_status not in {"completed", "archived"}
+            and (
+                state.execution_status in {"running", "backgrounded", "interrupted", "failed", "cancelled", "stopped"}
+                or stale_execution
+                or checkpoint_status == "interrupted"
+            )
+        ):
+            candidates.append(state)
+    if not candidates:
+        return None
+    return max(candidates, key=lambda state: state.updated_at or "").session_id
+
+
 def _print_resumable_session_hint(console: Console, workspace_root: Path, *, exclude_session_id: int) -> None:
     """Live-reported: "whenever you reinstall the sessions titles
     disappear and only the session ID remains" -- traced to expected,
@@ -262,10 +306,33 @@ async def _interactive_entry(
     console = Console(no_color=not config.colour)
 
     if not _use_remote(config, remote):
-        # A bare `tamfis-code` always opens a brand new session -- it never
-        # prompts to erase or reuse an existing one. Prior sessions for this
-        # (or any other) workspace stay exactly as they were and remain
-        # selectable via `tamfis-code resume` / `tamfis-code sessions`.
+        # Recover the latest stale/interrupted turn before creating a new
+        # conversation.  A live session is excluded, so opening a second
+        # terminal still gets its own session and cannot clobber the first.
+        resume_id = _latest_interrupted_local_session(workspace_root)
+        if resume_id is not None:
+            workspace = resolve_local_workspace(
+                workspace_root, session_id=resume_id, discover=True,
+            )
+            state = local_state.get_session_state(resume_id)
+            console.print(
+                f"[green]Automatically resuming[/green] "
+                f"{escape(local_state.session_display_title(resume_id))} "
+                f"(session {resume_id}) from its saved checkpoint."
+            )
+            if not any(
+                item.get("status") == "queued"
+                and str(item.get("text") or "").strip().lower() in {"continue", "resume"}
+                for item in state.queued_user_instructions
+            ):
+                local_state.enqueue_instruction(
+                    resume_id, "continue", classification="resume", priority=0,
+                )
+            await run_interactive(None, config, workspace, provider=provider, model=model)
+            return
+
+        # No interrupted checkpoint: keep the existing isolation behavior and
+        # open a new conversation rather than silently reusing a completed one.
         workspace = resolve_local_workspace(workspace_root, force_new=True)
         _print_resumable_session_hint(console, workspace_root, exclude_session_id=workspace.session_id)
         await run_interactive(None, config, workspace, provider=provider, model=model)

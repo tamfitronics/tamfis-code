@@ -82,7 +82,13 @@ from .orchestrator.validator import validate_completion, verified_no_change_comp
 from .orchestrator.planner import create_plan, extract_phase_outline, merge_phase_plans, MAX_PLAN_PHASES
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
-from .provider_protocols import normalize_stream_chunk, system_messages_first
+from .provider_protocols import (
+    normalize_stream_chunk,
+    normalize_tool_call,
+    provider_requires_single_tool_call,
+    system_messages_first,
+    single_tool_call_messages,
+)
 from .public_identity import (
     PUBLIC_MODEL_AUTO,
     model_is_within_public_group,
@@ -320,13 +326,22 @@ PORT_CONFLICT_CORRECTION = (
 # `<tool_call>` XML) as plain text instead of issuing a real, registered
 # tool call.
 MAX_FAKE_TOOL_CALL_RETRIES_PER_PROVIDER = 1
+SINGLE_TOOL_CALL_CORRECTION = (
+    "The previous response exposed a provider limitation: this model accepts only one "
+    "tool call per assistant turn. Continue using the registered tools, but issue exactly "
+    "one tool call now, wait for its result, and then issue the next call in a later turn. "
+    "Do not emit a batch of tool calls and do not describe a tool call in prose."
+)
+
 FAKE_TOOL_CALL_CORRECTION = (
-    "Your previous response wrote out what looks like a tool invocation in plain text or "
-    "markup (a function-call-style line, a JSON object naming a tool, CLI-style flags, or "
-    "`<tool_call>` markup), but no registered tool call was actually issued this turn -- "
-    "writing the call as text does not run it. Use the real tool-calling mechanism this "
-    "turn instead of describing or formatting one yourself, then continue based on its "
-    "actual result."
+    "Your previous response wrote out an internal tool invocation in plain text or markup "
+    "instead of issuing a registered tool call. This includes function-call text, JSON tool "
+    "objects, CLI-style flags, `<tool_call>` markup, or internal channel markers such as "
+    "`<|channel|>`. That text does not execute anything. Do not mention or reproduce the "
+    "internal channel/tool protocol. Use the provider's structured tool-call mechanism with "
+    "the exact registered tool name and a complete JSON object of arguments. If structured "
+    "tool calling is unavailable, stop calling tools and give a concise answer based only "
+    "on real tool results already present; do not repeat the pseudo-call."
 )
 
 # A final answer can evade all of the prose-shape guards above while still
@@ -2956,7 +2971,7 @@ async def _nonstream_one_completion_impl(
     """Run a non-streaming completion and preserve structured tool calls."""
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "messages": system_messages_first(messages),
+        "messages": single_tool_call_messages(messages),
         "stream": False,
         "temperature": 0.2,
         "max_tokens": MAX_TOKENS_PER_REQUEST,
@@ -2964,6 +2979,7 @@ async def _nonstream_one_completion_impl(
     if tools:
         request_kwargs["tools"] = tools
         request_kwargs["tool_choice"] = "auto"
+        request_kwargs["parallel_tool_calls"] = False
 
     response = await client.chat.completions.create(**request_kwargs)
     if not response.choices:
@@ -2972,13 +2988,23 @@ async def _nonstream_one_completion_impl(
     message = response.choices[0].message
     content = str(getattr(message, "content", None) or "")
     calls: list[_StreamedToolCall] = []
+    offered_names = {
+        str((tool.get("function") or {}).get("name") or "")
+        for tool in tools
+        if isinstance(tool, dict)
+    }
     for raw_call in getattr(message, "tool_calls", None) or []:
         function = getattr(raw_call, "function", None)
+        raw_name = str(getattr(function, "name", "") or "")
+        raw_arguments = str(getattr(function, "arguments", "") or "")
+        name, arguments = normalize_tool_call(
+            raw_name, raw_arguments, allowed_names=offered_names,
+        )
         calls.append(
             _StreamedToolCall(
                 call_id=str(getattr(raw_call, "id", "") or ""),
-                name=str(getattr(function, "name", "") or ""),
-                arguments=str(getattr(function, "arguments", "") or ""),
+                name=name,
+                arguments=arguments,
             )
         )
     return content, calls
@@ -3670,6 +3696,21 @@ _FAKE_TOOL_CALL_XML_RE = re.compile(
     r"</tool_call\s*>|<tool_call[\s>]|<function(?:\s*=|\s+name\s*=)|<parameter(?:\s*=|\s+name\s*=)",
     re.IGNORECASE,
 )
+# Some models copy the host agent's internal channel syntax into their answer,
+# for example `search_code<|channel|>commentary` or
+# `read_file<|channel|>commentary(...)`. This is never a valid Tamfis-Code
+# tool call. Keep it separate from the normal function/JSON detectors so the
+# recovery message can explain the exact protocol leak without exposing it.
+_INTERNAL_TOOL_CHANNEL_RE = re.compile(
+    r"\b(?:read_file|write_file|edit_file|extract_archive|repackage_archive|"
+    r"list_directory|search_code|execute_command|get_git_info|browser|web_search)"
+    r"\s*<\|channel\|>\s*(?:commentary|analysis|tool|functions?)?",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_internal_tool_channel_leak(text: str) -> bool:
+    return bool(_INTERNAL_TOOL_CHANNEL_RE.search(text or ""))
 
 
 def _looks_like_fake_tool_call(text: str) -> bool:
@@ -3678,6 +3719,7 @@ def _looks_like_fake_tool_call(text: str) -> bool:
         or _FAKE_TOOL_CALL_JSON_RE.search(text)
         or _FAKE_TOOL_CALL_FLAG_RE.search(text)
         or _FAKE_TOOL_CALL_XML_RE.search(text)
+        or _looks_like_internal_tool_channel_leak(text)
     )
 
 
@@ -4169,7 +4211,7 @@ async def _stream_one_completion_impl(
 
     request_kwargs: dict[str, Any] = {
         "model": model,
-        "messages": system_messages_first(messages),
+        "messages": single_tool_call_messages(messages),
         "stream": True,
         "temperature": 0.2,
         "max_tokens": MAX_TOKENS_PER_REQUEST,
@@ -4180,6 +4222,9 @@ async def _stream_one_completion_impl(
     if tools:
         request_kwargs["tools"] = tools
         request_kwargs["tool_choice"] = "auto"
+        # Keep the outbound protocol compatible with models that reject
+        # parallel tool calls; local execution can still parallelize safely.
+        request_kwargs["parallel_tool_calls"] = False
     if reasoning_effort:
         request_kwargs["reasoning_effort"] = reasoning_effort
 
@@ -4340,8 +4385,20 @@ async def _stream_one_completion_impl(
                 index = int(event.payload.get("index") or 0)
                 slot = tool_calls_by_index.setdefault(index, _StreamedToolCall())
                 slot.call_id = str(event.payload.get("id") or slot.call_id)
-                slot.name = str(event.payload.get("name") or slot.name)
-                _argument_delta = str(event.payload.get("arguments") or "")
+                raw_name = str(event.payload.get("name") or slot.name)
+                raw_arguments = str(event.payload.get("arguments") or "")
+                normalized_name, recovered_arguments = normalize_tool_call(
+                    raw_name,
+                    raw_arguments,
+                    allowed_names=offered_tool_names,
+                )
+                # If the provider leaked its internal channel suffix into the
+                # function name, keep only the registered name.  Otherwise
+                # MCP would classify the whole string as an unknown/dangerous
+                # tool and prompt for approval before returning an unknown-tool
+                # error.  Recover embedded JSON arguments when present.
+                slot.name = normalized_name or raw_name
+                _argument_delta = recovered_arguments if recovered_arguments != raw_arguments else raw_arguments
                 slot.arguments += _argument_delta
                 _count_output_chars(len(_argument_delta) + len(str(event.payload.get("name") or "")))
                 if (
@@ -6548,6 +6605,7 @@ async def _run_local_agent_turn_impl(
     fabricated_result_failed_providers: set[ProviderType] = set()
     fake_tool_call_retries: dict[ProviderType, int] = {}
     fake_tool_call_failed_providers: set[ProviderType] = set()
+    single_tool_call_retries: dict[ProviderType, int] = {}
     completion_evidence_retries = 0
     consecutive_scope_errors = 0
     # Distinct from consecutive_identical_rounds/_is_cycling above: those
@@ -8083,6 +8141,26 @@ async def _run_local_agent_turn_impl(
                 _persist_turn_checkpoint()
                 continue
 
+            # Some providers surface their single-tool-call protocol error
+            # as assistant text instead of an HTTP error. Treat that text as
+            # a recoverable protocol failure, not as the answer to the user's
+            # task, and ask the same route to serialize its next call.
+            if tools and provider_requires_single_tool_call(content):
+                working_messages.append({"role": "assistant", "content": content})
+                working_messages.append({"role": "system", "content": SINGLE_TOOL_CALL_CORRECTION})
+                attempts = single_tool_call_retries.get(resolved_provider, 0)
+                if attempts < 1:
+                    single_tool_call_retries[resolved_provider] = attempts + 1
+                    orchestrator.mark_repair(
+                        f"Serializing tool calls after {resolved_provider.value} reported a single-call limitation"
+                    )
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": "The selected model accepts one tool call at a time; serializing the next tool action."},
+                    })
+                    _persist_turn_checkpoint()
+                    continue
+
             # "Let me check..." is a promise, not evidence that a repository
             # check happened.  Keep it in the transcript, explicitly require
             # a real registered tool call, and retry.  AUTO mode abandons a
@@ -8623,6 +8701,28 @@ async def _run_local_agent_turn_impl(
                 continue
             return outcome
 
+        # Final execution-boundary normalization. Provider-specific stream
+        # adapters are not the only source of calls: reconnects, non-stream
+        # recovery, and test/provider compatibility paths can all hand this
+        # loop a raw function name. Never let channel markup reach permission
+        # classification or MCP as if it were a real tool identifier.
+        offered_tool_names = {
+            str((tool.get("function") or {}).get("name") or "")
+            for tool in tools
+            if isinstance(tool, dict)
+        }
+        invalid_tool_ids: set[str] = set()
+        for tc in tool_calls:
+            normalized_name, normalized_arguments = normalize_tool_call(
+                tc.name,
+                tc.arguments,
+                allowed_names=offered_tool_names,
+            )
+            tc.name = normalized_name
+            tc.arguments = normalized_arguments
+            if tc.name not in offered_tool_names:
+                invalid_tool_ids.add(tc.call_id)
+
         signature = _tool_calls_signature(tool_calls)
         if signature == previous_tool_calls_signature:
             consecutive_identical_rounds += 1
@@ -8668,6 +8768,41 @@ async def _run_local_agent_turn_impl(
         # and inspect reality instead of executing the action twice.
         _persist_turn_checkpoint()
 
+        if invalid_tool_ids:
+            # Protocol-invalid names are answered as rejected tool calls, not
+            # sent through risk classification or approval. This is the final
+            # safety boundary for provider channel-marker leakage.
+            for invalid_call in tool_calls:
+                if invalid_call.call_id not in invalid_tool_ids:
+                    continue
+                result = {
+                    "success": False,
+                    "error": (
+                        f"Unknown or unoffered MCP tool: {invalid_call.name}. "
+                        "Use exactly one of the registered tools offered in this turn; "
+                        "do not include internal channel markers in the tool name."
+                    ),
+                }
+                working_messages.append({
+                    "role": "tool",
+                    "tool_call_id": invalid_call.call_id,
+                    "content": json.dumps(result),
+                })
+                renderer.handle_event({
+                    "event_type": "tool_output",
+                    "payload": {"tool": invalid_call.name, "result": result},
+                })
+            working_messages.append({
+                "role": "system",
+                "content": (
+                    "One or more requested tool names were invalid and were not executed. "
+                    "Retry with the exact registered tool name from the offered tool list; "
+                    "never append <|channel|> or recipient/commentary markers to it."
+                ),
+            })
+            _persist_turn_checkpoint()
+            continue
+
         if stuck_reason is not None:
             outcome = await _handle_stuck_loop(stuck_reason, tool_calls)
             if outcome is not None:
@@ -8691,6 +8826,13 @@ async def _run_local_agent_turn_impl(
         # human to authorise an action that could never run.
         _turn_malformed_ids: set[str] = set()
         for _tc in tool_calls:
+            if _tc.call_id in invalid_tool_ids:
+                # Unknown/unoffered names are protocol failures, not risky
+                # actions. Keep them out of permission/risk calculation so a
+                # malformed provider name can never trigger an approval prompt.
+                _turn_batch_args[_tc.call_id] = {}
+                _turn_permission_decisions[_tc.call_id] = True
+                continue
             _tc_args, _tc_malformed_reason = parse_tool_call_arguments(_tc.arguments)
             if _tc_malformed_reason is not None:
                 _turn_malformed_ids.add(_tc.call_id)

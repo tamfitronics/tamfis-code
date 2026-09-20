@@ -1,4 +1,6 @@
-from tamfis_code.providers import ProviderManager, ProviderType
+from dataclasses import replace
+
+from tamfis_code.providers import ProviderManager, ProviderType, cost_policy
 from tamfis_code.model_registry import get_model
 from tamfis_code.routing import (
     ComplexityLevel,
@@ -231,6 +233,47 @@ def _manager_with(*providers):
     manager.config = {p.value: True for p in providers}
     manager._has_valid_api_key = lambda p: p in providers
     return manager
+
+
+def test_economy_policy_keeps_complex_openrouter_work_on_the_free_route(monkeypatch):
+    monkeypatch.setenv("TAMFIS_CODE_COST_POLICY", "economy")
+    monkeypatch.delenv("TAMFIS_CODE_ALLOW_PROVIDER_FALLBACK", raising=False)
+    manager = _manager_with(ProviderType.OPENROUTER)
+    config = manager.PROVIDERS[ProviderType.OPENROUTER]
+    profile = classify_task("audit the entire repository and fix every issue")
+
+    assert cost_policy() == "economy"
+    assert manager.select_model(config, profile) == config.free_model
+
+
+def test_quality_policy_promotes_complex_openrouter_work_only_when_requested(monkeypatch):
+    monkeypatch.setenv("TAMFIS_CODE_COST_POLICY", "quality")
+    manager = _manager_with(ProviderType.OPENROUTER)
+    config = manager.PROVIDERS[ProviderType.OPENROUTER]
+    profile = classify_task("audit the entire repository and fix every issue")
+
+    assert manager.select_model(config, profile) == config.default_model
+
+
+def test_local_ollama_is_not_an_automatic_route_but_cloud_and_explicit_selection_survive(monkeypatch):
+    monkeypatch.delenv("TAMFIS_CODE_AUTO_LOCAL_OLLAMA", raising=False)
+    manager = _manager_with(ProviderType.OLLAMA_CLOUD, ProviderType.NVIDIA)
+
+    # The local daemon is also the transport for :cloud models, so cloud must
+    # remain eligible. Only a genuinely local selected model is excluded.
+    assert manager._ollama_allowed_automatically() is True
+    manager.PROVIDERS = dict(manager.PROVIDERS)
+    manager.PROVIDERS[ProviderType.OLLAMA_CLOUD] = replace(
+        manager.PROVIDERS[ProviderType.OLLAMA_CLOUD],
+        base_url="http://127.0.0.1:11434/v1",
+        default_model="qwen3:4b",
+        models=["qwen3:4b"],
+    )
+    assert manager._ollama_allowed_automatically() is False
+    resolved, _ = manager.resolve_route(ProviderType.AUTO, classify_task("inspect app.py"))
+    assert resolved == ProviderType.NVIDIA
+    explicit, _ = manager.resolve_route(ProviderType.OLLAMA_CLOUD, classify_task("inspect app.py"))
+    assert explicit == ProviderType.OLLAMA_CLOUD
 
 
 def test_auto_is_weighted_85_percent_nim_first_when_alternatives_are_healthy():

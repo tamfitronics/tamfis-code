@@ -586,6 +586,10 @@ class CreditExhaustionCooldownTests(unittest.TestCase):
             with self.subTest(error=error[:40]):
                 self.assertGreater(self._cooldown(ProviderType.HF, error), 800)
 
+    def test_weekly_usage_limit_is_parked_until_after_the_reset_window(self):
+        cooldown = self._cooldown(ProviderType.OLLAMA_CLOUD, LIVE_OLLAMA_429)
+        self.assertGreater(cooldown, 5 * 60 * 60)
+
     def test_a_plain_rate_limit_or_503_stays_a_short_pause(self):
         self.assertLess(self._cooldown(ProviderType.HF, "HTTP 429 rate limit, retry in 5s"), 40)
         self.assertLess(self._cooldown(ProviderType.OPENROUTER, "HTTP 503 unavailable"), 40)

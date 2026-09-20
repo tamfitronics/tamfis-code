@@ -17,6 +17,19 @@ import pytest
 from tamfis_code.mcp import MCPServer, _parse_duckduckgo_html
 
 
+@pytest.mark.asyncio
+async def test_channel_marked_unknown_tool_is_rejected_before_external_dispatch(tmp_path):
+    server = MCPServer(workspace_root=str(tmp_path))
+    result = await server.call_tool(
+        "not_registered<|channel|>commentary({\"query\":\"gemma4\"})",
+        {"query": "gemma4"},
+    )
+    assert result["success"] is False
+    assert "Unknown MCP tool" in result["error"]
+
+
+
+
 class TestArchiveTools:
     @pytest.mark.asyncio
     async def test_external_explicit_zip_can_be_extracted_edited_and_repackaged(self, tmp_path):
@@ -236,6 +249,18 @@ class TestMCPServer:
         result = await self.server.call_tool('list_directory', {'path': self.temp_dir})
         assert result['success'] is True
         assert isinstance(result['result'], list)
+
+    @pytest.mark.asyncio
+    async def test_list_directory_accepts_depth_from_model_tool_call(self):
+        nested = Path(self.temp_dir) / "src" / "pkg"
+        nested.mkdir(parents=True)
+        (nested / "module.py").write_text("x = 1")
+        result = await self.server.call_tool(
+            "list_directory", {"path": self.temp_dir, "depth": 3},
+        )
+        assert result["success"] is True
+        paths = {item["path"] for item in result["result"] if "path" in item}
+        assert str(nested / "module.py") in paths
 
     @pytest.mark.asyncio
     async def test_search_code(self):

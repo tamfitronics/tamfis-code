@@ -2210,6 +2210,12 @@ async def _run_interactive_impl(
         if _ci_equals(text, "/update"):
             from .self_update import apply_update, check_update_available, reexec
 
+            # A live Ctrl+U or /update is represented by a durable queued
+            # command. Mark it consumed before re-exec so the fresh process
+            # resumes the checkpoint rather than seeing the same update
+            # request again.
+            if queued_item and str(queued_item.get("text") or "").strip().lower() == "/update":
+                local_state.update_instruction(workspace.session_id, str(queued_item.get("id")), "completed")
             pending = check_update_available()
             if not pending:
                 console.print("[dim]No newer version available.[/dim]")
