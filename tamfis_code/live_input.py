@@ -40,10 +40,9 @@ _HEADLINE_GLYPHS = ("✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳")
 _STATUS_TICK_PERIOD = 40
 _STATUS_REFRESH_INTERVAL_SECONDS = 0.25
 _STDOUT_BATCH_INTERVAL_SECONDS = 0.01
-# Keep the composer readable on ultrawide terminals. The input remains
-# left-aligned, but its top/bottom rules stop at the same practical width as
-# the assistant card instead of becoming a wall-to-wall separator.
-_COMPOSER_MAX_WIDTH = 140
+# The composer and Assistant message container deliberately share the full
+# terminal width, matching Claude Code's message layout.
+_COMPOSER_MAX_WIDTH = None
 
 # Claude Code's own bottom-toolbar phrasing for the three MODE_CYCLE stops
 # that actually change what gets auto-approved -- "manual" (/mode's "ask")
@@ -117,10 +116,9 @@ def composer_rule_html() -> str:
     import shutil
 
     terminal_width = shutil.get_terminal_size(fallback=(80, 24)).columns
-    # Keep roughly a ten-column margin on each side when the terminal is
-    # ordinary-sized, while allowing wide terminals to use a substantial
-    # readable span instead of collapsing to a 100-column half-width box.
-    width = min(_COMPOSER_MAX_WIDTH, max(20, terminal_width - 20))
+    width = max(20, terminal_width) if _COMPOSER_MAX_WIDTH is None else min(
+        _COMPOSER_MAX_WIDTH, max(20, terminal_width)
+    )
     return f"<ansigray>{'─' * width}</ansigray>"
 
 

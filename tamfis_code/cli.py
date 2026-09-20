@@ -174,13 +174,14 @@ def _print_local_sessions(console: Console, *, show_all: bool) -> None:
 @click.option("--provider", default="auto", hidden=True)
 @click.option("--model", default=None, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
 @click.option("--remote", is_flag=True, default=False, help="Use the legacy TamfisGPT Remote Workspace backend for the bare interactive REPL.")
+@click.option("--new-session", is_flag=True, default=False, help="Start a fresh local session instead of automatically resuming a saved checkpoint.")
 @click.option("--output-mode", type=click.Choice(["text", "json", "jsonl"]), default=None, help="Render human text, one JSON document, or streaming JSON Lines.")
 @click.version_option(__version__, prog_name="tamfis-code")
 @click.pass_context
 def cli(
     ctx: click.Context, debug: bool, approval_policy: Optional[str], api_base: Optional[str],
     cwd_override: Optional[str], provider: str, model: Optional[str], remote: bool,
-    output_mode: Optional[str],
+    new_session: bool, output_mode: Optional[str],
 ):
     """TamfisGPT Code -- a standalone terminal coding agent."""
     workspace_root = Path(cwd_override).resolve() if cwd_override else Path.cwd()
@@ -215,7 +216,7 @@ def cli(
     ctx.obj["workspace_root"] = workspace_root
 
     if ctx.invoked_subcommand is None:
-        _run_async(_interactive_entry(config, workspace_root, provider, model, remote))
+        _run_async(_interactive_entry(config, workspace_root, provider, model, remote, new_session=new_session))
 
 
 def _latest_interrupted_local_session(workspace_root: Path) -> Optional[int]:
@@ -299,7 +300,7 @@ def _print_resumable_session_hint(console: Console, workspace_root: Path, *, exc
 
 async def _interactive_entry(
     config: Config, workspace_root: Path, provider: str = "auto",
-    model: Optional[str] = None, remote: bool = False,
+    model: Optional[str] = None, remote: bool = False, new_session: bool = False,
 ) -> None:
     from .interactive import run_interactive
 
@@ -309,7 +310,7 @@ async def _interactive_entry(
         # Recover the latest stale/interrupted turn before creating a new
         # conversation.  A live session is excluded, so opening a second
         # terminal still gets its own session and cannot clobber the first.
-        resume_id = _latest_interrupted_local_session(workspace_root)
+        resume_id = None if new_session else _latest_interrupted_local_session(workspace_root)
         if resume_id is not None:
             workspace = resolve_local_workspace(
                 workspace_root, session_id=resume_id, discover=True,
@@ -331,8 +332,9 @@ async def _interactive_entry(
             await run_interactive(None, config, workspace, provider=provider, model=model)
             return
 
-        # No interrupted checkpoint: keep the existing isolation behavior and
-        # open a new conversation rather than silently reusing a completed one.
+        # No interrupted checkpoint (or --new-session): keep the existing
+        # isolation behavior and open a new conversation rather than silently
+        # reusing a completed one.
         workspace = resolve_local_workspace(workspace_root, force_new=True)
         _print_resumable_session_hint(console, workspace_root, exclude_session_id=workspace.session_id)
         await run_interactive(None, config, workspace, provider=provider, model=model)

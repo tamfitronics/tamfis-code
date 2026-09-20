@@ -6423,6 +6423,10 @@ async def _run_local_agent_turn_impl(
     # Repair / Validate / Report" text for a one-line typo fix and a
     # full-stack audit alike. A failure here (bad JSON, provider error)
     # silently keeps the template; the turn is never blocked on this.
+    # Always define this before the planning/resume branches. A restored plan
+    # intentionally skips fresh reconnaissance, but later phase drafting,
+    # critique, and diagnostics still consume the variable.
+    planning_reconnaissance = ""
     if (
         getattr(orchestration, "plan_restored", False)
         and orchestrator.run is not None

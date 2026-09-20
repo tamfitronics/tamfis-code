@@ -89,6 +89,20 @@ class ListDirectoryBoundsTests(unittest.TestCase):
             self.assertEqual(len(real_entries), MAX_LIST_DIRECTORY_ENTRIES)
 
 
+    def test_read_file_accepts_line_start_and_line_end_aliases(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            target = root / "sample.py"
+            target.write_text("one\ntwo\nthree\nfour\n")
+            server = MCPServer(workspace_root=str(root))
+            result = _run(server._read_file("sample.py", line_start=2, line_end=3))
+            self.assertIn("Showing lines 2-3", result)
+            self.assertIn("2: two", result)
+            self.assertIn("3: three", result)
+            self.assertNotIn("1: one", result)
+            self.assertNotIn("4: four", result)
+
+
 class SearchCodePagingTests(unittest.TestCase):
     """A broad query must not dump every match into one tool result, and must
     not throw away the rest either: it returns ONE page plus the offset that

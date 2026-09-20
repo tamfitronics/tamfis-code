@@ -583,6 +583,14 @@ class MCPServer:
                         "type": "integer", "minimum": 1,
                         "description": "Optional 1-based first line to return",
                     },
+                    "line_start": {
+                        "type": "integer", "minimum": 1,
+                        "description": "Compatibility alias for offset (1-based first line)",
+                    },
+                    "line_end": {
+                        "type": "integer", "minimum": 1,
+                        "description": "Optional inclusive ending line; may be used with line_start",
+                    },
                     "limit": {
                         "type": "integer", "minimum": 1, "maximum": 2000,
                         "description": "Optional maximum number of lines to return",
@@ -1484,7 +1492,18 @@ class MCPServer:
     
     async def _read_file(
         self, path: str, offset: Optional[int] = None, limit: Optional[int] = None,
+        line_start: Optional[int] = None, line_end: Optional[int] = None,
     ) -> str:
+        # Several MCP clients use the more descriptive line_start/line_end
+        # vocabulary. Normalize it at the tool boundary so providers can use
+        # either schema without producing an unexpected-keyword failure.
+        if offset is None and line_start is not None:
+            offset = line_start
+        if limit is None and line_end is not None and offset is not None:
+            try:
+                limit = int(line_end) - int(offset) + 1
+            except (TypeError, ValueError):
+                return "Error: read_file line_start and line_end must be positive integers"
         p = self._resolve_readable_input(path)
         if not p.exists():
             return f"Error: File '{path}' not found.{self._not_found_hint(path)}"

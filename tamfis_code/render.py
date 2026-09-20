@@ -200,11 +200,10 @@ _ASSISTANT_REFRESH_MIN_CHARS = 96
 # is what lets the terminal auto-scroll the way Claude Code/Codex do.
 _ASSISTANT_LIVE_TAIL_CHARS = 2_000
 _ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|```\s*$)")
-# Enclosing box width for the non-Live rendering path (see
-# _print_box_top/_print_box_line): capped well below typical wide terminals
-# so a long reply still reads as one message card, not a border stretched
-# edge-to-edge.
-_ASSISTANT_BOX_MAX_WIDTH = 100
+# Assistant message borders follow the console width, like Claude Code's
+# full-width message container. Content itself remains wrapped by Rich; only
+# the border is allowed to span the terminal.
+_ASSISTANT_BOX_MAX_WIDTH = None
 _USER_MESSAGE_MAX_DISPLAY_CHARS = 20_000
 # Messages longer than this threshold are shown collapsed with an expand
 # option. Shorter messages render fully as before.
@@ -1360,6 +1359,8 @@ class StreamRenderer:
             width = int(self.console.width)
         except Exception:
             width = 80
+        if _ASSISTANT_BOX_MAX_WIDTH is None:
+            return max(20, width)
         return max(20, min(width, _ASSISTANT_BOX_MAX_WIDTH))
 
     def _print_box_top(self, *, title: Optional[str] = None) -> None:
