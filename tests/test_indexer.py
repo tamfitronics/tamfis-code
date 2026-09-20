@@ -205,5 +205,50 @@ def goodbye():
         assert stats['files'] >= 1
         assert stats['total_symbols'] >= 2
 
+
+class TestRepositorySnapshotIndex:
+    def test_unchanged_check_is_metadata_only_and_does_not_rewrite_cache(self, tmp_path):
+        from tamfis_code.runtime.repository_index import RepositoryIndex
+
+        source = tmp_path / "app.py"
+        source.write_text("print('hello')\n")
+        cache = tmp_path / ".snapshot.json"
+        index = RepositoryIndex(tmp_path, cache)
+        first = index.build()
+        cache_mtime = cache.stat().st_mtime_ns
+
+        with patch.object(index, "_hash", side_effect=AssertionError("unchanged scan reread content")):
+            assert index.unchanged() is True
+        assert cache.stat().st_mtime_ns == cache_mtime
+        assert first.files["app.py"]["content_hash"]
+
+    def test_changed_and_removed_files_are_reported_without_rebuilding(self, tmp_path):
+        from tamfis_code.runtime.repository_index import RepositoryIndex
+
+        keep = tmp_path / "keep.py"
+        gone = tmp_path / "gone.py"
+        keep.write_text("one\n")
+        gone.write_text("gone\n")
+        index = RepositoryIndex(tmp_path, tmp_path / ".snapshot.json")
+        index.build()
+
+        time.sleep(0.001)
+        keep.write_text("two\n")
+        gone.unlink()
+        assert index.changed_files() == ["keep.py"]
+        assert index.removed_files() == ["gone.py"]
+
+    def test_build_reuses_hash_for_unchanged_files(self, tmp_path):
+        from tamfis_code.runtime.repository_index import RepositoryIndex
+
+        source = tmp_path / "stable.py"
+        source.write_text("stable\n")
+        index = RepositoryIndex(tmp_path, tmp_path / ".snapshot.json")
+        first = index.build()
+        with patch.object(index, "_hash", side_effect=AssertionError("unchanged file was hashed again")):
+            second = index.build()
+        assert second.files["stable.py"]["content_hash"] == first.files["stable.py"]["content_hash"]
+
+
 if __name__ == '__main__':
     pytest.main([__file__, '-v'])
