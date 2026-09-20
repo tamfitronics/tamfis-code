@@ -199,15 +199,19 @@ _ASSISTANT_REFRESH_MIN_CHARS = 96
 # itself short-and-bounded, with older text pushed into normal scrollback,
 # is what lets the terminal auto-scroll the way Claude Code/Codex do.
 _ASSISTANT_LIVE_TAIL_CHARS = 2_000
+# Ordinary answers and steering messages must remain readable in full. The
+# previous 500-character threshold made normal multi-paragraph responses look
+# truncated ("N more chars") and applied the same cutoff to user input. Keep
+# the expand/viewer safety rail only for genuinely huge messages.
+_MESSAGE_COLLAPSE_THRESHOLD = 20_000
+_USER_MESSAGE_MAX_DISPLAY_CHARS = 100_000
 _ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|```\s*$)")
 # Assistant message borders follow the console width, like Claude Code's
 # full-width message container. Content itself remains wrapped by Rich; only
 # the border is allowed to span the terminal.
 _ASSISTANT_BOX_MAX_WIDTH = None
-_USER_MESSAGE_MAX_DISPLAY_CHARS = 20_000
-# Messages longer than this threshold are shown collapsed with an expand
-# option. Shorter messages render fully as before.
-_MESSAGE_COLLAPSE_THRESHOLD = 500
+# Messages over _MESSAGE_COLLAPSE_THRESHOLD are shown collapsed with an
+# expand option; normal answers and user messages render completely.
 # How many still-unexpanded collapsed messages Ctrl+E can walk back
 # through after a turn ends (pruned in _forget_collapsed). Bounds memory:
 # each retained entry holds a full message body.
@@ -1740,16 +1744,24 @@ class StreamRenderer:
             # never trims legitimate streaming: _novel_continuation already
             # guarantees the runner only forwards the novel suffix.
             if content.strip():
-                if content == self._last_delta:
-                    self._identical_delta_streak += 1
-                else:
-                    self._identical_delta_streak = 0
-                    # Strict-prefix re-send of displayed content: the
-                    # whole delta is old, drop it entirely.
-                    if self._displayed_content.endswith(content) or self._displayed_content.startswith(content):
-                        self._last_delta = content
-                        return
-                if self._identical_delta_streak >= 2:
+                # The runner performs authoritative overlap trimming. The
+                # renderer must not discard short/repeated legitimate chunks:
+                # providers commonly stream repeated words ("the ", bullets,
+                # table separators) as separate deltas. Only suppress a large
+                # exact replay that is clearly a reconnect duplicate.
+                duplicate_replay = (
+                    len(content) >= 64
+                    and (
+                        content == self._last_delta
+                        or self._displayed_content.endswith(content)
+                        or self._displayed_content.startswith(content)
+                    )
+                )
+                self._identical_delta_streak = (
+                    self._identical_delta_streak + 1 if content == self._last_delta else 0
+                )
+                if duplicate_replay:
+                    self._last_delta = content
                     return
             self._last_delta = content
             if content.strip():

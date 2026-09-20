@@ -1099,7 +1099,7 @@ class CollapsedMessageTests(unittest.TestCase):
         COLLAPSED_MESSAGES.clear()
         self.addCleanup(COLLAPSED_MESSAGES.clear)
 
-    def _long(self, tag="A", size=1200):
+    def _long(self, tag="A", size=2200):
         return f"{tag}-start " + ("lorem ipsum " * size)
 
     def test_a_long_assistant_message_prints_a_hint_and_expands_in_full(self):
@@ -1118,9 +1118,27 @@ class CollapsedMessageTests(unittest.TestCase):
         self.assertTrue(renderer.expand_next_collapsed_message())
         expanded = console.file.getvalue()[before:]
         self.assertIn("Assistant (full)", expanded)
-        # Content past the collapse point is only present after expanding.
+        # Content past the collapse point is present after expanding, while
+        # ordinary sub-threshold responses are no longer clipped.
         self.assertGreater(len(expanded), _MESSAGE_COLLAPSE_THRESHOLD)
         self.assertEqual(renderer._collapsed.pending(), 0)
+
+    def test_normal_multi_paragraph_message_is_not_collapsed(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        body = "ordinary response " * 300
+        renderer._collapse_or_print_assistant(body)
+        self.assertNotIn("more chars", console.file.getvalue())
+        self.assertEqual(renderer._collapsed.pending(), 0)
+
+    def test_short_repeated_stream_chunks_are_not_dropped(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        for chunk in ("the ", "the ", "the ", "rest of the response"):
+            renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": chunk}})
+        renderer._close_assistant()
+        output = console.file.getvalue()
+        self.assertIn("the the the rest of the response", output)
 
     def test_a_short_message_is_never_collapsed(self):
         console = _console()
