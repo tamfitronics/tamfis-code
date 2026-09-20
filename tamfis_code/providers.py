@@ -34,9 +34,30 @@ from typing import (
     TYPE_CHECKING, Any, AsyncIterator, Dict, List, Mapping, Optional, Sequence,
 )
 
-from openai import AsyncOpenAI
+# `openai` is imported lazily (see __getattr__ below): the SDK's type tree costs
+# ~1.7s to import -- measured 2026-09-19 -- and used to be paid by EVERY invocation,
+# including `tamfis-code --version` and `--help`, before any client existed.
 
 from .provider_protocols import system_messages_first
+from . import route_stats
+
+
+def __getattr__(name: str):
+    """Module attribute access imports the SDK on first use; tests can still
+    monkeypatch `providers.AsyncOpenAI`."""
+    if name == "AsyncOpenAI":
+        from openai import AsyncOpenAI as _AsyncOpenAI
+
+        globals()["AsyncOpenAI"] = _AsyncOpenAI
+        return _AsyncOpenAI
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+
+
+def _async_openai_class():
+    """The AsyncOpenAI class (or whatever a test patched in its place)."""
+    import sys
+
+    return sys.modules[__name__].AsyncOpenAI
 
 
 def _provider_env_candidates(
@@ -311,7 +332,7 @@ try:
         5.0, float(os.environ.get("TAMFIS_CODE_FIRST_BYTE_TIMEOUT", "45"))
     )
 except (TypeError, ValueError):
-    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = 45.0
+    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = 25.0
 
 _HEALTH_LOCK = threading.RLock()
 _ROUTE_HEALTH: Dict[tuple[str, str], RouteHealth] = {}
@@ -466,6 +487,15 @@ def record_route_failure_for(
     # NIM itself is exempt -- its 429s are rate limits that clear in seconds.
     if provider != ProviderType.NVIDIA and _is_credit_exhaustion(status, exc):
         cooldown = max(cooldown, CREDIT_EXHAUSTED_COOLDOWN_SECONDS)
+    # Remember, across runs, a model that did not ANSWER (a timeout or stall, or a
+    # server error). Rate limits and credit walls are account-level and are handled
+    # above; they say nothing about whether this model is fast.
+    if model and model != "*" and (
+        isinstance(exc, (TimeoutError, asyncio.TimeoutError))
+        or type(exc).__name__ in {"APITimeoutError", "ReadTimeout", "ConnectTimeout", "ReadError"}
+        or status in {500, 502, 503, 504}
+    ):
+        route_stats.record_failure(model, "timeout" if status is None else f"http{status}")
     now = time.monotonic()
     with _HEALTH_LOCK:
         state = _ROUTE_HEALTH.setdefault((provider.value, model or "*"), RouteHealth())
@@ -847,18 +877,30 @@ class ProviderManager:
             # Cloud (kimi-k3:cloud, see above) and HF (see
             # model_registry.py); this is a third, independently verified
             # route.
-            default_model="moonshotai/kimi-k3",
+            # DEMOTED 2026-09-19 (owner ruling, superseding the 2026-09-01 one above):
+            # kimi-k3 and glm-5.3 are LAST in this pool, not first. Live-measured
+            # with this CLI's own prompt and 21 tools, both never answered inside
+            # 60s while nemotron-3-super made its tool call in 1.0s -- they were
+            # the cause of the latency in both tamfis-code and TamfisGPT. They
+            # stay in the pool (still the best answer when the fast models are
+            # down, and kimi-k3 is still the vision route) but are tried only
+            # after everything faster has failed.
+            default_model="nvidia/nemotron-3-super-120b-a12b",
             models=[
-                "moonshotai/kimi-k3",
-                # ADDED 2026-09-17 (owner directive: mirror TamfisGPT's free
-                # NIM frontier -- kimi-k3 + glm-5.3 + other tool-calling-
-                # verified models): live-verified this same day with a real
-                # account key -- plain chat 200, genuine get_weather
-                # tool_calls with reasoning_content, real SSE deltas. Not
-                # claiming vision (image probe timed out at 90s twice).
-                "z-ai/glm-5.3",
-                "nvidia/nemotron-3-ultra-550b-a55b",
+                # super BEFORE ultra (2026-09-19, live-measured with this CLI's own
+                # prompt and 21 tools): super made its tool call in 1.0s, ultra in
+                # 9.2s. Both are free and tool-calling; for an agent loop that
+                # makes a dozen rounds, the fast one leads. route_stats still
+                # reorders by what a given day actually measures.
                 "nvidia/nemotron-3-super-120b-a12b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                # ADDED 2026-09-19 (owner: find more free tool-calling models for the
+                # pool). Found by benchmarking every chat-capable id on NIM's
+                # /v1/models with this CLI's own prompt and 21 tools, three runs: first
+                # token 0.8-1.7s, correct read_file tool call at 1.7-4.2s. Faster than
+                # ultra (9.2s) and lightning (14s). route_stats keeps ranking it by
+                # what it measures on the day.
+                "meta/muse-glimmer-30b",
                 # Replaced retired nvidia/nemotron-3-nano-30b-a3b on
                 # 2026-09-13. Live re-verified against this account with
                 # HTTP 200 and a genuine get_weather tool_calls event.
@@ -893,12 +935,16 @@ class ProviderManager:
                 "meta/llama-3.1-405b-instruct",
                 "meta/llama-3.1-70b-instruct",
                 "moonshotai/kimi-k2.6",
-                # moonshotai/kimi-k3 moved to the front of this list as
-                # default_model above (2026-09-01) -- see that comment for
-                # the verification details, not repeated here.
                 "mistralai/mistral-large-2-123b",
                 "google/gemma-2-27b-it",
                 "microsoft/phi-3-medium-128k-instruct",
+                # LAST (2026-09-19 owner ruling, see default_model above). Live-verified
+                # 2026-08-30 (kimi-k3: plain chat, real get_weather tool_calls, and
+                # the catalog vision payload) and 2026-09-17 (glm-5.3: chat 200,
+                # genuine tool_calls with reasoning_content); both are correct, both
+                # are slow on NIM's free tier.
+                "moonshotai/kimi-k3",
+                "z-ai/glm-5.3",
             ],
             # priority=0 (2026-08-08, was 3): NIM made the top-priority
             # auto-routed provider -- reliable free tier vs. Ollama Cloud's
@@ -1282,7 +1328,7 @@ class ProviderManager:
                     # not mutating one client's key in place.
                     nim_keys = _nim_configured_keys()
                     self._nim_client_pool = [
-                        AsyncOpenAI(base_url=config.base_url, api_key=key, timeout=120.0, max_retries=0)
+                        _async_openai_class()(base_url=config.base_url, api_key=key, timeout=120.0, max_retries=0)
                         for key in nim_keys
                     ]
                     if self._nim_client_pool:
@@ -1291,7 +1337,7 @@ class ProviderManager:
                         ]
                     continue
 
-                self.clients[provider_type] = AsyncOpenAI(
+                self.clients[provider_type] = _async_openai_class()(
                     base_url=config.base_url,
                     api_key=self._get_api_key(provider_type),
                     timeout=120.0,
@@ -1380,14 +1426,14 @@ class ProviderManager:
             # A failed NIM deployment is a model-route failure first, not a
             # reason to abandon NIM. The bounded cooldown automatically
             # makes it probe-eligible again later.
-            # Kimi K3 is the flagship general-purpose NIM route, but a
-            # long-context task must not be silently truncated to keep it.
-            # ``requires_long_context`` is a qualitative repository/task
+            # A long-context task must not be silently truncated to fit a small-window
+            # model. ``requires_long_context`` is a qualitative repository/task
             # signal in the existing classifier, not proof that this turn
             # exceeds 128K. Only apply the hard 200K exclusion when a caller
-            # supplies an actual token estimate; otherwise preserve the
-            # established Kimi-first route and let the runner's existing
-            # bounded context accounting decide whether a retry is needed.
+            # supplies an actual token estimate; otherwise keep the configured
+            # order (fast nemotrons first, Kimi K3 / GLM 5.3 last) and let the
+            # runner's existing bounded context accounting decide whether a retry
+            # is needed.
             required_context_tokens = int(
                 getattr(task_profile, "required_context_tokens", 0) or 0
             )
@@ -1403,7 +1449,10 @@ class ProviderManager:
                     candidate for candidate in candidates
                     if context_windows.get(candidate, config.context_window) >= 200000
                 ]
-            for candidate in dict.fromkeys(item for item in candidates if item):
+            # Preference order, reordered by what has actually been measured: a model
+            # that timed out (remembered across runs) or is several times slower than
+            # an alternative is tried after it.
+            for candidate in route_stats.rank([item for item in candidates if item]):
                 if self.route_is_healthy(ProviderType.NVIDIA, candidate):
                     return candidate
 

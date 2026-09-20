@@ -44,6 +44,7 @@ from rich.console import Console
 
 from . import evidence as evidence_store
 from . import state as local_state
+from . import route_stats
 from .config import Config
 from .hooks import (
     load_hooks, run_session_completed_hooks, run_session_hooks,
@@ -477,10 +478,30 @@ except (TypeError, ValueError):
 # cross-provider fallback do its job. Env-tunable for slow/queued endpoints.
 try:
     PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = max(
-        5.0, float(os.getenv("TAMFIS_CODE_FIRST_BYTE_TIMEOUT", "45"))
+        5.0, float(os.getenv("TAMFIS_CODE_FIRST_BYTE_TIMEOUT", "25"))
     )
 except (TypeError, ValueError):
-    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = 45.0
+    PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = 25.0
+
+def first_byte_timeout_for(messages: Any, tools: Any = None) -> float:
+    """How long to wait for a route's first byte, scaled to how much it must read.
+
+    A route that is going to answer starts within seconds -- nemotron-super made a tool
+    call in 1s on a real 30K-character request -- while a queued or dead one never does
+    (kimi-k3 and glm-5.3 both stalled for 60s+). 45s of dead air per attempt was the
+    cost of finding that out, so the base is 25s; a very large prompt legitimately
+    needs longer to prefill, so add a second per ~4K characters beyond 60K, capped at
+    the old 45s ceiling (or the operator's TAMFIS_CODE_FIRST_BYTE_TIMEOUT if higher).
+    """
+    try:
+        size = sum(len(str(m.get("content") or "")) for m in (messages or []) if isinstance(m, dict))
+        size += len(json.dumps(tools)) if tools else 0
+    except Exception:
+        size = 0
+    extra = max(0.0, (size - 60_000) / 4_000.0)
+    ceiling = max(45.0, PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS)
+    return min(ceiling, PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS + extra)
+
 
 # Total wall-clock a single turn may spend cycling provider routes before it
 # gives up and reports which routes were tried. Without a cap the fallback
@@ -3951,20 +3972,19 @@ def _select_public_group_model(
         if requires_vision and not _model_supports_vision(manager, config, candidate):
             continue
         eligible.append(str(candidate))
-    # Match TamfisGPT Remote's provider policy. Kimi K3 NIM is the flagship
-    # general-purpose NIM route and wins whenever it survives the capability,
-    # health, and vision filters above. Filtering happens first so a request
-    # that needs a different modality or context is never forced onto Kimi.
+    # Filtering happens first so a request that needs a different modality or
+    # context is never forced onto a model that cannot serve it. Among the
+    # survivors, the configured order wins (fast nemotrons first; Kimi K3 and
+    # GLM 5.3 last -- owner ruling 2026-09-19, they were the latency), reordered
+    # by what has actually been MEASURED and remembered across runs: a model that
+    # timed out is skipped, and one several times slower than an alternative goes
+    # after it. This used to be "Kimi K3 if it survives the filters, else a RANDOM
+    # eligible model" -- so a run started on a model that never answers (45s
+    # lost), and the fallback then picked another dead one at random.
     if not eligible:
         return None
     if provider == ProviderType.NVIDIA:
-        selected = next(
-            (candidate for candidate in eligible
-             if str(candidate).strip().lower() == "moonshotai/kimi-k3"),
-            None,
-        )
-        if selected is None:
-            selected = random.choice(eligible)
+        selected = route_stats.rank(eligible)[0]
     else:
         selected = random.choice(eligible)
     normalize = getattr(manager, "normalize_model_for_endpoint", None)
@@ -4149,16 +4169,20 @@ async def _stream_one_completion_impl(
     # ProviderManager.is_retryable_provider_error (by exception TYPE, not by
     # message), so every caller's existing fallback path picks a different
     # route instead of stalling on this one for the SDK's full 120s.
+    first_byte_timeout = first_byte_timeout_for(messages, tools)
+    request_started = time.monotonic()
     try:
         stream = await asyncio.wait_for(
             client.chat.completions.create(**request_kwargs),
-            timeout=PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS,
+            timeout=first_byte_timeout,
         )
     except asyncio.TimeoutError as exc:
+        route_stats.record_failure(model, "timeout")
         raise asyncio.TimeoutError(
-            f"Provider sent no response within {PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS:.0f}s "
+            f"Provider sent no response within {first_byte_timeout:.0f}s "
             "(time-to-first-byte timeout)"
         ) from exc
+    first_action_recorded = False
     # Bounded rolling tail, not the full accumulated content -- checking a
     # fixed-size window on every chunk keeps this O(1) per chunk regardless
     # of how long a genuinely long (non-degenerate) response gets, instead
@@ -4211,6 +4235,8 @@ async def _stream_one_completion_impl(
                 # exception type first, so this message is for operator
                 # diagnostics, not correctness -- but a real message is
                 # strictly better than relying on the bare class name.
+                if not first_action_recorded:
+                    route_stats.record_failure(model, "stall")
                 raise asyncio.TimeoutError(
                     f"No stream activity for {STREAM_IDLE_TIMEOUT_SECONDS:.0f}s (stream idle timeout)"
                 )
@@ -4261,6 +4287,9 @@ async def _stream_one_completion_impl(
                     _count_output_chars(len(reasoning))
             elif event.event_type.value == "assistant_delta":
                 content = str(event.payload.get("content") or "")
+                if content and not first_action_recorded:
+                    first_action_recorded = True
+                    route_stats.record_latency(model, time.monotonic() - request_started)
                 if content:
                     visible_content = text_tool_filter.feed(content)
                     if visible_content:
@@ -4286,6 +4315,9 @@ async def _stream_one_completion_impl(
                         forward(pending_content[:flush_count])
                         pending_content = pending_content[flush_count:]
             elif event.event_type.value == "tool_call_delta":
+                if not first_action_recorded:
+                    first_action_recorded = True
+                    route_stats.record_latency(model, time.monotonic() - request_started)
                 index = int(event.payload.get("index") or 0)
                 slot = tool_calls_by_index.setdefault(index, _StreamedToolCall())
                 slot.call_id = str(event.payload.get("id") or slot.call_id)

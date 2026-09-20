@@ -493,7 +493,11 @@ def test_nvidia_default_model_is_tool_capable_and_not_unentitled_kimi():
     # without_replacing_verified_default below.
     default_model = ProviderManager.PROVIDERS[ProviderType.NVIDIA].default_model
     assert default_model != "moonshotai/kimi-k2.6"
-    assert default_model == "moonshotai/kimi-k3"
+    # DEMOTED 2026-09-19 (owner ruling): kimi-k3 and glm-5.3 never answered inside 60s on
+    # NIM's free tier and were the latency; the fast nemotron-3-super (first tool call in
+    # 1.0s on this CLI's real prompt) is the default and kimi-k3 stays in the pool, last.
+    assert default_model == "nvidia/nemotron-3-super-120b-a12b"
+    assert ProviderManager.PROVIDERS[ProviderType.NVIDIA].models[-2:] == ["moonshotai/kimi-k3", "z-ai/glm-5.3"]
 
 
 def test_kimi_k2_6_is_still_selectable_on_openrouter_and_hf():
@@ -532,7 +536,8 @@ def test_hf_prefers_official_qwen36_coding_route_and_keeps_deepseek_fallbacks():
 
 def test_nvidia_exposes_deepseek_v4_pro_without_replacing_verified_default():
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
-    assert config.default_model == "moonshotai/kimi-k3"
+    assert config.default_model == "nvidia/nemotron-3-super-120b-a12b"  # kimi-k3 demoted 2026-09-19
+    assert "moonshotai/kimi-k3" in config.models
     assert "nvidia/nemotron-3-ultra-550b-a55b" in config.models
     assert "deepseek-ai/deepseek-v4-pro" in config.models
     # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached NVIDIA NIM

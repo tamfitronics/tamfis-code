@@ -43,7 +43,7 @@ from .config import CONFIG_DIR
 # automatic retitle drag on after the answer was already delivered. The wall
 # now fits the whole NIM chain's worst case (12 + 12 + 20 + 20 + 20 = 84s, see
 # _TITLE_MODEL_TIMEOUT_SECONDS), but a healthy chain answers in seconds: the
-# budget is only spent when kimi-k3 / glm-5.3 stall and the nemotrons must
+# budget is only spent when the nemotrons stall and kimi-k3 / glm-5.3 must
 # take over.
 TITLE_UPGRADE_TIMEOUT_SECONDS = 90
 # Per-attempt cap forwarded to the OpenAI SDK (chat_completion forwards
@@ -59,9 +59,9 @@ _TITLE_ATTEMPT_TIMEOUT_SECONDS = 20
 # cross-provider fallback cannot wander off to a paid route; NIM key rotation
 # (several free accounts) still applies inside that one provider.
 #
-# kimi-k3 and glm-5.3 lead on purpose (owner ruling: they are the best NIM
-# models and stay in the pool). They are also the two that time out on NIM's
-# free tier, so each gets a SHORT per-attempt cap (_TITLE_MODEL_TIMEOUT_SECONDS)
+# kimi-k3 and glm-5.3 are LAST (owner ruling 2026-09-19: they cause the latency;
+# they stay in the pool as a final resort). They are the two that time out on
+# NIM's free tier, so each gets a SHORT per-attempt cap (_TITLE_MODEL_TIMEOUT_SECONDS)
 # and the loop skips any model whose per-model health circuit is open
 # (ProviderManager.route_is_healthy): one failure parks that model for 30s
 # (300s for a 404/410) without cooling NIM as a whole, so the next title goes
@@ -79,15 +79,15 @@ _TITLE_ATTEMPT_TIMEOUT_SECONDS = 20
 # nemotron-nano-3 / granite-34b-code (404, listed but not deployed),
 # deepseek-v4-flash-0731 (~60s, longer than the whole title budget).
 _TITLE_NIM_MODELS = (
-    "moonshotai/kimi-k3",
-    "z-ai/glm-5.3",
     "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3-super-120b-a12b",
     "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "moonshotai/kimi-k3",
+    "z-ai/glm-5.3",
 )
 # Bounded redraws: one attempt per model in the chain.
 _TITLE_MAX_MACHINERY_ATTEMPTS = len(_TITLE_NIM_MODELS)
-# Short cap for the two strongest-but-slow models so a stall costs seconds, not
+# Short cap for the two slow last-resort models so a stall costs seconds, not
 # the whole title budget.
 _TITLE_MODEL_TIMEOUT_SECONDS = {
     "moonshotai/kimi-k3": 12,

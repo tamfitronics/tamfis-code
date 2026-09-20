@@ -58,13 +58,26 @@ def test_public_group_selection_picks_among_eligible_models_under_ceiling():
     assert result in {"tamfis-gpt-pro", "tamfis-gpt-ultima"}
 
 
-def test_nim_public_group_prefers_kimi_k3_after_capability_filters():
-    manager = _Manager()
-    nim = _config(
-        "nvidia/nemotron-3-ultra-550b-a55b",
-        "moonshotai/kimi-k3",
-        default="nvidia/nemotron-3-ultra-550b-a55b",
+def test_nim_pool_puts_kimi_k3_and_glm_5_3_last_and_selection_follows_it():
+    """Owner ruling 2026-09-19: Kimi K3 and GLM 5.3 caused the latency (neither
+    answered inside 60s on NIM's free tier); the fast nemotrons lead and the two
+    are reached only when nothing else survives the capability filters."""
+    from tamfis_code.providers import ProviderManager
+
+    real = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
+    assert real.models[-2:] == ["moonshotai/kimi-k3", "z-ai/glm-5.3"]
+    assert real.default_model not in {"moonshotai/kimi-k3", "z-ai/glm-5.3"}
+    assert real.models.index(real.default_model) < real.models.index("moonshotai/kimi-k3")
+
+    picked = _select_public_group_model(
+        _Manager(), ProviderType.NVIDIA, real, None, PUBLIC_MODEL_ULTIMA,
     )
+    assert picked not in {"moonshotai/kimi-k3", "z-ai/glm-5.3"}
+
+
+def test_nim_public_group_still_serves_kimi_k3_when_it_is_the_only_survivor():
+    manager = _Manager()
+    nim = _config("moonshotai/kimi-k3", default="moonshotai/kimi-k3")
 
     assert _select_public_group_model(
         manager, ProviderType.NVIDIA, nim, None, PUBLIC_MODEL_ULTIMA,
