@@ -40,6 +40,10 @@ _HEADLINE_GLYPHS = ("✢", "✳", "✶", "✻", "✽", "✻", "✶", "✳")
 _STATUS_TICK_PERIOD = 40
 _STATUS_REFRESH_INTERVAL_SECONDS = 0.25
 _STDOUT_BATCH_INTERVAL_SECONDS = 0.01
+# Keep the composer readable on ultrawide terminals. The input remains
+# left-aligned, but its top/bottom rules stop at the same practical width as
+# the assistant card instead of becoming a wall-to-wall separator.
+_COMPOSER_MAX_WIDTH = 100
 
 # Claude Code's own bottom-toolbar phrasing for the three MODE_CYCLE stops
 # that actually change what gets auto-approved -- "manual" (/mode's "ask")
@@ -103,15 +107,17 @@ def _truncate(text: str, limit: int) -> str:
 
 
 def composer_rule_html() -> str:
-    """A full-width horizontal rule, the top/bottom edge of the composer.
+    """A bounded horizontal rule for the top/bottom edge of the composer.
 
     Claude Code and Codex draw the input between two plain rules with the
-    running status ABOVE it and the mode line BELOW -- not a framed box with
-    everything packed into one toolbar underneath.
+    running status ABOVE it and the mode line BELOW. Capping the rule at the
+    assistant card width keeps ultrawide terminals readable instead of
+    producing two wall-to-wall separators.
     """
     import shutil
 
-    width = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns)
+    terminal_width = shutil.get_terminal_size(fallback=(80, 24)).columns
+    width = min(_COMPOSER_MAX_WIDTH, max(20, terminal_width))
     return f"<ansigray>{'─' * width}</ansigray>"
 
 

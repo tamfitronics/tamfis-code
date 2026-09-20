@@ -230,12 +230,12 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertIn("esc to interrupt", footer_lines[1])
         self.assertNotIn("Tip:", footer_lines[1])
 
-    def test_rules_span_the_terminal_width(self):
+    def test_rules_are_capped_for_ultrawide_terminals(self):
         from tamfis_code.live_input import composer_rule_html
 
         with patch("shutil.get_terminal_size", return_value=os.terminal_size((120, 30))):
             rule = re.sub(r"<[^>]+>", "", composer_rule_html())
-        self.assertEqual(rule, "─" * 120)
+        self.assertEqual(rule, "─" * 100)
 
     def test_pending_update_replaces_the_tip_above_the_input_mid_task(self):
         # Informational only: self_update.py never installs/re-execs
@@ -911,11 +911,11 @@ class IdleFooterTipFitTests(_StatePatchMixin, unittest.TestCase):
             rendered = idle_bottom_toolbar(Config(), 1, model="auto", **kwargs)
         return "".join(text for _style, text in rendered.__pt_formatted_text__()).split("\n")
 
-    def test_the_idle_toolbar_is_a_rule_then_one_footer_line(self):
+    def test_the_idle_toolbar_is_a_bounded_rule_then_one_footer_line(self):
         lines = self._footer(120)
         self.assertEqual(len(lines), 2)
         self.assertEqual(set(lines[0]), {"─"})
-        self.assertEqual(len(lines[0]), 120)
+        self.assertEqual(len(lines[0]), 100)
 
     def test_the_tip_is_dropped_when_the_footer_is_too_narrow_for_it(self):
         footer = self._footer(70)[1]
