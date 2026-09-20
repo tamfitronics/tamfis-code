@@ -867,26 +867,24 @@ def _title_seed_objective(state: Any) -> str:
 
 
 def expand_collapsed_or_end_of_line(event: Any, console: Any) -> None:
-    """Idle-prompt Ctrl+E.
+    """Idle-prompt Ctrl+E: show the newest collapsed message in full -- or, if it is
+    already open, show less.
 
     render.py collapses a long message behind "N more chars -- press Ctrl+E to
-    show full message". Mid-task that key is bound in live_input.py, but the
-    hint stays in scrollback after the turn ends and the idle prompt had no
-    binding at all, so the hint pointed at a key that did nothing. With nothing
-    collapsed, Ctrl+E keeps its normal readline meaning (jump to end of line)
-    instead of being swallowed.
+    show full message"; the hint stays in scrollback after the turn ends, so the idle
+    prompt binds the key too. The message opens in a viewer above the input
+    (message_viewer.py) and the same key closes it -- nothing is printed into the
+    scrollback, so "show less" really restores the screen. With nothing collapsed,
+    Ctrl+E keeps its normal readline meaning (jump to end of line) instead of being
+    swallowed.
     """
-    from prompt_toolkit.application import run_in_terminal
+    from .message_viewer import VIEWER
 
-    from .render import COLLAPSED_MESSAGES, expand_next_collapsed_message
-
-    if not COLLAPSED_MESSAGES.pending():
-        buffer = event.current_buffer
-        buffer.cursor_position += buffer.document.get_end_of_line_position()
+    if VIEWER.toggle():
+        event.app.invalidate()
         return
-    # run_in_terminal suspends the prompt, prints the full message into
-    # scrollback like any other output, then redraws the composer.
-    run_in_terminal(lambda: expand_next_collapsed_message(console))
+    buffer = event.current_buffer
+    buffer.cursor_position += buffer.document.get_end_of_line_position()
 
 
 def session_title_report(previous_title: str, current_title: str, model_name: str = "") -> str:
@@ -1299,11 +1297,25 @@ async def _run_interactive_impl(
     def _expand_collapsed_message(event) -> None:
         expand_collapsed_or_end_of_line(event, console)
 
-    def _prompt_message() -> HTML:
+    # Scroll/close keys for the Ctrl+E viewer; active only while it is open, and last so
+    # they win over the ordinary Esc/Up/Down behaviour.
+    from .message_viewer import install_bindings as _install_viewer_bindings
+
+    _install_viewer_bindings(bindings)
+
+    def _prompt_message() -> Any:
         # Keep the editable line clean, like Codex/Claude Code: mode and
         # status live in prompt-toolkit's persistent toolbar *below* the
         # message box instead of consuming space before every message.
-        return message_prompt()
+        # While a long message is open (Ctrl+E) it is drawn above the input.
+        from .message_viewer import panel_ansi
+
+        viewer = panel_ansi()
+        if not viewer:
+            return message_prompt()
+        from prompt_toolkit.formatted_text import ANSI, FormattedText, to_formatted_text
+
+        return FormattedText(list(to_formatted_text(ANSI(viewer))) + list(to_formatted_text(message_prompt())))
 
     # multiline=True is essential for bracketed terminal paste: embedded
     # newlines remain part of one objective instead of submitting the first
@@ -1542,6 +1554,9 @@ async def _run_interactive_impl(
                             state=suggestion_state,
                         ),
                     )
+                    from .message_viewer import VIEWER as _viewer
+
+                    _viewer.close()
                 finally:
                     notification_task.cancel()
                     with suppress(asyncio.CancelledError):

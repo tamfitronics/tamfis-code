@@ -1000,3 +1000,20 @@ class RunningCommandActivityTests(_StatePatchMixin, unittest.TestCase):
     def test_a_long_command_is_cut_to_the_terminal_width(self):
         for line in self._message(width=72):
             self.assertLessEqual(len(line), 72, line)
+
+
+class TipLineFitsTheTerminalTests(_StatePatchMixin, unittest.TestCase):
+    """Every rotating tip must fit a narrow terminal: the tip line used to be the only
+    composer line that was not cut to the width (one tip is 83 characters)."""
+
+    def test_no_tip_wraps_on_a_narrow_terminal(self):
+        from tamfis_code import live_input as live_input_module
+
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
+        for _label, tip in live_input_module._ROTATING_TIPS:
+            with patch.object(live_input_module, "_tip_text", return_value=tip), \
+                    patch("shutil.get_terminal_size", return_value=os.terminal_size((60, 24))):
+                text = "".join(t for _s, t in listener._composer_message().__pt_formatted_text__())
+            for line in text.split("\n"):
+                self.assertLessEqual(len(line), 60, line)

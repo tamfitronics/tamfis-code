@@ -19,7 +19,7 @@ from typing import Any, Awaitable, Callable, Optional
 from prompt_toolkit.auto_suggest import AutoSuggest, Suggestion
 from prompt_toolkit.document import Document
 from prompt_toolkit.filters import Condition
-from prompt_toolkit.formatted_text import FormattedText, HTML, to_formatted_text
+from prompt_toolkit.formatted_text import ANSI, FormattedText, HTML, to_formatted_text
 from prompt_toolkit.styles import Style
 
 from . import state as local_state
@@ -505,8 +505,21 @@ class LiveInputListener:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await ticker
         await self._shutdown_prompt()
+        try:
+            from .message_viewer import VIEWER
+
+            VIEWER.close()
+        except Exception:
+            pass
         if self.renderer.live_input_listener is self:
             self.renderer.live_input_listener = None
+        # Whatever the outcome, commit the pinned plan's final state to scrollback once
+        # (a no-op when nothing was pinned): with the composer gone the plan would
+        # otherwise vanish. Idempotent -- print_work_summary below calls it too.
+        try:
+            self.renderer._print_final_plan()
+        except Exception:
+            pass
         if self._outcome_status:
             # The turn is over: do not restart Rich's transient live spinner
             # for the few milliseconds before renderer.finish(). Replace the
@@ -678,6 +691,22 @@ class LiveInputListener:
 
         spinner = _HEADLINE_GLYPHS[self._status_tick % len(_HEADLINE_GLYPHS)]
         lines = []
+        # The plan, pinned and redrawn in place as steps complete -- not a fresh panel
+        # printed into the scrollback per step. A blank line on each side so it does not
+        # crowd the tool records above or the status line below.
+        try:
+            import shutil
+
+            size = shutil.get_terminal_size(fallback=(80, 24))
+            plan_lines = self.renderer.live_input_plan_lines(size.columns, size.lines)
+        except Exception:
+            plan_lines = []
+        from .message_viewer import VIEWER, panel_ansi
+
+        if plan_lines and not VIEWER.is_open:  # the viewer takes the room while it is open
+            lines.append("")
+            lines.extend(plan_lines)
+            lines.append("")
         activity = self.renderer.live_input_activity_line()
         if activity:
             # "Reading 3 files…  ⎿  $ pytest -q (12s)" is two facts: what the round is
@@ -697,7 +726,19 @@ class LiveInputListener:
                     body, elapsed = match.group(1), match.group(2)
                 shown = _truncate(body, max(10, room - 5 - len(elapsed))) + elapsed
                 lines.append(f" <ansigray>  ⎿  {_xml_escape(shown)}</ansigray>")
-        headline = self.renderer.live_input_headline(spinner)
+        import shutil as _shutil
+
+        columns = _shutil.get_terminal_size(fallback=(80, 24)).columns
+        # Leave room for the right-aligned route note (when there is one) and the margin.
+        try:
+            from .state import route_status_compact as _note_for_width
+
+            reserved = len(_note_for_width(self.session_id) or "")
+        except Exception:
+            reserved = 0
+        headline = self.renderer.live_input_headline(
+            spinner, width=max(30, columns - 2 - (reserved + 2 if reserved else 0)),
+        )
         headline_html = f" <ansicyan>{_xml_escape(headline)}</ansicyan>"
         # A route exception (failover / exhausted route) rides on the SAME line,
         # right-aligned: this line is short, so it cannot be clipped away the
@@ -727,9 +768,21 @@ class LiveInputListener:
             tip = _tip_text(self.session_id, self._active_agents)
             if not tip.startswith("Tip"):
                 tip = f"Tip: {tip}"
-            lines.append(f" <ansigray>{_xml_escape(tip)}</ansigray>")
+            # Cut to the terminal width like the activity lines above: an 83-character
+            # tip wrapped onto a second row on a 72-column terminal, pushing the
+            # composer down (and made test_a_long_command_is_cut_to_the_terminal_width
+            # fail whenever that tip happened to be the one rotating in).
+            import shutil
+
+            tip_room = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns - 2)
+            lines.append(f" <ansigray>{_xml_escape(_truncate(tip, tip_room))}</ansigray>")
         lines.append(composer_rule_html())
-        return HTML("\n".join(lines) + "\n<ansicyan><b>❯</b></ansicyan> ")
+        composer = HTML("\n".join(lines) + "\n<ansicyan><b>❯</b></ansicyan> ")
+        viewer = panel_ansi()
+        if viewer:
+            # The full message (Ctrl+E) sits above the status; Ctrl+E/Esc closes it.
+            return FormattedText(list(to_formatted_text(ANSI(viewer))) + list(to_formatted_text(composer)))
+        return composer
 
     def _bottom_toolbar(self):
         """Everything BELOW the input: the bottom rule, then ONE footer line --
@@ -832,19 +885,19 @@ class LiveInputListener:
             self.renderer.background_requested.set()
 
         @bindings.add("c-e")
-        def _expand_collapsed_message(event) -> None:
-            # Ctrl+E expands the newest collapsed long message (user or
-            # assistant) in full -- render.py's collapse hint ("N more chars
-            # -- press Ctrl+E to show full message") points here. Repeat
-            # presses walk back through older collapsed messages; with none
-            # left it is a quiet no-op. Printing happens through the
-            # renderer's own console so the expansion lands in scrollback
-            # exactly where every other message lives.
+        def _toggle_full_message(event) -> None:
+            # Ctrl+E shows the newest collapsed long message (user or assistant) in
+            # full in a viewer above the input -- render.py's collapse hint ("N more
+            # chars -- press Ctrl+E to show full message") points here -- and Ctrl+E
+            # again (or Esc) shows less: nothing is printed into scrollback, so
+            # closing restores the screen exactly. With nothing collapsed it is a
+            # quiet no-op.
             try:
-                self.renderer.expand_next_collapsed_message()
+                from .message_viewer import VIEWER
+
+                VIEWER.toggle()
             except Exception:
-                # A rendering hiccup in an expansion path must never take
-                # down the input loop.
+                # A rendering hiccup in the viewer must never take down the input loop.
                 pass
             event.app.invalidate()
 
@@ -859,6 +912,13 @@ class LiveInputListener:
 
             if not event.app.is_done:
                 event.app.exit(result="")
+
+        # Registered LAST: for the same key prompt_toolkit takes the last matching
+        # binding, and while the full-message viewer is open Esc/Up/Down must scroll or
+        # close it, not cancel the turn or recall a queued instruction.
+        from .message_viewer import install_bindings as _install_viewer_bindings
+
+        _install_viewer_bindings(bindings)
 
         # The running composer is the same as the idle one: the input between
         # two plain rules, the running status and tip ABOVE it, the mode line

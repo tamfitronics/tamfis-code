@@ -120,41 +120,40 @@ _THINKING_STALE_SECONDS = 3.0
 # happening rather than picked at random -- "idle" is the constructor
 # default, never actually shown (task_started fires before the first
 # network call, see run_local_agent_turn).
-_VERB_BY_PHASE = {
-    "idle": "Working",
-    "submitting": "Submitting",
-    "queued": "Queued",
-    "understand": "Understanding",
-    "inspect": "Inspecting",
-    "route": "Routing",
-    "reasoning": "Thinking",
-    "respond": "Responding",
-    "plan": "Planning",
-    "execute": "Working",
-    "observe": "Observing",
-    "repair": "Repairing",
-    "waiting_for_approval": "Waiting",
-    "validate": "Checking",
-    "report": "Wrapping up",
+
+
+# What the agent is doing when nothing more specific is known, one honest label per
+# phase. This used to be THREE rotating words per phase, swapped every 2 seconds
+# ("Razzmatazzing", "Rummaging", "Wiring", "Polishing", "Untangling"): decoration that
+# said nothing about the work, so a stuck agent and a busy one looked the same. The
+# headline now shows the real activity (current_activity) and only falls back to these.
+_PHASE_ACTIVITY = {
+    "idle": "Starting",
+    "submitting": "Submitting the task",
+    "queued": "Waiting in the queue",
+    "understand": "Reading the request",
+    "inspect": "Inspecting the workspace",
+    "route": "Selecting a model",
+    "reasoning": "Reasoning through the next step",
+    "respond": "Writing the response",
+    "plan": "Planning the steps",
+    "execute": "Working through the plan",
+    "observe": "Reviewing the tool output",
+    "repair": "Fixing a failure",
+    "waiting_for_approval": "Waiting for your approval",
+    "validate": "Verifying the changes",
+    "report": "Writing the summary",
 }
 
-_ACTIVITY_VARIANTS_BY_PHASE = {
-    "idle": ("Working", "Razzmatazzing", "Smoothing"),
-    "submitting": ("Submitting", "Packing", "Dispatching"),
-    "queued": ("Queuing", "Lining up", "Preparing"),
-    "understand": ("Analyzing", "Orienting", "Evaluating"),
-    "inspect": ("Inspecting", "Tracing", "Rummaging"),
-    "route": ("Routing", "Selecting", "Calibrating"),
-    "reasoning": ("Reasoning", "Evaluating", "Synthesizing"),
-    "respond": ("Composing", "Smoothing", "Summarizing"),
-    "plan": ("Planning", "Sequencing", "Plotting"),
-    "execute": ("Coding", "Wiring", "Polishing"),
-    "observe": ("Observing", "Reviewing", "Measuring"),
-    "repair": ("Repairing", "Untangling", "Mending"),
-    "waiting_for_approval": ("Waiting", "Holding", "Standing by"),
-    "validate": ("Evaluating", "Checking", "Verifying"),
-    "report": ("Wrapping up", "Summarizing", "Finishing"),
-}
+# _status_detail values that describe a WAIT, not work: the plan step in progress says
+# more, so it is shown instead when there is one.
+_GENERIC_STATUS_DETAILS = frozenset({
+    "Preparing the task", "Submitting the task", "Loading workspace context",
+    "Preparing repository context", "Selecting the best available model",
+    "Waiting for the model's next step", "Thinking through the next step",
+    "Reviewing the tool result", "Checking the work and updating context",
+    "Finishing the response",
+})
 
 
 # Rotating hints shown under the live status line during longer-running
@@ -246,6 +245,12 @@ class CollapsedMessageStore:
     def pending(self) -> int:
         return sum(1 for item in self._items if not item["expanded"])
 
+    def entries(self) -> list[tuple[str, str]]:
+        """(kind, full_content) of every still-collapsed message, oldest first --
+        what the Ctrl+E viewer (message_viewer.py) pages through. Viewing does not mark
+        anything expanded: closing the viewer leaves the message collapsed."""
+        return [(item["kind"], item["content"]) for item in self._items if not item["expanded"]]
+
     def take_next(self) -> Optional[tuple[str, str]]:
         """(kind, full_content) of the newest still-collapsed message, marking
         it expanded; None when nothing is waiting."""
@@ -286,7 +291,7 @@ def expand_next_collapsed_message(console: Any, store: Optional[CollapsedMessage
     else:
         console.print("[bold green]You (full)[/bold green]")
         console.print(Text(content))
-    console.print("[dim]· show less (message above is the full content)[/dim]")
+    console.print("[dim]· (full message above)[/dim]")
     console.print()
     return True
 
@@ -296,6 +301,16 @@ def _current_tip(elapsed: float) -> Optional[str]:
         return None
     index = int((elapsed - _TIP_START_AFTER_SECONDS) // _TIP_ROTATE_EVERY_SECONDS) % len(_TIPS)
     return _TIPS[index]
+
+
+def _shorten_middle(text: str, limit: int) -> str:
+    """Cut the MIDDLE of an over-long activity ("Reading /home/…/deep/package.json"): the
+    start says what is happening and the end says to what."""
+    if len(text) <= limit:
+        return text
+    head = max(8, limit // 2 - 1)
+    tail = max(8, limit - head - 1)
+    return f"{text[:head].rstrip()}…{text[-tail:].lstrip()}"
 
 
 def _format_elapsed(seconds: float) -> str:
@@ -827,15 +842,46 @@ class StreamRenderer:
         if self._terminal_status is not None:
             model = self._model or "auto"
             return f"{self._terminal_status} · {model} · {details}"
-        activities = _ACTIVITY_VARIANTS_BY_PHASE.get(
-            self._phase,
-            (_VERB_BY_PHASE.get(self._phase, self._phase).capitalize(),),
-        )
-        activity_index = int((time.monotonic() - self._task_start) // 2) % len(activities)
-        verb = activities[activity_index]
+        verb = self.current_activity()
         model = self._model or "auto"
         prefix = f"{spinner_frame} " if spinner_frame else ""
         return f"{prefix}{verb}… · {model} · {details}"
+
+    def _active_plan_step_label(self) -> str:
+        """"Step 2/8 · Read package.json manifest" for the plan step in progress."""
+        steps = [
+            item for item in self._plan_steps
+            if isinstance(item, dict) and item.get("status") != "context" and str(item.get("step") or "").strip()
+        ]
+        for index, item in enumerate(steps, start=1):
+            if item.get("status") == "in_progress":
+                return f"Step {index}/{len(steps)} · {' '.join(str(item['step']).split())}"
+        return ""
+
+    def current_activity(self, *, include_command: bool = True) -> str:
+        """What the agent is doing RIGHT NOW, in words tied to the actual work.
+
+        In order: the command that is running ("Running pytest -q"), the tool call in
+        flight with its target ("Reading /home/x/package.json", "Editing runner.py"), the
+        plan step in progress ("Step 2/8 · Read package.json manifest") while the agent is
+        only waiting on the model, then an honest per-phase label. Never a decorative word.
+        """
+        if self._running_command:
+            if not include_command:
+                # The composer prints the command on its own "⎿ $ ..." line right under
+                # the headline; repeating it here would show it twice.
+                return "Running command"
+            command = " ".join(str(self._running_command).split())
+            return f"Running {_shorten_middle(command, 64)}"
+        detail = (self._status_detail or "").strip()
+        if detail and detail not in _GENERIC_STATUS_DETAILS:
+            return _shorten_middle(detail.replace(" · ", " ", 1), 72)
+        step = self._active_plan_step_label()
+        if step:
+            return _shorten_middle(step, 72)
+        if detail and detail != "Preparing the task":
+            return detail
+        return _PHASE_ACTIVITY.get(self._phase, str(self._phase).replace("_", " ").capitalize())
 
     def _is_thinking(self) -> bool:
         """True while reasoning text is actively arriving (the last reasoning
@@ -847,7 +893,7 @@ class StreamRenderer:
             and time.monotonic() - self._reasoning_last < _THINKING_STALE_SECONDS
         )
 
-    def live_input_headline(self, spinner_frame: str = "") -> str:
+    def live_input_headline(self, spinner_frame: str = "", width: Optional[int] = None) -> str:
         """The one-line running status shown ABOVE the composer, Claude/Codex
         style: "⠴ Musing… (5m 45s · ↓ 12.9k tokens)".
 
@@ -869,15 +915,45 @@ class StreamRenderer:
         joined = " · ".join(details)
         if self._terminal_status is not None:
             return f"{self._terminal_status} ({joined})"
-        activities = _ACTIVITY_VARIANTS_BY_PHASE.get(
-            self._phase,
-            (_VERB_BY_PHASE.get(self._phase, self._phase).capitalize(),),
-        )
-        verb = activities[int((time.monotonic() - self._task_start) // 2) % len(activities)]
-        return f"{spinner_frame or '✽'} {verb}… ({joined})"
+        glyph = spinner_frame or "✽"
+        activity = self.current_activity(include_command=False)
+        if width is not None:
+            # The activity gives way, not the timing: "(5m 47s · ↓ 7.7k tokens · thinking)"
+            # is what tells a long turn from a stuck one, so it is never cut.
+            room = width - len(f"{glyph} … ({joined})")
+            activity = _shorten_middle(activity, max(12, room))
+        return f"{glyph} {activity}… ({joined})"
+
+    def _plan_is_pinned(self) -> bool:
+        """True while the interactive composer (live_input.py) owns the screen and
+        draws the plan itself. Latched, so the end-of-turn snapshot still knows the
+        plan was pinned after the listener has detached."""
+        pinned = bool(self._is_tty and self.live_input_listener is not None)
+        if pinned:
+            self._plan_was_pinned = True
+        return pinned
+
+    def live_input_plan_lines(self, width: int, terminal_rows: int) -> list[str]:
+        """The pinned plan panel as prompt_toolkit HTML lines ([] with no plan)."""
+        from .plan_panel import plan_panel_html
+
+        return plan_panel_html(self._plan_steps, width=width, terminal_rows=terminal_rows)
+
+    def _print_final_plan(self) -> None:
+        """Commit the pinned plan's final state to scrollback, once."""
+        if not getattr(self, "_plan_was_pinned", False) or getattr(self, "_final_plan_printed", False):
+            return
+        self._final_plan_printed = True
+        from .plan_panel import visible_steps
+
+        steps = visible_steps(self._plan_steps)
+        if steps:
+            self.console.print()
+            self._print_plan_snapshot(steps, title="Plan progress")
 
     def print_work_summary(self, status: str = "completed") -> None:
         """Leave one Claude-style durable timing line after live UI exits."""
+        self._print_final_plan()
         elapsed = _format_elapsed(time.monotonic() - self._task_start)
         model = self._model or "auto"
         if status == "completed":
@@ -1064,7 +1140,7 @@ class StreamRenderer:
         elif self._reasoning_start is not None:
             # Still actively reasoning -- live-incrementing, not yet frozen.
             detail_parts.append(f"thought for {_format_elapsed(time.monotonic() - self._reasoning_start)}")
-        verb = _VERB_BY_PHASE.get(self._phase, self._phase)
+        verb = self.current_activity()
         # The literal brackets are escaped (\[...]) because Text.from_markup
         # below would otherwise parse "[accept-edits]" itself as an
         # (invalid, silently-dropped) markup tag rather than visible text --
@@ -1729,6 +1805,10 @@ class StreamRenderer:
                     return
                 self._last_plan_fingerprint = fingerprint
                 self._plan_steps = filtered
+                if self._plan_is_pinned():
+                    # The interactive composer draws the plan itself, in place (see
+                    # plan_panel.py); a durable panel per step is what it replaced.
+                    return
                 if self._live is not None:
                     self._refresh_live()
                 else:
@@ -1763,6 +1843,10 @@ class StreamRenderer:
                         f"→ Continuing: {done}/{len(self._plan_steps)} plan steps done",
                         style="dim",
                     ))
+                    return
+                if self._plan_is_pinned():
+                    # Pinned above the composer and updated in place; one durable
+                    # snapshot of the final state is printed when the turn ends.
                     return
                 # Rich's TTY Live region is transient and is stopped when
                 # assistant output begins. Always print a durable snapshot;

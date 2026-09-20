@@ -887,62 +887,43 @@ class ProviderManager:
             # after everything faster has failed.
             default_model="nvidia/nemotron-3-super-120b-a12b",
             models=[
-                # super BEFORE ultra (2026-09-19, live-measured with this CLI's own
-                # prompt and 21 tools): super made its tool call in 1.0s, ultra in
-                # 9.2s. Both are free and tool-calling; for an agent loop that
-                # makes a dozen rounds, the fast one leads. route_stats still
-                # reorders by what a given day actually measures.
+                # Pool rebuilt 2026-09-20 from a LIVE probe of every chat-capable id on this
+                # account's /v1/models (82 ids) plus a real agent-loop benchmark (tamfis-code's
+                # own prompt and 21 tools; a tool call, its result, then the answer), and a
+                # 6-task quality check. Only ~7 ids answer at all: NVIDIA lists ~40 that return
+                # "404 Function ... Not found for account", the large frontier models queue
+                # forever on the free tier, and deepseek-v4-pro was retired (410, EOL
+                # 2026-09-14). Every dead id is gone from this list -- each one cost a failed
+                # hop before a working model was reached. route_stats still reorders by what a
+                # given day measures.
+                #
+                # nemotron-3-super: tool call in 0.9-1.0s, whole loop ~2s, quality 5/6.
                 "nvidia/nemotron-3-super-120b-a12b",
+                # nemotron-3-ultra (550B): the strongest; loop 2.9s on a good day, 9s+ on a
+                # busy one. Quality 5/6.
                 "nvidia/nemotron-3-ultra-550b-a55b",
-                # ADDED 2026-09-19 (owner: find more free tool-calling models for the
-                # pool). Found by benchmarking every chat-capable id on NIM's
-                # /v1/models with this CLI's own prompt and 21 tools, three runs: first
-                # token 0.8-1.7s, correct read_file tool call at 1.7-4.2s. Faster than
-                # ultra (9.2s) and lightning (14s). route_stats keeps ranking it by
-                # what it measures on the day.
+                # meta/muse-glimmer-30b: loop 3.7s + 2.2s, quality 6/6 (owner: add more free
+                # tool-calling models).
                 "meta/muse-glimmer-30b",
-                # Replaced retired nvidia/nemotron-3-nano-30b-a3b on
-                # 2026-09-13. Live re-verified against this account with
-                # HTTP 200 and a genuine get_weather tool_calls event.
-                "nvidia/nemotron-3.5-lightning-30b-a3b",
-                # NVIDIA-hosted, live-verified real tool_calls on this
-                # account; high accuracy on reasoning/tool-calling per
-                # NVIDIA's own catalog, kept as mid-tier fallbacks below the
-                # newer nemotron-3 family.
-                "nvidia/llama-3.3-nemotron-super-49b-v1.5",
-                "nvidia/llama-3.3-nemotron-super-49b-v1",
-                # Third-party (MiniMax AI) multimodal MoE hosted on NVIDIA
-                # NIM, live-verified real tool_calls on this account.
-                # Marketplace models have previously turned out to be a
-                # per-account entitlement gap disguised as a working route
-                # (see the kimi-k2.6 404 fix) -- kept selectable, not
-                # promoted to default, until it has more real-world use.
-                "minimaxai/minimax-m3",
-                # Confirmed live: real tool_calls response (not narrated
-                # text), reasoning_effort and reasoning_budget both work
-                # without hanging. Demoted from default after the fake-
-                # tool-call-as-text incident above; still selectable.
+                # Confirmed real tool_calls, clean; loop 2.0s + 9.9s. Flaky with transient
+                # 500s, so behind the two above; also the (verified) vision route.
                 "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
-                # NVIDIA currently exposes these DeepSeek V4 hosted routes
-                # as mature coding/agent models. They remain selectable
-                # fallbacks; the verified Nemotron routes stay the default
-                # until an account-specific smoke test proves otherwise.
-                # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached
-                # NVIDIA NIM end-of-life 2026-08-07 (HTTP 410 confirmed live
-                # in tamgpt6's intent classifier), no longer callable.
-                "deepseek-ai/deepseek-v4-pro",
-                "deepseek-ai/deepseek-v4.1-flash",
-                "meta/llama-3.1-405b-instruct",
-                "meta/llama-3.1-70b-instruct",
-                "moonshotai/kimi-k2.6",
-                "mistralai/mistral-large-2-123b",
-                "google/gemma-2-27b-it",
-                "microsoft/phi-3-medium-128k-instruct",
+                # google/diffusiongemma-26b-a4b-it: loop 2.8s + 1.4s, valid tool args,
+                # quality 5/6 at ~1.4-2.9s per task.
+                "google/diffusiongemma-26b-a4b-it",
+                # openai/gpt-oss-20b: reliable tool calling, loop 1.3s + 3.6s, quality 5/6 but
+                # 12-15s per answer (long reasoning) -- a fallback, not a lead.
+                "openai/gpt-oss-20b",
+                # Small vision-capable model; loop 1.3s + 1.5s, quality 6/6 on easy tasks, but
+                # its queue is erratic (0.5s to 29s), so low in the order.
+                "meta/llama-3.2-11b-vision-instruct",
+                # nemotron-3.5-lightning: answers but slowly (7-30s, timeouts on a 6-task run).
+                "nvidia/nemotron-3.5-lightning-30b-a3b",
                 # LAST (2026-09-19 owner ruling, see default_model above). Live-verified
                 # 2026-08-30 (kimi-k3: plain chat, real get_weather tool_calls, and
                 # the catalog vision payload) and 2026-09-17 (glm-5.3: chat 200,
                 # genuine tool_calls with reasoning_content); both are correct, both
-                # are slow on NIM's free tier.
+                # are slow on NIM's free tier (never answered inside 60s on 2026-09-19/20).
                 "moonshotai/kimi-k3",
                 "z-ai/glm-5.3",
             ],

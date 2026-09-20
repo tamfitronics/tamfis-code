@@ -78,10 +78,13 @@ _TITLE_ATTEMPT_TIMEOUT_SECONDS = 20
 # qwen2.5-coder-32b (410 Gone, end-of-life), devstral / codestral-22b /
 # nemotron-nano-3 / granite-34b-code (404, listed but not deployed),
 # deepseek-v4-flash-0731 (~60s, longer than the whole title budget).
+# 2026-09-20 re-ranked on a live benchmark (see providers.py's NVIDIA pool comment):
+# super answers in ~1s, ultra in ~1-3s, muse-glimmer in ~1-4s; lightning (7-30s, timeouts)
+# is dropped from the chain -- a title is a background nicety, not worth a 30s route.
 _TITLE_NIM_MODELS = (
-    "nvidia/nemotron-3-ultra-550b-a55b",
     "nvidia/nemotron-3-super-120b-a12b",
-    "nvidia/nemotron-3.5-lightning-30b-a3b",
+    "nvidia/nemotron-3-ultra-550b-a55b",
+    "meta/muse-glimmer-30b",
     "moonshotai/kimi-k3",
     "z-ai/glm-5.3",
 )

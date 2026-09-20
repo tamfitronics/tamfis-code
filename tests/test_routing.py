@@ -534,39 +534,53 @@ def test_hf_prefers_official_qwen36_coding_route_and_keeps_deepseek_fallbacks():
     assert config.context_window >= 262144
 
 
-def test_nvidia_exposes_deepseek_v4_pro_without_replacing_verified_default():
+def test_nvidia_pool_holds_only_models_the_account_can_actually_serve():
+    """Rebuilt 2026-09-20 from a live probe of NIM's /v1/models. NVIDIA lists ~40 ids that
+    return "404 Function ... Not found for account" and retired deepseek-v4-pro (HTTP 410,
+    EOL 2026-09-14); every dead id used to cost a failed hop before a working model."""
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
     assert config.default_model == "nvidia/nemotron-3-super-120b-a12b"  # kimi-k3 demoted 2026-09-19
-    assert "moonshotai/kimi-k3" in config.models
+    assert "moonshotai/kimi-k3" in config.models  # kept, but last
     assert "nvidia/nemotron-3-ultra-550b-a55b" in config.models
-    assert "deepseek-ai/deepseek-v4-pro" in config.models
-    # deepseek-ai/deepseek-v4-flash removed 2026-08-08: reached NVIDIA NIM
-    # end-of-life 2026-08-07 (HTTP 410 confirmed live in tamgpt6's intent
-    # classifier) -- must not silently reappear as a selectable NIM route.
-    assert "deepseek-ai/deepseek-v4-flash" not in config.models
+    dead = {
+        "deepseek-ai/deepseek-v4-pro",        # 410 Gone, end of life 2026-09-14
+        "deepseek-ai/deepseek-v4.1-flash",    # not on the account
+        "deepseek-ai/deepseek-v4-flash",      # end of life 2026-08-07
+        "moonshotai/kimi-k2.6",               # 404 for this account
+        "minimaxai/minimax-m3",
+        "nvidia/llama-3.3-nemotron-super-49b-v1.5",
+        "nvidia/llama-3.3-nemotron-super-49b-v1",
+        "meta/llama-3.1-405b-instruct",
+        "meta/llama-3.1-70b-instruct",
+        "mistralai/mistral-large-2-123b",
+        "google/gemma-2-27b-it",
+        "microsoft/phi-3-medium-128k-instruct",
+    }
+    assert not dead & set(config.models), dead & set(config.models)
+    assert len(config.models) == len(set(config.models))
 
 
-def test_nvidia_exposes_newly_added_coding_and_tool_calling_models():
-    # 2026-07-26: added per a live NVIDIA NIM catalog re-check for models
-    # described as strong at coding/tool-calling. All were live-verified
-    # against this account (real chat-completions calls with tools
-    # attached, real tool_calls returned) before being added here.
+def test_nvidia_exposes_the_benchmarked_fast_tool_calling_models():
+    # 2026-09-20: each was run through tamfis-code's own prompt and 21 tools as a full
+    # agent loop (tool call -> result -> answer) against this account.
     config = ProviderManager.PROVIDERS[ProviderType.NVIDIA]
-    assert "nvidia/nemotron-3-ultra-550b-a55b" in config.models
-    assert "nvidia/nemotron-3-super-120b-a12b" in config.models
-    assert "nvidia/nemotron-3.5-lightning-30b-a3b" in config.models
+    for model in (
+        "nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-super-120b-a12b",
+        "meta/muse-glimmer-30b", "google/diffusiongemma-26b-a4b-it", "openai/gpt-oss-20b",
+        "nvidia/nemotron-3.5-lightning-30b-a3b",
+        # The nano-omni-reasoning route stays selectable (and is a vision route).
+        "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning",
+    ):
+        assert model in config.models, model
     assert "nvidia/nemotron-3-nano-30b-a3b" not in config.models
     lightning = get_model("nvidia/nemotron-3.5-lightning-30b-a3b")
     assert lightning is not None
     assert lightning.provider == "nvidia"
     assert lightning.capabilities.tool_calling is True
-    assert "nvidia/llama-3.3-nemotron-super-49b-v1.5" in config.models
-    assert "nvidia/llama-3.3-nemotron-super-49b-v1" in config.models
-    assert "minimaxai/minimax-m3" in config.models
-    # The nano-omni-reasoning route stays selectable (not removed), just no
-    # longer the default -- see test_nvidia_default_model_is_tool_capable_
-    # and_not_unentitled_kimi.
-    assert "nvidia/nemotron-3-nano-omni-30b-a3b-reasoning" in config.models
+    # ...and the fast ones are ahead of the slow lightning route.
+    assert config.models.index("nvidia/nemotron-3-super-120b-a12b") < config.models.index(
+        "nvidia/nemotron-3.5-lightning-30b-a3b"
+    )
 
 
 def test_remote_fallback_candidates_stay_in_policy_order():

@@ -171,9 +171,9 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         self.assertEqual(
             list(state_module._TITLE_NIM_MODELS),
             [
-                "nvidia/nemotron-3-ultra-550b-a55b",
                 "nvidia/nemotron-3-super-120b-a12b",
-                "nvidia/nemotron-3.5-lightning-30b-a3b",
+                "nvidia/nemotron-3-ultra-550b-a55b",
+                "meta/muse-glimmer-30b",
                 "moonshotai/kimi-k3",
                 "z-ai/glm-5.3",
             ],
@@ -181,13 +181,13 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
 
     def test_a_stalled_leading_model_fails_open_to_the_next(self):
         """The first route raises (timeout-shaped), the second answers: the
-        title lands from nemotron-super, and every attempt stayed on NIM."""
+        title lands from nemotron-ultra, and every attempt stayed on NIM."""
         state_module.save_session_state(1, workspace_root="/a")
         seen = []
 
         async def flaky(provider, messages, **kwargs):
             seen.append(kwargs["model"])
-            if kwargs["model"] == "nvidia/nemotron-3-ultra-550b-a55b":
+            if kwargs["model"] == "nvidia/nemotron-3-super-120b-a12b":
                 raise TimeoutError("Request timed out.")
             yield "Fix Flaky Auth Test"
 
@@ -197,19 +197,19 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         with patch("tamfis_code.providers.ProviderManager", return_value=manager):
             asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
         self.assertEqual(
-            seen, ["nvidia/nemotron-3-ultra-550b-a55b", "nvidia/nemotron-3-super-120b-a12b"],
+            seen, ["nvidia/nemotron-3-super-120b-a12b", "nvidia/nemotron-3-ultra-550b-a55b"],
         )
         state = state_module.get_session_state(1)
         self.assertEqual(state.session_title, "Fix Flaky Auth Test")
-        self.assertEqual(state.title_model, "nvidia/nemotron-3-super-120b-a12b")
+        self.assertEqual(state.title_model, "nvidia/nemotron-3-ultra-550b-a55b")
 
-    def test_kimi_is_only_reached_after_every_nemotron_has_failed(self):
+    def test_kimi_is_only_reached_after_every_faster_model_has_failed(self):
         state_module.save_session_state(1, workspace_root="/a")
         seen = []
 
         async def flaky(provider, messages, **kwargs):
             seen.append(kwargs["model"])
-            if kwargs["model"].startswith("nvidia/"):
+            if kwargs["model"] not in ("moonshotai/kimi-k3", "z-ai/glm-5.3"):
                 raise TimeoutError("Request timed out.")
             yield "Fix Flaky Auth Test"
 
@@ -219,7 +219,7 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         with patch("tamfis_code.providers.ProviderManager", return_value=manager):
             asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
         self.assertEqual(seen[-1], "moonshotai/kimi-k3")
-        self.assertEqual(len(seen), 4)
+        self.assertEqual(len(seen), 4)  # super, ultra, muse-glimmer, then kimi
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix Flaky Auth Test")
 
     def test_a_model_parked_by_its_health_circuit_is_skipped_not_retried(self):
@@ -235,10 +235,10 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
 
         manager = MagicMock()
         manager.chat_completion = ok
-        manager.route_is_healthy = lambda provider, model: model != "nvidia/nemotron-3-ultra-550b-a55b"
+        manager.route_is_healthy = lambda provider, model: model != "nvidia/nemotron-3-super-120b-a12b"
         with patch("tamfis_code.providers.ProviderManager", return_value=manager):
             asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
-        self.assertEqual(seen, ["nvidia/nemotron-3-super-120b-a12b"])
+        self.assertEqual(seen, ["nvidia/nemotron-3-ultra-550b-a55b"])
 
     def test_when_every_model_is_parked_they_are_all_still_tried(self):
         """A circuit is a latency heuristic, not proof a route is dead: no title
@@ -255,7 +255,7 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         manager.route_is_healthy = lambda provider, model: False
         with patch("tamfis_code.providers.ProviderManager", return_value=manager):
             asyncio.run(state_module.upgrade_session_title_with_ai(1, "Fix the flaky auth test"))
-        self.assertEqual(seen, ["nvidia/nemotron-3-ultra-550b-a55b"])
+        self.assertEqual(seen, ["nvidia/nemotron-3-super-120b-a12b"])
         self.assertEqual(state_module.get_session_state(1).session_title, "Fix Flaky Auth Test")
 
     def test_the_two_slow_strong_models_get_a_short_cap_the_nemotrons_a_longer_one(self):

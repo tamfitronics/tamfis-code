@@ -310,7 +310,7 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("thought for", label)
         renderer.finish()
 
-    def test_live_footer_has_spinner_rotating_activity_model_and_elapsed(self):
+    def test_live_footer_has_spinner_activity_model_and_elapsed(self):
         console = _console()
         renderer = StreamRenderer(console)
         renderer._phase = "execute"
@@ -320,7 +320,7 @@ class StreamRendererTests(unittest.TestCase):
         status = renderer.live_input_status("⠹")
 
         self.assertTrue(status.startswith("⠹ "))
-        self.assertTrue(any(word in status for word in ("Coding", "Wiring", "Polishing")))
+        self.assertIn("Working through the plan", status)  # an honest label, not a rotating word
         self.assertIn("kimi-k2.7-code:cloud", status)
         self.assertIn("5s", status)
 
@@ -1109,7 +1109,6 @@ class CollapsedMessageTests(unittest.TestCase):
         self.assertTrue(renderer.expand_next_collapsed_message())
         expanded = console.file.getvalue()[before:]
         self.assertIn("Assistant (full)", expanded)
-        self.assertIn("show less", expanded)
         # Content past the collapse point is only present after expanding.
         self.assertGreater(len(expanded), _MESSAGE_COLLAPSE_THRESHOLD)
         self.assertEqual(renderer._collapsed.pending(), 0)
@@ -1184,19 +1183,25 @@ class CollapsedMessageTests(unittest.TestCase):
         renderer.conclude("completed")
         self.assertLessEqual(COLLAPSED_MESSAGES.pending(), _COLLAPSED_QUEUE_RETENTION)
 
-    def test_idle_ctrl_e_expands_a_pending_message(self):
-        from unittest.mock import MagicMock, patch
+    def test_idle_ctrl_e_opens_the_viewer_and_a_second_press_shows_less(self):
+        from unittest.mock import MagicMock
 
         from tamfis_code.interactive import expand_collapsed_or_end_of_line
+        from tamfis_code.message_viewer import VIEWER
+        from tamfis_code.render import COLLAPSED_MESSAGES
 
+        self.addCleanup(VIEWER.close)
         StreamRenderer(_console())._collapse_or_print_assistant(self._long("IDLE"))
         console = _console()
         event = MagicMock()
-        # run_in_terminal needs a live prompt_toolkit app; run its callable inline.
-        with patch("prompt_toolkit.application.run_in_terminal", side_effect=lambda fn: fn()):
-            expand_collapsed_or_end_of_line(event, console)
-        self.assertIn("IDLE-start", console.file.getvalue())
+        expand_collapsed_or_end_of_line(event, console)
+        self.assertTrue(VIEWER.is_open)
+        # Nothing is printed into scrollback: that is what makes "show less" possible.
+        self.assertEqual(console.file.getvalue(), "")
         event.current_buffer.assert_not_called()
+        expand_collapsed_or_end_of_line(event, console)
+        self.assertFalse(VIEWER.is_open)
+        self.assertEqual(COLLAPSED_MESSAGES.pending(), 1)  # still collapsed in scrollback
 
     def test_idle_ctrl_e_with_nothing_collapsed_keeps_end_of_line(self):
         from prompt_toolkit.buffer import Buffer
@@ -1265,7 +1270,7 @@ class UsedTokenStatusTests(unittest.TestCase):
         renderer = self._renderer()
         renderer.handle_event({"event_type": "reasoning_delta", "payload": {"content": "x" * 30800}})
         headline = renderer.live_input_headline("✢")
-        self.assertRegex(headline, r"^✢ \S+… \(\d+s · ↓ 7\.7k tokens · thinking\)$")
+        self.assertRegex(headline, r"^✢ .+… \(\d+s · ↓ 7\.7k tokens · thinking\)$")
 
 
 def _prose(chars):
