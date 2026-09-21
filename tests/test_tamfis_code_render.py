@@ -786,6 +786,22 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("└ ok", output)  # success: the command's output
         self.assertIn("└ Error: bad", output)  # failure: named as an error, with the reason
 
+    def test_long_command_output_is_a_visible_collapsible_bubble(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        output = "\n".join(f"result-{index}" for index in range(10))
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "execute_command",
+                "arguments": {"command": "find . -type f"},
+                "result": {"success": True, "exit_code": 0, "stdout": output},
+            },
+        })
+        rendered = console.file.getvalue()
+        self.assertIn("Tool output · collapsed", rendered)
+        self.assertIn("Ctrl+O for full output", rendered)
+
     def test_failed_read_shows_the_actual_reason_not_just_the_target(self):
         # Live-caught bug: this used to print only "Read failed <target>"
         # with the real error (not_found/permission_denied/etc.) silently

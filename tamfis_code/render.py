@@ -201,11 +201,11 @@ _ASSISTANT_REFRESH_MIN_CHARS = 96
 # itself short-and-bounded, with older text pushed into normal scrollback,
 # is what lets the terminal auto-scroll the way Claude Code/Codex do.
 _ASSISTANT_LIVE_TAIL_CHARS = 2_000
-# Ordinary answers and steering messages must remain readable in full. The
-# previous 500-character threshold made normal multi-paragraph responses look
-# truncated ("N more chars") and applied the same cutoff to user input. Keep
-# the expand/viewer safety rail only for genuinely huge messages.
-_MESSAGE_COLLAPSE_THRESHOLD = 20_000
+# Ordinary answers and user messages remain readable in full, but a several-
+# thousand-character transcript/log should become a visible bubble instead of
+# pushing the composer off-screen. The previous 20,000-character threshold
+# meant the collapse UI was effectively invisible for normal long replies.
+_MESSAGE_COLLAPSE_THRESHOLD = 6_000
 _USER_MESSAGE_MAX_DISPLAY_CHARS = 100_000
 _ASSISTANT_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?](?:[\"'’)]*)\s+|\n{2,}|```\s*$)")
 # Assistant message borders follow the console width, like Claude Code's
@@ -1485,10 +1485,29 @@ class StreamRenderer:
             if failed and not output.strip() and lines:
                 # A refused/blocked call carries its reason in the summary lines, not in an output stream.
                 output = "\n".join(str(line) for line in lines)
-            self._print_rows(
-                _tool_display.ran_block(command, output, width=width, exit_code=code, failed=failed),
-                failed=failed,
-            )
+            rows = _tool_display.ran_block(command, output, width=width, exit_code=code, failed=failed)
+            if _tool_display.output_was_cut(output):
+                # Make the disclosure an actual visible bubble, not merely a
+                # dim text line that is easy to miss in a long transcript.
+                # Ctrl+O still opens the complete stored transcript.
+                head = [(role, text) for role, text in rows if role in {"head", "cmd"}]
+                self._print_rows(head, failed=failed)
+                preview = "\n".join(
+                    text for role, text in rows if role in {"out", "err"}
+                )
+                hidden = len(str(output).strip("\\n").split("\\n")) - _tool_display._PREVIEW_LINES_WHEN_CUT
+                self.console.print(Panel(
+                    Text(
+                        preview + f"\\n… +{hidden} lines hidden · Ctrl+O for full output",
+                        style="red" if failed else "dim",
+                    ),
+                    title="Tool output · collapsed",
+                    border_style="red" if failed else "cyan",
+                    expand=False,
+                    padding=(0, 1),
+                ))
+            else:
+                self._print_rows(rows, failed=failed)
             # Everything, not just the preview: what Ctrl+O shows.
             full = f"$ {redact_secrets(command)}\n\n{redact_secrets(output) if output else '(no output)'}"
             if len(full) > _TRANSCRIPT_ENTRY_MAX_CHARS:
