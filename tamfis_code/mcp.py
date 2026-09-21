@@ -813,6 +813,32 @@ class MCPServer:
         )
 
         self.register_tool(
+            name="read_archive",
+            description=(
+                "Read-only look inside a ZIP or TAR archive (.zip .tar .tar.gz .tgz .tar.bz2 .tar.xz), "
+                "with NO size limit on the archive and NO extraction to disk: list its files (paged, "
+                "optional pattern filter) or read one text member by name (paged like read_file). "
+                "Archives inside archives work to any depth: chain them with '!/', e.g. "
+                "path='pack.zip!/data/inner.tar.gz' lists the inner archive and adding "
+                "member='notes/readme.txt' reads a file from it. Use this instead of read_file on "
+                "an archive (read_file rejects binary files) and instead of extract_archive when you "
+                "only need to inspect; use extract_archive only when files must be edited or run."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Archive path; chain nested archives with '!/'"},
+                    "member": {"type": "string", "description": "Text file inside the (innermost) archive to read; omit to list files"},
+                    "pattern": {"type": "string", "description": "When listing: only names containing this text or matching this glob"},
+                    "offset": {"type": "integer", "minimum": 1, "description": "1-based first entry (listing) or first line (member) to return"},
+                    "limit": {"type": "integer", "minimum": 1, "description": "Entries (default 200, max 1000) or lines (default 800, max 2000) per call"},
+                },
+                "required": ["path"],
+            },
+            handler=self._read_archive,
+        )
+
+        self.register_tool(
             name="extract_archive",
             description=(
                 "Safely extract a ZIP or TAR variant inside the workspace, preserving binary files. "
@@ -1578,8 +1604,9 @@ class MCPServer:
                 f"Error: '{path}' looks like a binary file (a null byte was found in its first "
                 "8000 bytes) -- read_file only supports text. If this is an attached image, its "
                 "content is already included directly in this conversation for vision-capable "
-                "models -- look at it there instead of calling read_file. For an archive, use "
-                "extract_archive."
+                "models -- look at it there instead of calling read_file. For a ZIP/TAR archive, "
+                "use read_archive (list or read members with no size limit, nested to any depth); "
+                "extract_archive only when files must be edited or run."
             )
         content = p.read_text(encoding='utf-8', errors='ignore')
         lines = content.splitlines(keepends=True)
@@ -2232,6 +2259,31 @@ class MCPServer:
         if normalized.startswith("/") or normalized.startswith("../"):
             return None
         return normalized
+
+    async def _read_archive(
+        self, path: str, member: str = "", pattern: str = "",
+        offset: Optional[int] = None, limit: Optional[int] = None,
+    ) -> str:
+        from .archive_reader import read_archive, split_chain
+
+        chain = split_chain(path)
+        if not chain:
+            return "Error: read_archive needs an archive path"
+        try:
+            root = self._resolve_readable_input(chain[0])
+        except (PermissionError, FileNotFoundError) as exc:
+            return f"Error: {exc}"
+        if not root.is_file():
+            return f"Error: Archive not found: {chain[0]}"
+        try:
+            start = int(offset or 1)
+            page = int(limit) if limit else None
+        except (TypeError, ValueError):
+            return "Error: read_archive offset and limit must be positive integers"
+        return await run_blocking_bounded(
+            lambda: read_archive(root, chain[1:], str(member or ""), pattern=str(pattern or ""), offset=start, limit=page),
+            timeout=150.0,
+        )
 
     async def _extract_archive(self, path: str, destination: Optional[str] = None) -> Dict[str, Any]:
         source = self._resolve_readable_input(path)

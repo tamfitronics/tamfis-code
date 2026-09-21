@@ -2402,6 +2402,7 @@ async def _run_interactive_impl(
             table.add_row("search_code", "ripgrep-backed content search", "Read-only")
             table.add_row("find_references", "Find where a symbol is defined and referenced", "Read-only")
             table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
+            table.add_row("read_archive", "List/read files inside ZIP/TAR archives (no size limit, nested)", "Read-only")
             table.add_row("read_background_job", "Check on a Ctrl+B-backgrounded command", "Read-only")
             table.add_row("list_external_agent_sessions", "List sessions from Claude Code/Codex/Copilot/etc on this machine", "Read-only")
             table.add_row("read_external_agent_session", "Read one of those sessions to continue its work", "Read-only")

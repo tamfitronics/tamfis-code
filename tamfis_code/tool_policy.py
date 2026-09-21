@@ -31,7 +31,7 @@ from .routing import TaskProfile, TaskType
 # either way. Claude Code's TodoWrite and Codex's to-do tracking are both
 # available in every mode for the same reason.
 READ_TOOLS = [
-    "list_directory", "search_code", "find_references", "read_file",
+    "list_directory", "search_code", "find_references", "read_file", "read_archive",
     "get_git_info", "ask_user_question", "inspect_artifact", "save_memory",
     "list_external_agent_sessions", "read_external_agent_session",
     "write_todos",
@@ -49,7 +49,7 @@ EXECUTE_TOOLS = [*READ_TOOLS, "execute_command"]
 GIT_TOOLS = ["get_git_info", "read_file", "search_code", "find_references", "execute_command", "ask_user_question"]
 RESEARCH_TOOLS = [
     "web_search", "browser", "knowledge_base_search", "knowledge_base_index",
-    "read_file", "search_code", "find_references", "ask_user_question",
+    "read_file", "read_archive", "search_code", "find_references", "ask_user_question",
 ]
 
 

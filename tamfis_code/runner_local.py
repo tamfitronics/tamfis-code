@@ -4342,11 +4342,12 @@ async def _stream_one_completion_impl(
     # by chunks that carry no reasoning/content/tool-call delta.
     last_meaningful_at = time.monotonic()
     request_deadline = request_started + STREAM_TOTAL_TIMEOUT_SECONDS
+    steering_deferred = False
     while True:
         next_chunk_task = asyncio.create_task(stream_iterator.__anext__())
         steering_task: Optional[asyncio.Task] = None
         wait_for_steering = getattr(renderer, "wait_for_steering", None)
-        if emit and callable(wait_for_steering):
+        if emit and callable(wait_for_steering) and not steering_deferred:
             steering_task = asyncio.create_task(wait_for_steering())
         try:
             # FIX: bounds the gap between two consecutive chunks, not the
@@ -4388,6 +4389,22 @@ async def _stream_one_completion_impl(
                 raise asyncio.TimeoutError(
                     f"No stream activity for {STREAM_IDLE_TIMEOUT_SECONDS:.0f}s (stream idle timeout)"
                 )
+            if steering_task is not None and steering_task in done and (content_parts or pending_content) and not tool_calls_by_index:
+                # The model is already writing its reply. Cutting the stream here dropped the rest of the
+                # sentence ("...the planned" and nothing more; owner report 2026-09-21). Let the reply
+                # finish: the follow-up is already queued and is applied at the next safe boundary
+                # (the top of the next round, or straight after this turn), exactly as the acknowledgement
+                # promised.
+                steering_deferred = True
+                if next_chunk_task not in done:
+                    done, _pending = await asyncio.wait(
+                        {next_chunk_task}, timeout=max(0.01, min(_idle_left, _total_left)),
+                    )
+                    if not done:
+                        raise asyncio.TimeoutError(
+                            f"No stream activity for {STREAM_IDLE_TIMEOUT_SECONDS:.0f}s (stream idle timeout)"
+                        )
+                steering_task = None
             if steering_task is not None and steering_task in done:
                 next_chunk_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError, Exception):

@@ -25,6 +25,7 @@ from .safety import redact_secrets
 # Tool name -> the short title shown before the parenthesised target.
 _DISPLAY_NAMES = {
     "read_file": "Read",
+    "read_archive": "Read archive",
     "list_directory": "List",
     "create_directory": "Mkdir",
     "search_code": "Search",
@@ -60,6 +61,7 @@ _DISPLAY_NAMES = {
 # tool -> (past verb, singular noun, plural noun).
 _GROUP_CATEGORY = {
     "read_file": ("Read", "file", "files"),
+    "read_archive": ("Read", "archive", "archives"),
     "list_directory": ("Listed", "directory", "directories"),
     "search_code": ("Searched for", "pattern", "patterns"),
     "search_files": ("Searched for", "pattern", "patterns"),
@@ -144,6 +146,7 @@ def group_header(counts: dict[str, int]) -> str:
 
 _FAILURE_PREFIX = {
     "read_file": "Read failed: ",
+    "read_archive": "Read failed: ",
     "list_directory": "List failed: ",
     "write_file": "Write failed: ",
     "create_file": "Write failed: ",
@@ -255,7 +258,7 @@ def summarize_result(
     if _is_failure(envelope, inner):
         return [f"Error: {_one_line(_failure_text(envelope, inner), 200)}"], True
 
-    if name == "read_file":
+    if name in {"read_file", "read_archive"}:
         text = inner if isinstance(inner, str) else str(inner.get("content") or "") if isinstance(inner, dict) else ""
         count = _count_lines(text)
         return [f"Read {count} line{'s' if count != 1 else ''}" if count else "Read 0 lines (empty file)"], False
@@ -479,7 +482,7 @@ def explored_lines(items: list[dict[str, Any]], width: int) -> list[str]:
     for item in items:
         tool = normalized_name(item.get("tool") or "")
         args = item.get("args") if isinstance(item.get("args"), dict) else {}
-        if tool == "read_file":
+        if tool in {"read_file", "read_archive"}:
             path = str(args.get("path") or args.get("file_path") or item.get("short") or "file")
             name = path.rstrip("/").rsplit("/", 1)[-1] or path
             reads[name] = reads.get(name, 0) + 1

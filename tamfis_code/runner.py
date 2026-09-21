@@ -769,7 +769,7 @@ async def _stream_task(
                 if "<|" in raw_tool_name:
                     known_tool_names = {
                         "read_file", "write_file", "edit_file", "list_directory",
-                        "search_code", "find_references", "extract_archive",
+                        "search_code", "find_references", "read_archive", "extract_archive",
                         "repackage_archive", "create_artifact", "inspect_artifact",
                         "execute_command", "get_git_info", "read_background_job",
                         "ask_user_question", "save_memory", "browser", "web_search",

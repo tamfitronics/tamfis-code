@@ -176,6 +176,58 @@ class StreamReconnectDiagnosticsTests(unittest.TestCase):
         self.assertEqual(finish_reason, "live_steering")
         self.assertTrue(stream.closed)
 
+    def test_live_steering_does_not_cut_a_reply_that_is_already_streaming(self):
+        """Owner report 2026-09-21: Enter mid-reply ended the answer at "...the planned". Once text is
+        flowing the reply finishes; the queued follow-up is applied at the next safe boundary."""
+        from test_reasoning_plan import _chunk, _delta
+
+        release = asyncio.Event()
+
+        class Stream:
+            def __init__(self):
+                self.closed = False
+                self.step = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                self.step += 1
+                if self.step == 1:
+                    return _chunk(_delta(content="The plan is "))
+                if self.step == 2:
+                    await release.wait()
+                    return _chunk(_delta(content="to read the file."))
+                raise StopAsyncIteration
+
+            async def close(self):
+                self.closed = True
+
+        stream = Stream()
+
+        class Completions:
+            async def create(self, **_kwargs):
+                return stream
+
+        client = SimpleNamespace(chat=SimpleNamespace(completions=Completions()))
+
+        async def run():
+            renderer = StreamRenderer(Console(file=StringIO(), no_color=True))
+            task = asyncio.create_task(_stream_one_completion(
+                client, model="test-model", messages=[], tools=[], renderer=renderer,
+            ))
+            for _ in range(5):
+                await asyncio.sleep(0)
+            renderer.request_steering()          # Enter pressed while the reply is streaming
+            await asyncio.sleep(0.05)
+            release.set()
+            return await asyncio.wait_for(task, timeout=2)
+
+        content, calls, finish_reason = asyncio.run(run())
+        self.assertEqual(content, "The plan is to read the file.")
+        self.assertNotEqual(finish_reason, "live_steering")
+        self.assertFalse(stream.closed)
+
     def test_idle_timeout_raises_a_descriptive_timeout_error(self):
         """FIX: this used to `raise asyncio.TimeoutError()` with no message
         when a provider stopped sending chunks. str(TimeoutError()) == "",

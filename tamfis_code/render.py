@@ -350,6 +350,7 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
         target = redact_secrets(target)
     verbs = {
         "read_file": ("Reading", "Read"),
+        "read_archive": ("Reading archive", "Read archive"),
         # search_code is the real, currently-registered local tool
         # (mcp.py) -- glob_files/search_files/grep_files/remote_exec/
         # run_command are kept here only because an external tool
@@ -382,7 +383,7 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
 
 
 _READ_ONLY_TOOLS = {
-    "read_file", "search_code", "find_references", "get_git_info", "read_background_job",
+    "read_file", "read_archive", "search_code", "find_references", "get_git_info", "read_background_job",
     "glob_files", "search_files", "grep_files", "list_directory",
 }
 _MUTATION_TOOLS = {"write_file", "edit_file", "file_edit", "create_file", "update_file"}
@@ -448,6 +449,7 @@ _TOOL_CATEGORY = {
     "search_files": ("Searching for", "pattern", "patterns"),
     "find_references": ("Finding references for", "symbol", "symbols"),
     "read_file": ("Reading", "file", "files"),
+    "read_archive": ("Reading", "archive", "archives"),
     "list_directory": ("Listing", "directory", "directories"),
     "glob_files": ("Finding", "file", "files"),
     "execute_command": ("Running", "shell command", "shell commands"),
@@ -2034,7 +2036,7 @@ class StreamRenderer:
                 # the run of them ends (see _flush_read_group).
                 target = _tool_display.display_target(name, args)
                 short = (
-                    target.rsplit("/", 1)[-1] if normalized in {"read_file", "list_directory", "get_git_info"}
+                    target.rsplit("/", 1)[-1] if normalized in {"read_file", "read_archive", "list_directory", "get_git_info"}
                     else target
                 )
                 self._read_group.append({
@@ -2355,7 +2357,12 @@ class StreamRenderer:
                 self._close_assistant()
                 self.console.print(f"[yellow]{escape(content)}[/yellow]")
             elif content.startswith(("◆", "↳")):
-                self._close_assistant()
+                # An acknowledgement of something the user just did (a queued follow-up, a steering
+                # update). It must NOT close the assistant block: closing printed the text streamed so
+                # far as one Assistant panel and the rest of the same reply opened a second one, so a
+                # follow-up typed mid-reply cut it in two ("...checkpoint metad" / "ata file)...").
+                # Assistant text is buffered until the reply ends, so printing the note now is safe and
+                # it stays immediate.
                 self.console.print(f"[dim]{escape(content)}[/dim]")
             elif self.debug and content:
                 self._close_assistant()

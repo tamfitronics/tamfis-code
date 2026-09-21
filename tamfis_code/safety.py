@@ -29,7 +29,7 @@ RISK_DANGEROUS = "dangerous"
 
 READ_ONLY_TOOLS = {
     "read_file", "list_directory", "search_code", "find_references", "get_git_info",
-    "ask_user_question", "inspect_artifact",
+    "read_archive", "ask_user_question", "inspect_artifact",
     "list_external_agent_sessions", "read_external_agent_session",
     # write_todos only edits the session's own task-state ledger (never a workspace file) and
     # tool_policy OFFERS it in every non-plain turn. Missing from this table it fell through to the

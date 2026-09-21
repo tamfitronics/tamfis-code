@@ -42,3 +42,21 @@ class PlaceholderTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AcknowledgementDoesNotSplitAReplyTests(unittest.TestCase):
+    """Owner report 2026-09-21: pressing Enter on a follow-up mid-reply cut the Assistant panel in two."""
+
+    def test_a_follow_up_ack_in_the_middle_of_a_reply_keeps_one_panel(self):
+        console = Console(file=io.StringIO(), width=100, force_terminal=False)
+        renderer = StreamRenderer(console)
+        renderer._is_tty = True
+        renderer.live_input_listener = object()
+        renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": "The checkpoint metadata file"}})
+        renderer.handle_event({"event_type": "diagnostics", "payload": {"content": "↳ Follow-up queued (instruction_1): close the gaps"}})
+        renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": " is the only source."}})
+        renderer._close_assistant()
+        output = console.file.getvalue()
+        self.assertEqual(output.count("Assistant"), 1)
+        self.assertIn("Follow-up queued", output)
+        self.assertIn("The checkpoint metadata file is the only source.", " ".join(output.split()).replace("│ ", "").replace(" │", ""))
