@@ -2321,6 +2321,9 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
             f"session {workspace.session_id} · workspace_root={workspace.workspace_root}"
         )
         print_resume_plan_status(console, target_state)
+        from .return_recap import print_return_recap
+
+        print_return_recap(console, workspace.session_id)
         await run_interactive(None, config, workspace, provider=provider, model=model)
         return
 

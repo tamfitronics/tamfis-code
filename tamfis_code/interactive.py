@@ -329,7 +329,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/clear", "clear the screen"),
     ("/compact", "compress the thread (fold older turns into the summary, keep recent turns)"),
     ("/summary", "show a structured recap of the conversation so far"),
-    ("/recap", "alias for /summary"),
+    ("/recap", "short recap: objective, where it stands, next step (/summary is the full card)"),
     ("/sidebar", "toggle or scroll the session sidebar"),
     ("/permissions", "show approval policy and immutable server safeguards"),
     ("/mode", "show or switch the active approval mode"),
@@ -486,6 +486,31 @@ def render_sidebar(console: Console, session_id: int, sidebar: _SidebarState) ->
 # this just stops one very long-lived REPL process from growing the list
 # forever in memory.
 MAX_STANDALONE_HISTORY_TURNS = 30
+
+
+async def _show_recap_when_away(session_id: int, prompt_session: PromptSession, console: Console) -> None:
+    """Print the short "Conversation recap" once when the user has sat at the idle prompt for a while
+    (default 10 min, TAMFIS_CODE_AWAY_RECAP_MINUTES=0 disables) without typing, so coming back to a
+    long-running session starts with where it stands instead of a blank prompt. Runs beside
+    ``prompt_async`` and prints through prompt_toolkit so the input line is not corrupted."""
+    from prompt_toolkit.application import run_in_terminal
+
+    from .return_recap import away_threshold_seconds, print_return_recap
+
+    threshold = away_threshold_seconds()
+    if threshold <= 0:
+        return
+    waited = 0.0
+    while waited < threshold:
+        await asyncio.sleep(min(5.0, threshold - waited))
+        waited += 5.0
+        buffer = getattr(prompt_session, "default_buffer", None)
+        if buffer is not None and getattr(buffer, "text", ""):
+            return  # the user is back and typing
+    app = getattr(prompt_session, "app", None)
+    if app is None or not getattr(app, "is_running", False):
+        return
+    await run_in_terminal(lambda: print_return_recap(console, session_id))
 
 
 async def _wait_for_background_reinjection(session_id: int, prompt_session: PromptSession) -> None:
@@ -1584,6 +1609,7 @@ async def _run_interactive_impl(
                 notification_task = asyncio.create_task(
                     _wait_for_background_reinjection(workspace.session_id, session)
                 )
+                away_task = asyncio.create_task(_show_recap_when_away(workspace.session_id, session, console))
                 try:
                     text = await session.prompt_async(
                         _prompt_message, show_frame=False,
@@ -1598,8 +1624,11 @@ async def _run_interactive_impl(
                     _viewer.close()
                 finally:
                     notification_task.cancel()
-                    with suppress(asyncio.CancelledError):
+                    away_task.cancel()
+                    with suppress(asyncio.CancelledError, Exception):
                         await notification_task
+                    with suppress(asyncio.CancelledError, Exception):
+                        await away_task
             except KeyboardInterrupt:
             # NOTE: this used to just `continue`, silently redrawing the
             # prompt -- Ctrl+C appeared to do nothing at all, with no
@@ -2680,7 +2709,13 @@ async def _run_interactive_impl(
             console.print("[green]Thread compressed.[/green] Older turns were folded into the session summary; recent turns are retained in full.")
             console.print(f"[dim]~{len(recap)} char recap saved. Next turn starts from the compressed context.[/dim]")
             continue
-        if _ci_equals(text, "/summary") or _ci_equals(text, "/recap"):
+        if _ci_equals(text, "/recap"):
+            from .return_recap import print_return_recap
+
+            if not print_return_recap(console, workspace.session_id):
+                console.print("[dim]Nothing to recap yet: this session has no recorded conversation.[/dim]")
+            continue
+        if _ci_equals(text, "/summary"):
             recap = local_state.build_thread_recap(workspace.session_id)
             render_thread_recap(console, recap, title="Thread summary")
             continue
@@ -2945,6 +2980,9 @@ async def _run_interactive_impl(
                 "[dim]" + escape(str(target_state.conversation_summary[-1000:])) + "[/dim]"
             )
                 print_resume_plan_status(console, target_state)
+                from .return_recap import print_return_recap
+
+                print_return_recap(console, workspace.session_id)
                 continue
             try:
                 if arg:

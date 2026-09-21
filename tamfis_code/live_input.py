@@ -1592,8 +1592,19 @@ class LiveInputListener:
             self._request_interrupt(classification)
             return True
         if head == "/help":
-            note("While a task runs: /status, /btw <question>, /model, /queue, /stop, /pause, /update run at once; "
+            note("While a task runs: /status, /recap, /btw <question>, /model, /queue, /stop, /pause, /update run at once; "
                  "any other /command is queued and runs when the task finishes. Plain messages steer the task.")
+            return True
+        if head == "/recap":
+            from .return_recap import build_return_recap
+
+            recap = build_return_recap(self.session_id)
+            if recap is None:
+                note("Nothing to recap yet: this session has no recorded conversation.")
+            else:
+                note(f"Objective: {recap.objective}")
+                note(f"Where it stands: {recap.standing}")
+                note(f"Next: {recap.next_step}")
             return True
         if head == "/queue":
             items = [
