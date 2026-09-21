@@ -30,6 +30,19 @@ GREEN = {"tool_name": "execute_command", "success": True, "exit_code": 0, "argum
 
 
 class TerseNoChangeReportTests(unittest.TestCase):
+    def test_read_only_recovery_wrapper_does_not_require_a_mutation(self):
+        # The UI's machine-generated "Repair the failed plan step" wrapper
+        # contains mutation language, while the durable step can still be a
+        # pure inspection. Effective runtime mode must win over wrapper text.
+        report = validate_completion(
+            profile=classify_task("Repair the failed plan step, then revalidate it: Read pyproject.toml"),
+            tool_records=[{"tool_name": "read_file", "success": True, "arguments": {"path": "pyproject.toml"}}],
+            any_mutation=False,
+            final_text="Summary\n- Read pyproject.toml.\n\nChanges\n- None; this was inspection only.",
+            read_only=True,
+        )
+        self.assertTrue(report.passed, report.unresolved)
+
     def test_a_green_check_plus_a_none_required_report_is_a_verified_no_op(self):
         self.assertTrue(verified_no_change_completion(tool_records=[GREEN], final_text=REPORT))
 

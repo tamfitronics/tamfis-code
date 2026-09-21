@@ -428,7 +428,7 @@ def _deploy_command_satisfied(required_commands: list[str], successful_commands:
 def validate_completion(
     *, profile: TaskProfile, tool_records: list[dict[str, Any]],
     any_mutation: bool, final_text: str, objective: str = "", workspace_root: str = "",
-    project_instructions: str = "",
+    project_instructions: str = "", read_only: bool = False,
 ) -> ValidationReport:
     checks: list[dict[str, Any]] = []
     unresolved: list[str] = []
@@ -592,7 +592,11 @@ def validate_completion(
                 "come from an actual search, not general knowledge presented as a current finding."
             )
 
-    if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}:
+    # Recovery wrappers can say "repair" even when the durable step is
+    # observational (for example, "Read pyproject.toml"). The effective
+    # runtime mode is authoritative; do not demand a mutation in read-only.
+    effective_edit_task = profile.task_type in {TaskType.EDIT, TaskType.DEBUG} and not read_only
+    if effective_edit_task:
         git_diffstat_evidence = bool(_successful_changed_paths(tool_records, workspace_root))
         mutation_requirement_met = any_mutation or verified_no_change or git_diffstat_evidence
         checks.append({
@@ -659,7 +663,7 @@ def validate_completion(
         # requires_validation task types (e.g. INSPECT-like work, where a
         # read/search genuinely is the deliverable) keep the broader set.
         evidence_tools = (
-            {"execute_command"} if profile.task_type in {TaskType.EDIT, TaskType.DEBUG}
+            {"execute_command"} if effective_edit_task
             else _VALIDATION_EVIDENCE_TOOLS
         )
         validated = any(
@@ -717,7 +721,7 @@ def validate_completion(
         ):
             severity = "error"
         if (
-            profile.task_type in {TaskType.EDIT, TaskType.DEBUG}
+            effective_edit_task
             and not any_mutation
             and not verified_no_change
         ):

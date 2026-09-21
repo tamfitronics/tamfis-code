@@ -263,7 +263,18 @@ FINAL_RESPONSE_FORMAT_INSTRUCTION = (
     "table with these columns: Priority, Finding, Evidence, Next action. Keep each "
     "cell to one concise sentence; cite paths and the observed fact instead of "
     "pasting long configuration inventories. Put unverified items only under "
-    "Remaining issues. If no files changed, say so plainly under Summary."
+    "Remaining issues. If no files changed, say so plainly under Summary. Never claim "
+    "the user cancelled merely because this agent turn or provider was interrupted; "
+    "say the agent/provider was interrupted unless a real process or manifest explicitly "
+    "records user cancellation. Do not repeat the same report block."
+)
+
+STUCK_LOOP_FINAL_CORRECTION = (
+    "This is the final recovery pass after a repeated tool-call loop. Tools are disabled. "
+    "Use only real tool results already present. Produce exactly one concise report using "
+    "Summary, Changes, Verification, and Remaining issues. Do not repeat an earlier report, "
+    "invent user cancellation, or demand a mutation for an observational/read-only step. "
+    "If evidence is missing, put that fact under Remaining issues."
 )
 
 # Same one-chance-then-fallback shape as narrated tool intent, for the
@@ -6321,6 +6332,12 @@ async def _run_local_agent_turn_impl(
     )
     _read_only_reject_count = 0
     selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)
+    # A resumed checkpoint may need a live PID/process check to reconcile a
+    # durable job, but ordinary audits and questions must not receive shell
+    # execution at all. The runner still enforces the process-inspection
+    # grammar in safety.py and rejects every other command.
+    if turn_read_only and resume_requested and "execute_command" not in selected_tool_names:
+        selected_tool_names = [*selected_tool_names, "execute_command"]
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
     )
@@ -7116,7 +7133,9 @@ async def _run_local_agent_turn_impl(
             _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
             await _fire_session_interrupted_hooks(message)
             return TaskOutcome(status="failed", error=message, summary=content)
-        validation = orchestrator.validate(final_text=content, any_mutation=any_mutation)
+        validation = orchestrator.validate(
+            final_text=content, any_mutation=any_mutation, read_only=turn_read_only,
+        )
         if validation.severity == "error":
             # Do not throw away a completed response behind an opaque
             # "internal validation" message. A real evidence mismatch is
@@ -7391,13 +7410,7 @@ async def _run_local_agent_turn_impl(
         })
         working_messages.append({
             "role": "system",
-            "content": (
-                "Tool calls are now disabled for the rest of this turn -- you repeated the same "
-                "action(s) without making progress even after being told to stop. Give your best "
-                "current answer or plan based on everything you've actually found so far. Be explicit "
-                "about what remains unknown/unverified, and if the original request was too broad to "
-                "finish this way, say so plainly and tell the user what to narrow it to."
-            ),
+            "content": STUCK_LOOP_FINAL_CORRECTION,
         })
         # Confirmed live: this recovery call used to hit one pre-resolved
         # provider with no retry, unlike the main answer-streaming path

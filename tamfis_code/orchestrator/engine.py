@@ -695,7 +695,7 @@ class AgentOrchestrator:
             self.run.runtime.snapshot.repair_rounds = 0
         self.transition(AgentPhase.REPAIR, action=reason)
 
-    def validate(self, *, final_text: str, any_mutation: bool) -> ValidationReport:
+    def validate(self, *, final_text: str, any_mutation: bool, read_only: bool = False) -> ValidationReport:
         assert self.run is not None
         self.run.runtime.begin_validation()
         self.transition(AgentPhase.VALIDATE, action="Validate evidence and completion claims")
@@ -712,7 +712,7 @@ class AgentOrchestrator:
             tool_records=[item.to_dict() for item in self.run.tool_records],
             any_mutation=any_mutation, final_text=final_text,
             objective=self.run.objective, workspace_root=self.workspace_root,
-            project_instructions=project_instructions,
+            project_instructions=project_instructions, read_only=read_only,
         )
         if (
             self.run.reasoning_plan

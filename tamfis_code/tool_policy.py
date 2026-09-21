@@ -36,12 +36,11 @@ READ_TOOLS = [
     "list_external_agent_sessions", "read_external_agent_session",
     "write_todos",
 ]
-# A read-only shell inspection surface is still useful for process/service
-# status. It is the same registered tool name, but safety.py classifies the
-# command itself and the runner rejects anything outside the read-only command
-# grammar. Advertising this constrained surface prevents models from emitting
-# an "unknown or unoffered execute_command" call during audits.
-READ_ONLY_INSPECTION_TOOLS = [*READ_TOOLS, "execute_command"]
+# Keep ordinary read-only turns strictly read-only. A resumed machine-generated
+# checkpoint gets the separately gated process-inspection surface in
+# runner_local.py; exposing shell execution to every audit/question made the
+# public tool contract unsafe and broke callers that rely on this boundary.
+READ_ONLY_INSPECTION_TOOLS = [*READ_TOOLS]
 EDIT_TOOLS = [
     *READ_TOOLS,
     "execute_command",
