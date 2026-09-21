@@ -323,6 +323,15 @@ PORT_CONFLICT_CORRECTION = (
     "disrupt it when the user's request explicitly asks to stop, restart, or replace it."
 )
 
+TRAINING_LIFECYCLE_CORRECTION = (
+    "A training/frontier process is a durable stateful job. Do not kill it because a "
+    "foreground wait or sandbox ended, and do not retry a nohup/setsid/& launch after a "
+    "timeout without first checking whether it actually started. Inspect PID, log, lock, "
+    "and checkpoint state first. If it is running, leave it alone. For persistence use the "
+    "project's existing supervisor/queue or a tracked background-job handle, never a second "
+    "writer for the same checkpoint directory."
+)
+
 # Same one-chance-then-fallback shape as narrated tool intent, capitulation,
 # and fabricated results, for the distinct failure of writing out a fake
 # tool invocation (paren-call, JSON object, CLI-flag syntax, or malformed
@@ -9359,6 +9368,20 @@ async def _run_local_agent_turn_impl(
                             "Port conflict detected -- preserving the existing listener and "
                             "requesting ownership plus health checks instead of another start/kill cycle."
                         ),
+                    },
+                })
+            if tc.name == "execute_command" and any(
+                marker in str(arguments.get("command") or "").lower()
+                for marker in ("train_frontier", "train_sft", "train2", "training_queue")
+            ) and result.get("success") is False:
+                working_messages.append({
+                    "role": "system",
+                    "content": TRAINING_LIFECYCLE_CORRECTION,
+                })
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": "Training lifecycle guard: inspect existing job state; do not kill or duplicate the run.",
                     },
                 })
             if (

@@ -108,6 +108,13 @@ class ClassifyCommandRiskTests(unittest.TestCase):
     def test_empty_command_is_medium_not_crash(self):
         self.assertEqual(classify_command_risk(""), RISK_MEDIUM)
 
+    def test_training_lifecycle_commands_are_not_treated_as_read_only(self):
+        # A training job must be supervised/inspected as a durable workload;
+        # it must never be mistaken for a harmless shell read.
+        self.assertNotEqual(
+            classify_command_risk("kill 1234 # train_frontier"), RISK_READ_ONLY
+        )
+
 
 class RedactSecretsTests(unittest.TestCase):
     """Confirmed live: a model that just read a live DB password out of

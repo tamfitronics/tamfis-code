@@ -925,8 +925,11 @@ class MCPServer:
                 "scripts, Makefile, pyproject) over invented ones; run check/test/build "
                 "commands after every non-trivial edit. To run in a subdirectory, pass "
                 "cwd -- do not chain `cd <dir> && ...` into the command string. For "
-                "long-running or daemonized commands use nohup/setsid with output "
-                "redirected to a log file rather than blocking on them."
+                "long-running commands must not be daemonized with nohup/setsid/disown or "
+                "a trailing '&'. If a command is already running, inspect it and leave it "
+                "alone; do not kill/restart it. Use the existing project supervisor/queue "
+                "for persistence, or let the user press Ctrl+B to move this exact command "
+                "to Tamfis-Code's tracked background-job handle."
             ),
             parameters={
                 "type": "object",
@@ -2497,6 +2500,31 @@ class MCPServer:
             return {"error": str(e), "success": False}
         if not run_dir.is_dir():
             return {"error": f"cwd '{cwd}' is not a directory", "success": False}
+
+        # Training and frontier jobs are durable, stateful workloads. Killing
+        # one merely because the foreground wait ended, then launching a
+        # duplicate through nohup, can corrupt the run's meaning and create
+        # two writers for the same checkpoint directory. Keep this boundary
+        # below the model's prose/tool policy so a generated shell command
+        # cannot bypass it.
+        lowered_command = command.lower()
+        protected_training = any(
+            marker in lowered_command
+            for marker in ("train_frontier", "train_sft", "train2", "training_queue")
+        )
+        if protected_training and re.search(
+            r"(?:\bkill(?:all)?\b|\bpkill\b|\b fuser\s+[^\n]*--kill\b|\bnohup\b|\bsetsid\b|\bdisown\b|(?<!&)\&(?!&)\s*$)",
+            lowered_command,
+        ):
+            return {
+                "error": (
+                    "Refusing to kill or daemonize a training job from execute_command. "
+                    "If it is running, leave it running and inspect its PID/log/checkpoint. "
+                    "Use the repository's supervisor/queue for persistence; never launch a "
+                    "duplicate writer for the same checkpoint directory."
+                ),
+                "success": False,
+            }
 
         first = command.strip().split(None, 1)[0] if command.strip() else ""
         first = Path(first).name
