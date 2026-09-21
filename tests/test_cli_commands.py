@@ -154,6 +154,37 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
         state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
         self.tmp.cleanup()
 
+    def _opt_in_to_launch_resume(self):
+        patcher = patch.dict("os.environ", {"TAMFIS_CODE_RESUME_ON_LAUNCH": "1"})
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_bare_launch_starts_a_new_session_even_when_one_was_just_interrupted(self):
+        """Owner report 2026-09-21: `tamfis-code` dropped into "Check Tamgpt Model Integrity" (session
+        interrupted 2 hours earlier) instead of a new session. Resuming needs `tamfis-code resume`."""
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(
+                1,
+                workspace_root=str(root),
+                execution_status="failed",
+                turn_checkpoint={
+                    "status": "interrupted",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "objective": "Fix the interrupted task",
+                    "messages": [{"role": "user", "content": "Fix the interrupted task"}],
+                },
+            )
+            run_interactive = AsyncMock()
+            with patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+                asyncio.run(_interactive_entry(Config(), root))
+
+        self.assertEqual(run_interactive.call_args.args[2].session_id, 2)   # a brand new session
+        self.assertFalse(any(
+            str(item.get("text")).strip().lower() in {"continue", "resume"}
+            for item in state_module.get_session_state(1).queued_user_instructions
+        ))
+
     def test_bare_launch_never_prompts_and_never_erases_an_old_session(self):
         with tempfile.TemporaryDirectory() as proj:
             root = Path(proj).resolve()
@@ -175,6 +206,7 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
         self.assertEqual(started_workspace.session_id, 2)
 
     def test_bare_launch_recovers_a_checkpoint_even_when_process_lifecycle_says_failed(self):
+        self._opt_in_to_launch_resume()
         with tempfile.TemporaryDirectory() as proj:
             root = Path(proj).resolve()
             state_module.save_session_state(
@@ -200,6 +232,7 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
         )
 
     def test_an_old_interrupted_checkpoint_is_restored_but_never_auto_continued(self):
+        self._opt_in_to_launch_resume()
         """Live report 2026-09-21: launching the CLI re-ran an hours-old plan on its own."""
         with tempfile.TemporaryDirectory() as proj:
             root = Path(proj).resolve()
@@ -225,6 +258,7 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
         ))
 
     def test_a_relaunch_right_after_an_auto_continue_does_not_auto_continue_again(self):
+        self._opt_in_to_launch_resume()
         with tempfile.TemporaryDirectory() as proj:
             root = Path(proj).resolve()
             state_module.save_session_state(
@@ -250,6 +284,7 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
         self.assertEqual(queued, [])
 
     def test_bare_launch_automatically_resumes_the_latest_interrupted_checkpoint(self):
+        self._opt_in_to_launch_resume()
         with tempfile.TemporaryDirectory() as proj:
             root = Path(proj).resolve()
             state_module.save_session_state(

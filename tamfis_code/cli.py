@@ -296,9 +296,12 @@ def _print_resumable_session_hint(console: Console, workspace_root: Path, *, exc
     latest_state = local_state.get_session_state(latest)
     activity = "" if latest_state.session_title else local_state.best_effort_session_label(latest_state)
     activity_note = f" (last: {escape(activity)})" if activity else ""
+    interrupted = ""
+    if _latest_interrupted_local_session(workspace_root) == latest:
+        interrupted = f" It was interrupted {_age_words(_interruption_time(latest_state))}."
     console.print(
         f"[dim]Starting a new session. Run `tamfis-code resume {latest}` to continue "
-        f'"{escape(title)}"{activity_note} instead.[/dim]'
+        f'"{escape(title)}"{activity_note} instead.{interrupted}[/dim]'
     )
 
 
@@ -401,7 +404,13 @@ async def _interactive_entry(
         # Recover the latest stale/interrupted turn before creating a new
         # conversation.  A live session is excluded, so opening a second
         # terminal still gets its own session and cannot clobber the first.
-        resume_id = None if new_session else _latest_interrupted_local_session(workspace_root)
+        # A bare `tamfis-code` starts a NEW session (owner ruling 2026-09-21: it kept dropping the user
+        # into an old, hours-stale one). Resuming is explicit -- `tamfis-code resume [id]` -- and the hint
+        # printed below names the interrupted session. TAMFIS_CODE_RESUME_ON_LAUNCH=1 restores the old
+        # implicit recovery for anyone who wants it.
+        resume_id = None
+        if not new_session and os.environ.get("TAMFIS_CODE_RESUME_ON_LAUNCH", "").strip().lower() in {"1", "true", "yes", "on"}:
+            resume_id = _latest_interrupted_local_session(workspace_root)
         if resume_id is not None:
             workspace = resolve_local_workspace(
                 workspace_root, session_id=resume_id, discover=True,
