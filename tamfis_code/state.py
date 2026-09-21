@@ -193,7 +193,7 @@ def _volatile_key(session_id: int) -> tuple[str, int]:
     return (str(STATE_PATH), int(session_id))
 MAX_ACTION_HISTORY = 250
 MAX_CHECKPOINTS = 50
-MAX_SAVED_PLANS = 50
+MAX_SAVED_PLANS = 20
 MAX_CONVERSATION_MESSAGES = 60
 MAX_TURN_CHECKPOINT_MESSAGES = 80
 # Keep the on-disk recovery record useful without allowing a long thread or a
@@ -229,6 +229,29 @@ MAX_QUEUED_INSTRUCTIONS = 200
 # `/compact` checkpoints are untouched, so nothing is actually lost -- it is
 # just no longer paid for on every unrelated session's write.
 STALE_SESSION_MAX_AGE = timedelta(days=21)
+
+# Size budgets. The entry-count caps above bound how MANY rows a session keeps, not how BIG they are: one
+# edit of a 400 KB file stores that file twice (pre-image + diff), and every checkpoint embedded a full
+# copy of the task ledger, so a live store reached 62 MB (single sessions of 3-5 MB) and each write cost
+# seconds. Codex and Claude Code keep a session as an append-only log and never rewrite history; this
+# store rewrites everything on every save, so it has to stay small instead.
+# Revert pre-images (original_content + unified_diff) kept per session, newest first. Older mutations
+# keep their metadata (path, operation, time) but not the bodies and are marked `body_trimmed`.
+REVERT_BODY_BUDGET_CHARS = 256_000
+# Checkpoints that keep their embedded task ledger (older ones keep only the index fields).
+CHECKPOINTS_WITH_LEDGER = 3
+# Longest string kept inside an action / checkpoint / plan row once it is no longer the newest.
+CLIPPED_STRING_CHARS = 2_000
+CLIPPED_PLAN_CHARS = 6_000
+# A session idle this long is "cold": compacted once more, hard, and marked so it is not re-scanned.
+COLD_SESSION_AGE = timedelta(hours=12)
+COLD_REVERT_BODY_BUDGET_CHARS = 32_000
+COLD_ACTIONS_KEPT = 40
+COLD_CLIPPED_STRING_CHARS = 600
+COLD_TURN_MESSAGES_KEPT = 12
+COLD_PLANS_KEPT = 5
+COLD_CHECKPOINTS_KEPT = 10
+COLD_COMPACT_MARKER = "_cold_compacted"
 
 # How recently a "running" session's updated_at must have moved for it to
 # still count as a live process actively working. start_action/finish_action
@@ -561,6 +584,14 @@ def _load_raw() -> dict[str, Any]:
         _quarantine_corrupt_state_file(exc)
         return _STATE_CACHE if _STATE_CACHE is not None else {}
     _STATE_CACHE, _STATE_CACHE_KEY = result, cache_key
+    # Rows read from disk were sanitized when they were written (every writer goes through
+    # _save_raw -> _sanitize_store), so they are trusted as-is. Without this, every time ANOTHER process
+    # rewrote state.json (the long-running tamfis-code-server, a second terminal) this process re-parsed
+    # the file, every row became a "new object", and the next save re-ran the redaction regexes over ALL
+    # sessions: ~7 s of blocking work on a 63 MB store, on the thread driving the terminal. Only rows
+    # this process actually changes are sanitized now.
+    for key, row in result.items():
+        _SANITIZED_ROW_CACHE[key] = (id(row), row)
     return result
 
 
@@ -618,7 +649,8 @@ def _save_raw(data: dict[str, Any]) -> None:
     fd, temp_name = tempfile.mkstemp(prefix=".state-", suffix=".json", dir=CONFIG_DIR)
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(_sanitize_store(data), handle, indent=2, sort_keys=True)
+            # dumps, not dump: dump streams through the pure-Python encoder, dumps uses the C one (~2x).
+            handle.write(json.dumps(_sanitize_store(data), separators=(",", ":"), sort_keys=True))
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temp_name, stat.S_IRUSR | stat.S_IWUSR)
@@ -775,6 +807,113 @@ def _enforce_state_caps(state: SessionState) -> None:
     }
 
 
+def _clip_strings(value: Any, limit: int) -> Any:
+    """Copy of ``value`` with every string longer than ``limit`` cut to head + a marker."""
+    if isinstance(value, str):
+        if len(value) <= limit:
+            return value
+        keep = max(1, limit // 2)
+        return f"{value[:keep]}\n[... {len(value) - 2 * keep} chars trimmed ...]\n{value[-keep:]}"
+    if isinstance(value, list):
+        return [_clip_strings(item, limit) for item in value]
+    if isinstance(value, dict):
+        return {key: _clip_strings(item, limit) for key, item in value.items()}
+    return value
+
+
+def _budget_revert_bodies(entries: list[dict[str, Any]], budget: int) -> list[dict[str, Any]]:
+    """Keep revert bodies for the newest mutations within ``budget`` characters; drop them from the
+    rest and say so (`body_trimmed`), because a mutation with no pre-image can no longer be reverted."""
+    used = 0
+    out: list[dict[str, Any]] = []
+    for entry in reversed(entries):
+        if not isinstance(entry, dict):
+            out.append(entry)
+            continue
+        cost = len(entry.get("original_content") or "") + len(entry.get("unified_diff") or "")
+        if entry.get("body_trimmed") or used + cost > budget:
+            if cost or not entry.get("body_trimmed"):
+                entry = {**entry, "original_content": None, "unified_diff": "", "body_trimmed": True}
+        else:
+            used += cost
+        out.append(entry)
+    out.reverse()
+    return out
+
+
+def _slim_checkpoints(checkpoints: list[dict[str, Any]], keep_ledgers: int) -> list[dict[str, Any]]:
+    """Only the newest checkpoints keep the embedded task ledger; older ones keep the index fields."""
+    cutoff = len(checkpoints) - keep_ledgers
+    return [
+        {k: v for k, v in item.items() if k != "task_state"} if index < cutoff and isinstance(item, dict) else item
+        for index, item in enumerate(checkpoints)
+    ]
+
+
+def _compact_row(row: dict[str, Any], *, cold: bool) -> dict[str, Any]:
+    """Size-bound one stored session row (a dict, as persisted). Pure: returns the compacted row."""
+    row = dict(row)
+    if isinstance(row.get("modified_files"), list):
+        row["modified_files"] = _budget_revert_bodies(
+            row["modified_files"], COLD_REVERT_BODY_BUDGET_CHARS if cold else REVERT_BODY_BUDGET_CHARS,
+        )
+    if isinstance(row.get("context_checkpoints"), list):
+        row["context_checkpoints"] = _slim_checkpoints(row["context_checkpoints"], 1 if cold else CHECKPOINTS_WITH_LEDGER)
+    whole = 0 if cold else 5  # the newest few rows stay untouched while the session is hot
+    limit = COLD_CLIPPED_STRING_CHARS if cold else CLIPPED_STRING_CHARS
+    for name in ("completed_actions", "validation_results", "unresolved_issues", "pending_actions"):
+        items = row.get(name)
+        if isinstance(items, list):
+            if cold and name == "completed_actions":
+                items = items[-COLD_ACTIONS_KEPT:]
+            split = max(0, len(items) - whole)
+            row[name] = [_clip_strings(item, limit) for item in items[:split]] + items[split:]
+    if isinstance(row.get("saved_plans"), list):
+        plans = row["saved_plans"]
+        row["saved_plans"] = [
+            plan if index >= len(plans) - 3 and not cold else _clip_strings(plan, CLIPPED_PLAN_CHARS)
+            for index, plan in enumerate(plans)
+        ]
+    if cold:
+        for name in ("active_task", "task_state", "repository_context", "running_action"):
+            if row.get(name):
+                row[name] = _clip_strings(row[name], CLIPPED_STRING_CHARS)
+        if isinstance(row.get("saved_plans"), list):
+            active = row.get("active_plan_id")
+            plans = row["saved_plans"]
+            row["saved_plans"] = [p for p in plans[:-COLD_PLANS_KEPT] if isinstance(p, dict) and p.get("id") == active] + plans[-COLD_PLANS_KEPT:]
+        if isinstance(row.get("context_checkpoints"), list):
+            row["context_checkpoints"] = [_clip_strings(c, CLIPPED_STRING_CHARS) for c in row["context_checkpoints"][-COLD_CHECKPOINTS_KEPT:]]
+        if row.get("execution_status") in ("completed", "idle", "done") and row.get("turn_checkpoint"):
+            row["turn_checkpoint"] = None
+        elif isinstance(row.get("turn_checkpoint"), dict):
+            checkpoint = dict(row["turn_checkpoint"])
+            if isinstance(checkpoint.get("messages"), list):
+                checkpoint["messages"] = checkpoint["messages"][-COLD_TURN_MESSAGES_KEPT:]
+            row["turn_checkpoint"] = _clip_strings(checkpoint, CLIPPED_STRING_CHARS)
+        row[COLD_COMPACT_MARKER] = 1
+    return row
+
+
+def _compact_cold_sessions(data: dict[str, Any], *, keep_session_id: int) -> None:
+    """Hard-compact every session idle for COLD_SESSION_AGE, once (the marker survives until that
+    session is written again, which rebuilds its row without it)."""
+    cutoff = datetime.now(timezone.utc) - COLD_SESSION_AGE
+    keep_key = str(keep_session_id)
+    for key in list(data.keys()):
+        row = data.get(key)
+        if key == keep_key or not isinstance(row, dict) or row.get(COLD_COMPACT_MARKER):
+            continue
+        try:
+            when = datetime.fromisoformat(str(row.get("updated_at") or ""))
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if when < cutoff:
+            data[key] = _compact_row(row, cold=True)
+
+
 def _prune_stale_sessions(data: dict[str, Any], *, keep_session_id: int) -> None:
     """Drop sessions untouched for STALE_SESSION_MAX_AGE from the hot,
     shared state.json so an install with months of history doesn't force
@@ -855,8 +994,9 @@ def _put_session_state_locked(state: SessionState) -> None:
     # synchronous json.dump+fsync on the same thread driving the live
     # terminal UI, which is what actually presented as "the UI freezes".
     _enforce_state_caps(state)
-    data[str(state.session_id)] = asdict(state)
+    data[str(state.session_id)] = _compact_row(asdict(state), cold=False)
     _prune_stale_sessions(data, keep_session_id=state.session_id)
+    _compact_cold_sessions(data, keep_session_id=state.session_id)
     # Keep the live session usable when a container, sandbox, or ownership
     # mismatch makes the configured state directory unwritable. This is not a
     # substitute for durable recovery: the warning makes that limitation
@@ -2961,6 +3101,7 @@ def reset_session_task_state(session_id: int) -> bool:
             "completed_actions": [],
             "queued_user_instructions": [],
         })
+        _SANITIZED_ROW_CACHE.pop(key, None)  # edited in place: must be sanitized again on write
         _save_raw(data)
     _VOLATILE_STATE.pop(_volatile_key(session_id), None)
     return True

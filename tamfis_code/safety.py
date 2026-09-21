@@ -424,6 +424,13 @@ def revert_mutation(session_id: int, mutation_id: str) -> dict[str, Any]:
     if entry.get("revert_status") == "reverted":
         return entry
 
+    if entry.get("body_trimmed"):
+        # Without this, the missing pre-image reads as "this mutation created the file" and the revert
+        # would DELETE a file that existed before it.
+        raise ValueError(
+            f"The pre-change copy of {entry.get('path')} was trimmed to keep session state small, "
+            "so this change can no longer be reverted here. Restore it with git or a backup."
+        )
     path = Path(entry["path"])
     original_content = entry.get("original_content")
     if original_content is None:

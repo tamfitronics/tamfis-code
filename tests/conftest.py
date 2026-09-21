@@ -132,3 +132,19 @@ def _isolate_session_state(monkeypatch, tmp_path):
     monkeypatch.setattr(config_module, "CONFIG_DIR", base)
     monkeypatch.setattr(state_module, "CONFIG_DIR", base)
     monkeypatch.setattr(state_module, "STATE_PATH", base / "state.json")
+
+
+@pytest.fixture(autouse=True)
+def _no_live_title_upgrade(monkeypatch, request):
+    """End-of-turn title generation makes a real provider call (`[title] attempt 1/5 ... 503`). Tests that
+    are not about titles must not depend on that network round-trip: it made timing-sensitive tests flake
+    when the provider was slow or overloaded."""
+    if "title" in request.node.path.name:
+        return
+
+    async def _skip(*_args, **_kwargs):
+        return None
+
+    from tamfis_code import state as _state
+
+    monkeypatch.setattr(_state, "upgrade_session_title_with_ai", _skip)
