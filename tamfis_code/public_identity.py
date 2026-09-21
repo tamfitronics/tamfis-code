@@ -345,6 +345,42 @@ def redact_routing_text(value: Any) -> str:
     return text
 
 
+_INTERNAL_ASSISTANT_LEAK_RE = re.compile(
+    r"(?is)(?:"
+    r"we\s+are\s+in\s+a\s+read[- ]only\s+mode\s+for\s+execute_command|"
+    r"read[- ]only\s+execute_command\s+is\s+limited\s+to\s+process\s+inspection|"
+    r"let['’]?s\s+re[- ]read\s+the\s+initial\s+instructions|"
+    r"(?:here\s+are|check)\s+the\s+(?:available|offered)\s+tools|"
+    r"we\s+do\s+not\s+have\s+(?:write_file|edit_file)|"
+    r"unknown\s+or\s+unoffered\s+mcp\s+tool|"
+    r"use\s+exactly\s+one\s+of\s+the\s+registered\s+tools|"
+    r"(?:the\s+)?system\s+prompt\s+(?:says|instructs|requires)|"
+    r"<\|channel\|>|"
+    r"(?:registered|available)\s+tools\s*:\s*(?:read_file|list_directory|search_code)"
+    r")"
+)
+_INTERNAL_ASSISTANT_LEAK_FALLBACK = (
+    "The model response was suppressed because it exposed internal execution "
+    "instructions. Retry the request to receive a clean result."
+)
+
+
+def sanitize_assistant_text(text: Any) -> str:
+    """Remove provider attempts to expose Tamfis-Code's internal protocol.
+
+    This applies only to assistant-generated output, never user text or real
+    tool results. The markers are deliberately strong (tool-protocol errors,
+    system-prompt narration, and channel markup); ordinary technical mentions
+    of tools or system prompts remain unchanged.
+    """
+    value = str(text or "")
+    match = _INTERNAL_ASSISTANT_LEAK_RE.search(value)
+    if not match:
+        return value
+    prefix = value[:match.start()].strip()
+    return prefix if len(prefix) >= 40 else _INTERNAL_ASSISTANT_LEAK_FALLBACK
+
+
 def sanitize_public_event(event: dict[str, Any]) -> dict[str, Any]:
     """Copy and brand routing metadata in a structured CLI event."""
     event_type = str(event.get("event_type") or event.get("event") or event.get("type") or "")

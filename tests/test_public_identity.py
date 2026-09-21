@@ -11,6 +11,7 @@ from tamfis_code.public_identity import (
     public_model_name,
     redact_routing_text,
     resolve_public_model_alias,
+    sanitize_assistant_text,
     sanitize_public_event,
 )
 from tamfis_code.render import StructuredRenderer
@@ -106,6 +107,24 @@ def test_top_level_legacy_event_shape_is_also_sanitized():
     event = sanitize_public_event({"type": "model_selected", "provider": "nvidia", "model": "kimi-k2"})
     assert event["provider"] == "TamfisGPT"
     assert event["model"] == PUBLIC_MODEL_ULTRA
+
+
+def test_assistant_system_prompt_and_tool_inventory_leak_is_suppressed():
+    leaked = (
+        "We are in a read-only mode for execute_command, but we can still use other tools. "
+        "Let's re-read the initial instructions. Available tools: read_file, list_directory, "
+        "search_code, write_file."
+    )
+    result = sanitize_assistant_text(leaked)
+    assert "read-only mode" not in result.lower()
+    assert "available tools" not in result.lower()
+    assert "system prompt" not in result.lower()
+    assert "retry" in result.lower()
+
+
+def test_legitimate_tool_discussion_is_not_suppressed():
+    text = "The audit found that the read_file tool is used for source inspection."
+    assert sanitize_assistant_text(text) == text
 
 
 def test_redact_routing_text_leaves_urls_intact_even_with_a_provider_name_inside():

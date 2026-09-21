@@ -36,6 +36,7 @@ from .public_identity import (
     public_model_name,
     public_route_name,
     redact_routing_text,
+    sanitize_assistant_text,
     sanitize_public_event,
 )
 from .safety import redact_secrets
@@ -677,6 +678,11 @@ class StreamRenderer:
         self._displayed_content: str = ""
         self._last_delta: str = ""
         self._identical_delta_streak: int = 0
+        # Once a provider exposes internal prompt/tool-protocol text, suppress
+        # the remainder of that completion too; filtering only the marker's
+        # chunk would still let the following streamed chunks leak the rest of
+        # the system prompt.
+        self._assistant_leak_suppressed = False
         # Recovery-narration throttle state: one "Switching/Recovering…"
         # line per episode. task_started resets it (new turn = new
         # episode budget).
@@ -1088,6 +1094,7 @@ class StreamRenderer:
             self._displayed_content = ""
             self._last_delta = ""
             self._identical_delta_streak = 0
+            self._assistant_leak_suppressed = False
             self._last_plan_fingerprint = None
             self._route_announce_count = 0
         elif event_type in {"context_reused", "context_rescanned"}:
@@ -1819,7 +1826,12 @@ class StreamRenderer:
             return
 
         if event_type == "assistant_delta":
-            content = str(payload.get("content", ""))
+            if self._assistant_leak_suppressed:
+                return
+            raw_content = str(payload.get("content", ""))
+            content = sanitize_assistant_text(raw_content)
+            if content != raw_content:
+                self._assistant_leak_suppressed = True
             # Some OpenAI-compatible providers emit empty or whitespace-only
             # assistant frames between reasoning/tool chunks. Never open a
             # visible assistant card until there is actual answer content;

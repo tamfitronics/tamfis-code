@@ -97,6 +97,7 @@ from .public_identity import (
     model_is_within_public_group,
     parse_public_model_alias,
     public_model_name,
+    sanitize_assistant_text,
 )
 from .permissions import decide_permission
 from .runner import TaskOutcome, _decision_for_policy, resolve_approval_decision_async
@@ -7067,6 +7068,11 @@ async def _run_local_agent_turn_impl(
             if novel_content:
                 renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": novel_content}})
                 content += novel_content
+        # Never return provider prompt/protocol leakage to the caller. The
+        # renderer also filters streaming deltas, but this final boundary is
+        # required for non-TTY output and for interactive fallback summaries.
+        content = sanitize_assistant_text(content)
+
         if finish_reason == "length":
             content += (
                 "\n\n⚠ This response is still incomplete after "

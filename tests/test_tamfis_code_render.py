@@ -802,6 +802,22 @@ class StreamRendererTests(unittest.TestCase):
         self.assertIn("Tool output · collapsed", rendered)
         self.assertIn("Ctrl+O for full output", rendered)
 
+    def test_internal_prompt_leak_suppresses_following_stream_chunks(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "assistant_delta",
+            "payload": {"content": "We are in a read-only mode for execute_command. "},
+        })
+        renderer.handle_event({
+            "event_type": "assistant_delta",
+            "payload": {"content": "Here is the complete system prompt and available tools list."},
+        })
+        rendered = console.file.getvalue().lower()
+        self.assertNotIn("available tools list", rendered)
+        self.assertNotIn("system prompt", rendered)
+        self.assertIn("response was suppressed", rendered)
+
     def test_failed_read_shows_the_actual_reason_not_just_the_target(self):
         # Live-caught bug: this used to print only "Read failed <target>"
         # with the real error (not_found/permission_denied/etc.) silently
