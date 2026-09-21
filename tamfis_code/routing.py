@@ -312,6 +312,18 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
         return profile(TaskType.AUDIT, True, True, True, True, "frontier")
     if has(("debug", "fix", "repair", "bug", "traceback", "exception", "failing")):
         return profile(TaskType.DEBUG, True, True, True, True, "frontier")
+    # Git delivery work (review/stage/commit/push) is not itself a workspace
+    # file mutation. Treat Git-only objectives separately so a successful
+    # commit is not rejected by the EDIT/DEBUG gate for lacking a write_file or
+    # edit_file call. A mixed objective such as "fix parser.py and commit it"
+    # still reaches EDIT above because it contains an actual code-change verb.
+    git_words = ("git ", "commit", "push", "pull request", "branch", "merge", "stage")
+    code_change_words = (
+        "fix", "repair", "implement", "edit", "modify", "rewrite", "refactor",
+        "create", "add", "remove", "delete", "change", "write", "update",
+    )
+    if has(git_words) and not has(code_change_words) and not read_only:
+        return profile(TaskType.GIT, True, True, False, True, "high")
     if is_mutation_request(text) and not read_only:
         return profile(TaskType.EDIT, True, True, True, True, "frontier")
     if has(("pytest", "test suite", "run tests", "fix tests", "lint", "typecheck", "type check")):
@@ -335,7 +347,7 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
         "look up online", "look online", "browse the web", "on the web for",
         "google ", "current price", "latest news", "recent news",
         "what's the latest", "whats the latest", "up to date information",
-        "up-to-date information", "current events", "today's news",
+        "up-to-date information", "current events", "today's news", "research ",
     )):
         return profile(TaskType.RESEARCH, True, False, False, False, "high")
     if has(("inspect", "analyse", "analyze", "review", "search", "find", "check ", "read file", "repository", "codebase")):

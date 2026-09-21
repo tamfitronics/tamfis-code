@@ -178,6 +178,20 @@ class NextMessageSuggestionTests(unittest.TestCase):
             "Push the latest commit to the configured remote and verify the branch is synchronized",
         )
 
+    def test_green_research_result_does_not_suggest_a_commit(self):
+        self.assertIsNone(
+            next_message_suggestion(
+                "The research tests passed.",
+                "Research current training data sources for TamGPT models",
+            )
+        )
+
+    def test_green_edit_result_can_still_suggest_review_and_commit(self):
+        self.assertEqual(
+            next_message_suggestion("The tests passed.", "Fix the retry loop"),
+            "Review the verified diff, then commit only the intended changes",
+        )
+
     def test_restart_instruction_is_adaptive(self):
         self.assertEqual(
             next_message_suggestion("Restart Tamfis Code to load the updated module."),

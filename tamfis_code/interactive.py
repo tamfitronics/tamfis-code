@@ -85,6 +85,7 @@ from .workspace import (
     WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository,
     find_resumable_session,
 )
+from .routing import is_mutation_request
 
 # A pasted block strictly longer than this many lines is collapsed to a
 # placeholder in the input line (Claude Code/Codex-style) instead of
@@ -603,8 +604,16 @@ def next_message_suggestion(
         if match and not cleaned.endswith(":"):
             return cleaned[:240]
 
-    if re.search(r"\btests?\b.{0,40}\bpassed\b", lowered) and not re.search(
-        r"\b(?:failed|failure|error)\b", lowered
+    # A green test result is not a universal invitation to commit. In
+    # particular, a research/audit/question turn may mention tests while
+    # deliberately making no edits; offering a commit ghost there contaminates
+    # the next objective when the user accepts the suggestion and continues
+    # typing. Keep the legacy no-objective fallback, but require an explicit
+    # mutation-oriented objective whenever one is available.
+    if (
+        re.search(r"\btests?\b.{0,40}\bpassed\b", lowered)
+        and not re.search(r"\b(?:failed|failure|error)\b", lowered)
+        and (not objective or is_mutation_request(objective))
     ):
         return "Review the verified diff, then commit only the intended changes"
 

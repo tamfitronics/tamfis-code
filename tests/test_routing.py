@@ -74,6 +74,19 @@ def test_genuine_debug_request_is_unaffected():
     assert profile.requires_tools
 
 
+def test_git_only_delivery_does_not_require_a_file_mutation():
+    profile = classify_task("review the verified diff, stage it, commit it, and push it")
+    assert profile.task_type == TaskType.GIT
+    assert profile.requires_validation
+    assert not profile.requires_long_context
+
+
+def test_fix_then_commit_remains_an_edit_task():
+    profile = classify_task("fix the bug in calc.py, run tests, and commit the change")
+    assert profile.task_type == TaskType.DEBUG
+    assert profile.requires_validation
+
+
 def test_natural_product_improvement_requests_receive_engineering_tools():
     requests = (
         "Improve the coding and reasoning abilities of tamfis-code",
@@ -211,6 +224,7 @@ def test_explicit_web_search_request_is_research_not_inspect():
         "look up online what the current bitcoin price is",
         "please google the error message for me",
         "what's the latest news on this library",
+        "research current training data sources for TamGPT models",
     ):
         assert classify_task(text).task_type == TaskType.RESEARCH, text
 

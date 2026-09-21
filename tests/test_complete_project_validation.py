@@ -82,6 +82,46 @@ def test_mutation_claim_ignores_api_routes_and_unrelated_backticked_mentions(tmp
     assert report.unresolved == []
 
 
+def test_git_only_commit_task_does_not_require_a_file_mutation(tmp_path: Path):
+    report = validate_completion(
+        profile=classify_task("review the verified diff, stage it, commit it, and push it"),
+        tool_records=[
+            {
+                "tool_name": "execute_command", "success": True, "exit_code": 0,
+                "arguments": {"command": "git commit -m 'verified change'"},
+            },
+            {
+                "tool_name": "execute_command", "success": True, "exit_code": 0,
+                "arguments": {"command": "git diff --check"},
+            },
+        ],
+        any_mutation=False,
+        final_text="The verified diff was committed; the commit completed successfully.",
+        objective="review the verified diff, stage it, commit it, and push it",
+        workspace_root=str(tmp_path),
+    )
+    assert report.passed is True, report.unresolved
+
+
+def test_failed_git_commit_exposes_the_real_error_in_validation(tmp_path: Path):
+    report = validate_completion(
+        profile=classify_task("review the verified diff and commit it"),
+        tool_records=[
+            {
+                "tool_name": "execute_command", "success": False, "exit_code": 1,
+                "arguments": {"command": "git commit -m 'verified change'"},
+                "stderr": "nothing to commit, working tree clean",
+            },
+        ],
+        any_mutation=False,
+        final_text="The commit completed successfully.",
+        objective="review the verified diff and commit it",
+        workspace_root=str(tmp_path),
+    )
+    assert report.passed is False
+    assert any("nothing to commit, working tree clean" in item for item in report.unresolved)
+
+
 def test_git_commit_of_preexisting_unedited_code_requires_authorship_disclosure(tmp_path: Path):
     # FIX regression (2026-08-04, live incident): a turn found code already
     # sitting uncommitted on disk -- written by a completely different

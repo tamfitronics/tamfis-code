@@ -696,8 +696,10 @@ def validate_completion(
         })
         if latest_command_failed:
             command = latest_command.get("arguments", {}).get("command", "verification command")
+            detail = str(latest_command.get("stderr") or latest_command.get("stdout") or "").strip()
+            detail_suffix = f" Observed output: {detail[-320:]}" if detail else ""
             unresolved.append(
-                f"The latest verification command failed: {str(command)[:160]}. "
+                f"The latest verification command failed: {str(command)[:160]}.{detail_suffix} "
                 "The task cannot be reported complete until it is repaired and rerun successfully."
             )
             validated = False
