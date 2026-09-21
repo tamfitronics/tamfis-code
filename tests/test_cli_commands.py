@@ -1,4 +1,5 @@
 import asyncio
+from datetime import datetime, timedelta, timezone
 import os
 import tempfile
 import unittest
@@ -182,6 +183,7 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
                 execution_status="failed",
                 turn_checkpoint={
                     "status": "interrupted",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                     "objective": "Fix the interrupted task",
                     "messages": [{"role": "user", "content": "Fix the interrupted task"}],
                 },
@@ -197,6 +199,56 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
             for item in state_module.get_session_state(1).queued_user_instructions
         )
 
+    def test_an_old_interrupted_checkpoint_is_restored_but_never_auto_continued(self):
+        """Live report 2026-09-21: launching the CLI re-ran an hours-old plan on its own."""
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(
+                1,
+                workspace_root=str(root),
+                execution_status="failed",
+                turn_checkpoint={
+                    "status": "interrupted",
+                    "updated_at": (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat(),
+                    "objective": "Backup the database",
+                    "messages": [{"role": "user", "content": "Backup the database"}],
+                },
+            )
+            run_interactive = AsyncMock()
+            with patch("tamfis_code.interactive.run_interactive", new=run_interactive):
+                asyncio.run(_interactive_entry(Config(), root))
+
+        self.assertEqual(run_interactive.call_args.args[2].session_id, 1)          # restored...
+        self.assertFalse(any(                                                       # ...but NOT continued
+            str(item.get("text")).strip().lower() in {"continue", "resume"}
+            for item in state_module.get_session_state(1).queued_user_instructions
+        ))
+
+    def test_a_relaunch_right_after_an_auto_continue_does_not_auto_continue_again(self):
+        with tempfile.TemporaryDirectory() as proj:
+            root = Path(proj).resolve()
+            state_module.save_session_state(
+                1,
+                workspace_root=str(root),
+                execution_status="failed",
+                turn_checkpoint={
+                    "status": "interrupted",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                    "objective": "Fix the interrupted task",
+                    "messages": [{"role": "user", "content": "Fix the interrupted task"}],
+                },
+            )
+            with patch("tamfis_code.interactive.run_interactive", new=AsyncMock()):
+                asyncio.run(_interactive_entry(Config(), root))      # crash recovery: continues once
+                first = [i for i in state_module.get_session_state(1).queued_user_instructions if i.get("text") == "continue"]
+                for item in first:
+                    state_module.update_instruction(1, str(item["id"]), "completed")
+                asyncio.run(_interactive_entry(Config(), root))      # the user stopped it and relaunched
+            queued = [i for i in state_module.get_session_state(1).queued_user_instructions
+                      if i.get("text") == "continue" and i.get("status") == "queued"]
+        self.assertEqual(len(first), 1)
+        self.assertEqual(queued, [])
+
     def test_bare_launch_automatically_resumes_the_latest_interrupted_checkpoint(self):
         with tempfile.TemporaryDirectory() as proj:
             root = Path(proj).resolve()
@@ -206,6 +258,7 @@ class BareLaunchAlwaysStartsANewSessionTests(unittest.TestCase):
                 execution_status="interrupted",
                 turn_checkpoint={
                     "status": "interrupted",
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                     "objective": "Fix the interrupted task",
                     "messages": [{"role": "user", "content": "Fix the interrupted task"}],
                 },

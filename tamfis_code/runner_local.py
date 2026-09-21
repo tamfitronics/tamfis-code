@@ -2139,6 +2139,15 @@ def _nim_retry_model(config: Any, attempt: int) -> Optional[str]:
     return str(models[(max(1, attempt) - 1) % len(models)]) if models else None
 
 
+# Infrastructure internals a provider's crash text can carry: GPU/driver/engine names and sizes, stack-trace
+# pointers, hostnames. None of it is actionable for a user and it exposes how the backend is built.
+_INFRA_DETAIL_RE = re.compile(
+    r"\bCUDA\b|\bGPU\s*\d|\d\s*GiB\b|out[\s_-]*of[\s_-]*memory|OutOfMemory|\bvllm\b|\btorch\b|\bNCCL\b"
+    r"|engine loop|stack\s*trace|traceback|segmentation fault|\bOOM\b|\bnvidia-smi\b|\bcuda_|\bdevice-side\b",
+    re.IGNORECASE,
+)
+
+
 def _public_failure_detail(manager: Any, error: Exception) -> str:
     """The reason a task stopped, in words a user should see.
 
@@ -2160,6 +2169,8 @@ def _public_failure_detail(manager: Any, error: Exception) -> str:
     if status in {401, 402, 403}:
         return "no route with available credit could take the request"
     text = " ".join((str(error).strip() or type(error).__name__).split())
+    if _INFRA_DETAIL_RE.search(text):
+        return "the model route hit an internal capacity error and could not finish the response"
     return redact_routing_text(text)[:300]
 
 
@@ -5125,17 +5136,29 @@ _LIVE_INSTRUCTION_CLASSIFICATIONS = {"append", "follow_up", "clarification", "re
 _LIVE_INSTRUCTION_STOP_CLASSIFICATIONS = {"cancel", "pause", "exit"}
 
 
-def _claim_live_queued_instructions(session_id: int) -> list[dict[str, Any]]:
+def _claim_live_queued_instructions(session_id: int, *, since: Optional[str] = None) -> list[dict[str, Any]]:
     """Every still-`queued` instruction in this session's on-disk queue,
     claimed (marked `running`) so a concurrent second `tamfis-code queue
     ...` process -- or the next REPL turn, if this one finishes first --
     doesn't also pick the same one up. Ordered oldest/highest-priority
     first, matching `enqueue_instruction`'s own sort."""
     state = local_state.get_session_state(session_id)
-    claimed = [
-        dict(item) for item in state.queued_user_instructions
-        if item.get("status") == "queued" and item.get("classification") in _LIVE_INSTRUCTION_CLASSIFICATIONS
-    ]
+    claimed = []
+    for item in state.queued_user_instructions:
+        if item.get("status") != "queued" or item.get("classification") not in _LIVE_INSTRUCTION_CLASSIFICATIONS:
+            continue
+        if (
+            since is not None
+            and item.get("classification") in _LIVE_INSTRUCTION_STOP_CLASSIFICATIONS
+            and str(item.get("created_at") or "") < since
+        ):
+            # A stop request made BEFORE this run started targeted a previous run. A process that
+            # died (or was killed) after queueing a cancel but before consuming it left it behind, and
+            # the auto-resumed run then claimed it and stopped itself at its first boundary ("Stopped
+            # after 27s ... Task canceld by user request") though the user never cancelled THIS run.
+            local_state.update_instruction(session_id, str(item.get("id")), "completed")
+            continue
+        claimed.append(dict(item))
     for item in claimed:
         local_state.update_instruction(session_id, str(item.get("id")), "running")
     return claimed
@@ -5168,7 +5191,8 @@ def _apply_live_queued_instruction(
         })
         if classification == "exit":
             return TaskOutcome(status="exited", error="Exit requested by user")
-        summary = f"Task {classification}d by user request" + (f": {text}" if text else ".")
+        past = {"cancel": "cancelled", "pause": "paused"}.get(classification, f"{classification}ed")
+        summary = f"Task {past} by user request" + (f": {text}" if text else ".")
         return TaskOutcome(status="cancelled", error=summary)
 
     renderer.handle_event({
@@ -7294,6 +7318,7 @@ async def _run_local_agent_turn_impl(
     _round = -1
     _round_extensions_used = 0
     _round_window_size = max_rounds
+    _turn_started_at = local_state._now()   # stop requests older than this belong to a previous run
     provider_exhaustion_recoveries = 0
     while True:
         _round += 1
@@ -7355,7 +7380,7 @@ async def _run_local_agent_turn_impl(
         # the top of every round (a natural checkpoint -- never mid-stream)
         # closes that gap for anything queued between rounds.
         steering_revision = getattr(renderer, "steering_revision", lambda: None)()
-        for live in _claim_live_queued_instructions(session_id):
+        for live in _claim_live_queued_instructions(session_id, since=_turn_started_at):
             outcome = _apply_live_queued_instruction(
                 live, session_id=session_id, working_messages=working_messages, renderer=renderer,
             )

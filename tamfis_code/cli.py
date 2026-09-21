@@ -15,12 +15,14 @@ from __future__ import annotations
 import asyncio
 import functools
 import getpass
+import json
 import os
+from datetime import datetime, timezone
 import re
 import sys
 import time
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import click
 import httpx
@@ -300,6 +302,93 @@ def _print_resumable_session_hint(console: Console, workspace_root: Path, *, exc
     )
 
 
+AUTO_CONTINUE_WINDOW_SECONDS = 15 * 60
+
+
+def _auto_resume_marker() -> Path:
+    return local_state.CONFIG_DIR / "auto_resume.json"
+
+
+def _read_auto_resume_marker() -> dict:
+    try:
+        data = json.loads(_auto_resume_marker().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _mark_auto_resumed(session_id: int) -> None:
+    """Remember that THIS session was automatically continued now (best effort)."""
+    try:
+        data = _read_auto_resume_marker()
+        data[str(session_id)] = time.time()
+        path = _auto_resume_marker()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _interruption_time(state: Any) -> Optional[str]:
+    """When the interrupted run last made real progress: its checkpoint's own timestamp. NOT the session's
+    ``updated_at`` -- every launch touches that, so a session looked "recent" forever."""
+    checkpoint = getattr(state, "turn_checkpoint", None) or {}
+    value = checkpoint.get("updated_at")
+    return str(value) if value else None
+
+
+def _should_auto_continue(
+    updated_at: Optional[str], *, session_id: Optional[int] = None, now: Optional[datetime] = None,
+) -> bool:
+    """Whether launching the CLI may RESUME EXECUTION of an interrupted session by itself.
+
+    Recovering from a crash a minute ago is one thing; silently re-running a plan that was left hours or
+    days ago is another -- it did exactly that (a production "Backup ... database" step) the moment the
+    user launched the CLI. Only a recent interruption continues on its own
+    (TAMFIS_CODE_AUTO_RESUME_WINDOW seconds, default 900; 0 = never). An older one is still restored (the
+    conversation and checkpoint are loaded) but waits for the user to type `continue`."""
+    try:
+        window = float(os.environ.get("TAMFIS_CODE_AUTO_RESUME_WINDOW", AUTO_CONTINUE_WINDOW_SECONDS))
+    except ValueError:
+        window = AUTO_CONTINUE_WINDOW_SECONDS
+    if window <= 0 or not updated_at:
+        return False
+    try:
+        stamp = datetime.fromisoformat(str(updated_at))
+    except ValueError:
+        return False
+    if stamp.tzinfo is None:
+        stamp = stamp.replace(tzinfo=timezone.utc)
+    current = now or datetime.now(timezone.utc)
+    if (current - stamp).total_seconds() > window:
+        return False
+    if session_id is not None:
+        # ONE automatic recovery per session per window. An auto-continued run rewrites the checkpoint, so
+        # without this a user who stopped it and relaunched was auto-continued again, indefinitely.
+        try:
+            last = float(_read_auto_resume_marker().get(str(session_id), 0))
+        except (TypeError, ValueError):
+            last = 0.0
+        if last and current.timestamp() - last <= window:
+            return False
+    return True
+
+
+def _age_words(updated_at: Optional[str]) -> str:
+    try:
+        stamp = datetime.fromisoformat(str(updated_at))
+        if stamp.tzinfo is None:
+            stamp = stamp.replace(tzinfo=timezone.utc)
+        seconds = int((datetime.now(timezone.utc) - stamp).total_seconds())
+    except (TypeError, ValueError):
+        return "earlier"
+    for unit, size in (("day", 86400), ("hour", 3600), ("minute", 60)):
+        if seconds >= size:
+            count = seconds // size
+            return f"{count} {unit}{'s' if count != 1 else ''} ago"
+    return "moments ago"
+
+
 async def _interactive_entry(
     config: Config, workspace_root: Path, provider: str = "auto",
     model: Optional[str] = None, remote: bool = False, new_session: bool = False,
@@ -323,13 +412,30 @@ async def _interactive_entry(
                 f"{escape(local_state.session_display_title(resume_id))} "
                 f"(session {resume_id}) from its saved checkpoint."
             )
-            if not any(
-                item.get("status") == "queued"
-                and str(item.get("text") or "").strip().lower() in {"continue", "resume"}
-                for item in state.queued_user_instructions
-            ):
-                local_state.enqueue_instruction(
-                    resume_id, "continue", classification="resume", priority=0,
+            if _should_auto_continue(_interruption_time(state), session_id=resume_id):
+                _mark_auto_resumed(resume_id)
+                if not any(
+                    item.get("status") == "queued"
+                    and str(item.get("text") or "").strip().lower() in {"continue", "resume"}
+                    for item in state.queued_user_instructions
+                ):
+                    local_state.enqueue_instruction(
+                        resume_id, "continue", classification="resume", priority=0,
+                    )
+            else:
+                where = ""
+                try:
+                    from .runtime.resume import describe_resume_point
+
+                    point = describe_resume_point(resume_id)
+                    if point:
+                        where = f" at step {point['step']}/{point['total']}: {escape(str(point['name']))}"
+                except Exception:
+                    pass
+                console.print(
+                    f"[yellow]◆ Not continuing automatically:[/yellow] this session was interrupted "
+                    f"{_age_words(_interruption_time(state))}{where}. Type [bold]continue[/bold] to pick it up, "
+                    "or just give a new task."
                 )
             await run_interactive(None, config, workspace, provider=provider, model=model)
             return

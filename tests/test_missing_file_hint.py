@@ -61,3 +61,41 @@ class MissingFileHintTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TypoCorrectionTests(unittest.TestCase):
+    """Live report 2026-09-21: the model read /home/tmafisseo/.../caompgns/caompgns.php (the user's typos,
+    verbatim) and could not recover -- the error only said to search for the right path."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        (self.root / "tamfisseo" / "www" / "wp-content" / "plugins" / "campaigns").mkdir(parents=True)
+        (self.root / "tamfisseo" / "www" / "wp-content" / "plugins" / "campaigns" / "campaigns.php").write_text("<?php\n")
+        (self.root / "tamfitronics").mkdir()
+        self.server = MCPServer(workspace_root=str(self.root))
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def test_every_misspelled_component_is_corrected(self):
+        wrong = self.root / "tmafisseo" / "www" / "wp-content" / "plugins" / "caompgns" / "caompgns.php"
+        right = self.root / "tamfisseo" / "www" / "wp-content" / "plugins" / "campaigns" / "campaigns.php"
+        self.assertEqual(self.server._correct_path_typos(str(wrong)), str(right))
+        message = asyncio.run(self.server._read_file(str(wrong)))
+        self.assertIn("Did you mean", message)
+        self.assertIn(str(right), message)
+
+    def test_a_missing_directory_gets_the_suggestion_too(self):
+        result = asyncio.run(self.server._list_directory(str(self.root / "tmafisseo" / "www")))
+        self.assertIn(str(self.root / "tamfisseo" / "www"), result[0]["error"])
+
+    def test_relative_paths_and_an_existing_path_behave(self):
+        self.assertEqual(
+            self.server._correct_path_typos("tamfitroincs"), str(self.root / "tamfitronics"),
+        )
+        self.assertIsNone(self.server._correct_path_typos("tamfisseo/www"))          # exists: nothing to fix
+
+    def test_it_never_guesses_wildly(self):
+        self.assertIsNone(self.server._correct_path_typos(str(self.root / "zzzzzz" / "file.txt")))
+        self.assertIsNone(self.server._correct_path_typos(str(self.root / "tamfisseo" / "www" / "banana.txt")))

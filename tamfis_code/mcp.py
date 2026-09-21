@@ -1690,6 +1690,42 @@ class MCPServer:
                         return matches
         return matches
 
+    def _correct_path_typos(self, path: str) -> Optional[str]:
+        """The existing path this one is most likely a misspelling of, or None.
+
+        Users (and models copying them) mistype names -- "/home/tmafisseo/.../caompgns/caompgns.php" for
+        /home/tamfisseo/.../campaigns/campaigns.php -- and a not-found that only says "search for the right
+        path" sends the model hunting for a name that cannot exist. Walk the path from the root; at the first
+        component that is missing, take the closest real sibling name. Bounded: one directory listing per
+        misspelled component, huge directories skipped, and it only answers when EVERY missing component has a
+        close match."""
+        import difflib
+
+        try:
+            raw = Path(path)
+            target = raw if raw.is_absolute() else Path(self.workspace_root or os.getcwd()) / raw
+            parts = target.parts
+            current = Path(parts[0])
+            changed = False
+            for part in parts[1:]:
+                candidate = current / part
+                if candidate.exists():
+                    current = candidate
+                    continue
+                if not current.is_dir():
+                    return None
+                names = os.listdir(current)
+                if len(names) > 5000:
+                    return None
+                match = difflib.get_close_matches(part, names, n=1, cutoff=0.78)
+                if not match:
+                    return None
+                current = current / match[0]
+                changed = True
+            return str(current) if changed and current.exists() else None
+        except (OSError, ValueError):
+            return None
+
     def _written_earlier_this_session(self, path: str) -> bool:
         """True when the session's mutation ledger says this session wrote ``path`` (it has since been
         deleted or moved outside the session)."""
@@ -1715,6 +1751,9 @@ class MCPServer:
                 "this session). Do not keep searching for it: recreate it with write_file only if it is "
                 "still needed, otherwise continue without it."
             )
+        corrected = self._correct_path_typos(path)
+        if corrected:
+            return f" A name in that path looks misspelled. Did you mean '{corrected}'?"
         suggestions = self._suggest_similar_paths(path)
         if suggestions:
             return f" Found '{Path(path).name}' at: {', '.join(suggestions)}."
@@ -1879,7 +1918,9 @@ class MCPServer:
         except PermissionError as exc:
             return [{"error": str(exc)}]
         if not p.exists():
-            return [{"error": f"Directory '{path}' not found"}]
+            corrected = self._correct_path_typos(path)
+            hint = f" A name in that path looks misspelled. Did you mean '{corrected}'?" if corrected else ""
+            return [{"error": f"Directory '{path}' not found.{hint}"}]
         if not p.is_dir():
             return [{"error": f"'{path}' is not a directory"}]
         try:
