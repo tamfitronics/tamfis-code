@@ -56,14 +56,15 @@ class MessageViewer:
         self._index = 0
         self._offset = 0
         self._entries: list[tuple[str, str]] = []
+        self._key = "Ctrl+E"
         self._cache_key: Optional[tuple] = None
         self._cache_lines: list[str] = []
         self._last_body_rows = MIN_ROWS
 
     # -- state -------------------------------------------------------------------
-    def toggle(self, store: Any = None) -> bool:
-        """Open the newest collapsed message, or close the viewer if it is open.
-        False (and nothing changes) when there is nothing to show."""
+    def toggle(self, store: Any = None, *, key: str = "Ctrl+E") -> bool:
+        """Open the newest collapsed message (Ctrl+E) or tool output (Ctrl+T), or close the viewer if
+        it is open. False (and nothing changes) when there is nothing to show."""
         if self.is_open:
             self.close()
             return True
@@ -72,6 +73,7 @@ class MessageViewer:
         entries = store.entries()
         if not entries:
             return False
+        self._key = key
         self._entries = entries
         self._index = len(entries) - 1
         self._offset = 0
@@ -126,18 +128,19 @@ class MessageViewer:
         body = self._cache_lines[self._offset:self._offset + rows]
         first = self._offset + 1
         last = self._offset + len(body)
-        label = "Assistant" if kind == "assistant" else "You"
-        parts = [f"{label} · full message", f"lines {first}-{last} of {total}"]
+        label = {"assistant": "Assistant", "tool": "Tool output"}.get(kind, "You")
+        noun = "output" if kind == "tool" else "message"
+        parts = [f"{label} · full {'transcript' if kind == 'tool' else 'message'}", f"lines {first}-{last} of {total}"]
         if len(self._entries) > 1:
-            parts.append(f"message {self._index + 1} of {len(self._entries)}")
+            parts.append(f"{noun} {self._index + 1} of {len(self._entries)}")
         head_text = "── " + " ── ".join(parts) + " "
         head = f"{_CYAN}{head_text}{'─' * max(0, columns - len(head_text))}{_RESET}"
         hints = ["↑/↓ scroll"]
         if total > rows:
             hints.append("PgUp/PgDn page")
         if len(self._entries) > 1:
-            hints.append("←/→ other messages")
-        hints.append("Ctrl+E or Esc to show less")
+            hints.append(f"←/→ other {noun}s")
+        hints.append(f"{self._key} or Esc to show less")
         foot = f"{_DIM}  {' · '.join(hints)}{_RESET}"
         return ["", head, *[f"{line}{_RESET}" for line in body], foot, ""]
 

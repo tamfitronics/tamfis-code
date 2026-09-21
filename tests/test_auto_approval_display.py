@@ -28,14 +28,23 @@ def _renderer():
 
 
 class RenderTests(unittest.TestCase):
-    def test_auto_notice_is_one_dim_line_not_a_card(self):
+    def test_auto_approval_prints_no_card_and_no_repeat_of_the_command(self):
         renderer, console = _renderer()
         renderer.handle_event({"event_type": "approval_auto", "payload": {
             "command": "write_file(path='/home/x/check.txt')", "risk_level": "medium", "diff": None}})
         out = console.file.getvalue()
-        self.assertIn("auto · risk: medium · write_file", out)
+        self.assertEqual(out.strip(), "")          # the call's own block names it; no "Approval required" card
         self.assertNotIn("Approval required", out)
-        self.assertNotIn("╭", out)
+
+    def test_auto_approval_still_shows_the_proposed_diff(self):
+        renderer, console = _renderer()
+        renderer.handle_event({"event_type": "approval_auto", "payload": {
+            "command": "write_file(path='x')", "risk_level": "medium",
+            "diff": "--- a/x\n+++ b/x\n@@ -0,0 +1 @@\n+hello\n"}})
+        out = console.file.getvalue()
+        self.assertIn("Proposed change", out)
+        self.assertIn("+hello", out)
+        self.assertNotIn("Approval required", out)
 
     def test_a_real_prompt_still_gets_the_full_card(self):
         renderer, console = _renderer()

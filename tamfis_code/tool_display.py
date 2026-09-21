@@ -318,3 +318,191 @@ def summarize_result(
         if message:
             return _output_lines(message), False
     return ["Done"], False
+
+
+# ---------------------------------------------------------------------------------------------
+# Codex-style activity blocks
+#
+#   • Explored
+#     └ Read README.md, index.ts (×2), campaign-engine.ts
+#       Search campaign|scheduler in worker.ts
+#       List src
+#
+#   • Ran systemctl status tamfisseo --no-pager -l 2>&1 | sed -n '1,100p'; systemctl cat
+#     │ tamfisseo 2>&1 | sed -n '1,160p'; journalctl -u tamfisseo --since '2026-09-20'
+#     │ … +1 lines
+#     └ ● tamfisseo.service - TamfisSEO Pro v3 - Enterprise SEO Automation
+#          Loaded: loaded (/etc/systemd/system/tamfisseo.service; enabled)
+#       … +134 lines (ctrl + t to view transcript)
+#
+# Pure functions again: they return plain text (with a role per line) and the renderer only
+# decides colours. The "(ctrl + t …)" hint is only ever emitted for output that was actually cut,
+# and the full output is what Ctrl+T shows (see render.TOOL_TRANSCRIPT).
+# ---------------------------------------------------------------------------------------------
+
+TRANSCRIPT_HINT = "ctrl + t to view transcript"
+_MAX_COMMAND_LINES = 3
+_PREVIEW_LINES_WHEN_CUT = 2
+_SHOW_ALL_UP_TO = 4
+
+_EDIT_VERBS = {
+    "write_file": "Wrote", "create_file": "Wrote",
+    "edit_file": "Edited", "file_edit": "Edited", "update_file": "Edited",
+    "web_fetch": "Fetched", "fetch_url": "Fetched", "fetch": "Fetched",
+    "web_search": "Searched the web for",
+}
+_SEARCH_TOOLS = {"search_code", "search_files", "grep_files"}
+_COMMAND_TOOLS = {"execute_command", "run_command", "remote_exec"}
+
+
+def block_verb(tool: str) -> str:
+    name = normalized_name(tool)
+    return _EDIT_VERBS.get(name) or display_name(tool)
+
+
+def is_command_tool(tool: str) -> bool:
+    return normalized_name(tool) in _COMMAND_TOOLS
+
+
+def _wrap(text: str, width: int) -> list[str]:
+    """Hard-wrap each physical line of `text` to `width` (long tokens are split)."""
+    import textwrap
+
+    width = max(12, width)
+    rows: list[str] = []
+    for physical in str(text or "").split("\n"):
+        wrapped = textwrap.wrap(
+            physical, width=width, break_long_words=True, break_on_hyphens=False,
+            replace_whitespace=False, drop_whitespace=True,
+        )
+        rows.extend(wrapped or [""])
+    while rows and rows[-1] == "":
+        rows.pop()
+    return rows or [""]
+
+
+def _cut(text: str, width: int) -> str:
+    text = str(text).rstrip()
+    return text if len(text) <= width else text[: max(1, width - 1)].rstrip() + "…"
+
+
+def _pluralise(count: int, word: str = "line") -> str:
+    return f"{count} {word}{'s' if count != 1 else ''}"
+
+
+def command_output(payload: dict[str, Any]) -> tuple[str, Optional[int], bool]:
+    """(full output text, exit code, failed) for a finished command tool call."""
+    envelope = _envelope(payload)
+    inner = _inner(envelope)
+    if isinstance(inner, dict):
+        code = inner.get("return_code", inner.get("exit_code"))
+        stdout = str(inner.get("stdout") or inner.get("content") or "")
+        stderr = str(inner.get("stderr") or "")
+        text = "\n".join(part for part in (stdout.rstrip("\n"), stderr.rstrip("\n")) if part)
+        failed = code not in (None, 0) or inner.get("success") is False or envelope.get("success") is False
+        return text, (code if isinstance(code, int) else None), bool(failed)
+    if _is_failure(envelope, inner):
+        return _failure_text(envelope, inner), None, True
+    return (inner if isinstance(inner, str) else ""), None, False
+
+
+def ran_block(
+    command: str, output: str, *, width: int, exit_code: Optional[int] = None, failed: bool = False,
+) -> list[tuple[str, str]]:
+    """The "• Ran …" record as (role, text) rows.
+
+    roles: head (first row; the renderer bolds its verb), cmd (wrapped command continuation),
+    out (output preview), err (failure preview), more ("… +N lines" tails)."""
+    body = max(20, width - 6)
+    command_rows = _wrap(redact_secrets(str(command or "").strip()), body)
+    rows: list[tuple[str, str]] = [("head", "Ran " + command_rows[0])]
+    rows.extend(("cmd", row) for row in command_rows[1:_MAX_COMMAND_LINES])
+    if len(command_rows) > _MAX_COMMAND_LINES:
+        rows.append(("cmd", f"… +{_pluralise(len(command_rows) - _MAX_COMMAND_LINES)}"))
+
+    role = "err" if failed else "out"
+    lines = [ln.rstrip() for ln in str(output or "").strip("\n").split("\n")] if str(output or "").strip() else []
+    if failed and exit_code not in (None, 0):
+        rows.append(("err", f"Exit code {exit_code}"))
+    if not lines:
+        if not (failed and exit_code not in (None, 0)):
+            rows.append(("out", "(no output)"))
+        return rows
+    if len(lines) <= _SHOW_ALL_UP_TO:
+        rows.extend((role, _cut(line, body)) for line in lines)
+    else:
+        rows.extend((role, _cut(line, body)) for line in lines[:_PREVIEW_LINES_WHEN_CUT])
+        hidden = len(lines) - _PREVIEW_LINES_WHEN_CUT
+        rows.append(("more", f"… +{_pluralise(hidden)} ({TRANSCRIPT_HINT})"))
+    return rows
+
+
+def output_was_cut(output: str) -> bool:
+    text = str(output or "").strip("\n")
+    return bool(text) and text.count("\n") + 1 > _SHOW_ALL_UP_TO
+
+
+_FAILED_VERBS = {"Wrote": "Failed to write", "Edited": "Failed to edit", "Fetched": "Failed to fetch"}
+
+
+def tool_block(
+    tool: str, arguments: Optional[dict[str, Any]], result_lines: list[str], *, width: int,
+    failed: bool = False,
+) -> list[tuple[str, str]]:
+    """Any other finished tool call: "• Edited path" + a └ summary line. A FAILED call never wears
+    the success verb ("Edited"): it reads "Failed to edit path"."""
+    body = max(20, width - 6)
+    target = display_target(tool, arguments, limit=body)
+    verb = block_verb(tool)
+    if failed:
+        verb = _FAILED_VERBS.get(verb, verb)
+    head = f"{verb} {target}".rstrip()
+    rows: list[tuple[str, str]] = [("head", _cut(head, width - 4))]
+    rows.extend(("out", _cut(line, body)) for line in (result_lines or ["Done"]))
+    return rows
+
+
+def explored_lines(items: list[dict[str, Any]], width: int) -> list[str]:
+    """The body of the "• Explored" block: consecutive reads merged into one "Read a, b, c" line,
+    each search / listing on its own line. A file read more than once shows "(×N)" -- a re-read loop is
+    exactly what a reader wants to notice."""
+    body = max(20, width - 4)
+    entries: list[str] = []
+    reads: dict[str, int] = {}
+
+    def flush_reads() -> None:
+        if reads:
+            names = [f"{name} (×{count})" if count > 1 else name for name, count in reads.items()]
+            entries.append("Read " + ", ".join(names))
+            reads.clear()
+
+    for item in items:
+        tool = normalized_name(item.get("tool") or "")
+        args = item.get("args") if isinstance(item.get("args"), dict) else {}
+        if tool == "read_file":
+            path = str(args.get("path") or args.get("file_path") or item.get("short") or "file")
+            name = path.rstrip("/").rsplit("/", 1)[-1] or path
+            reads[name] = reads.get(name, 0) + 1
+            continue
+        flush_reads()
+        path = str(args.get("path") or args.get("directory") or "")
+        shown_path = "" if path in {"", ".", "./"} else path
+        if tool == "list_directory":
+            entries.append(f"List {shown_path or '.'}")
+        elif tool in _SEARCH_TOOLS:
+            pattern = _one_line(args.get("query") or args.get("pattern") or "", 60)
+            entries.append(f"Search {pattern}" + (f" in {shown_path}" if shown_path else ""))
+        elif tool == "find_references":
+            entries.append(f"References {_one_line(args.get('symbol') or args.get('query') or args.get('name') or '', 60)}"
+                           + (f" in {shown_path}" if shown_path else ""))
+        elif tool == "glob_files":
+            entries.append(f"Glob {_one_line(args.get('pattern') or args.get('query') or '', 60)}")
+        elif tool == "get_git_info":
+            entries.append("Git status")
+        else:
+            entries.append(f"{display_name(tool)} {display_target(tool, args, limit=body)}".rstrip())
+    flush_reads()
+    rows: list[str] = []
+    for entry in entries:
+        rows.extend(_wrap(entry, body))
+    return rows

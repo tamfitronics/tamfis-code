@@ -269,6 +269,11 @@ class CollapsedMessageStore:
 
 
 COLLAPSED_MESSAGES = CollapsedMessageStore()
+# Full output of finished tool calls (commands), newest last: what Ctrl+T pages through when a block
+# says "… +N lines (ctrl + t to view transcript)". Separate from COLLAPSED_MESSAGES (Ctrl+E, long
+# assistant/user messages), which is unchanged.
+TOOL_TRANSCRIPT = CollapsedMessageStore(retention=30)
+_TRANSCRIPT_ENTRY_MAX_CHARS = 200_000
 
 
 def expand_next_collapsed_message(console: Any, store: Optional[CollapsedMessageStore] = None) -> bool:
@@ -1043,7 +1048,7 @@ class StreamRenderer:
 
     def conclude(self, status: str) -> None:
         """Clear transient activity before the terminal returns to the REPL."""
-        self._flush_read_group()
+        self._flush_read_group(force=True)
         self.progress.finish(status)
         self._round_tool_counts = {}
         self._running_command = None
@@ -1433,47 +1438,90 @@ class StreamRenderer:
             width = 100
         return max(30, min(100, width - 14))
 
-    def _print_tool_header(self, tool: str, arguments: Optional[dict[str, Any]]) -> None:
-        line = Text()
-        line.append("● ", style="green")
-        line.append(_tool_display.display_name(tool), style="bold")
-        target = _tool_display.display_target(tool, arguments, limit=self._tool_target_limit())
-        if target:
-            line.append(f"({target})", style="dim")
-        self.console.print(line, highlight=False)
+    def _block_width(self) -> int:
+        try:
+            return max(40, int(self.console.width))
+        except Exception:
+            return 100
 
-    def _print_tool_result(self, lines: list[str], failed: bool) -> None:
-        for index, text in enumerate(lines):
-            row = Text("  ⎿  " if index == 0 else "     ", style="dim")
-            row.append(text, style="red" if failed and index == 0 else "dim")
-            self.console.print(row, highlight=False)
+    def _print_rows(self, rows: list[tuple[str, str]], *, failed: bool = False) -> None:
+        """Print (role, text) rows from tool_display as a Codex-style block:
 
-    def _flush_read_group(self) -> None:
-        """Print the pending read-only calls: one full record for a single call,
-        one collapsed line ("Read 3 files, searched for 2 patterns") for several."""
+            • Ran <command>
+              │ <wrapped continuation>
+              └ <output preview>
+                … +N lines (ctrl + t to view transcript)
+        """
+        seen_output = False
+        for role, text in rows:
+            line = Text()
+            if role == "head":
+                line.append("• ", style="red" if failed else "green")
+                verb, _, rest = text.partition(" ")
+                line.append(verb, style="bold")
+                if rest:
+                    line.append(" " + rest)
+            elif role == "cmd":
+                line.append("  │ ", style="dim")
+                line.append(text, style="dim")
+            else:  # out / err / more
+                line.append("  └ " if not seen_output else "    ", style="dim")
+                seen_output = True
+                line.append(text, style="red" if role == "err" else ("dim italic" if role == "more" else "dim"))
+            self.console.print(line, highlight=False)
+
+    def _print_tool_block(
+        self, tool: str, arguments: Optional[dict[str, Any]], lines: list[str], failed: bool,
+        payload: Optional[dict[str, Any]] = None,
+    ) -> None:
+        width = self._block_width()
+        if _tool_display.is_command_tool(tool) and isinstance(payload, dict):
+            output, code, cmd_failed = _tool_display.command_output(payload)
+            command = str((arguments or {}).get("command") or "")
+            failed = failed or cmd_failed
+            if failed and not output.strip() and lines:
+                # A refused/blocked call carries its reason in the summary lines, not in an output stream.
+                output = "\n".join(str(line) for line in lines)
+            self._print_rows(
+                _tool_display.ran_block(command, output, width=width, exit_code=code, failed=failed),
+                failed=failed,
+            )
+            # Everything, not just the preview: what Ctrl+T shows.
+            full = f"$ {redact_secrets(command)}\n\n{redact_secrets(output) if output else '(no output)'}"
+            if len(full) > _TRANSCRIPT_ENTRY_MAX_CHARS:
+                full = full[:_TRANSCRIPT_ENTRY_MAX_CHARS] + "\n… (output truncated)"
+            TOOL_TRANSCRIPT.add("tool", full)
+            return
+        rows = _tool_display.tool_block(tool, arguments, lines, width=width, failed=failed)
+        self._print_rows(rows, failed=failed)
+
+    def _flush_read_group(self, force: bool = False) -> None:
+        """Print the pending read-only calls as one "• Explored" block: consecutive reads merged onto
+        one "Read a, b, c" line, each search/listing on its own line. Failures stay visible under it.
+
+        Unless `force`, the block is held back while any call in it is still waiting for its result:
+        in a parallel batch, unrelated events (plan updates...) arrive between the requests and their
+        results, and flushing then printed the block early and every result AGAIN as its own record."""
+        if not self._read_group:
+            return
+        if not force and any(not item["done"] for item in self._read_group):
+            return
         group, self._read_group = self._read_group, []
-        if not group:
-            return
-        if len(group) == 1:
-            item = group[0]
-            self._print_tool_header(item["tool"], item["args"])
-            self._print_tool_result(item["lines"] or ["Done"], item["failed"])
-            return
-        counts: dict[str, int] = {}
-        for item in group:
-            counts[item["tool"]] = counts.get(item["tool"], 0) + 1
+        rows = _tool_display.explored_lines(group, self._block_width())
         header = Text()
-        header.append("● ", style="green")
-        header.append(_tool_display.group_header(counts) or f"{len(group)} tool calls", style="bold")
+        header.append("• ", style="green")
+        header.append("Explored", style="bold")
         self.console.print(header, highlight=False)
-        names = [item["short"] for item in group if item["short"]]
-        shown = ", ".join(names[:4]) + (f" … +{len(names) - 4} more" if len(names) > 4 else "")
-        if shown:
-            self._print_tool_result([shown], False)
+        for index, body in enumerate(rows):
+            line = Text("  └ " if index == 0 else "    ", style="dim")
+            line.append(body, style="dim")
+            self.console.print(line, highlight=False)
         for item in group:
             if item["failed"]:
                 reason = (item["lines"] or ["failed"])[0]
-                self._print_tool_result([f"✗ {item['short'] or item['tool']}: {reason}"], True)
+                line = Text("    ", style="dim")
+                line.append(f"✗ {item['short'] or item['tool']}: {reason}", style="red")
+                self.console.print(line, highlight=False)
 
     def _keeps_read_group_open(self, event_type: str, payload: dict[str, Any]) -> bool:
         if event_type in ("tool_call_requested", "tool_output"):
@@ -1989,10 +2037,9 @@ class StreamRenderer:
                     "lines": None, "failed": False, "done": False,
                 })
                 return
-            # Every other call is a durable record: "● Bash(cmd)" now, its
-            # "⎿ result" line when the output arrives. (Edits and writes used to
-            # print nothing at all on a terminal.)
-            self._print_tool_header(name, args)
+            # Every other call becomes ONE block ("• Ran <cmd>" / "• Edited <path>") printed
+            # when its output arrives, like Codex. While it runs, the live status line under the
+            # composer already shows what is executing (and for how long).
             self._tool_args_queue.setdefault(normalized, []).append(args)
             return
 
@@ -2032,11 +2079,7 @@ class StreamRenderer:
                     # Errors are shown promptly, not held behind a pending group.
                     self._flush_read_group()
                 return
-            if _tool_display.is_groupable(tool):
-                # A result with no matching request (e.g. a blocked read): give it
-                # its own complete record rather than dropping it.
-                self._print_tool_header(tool, args)
-            self._print_tool_result(lines, failed)
+            self._print_tool_block(tool, args, lines, failed, payload=payload)
             return
 
         if event_type in (
@@ -2072,7 +2115,7 @@ class StreamRenderer:
             # A continuation of the "⎿ Edited path" line above it, not a separate
             # card: same information (kind, size, /diff and /revert handles).
             self.console.print(
-                f"     [dim]{escape(label)} · +{added}/-{removed} · /diff {escape(str(mutation_id))} to expand · "
+                f"    [dim]{escape(label)} · +{added}/-{removed} · /diff {escape(str(mutation_id))} to expand · "
                 f"/revert {escape(str(mutation_id))}[/dim]"
             )
             return
@@ -2104,10 +2147,10 @@ class StreamRenderer:
             # non-dangerous risk). It used to render the same boxed "Approval required" card as a
             # real prompt and then run at once -- which read as the CLI being blocked on the user.
             self._close_assistant()
-            auto_command = _bounded_preview(redact_secrets(str(payload.get("command") or "")))
-            self.console.print(
-                f"[dim]⏵⏵ auto · risk: {escape(str(payload.get('risk_level', '?')))} · {escape(auto_command)}[/dim]"
-            )
+            # Nothing to print for the call itself any more: its own block ("• Ran <cmd>" /
+            # "• Edited <path>") already names it, and repeating "⏵⏵ auto · risk · <command>" above every
+            # block was pure noise. The proposed diff for a write is still shown (and the event is
+            # still emitted, so the audit trail in the event stream is unchanged).
             auto_diff = payload.get("diff")
             if auto_diff:
                 print_unified_diff(self.console, str(auto_diff), title="Proposed change", max_lines=80)

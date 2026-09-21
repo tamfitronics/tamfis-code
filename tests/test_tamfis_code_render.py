@@ -193,10 +193,10 @@ class StreamRendererTests(unittest.TestCase):
         })
         renderer.conclude("completed")  # a run of reads is printed when the run ends
         output = console.file.getvalue()
-        # Claude Code-style record: "● Read(path)" + "⎿ Read N lines" -- the file's
-        # contents are never dumped into the scrollback.
-        self.assertIn("● Read(src/app.ts)", output)
-        self.assertIn("⎿  Read 1 line", output)
+        # Codex-style block: "• Explored" + "└ Read app.ts" -- the file's contents are never
+        # dumped into the scrollback.
+        self.assertIn("• Explored", output)
+        self.assertIn("└ Read app.ts", output)
         self.assertNotIn("secret implementation", output)
         self.assertNotIn("→", output)
 
@@ -783,8 +783,8 @@ class StreamRendererTests(unittest.TestCase):
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "remote_exec", "content": "ok", "success": True}})
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "remote_exec", "content": "Error: bad", "success": False}})
         output = console.file.getvalue()
-        self.assertIn("⎿  ok", output)  # success: the command's output
-        self.assertIn("⎿  Error: bad", output)  # failure: named as an error, with the reason
+        self.assertIn("└ ok", output)  # success: the command's output
+        self.assertIn("└ Error: bad", output)  # failure: named as an error, with the reason
 
     def test_failed_read_shows_the_actual_reason_not_just_the_target(self):
         # Live-caught bug: this used to print only "Read failed <target>"

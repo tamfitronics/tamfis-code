@@ -1066,6 +1066,19 @@ class LiveInputListener:
                 pass
             event.app.invalidate()
 
+        @bindings.add("c-t")
+        def _toggle_tool_transcript(event) -> None:
+            # Ctrl+T pages through the FULL output of finished tool calls -- what a block's
+            # "… +N lines (ctrl + t to view transcript)" refers to. Ctrl+E (long messages) is untouched.
+            try:
+                from .message_viewer import VIEWER
+                from .render import TOOL_TRANSCRIPT
+
+                VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T")
+            except Exception:
+                pass
+            event.app.invalidate()
+
         @bindings.add("escape")
         def _cancel_running_turn(event) -> None:
             # Escape cancels the active turn immediately and returns control

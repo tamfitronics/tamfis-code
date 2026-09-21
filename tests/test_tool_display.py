@@ -121,40 +121,101 @@ class ResultSummaryTests(unittest.TestCase):
 
 
 class ScrollbackRecordTests(unittest.TestCase):
-    def test_a_command_is_a_header_with_a_result_line_under_it(self):
+    """Codex-style activity blocks: "• Explored / └ Read a, b", "• Ran <cmd> / └ output"."""
+
+    def test_a_command_is_a_bullet_with_its_output_under_a_tree_connector(self):
         console, renderer = _renderer()
         _call(renderer, "execute_command", {"command": "pytest -q"},
               {"stdout": "60 passed\n", "stderr": "", "return_code": 0})
         lines = _out(console).splitlines()
-        self.assertEqual(lines[0], "● Bash(pytest -q)")
-        self.assertEqual(lines[1], "  ⎿  60 passed")
+        self.assertEqual(lines[0], "• Ran pytest -q")
+        self.assertEqual(lines[1], "  └ 60 passed")
 
-    def test_a_long_command_stays_on_one_line(self):
-        console, renderer = _renderer(width=80)
-        _call(renderer, "execute_command", {"command": "cd /home/x && " + "python3 -m pytest tests/a.py " * 10},
+    def test_a_long_command_wraps_and_is_cut_with_a_line_count(self):
+        console, renderer = _renderer(width=60)
+        _call(renderer, "execute_command", {"command": "cd /home/x && " + "python3 -m pytest tests/a.py " * 12},
               {"stdout": "ok\n", "stderr": "", "return_code": 0})
-        header = _out(console).splitlines()[0]
-        self.assertEqual(len(_out(console).splitlines()), 2)  # header + result, no wrapped continuation
-        self.assertTrue(header.endswith("…)"))
-        self.assertLessEqual(len(header), 80)
+        lines = _out(console).splitlines()
+        self.assertTrue(lines[0].startswith("• Ran cd /home/x"))
+        self.assertTrue(lines[1].startswith("  │ "))                      # wrapped continuation
+        self.assertTrue(any(line.startswith("  │ … +") and line.endswith(" lines") for line in lines))
+        self.assertEqual(lines[-1], "  └ ok")
+        self.assertTrue(all(len(line) <= 60 for line in lines))
 
-    def test_consecutive_reads_and_searches_collapse_into_one_line(self):
+    def test_long_output_shows_a_preview_and_the_transcript_hint_and_ctrl_t_has_all_of_it(self):
+        from tamfis_code.render import TOOL_TRANSCRIPT
+
+        TOOL_TRANSCRIPT.clear()
+        console, renderer = _renderer()
+        output = "\n".join(f"line {i}" for i in range(1, 137)) + "\n"
+        _call(renderer, "execute_command", {"command": "journalctl -u x"},
+              {"stdout": output, "stderr": "", "return_code": 0})
+        lines = _out(console).splitlines()
+        self.assertEqual(lines[1], "  └ line 1")
+        self.assertEqual(lines[2], "    line 2")
+        self.assertEqual(lines[3], "    … +134 lines (ctrl + t to view transcript)")
+        self.assertEqual(len(lines), 4)
+        (kind, full), = TOOL_TRANSCRIPT.entries()                        # what Ctrl+T shows
+        self.assertEqual(kind, "tool")
+        self.assertIn("$ journalctl -u x", full)
+        self.assertIn("line 1\n", full)
+        self.assertIn("line 136", full)
+
+    def test_short_output_is_shown_whole_and_never_advertises_a_transcript(self):
+        console, renderer = _renderer()
+        _call(renderer, "execute_command", {"command": "ls"},
+              {"stdout": "a\nb\nc\nd\n", "stderr": "", "return_code": 0})
+        text = _out(console)
+        self.assertNotIn("ctrl + t", text)
+        self.assertEqual(text.splitlines()[1:], ["  └ a", "    b", "    c", "    d"])
+
+    def test_a_failing_command_says_so_and_uses_the_error_role(self):
+        console, renderer = _renderer()
+        _call(renderer, "execute_command", {"command": "false"},
+              {"stdout": "", "stderr": "boom\n", "return_code": 2})
+        lines = _out(console).splitlines()
+        self.assertEqual(lines[0], "• Ran false")
+        self.assertEqual(lines[1], "  └ Exit code 2")
+        self.assertIn("boom", lines[2])
+
+    def test_secrets_are_redacted_in_the_block_and_in_the_transcript(self):
+        from tamfis_code.render import TOOL_TRANSCRIPT
+
+        TOOL_TRANSCRIPT.clear()
+        console, renderer = _renderer()
+        _call(renderer, "execute_command", {"command": "mysql -pSuperSecret123 -e 'select 1'"},
+              {"stdout": "1\n", "stderr": "", "return_code": 0})
+        self.assertNotIn("SuperSecret123", _out(console))
+        self.assertNotIn("SuperSecret123", TOOL_TRANSCRIPT.entries()[0][1])
+
+    def test_consecutive_reads_and_searches_are_one_explored_block(self):
         console, renderer = _renderer()
         _call(renderer, "read_file", {"path": "src/a.py"}, "x\n" * 10)
         _call(renderer, "read_file", {"path": "src/b.py"}, "y\n" * 5)
-        _call(renderer, "search_code", {"query": "TODO"}, [{"file": "a.py", "line": 1}])
+        _call(renderer, "search_code", {"query": "TODO", "path": "src"}, [{"file": "a.py", "line": 1}])
+        _call(renderer, "list_directory", {"path": "src"}, [{"name": "a.py"}])
         self.assertEqual(_out(console), "")  # nothing yet: the run of reads is still open
         renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": "Found it."}})
         text = _out(console)
-        self.assertIn("● Read 2 files, searched for 1 pattern", text)
-        self.assertIn("⎿  a.py, b.py, pattern: \"TODO\"", text)
-        self.assertLess(text.index("● Read 2 files"), text.index("Found it."))
+        self.assertEqual(
+            text.splitlines()[:4],
+            ["• Explored", "  └ Read a.py, b.py", "    Search TODO in src", "    List src"],
+        )
+        self.assertLess(text.index("• Explored"), text.index("Found it."))
 
-    def test_a_single_read_is_a_full_record(self):
+    def test_a_file_read_repeatedly_is_shown_with_a_count(self):
+        console, renderer = _renderer()
+        for _ in range(3):
+            _call(renderer, "read_file", {"path": "/home/tamfitronics/mu-plugins/chat.php"}, "x\n")
+        _call(renderer, "read_file", {"path": "other.php"}, "x\n")
+        renderer.conclude("completed")
+        self.assertIn("Read chat.php (×3), other.php", _out(console))
+
+    def test_a_single_read_is_still_an_explored_block(self):
         console, renderer = _renderer()
         _call(renderer, "read_file", {"path": "src/a.py"}, "x\n" * 400)
         renderer.conclude("completed")
-        self.assertEqual(_out(console).splitlines()[:2], ["● Read(src/a.py)", "  ⎿  Read 400 lines"])
+        self.assertEqual(_out(console).splitlines()[:2], ["• Explored", "  └ Read a.py"])
 
     def test_a_non_read_call_ends_the_run_of_reads_in_order(self):
         console, renderer = _renderer()
@@ -162,7 +223,7 @@ class ScrollbackRecordTests(unittest.TestCase):
         _call(renderer, "read_file", {"path": "b.py"}, "x\n")
         _call(renderer, "execute_command", {"command": "ls"}, {"stdout": "a\n", "stderr": "", "return_code": 0})
         text = _out(console)
-        self.assertLess(text.index("Read 2 files"), text.index("● Bash(ls)"))
+        self.assertLess(text.index("Read a.py, b.py"), text.index("• Ran ls"))
 
     def test_a_failed_read_is_shown_at_once_with_the_real_reason(self):
         console, renderer = _renderer()
@@ -170,28 +231,36 @@ class ScrollbackRecordTests(unittest.TestCase):
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "read_file", "result": {
             "success": False, "status": "permission_denied", "path": "/etc/shadow"}}})
         text = _out(console)  # no later event: errors are not held behind the group
-        self.assertIn("● Read(/etc/shadow)", text)
+        self.assertIn("• Explored", text)
         self.assertIn("Read failed: Permission denied: /etc/shadow", text)
 
-    def test_a_write_shows_lines_and_the_diff_and_revert_handles(self):
+    def test_a_write_shows_its_summary_and_the_diff_and_revert_handles(self):
         console, renderer = _renderer()
         _call(renderer, "write_file", {"path": "docs/notes.md", "content": "hello\n" * 30}, "✅ Successfully wrote 180 bytes")
         renderer.handle_event({"event_type": "file_mutation", "payload": {
             "path": "docs/notes.md", "lines_added": 30, "lines_removed": 0, "mutation_id": "m_ab12"}})
         lines = _out(console).splitlines()
-        self.assertEqual(lines[0], "● Write(docs/notes.md)")
-        self.assertEqual(lines[1], "  ⎿  Wrote 30 lines to docs/notes.md")
+        self.assertEqual(lines[0], "• Wrote docs/notes.md")
+        self.assertEqual(lines[1], "  └ Wrote 30 lines to docs/notes.md")
         self.assertIn("+30/-0 · /diff m_ab12 to expand · /revert m_ab12", lines[2])
 
-    def test_an_edit_used_to_print_nothing_on_a_terminal_and_now_has_a_record(self):
+    def test_an_edit_has_a_record_on_a_terminal(self):
         console = Console(file=StringIO(), no_color=True, width=110, force_terminal=True)
         renderer = StreamRenderer(console)
         renderer.handle_event({"event_type": "task_started", "payload": {"mode": "local"}})
         _call(renderer, "edit_file", {"path": "src/a.py", "old_string": "a", "new_string": "b"}, "✅ Edited 'src/a.py'")
         plain = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", _out(console))  # a live terminal emits styling
-        self.assertIn("● Update(src/a.py)", plain)
-        self.assertIn("⎿  Edited src/a.py", plain)
+        self.assertIn("• Edited src/a.py", plain)
+        self.assertIn("└ Edited src/a.py", plain)
         renderer.finish()
+
+    def test_a_failed_edit_never_wears_the_success_verb(self):
+        console, renderer = _renderer()
+        _call(renderer, "edit_file", {"path": "src/a.py", "old_string": "a", "new_string": "b"},
+              {"success": False, "error": "old_string not found"})
+        text = _out(console)
+        self.assertIn("• Failed to edit src/a.py", text)
+        self.assertNotIn("Edited", text)
 
     def test_the_todo_checklist_is_untouched(self):
         console, renderer = _renderer()
@@ -200,7 +269,7 @@ class ScrollbackRecordTests(unittest.TestCase):
         renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "write_todos", "result": {"success": True, "result": "ok"}}})
         text = _out(console)
         self.assertIn("✔ first", text)
-        self.assertNotIn("● Write Todos", text)
+        self.assertNotIn("Write Todos", text)
         self.assertNotIn("Done", text)
 
     def test_an_empty_completion_envelope_prints_nothing(self):
@@ -214,7 +283,60 @@ class ScrollbackRecordTests(unittest.TestCase):
               {"stdout": "[bold]not markup[/bold] [red]x\n", "stderr": "", "return_code": 0})
         text = _out(console)
         self.assertIn("[bold]not markup[/bold] [red]x", text)
-        self.assertIn("pattern-free" if False else "grep '[0-9]+' f", text)
+        self.assertIn("grep '[0-9]+' f", text)
+
+
+class TranscriptViewerTests(unittest.TestCase):
+    """Ctrl+T shows full tool output in the same viewer Ctrl+E uses for long messages -- which is unchanged."""
+
+    def setUp(self):
+        from tamfis_code.message_viewer import VIEWER
+        from tamfis_code.render import COLLAPSED_MESSAGES, TOOL_TRANSCRIPT
+
+        VIEWER.close()
+        TOOL_TRANSCRIPT.clear()
+        COLLAPSED_MESSAGES.clear()
+        self.addCleanup(VIEWER.close)
+        self.addCleanup(TOOL_TRANSCRIPT.clear)
+        self.addCleanup(COLLAPSED_MESSAGES.clear)
+
+    def test_ctrl_t_opens_the_newest_tool_output_and_closes_again(self):
+        from tamfis_code.message_viewer import VIEWER
+        from tamfis_code.render import TOOL_TRANSCRIPT
+
+        TOOL_TRANSCRIPT.add("tool", "$ ls\n\n" + "\n".join(f"row {i}" for i in range(300)))
+        self.assertTrue(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T"))
+        panel = "\n".join(VIEWER.panel_lines(100, 40))
+        self.assertIn("Tool output · full transcript", panel)
+        self.assertIn("Ctrl+T or Esc to show less", panel)
+        self.assertIn("row 0", panel)
+        self.assertTrue(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T"))
+        self.assertFalse(VIEWER.is_open)
+
+    def test_nothing_to_show_is_a_no_op(self):
+        from tamfis_code.message_viewer import VIEWER
+        from tamfis_code.render import TOOL_TRANSCRIPT
+
+        self.assertFalse(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T"))
+        self.assertFalse(VIEWER.is_open)
+
+    def test_ctrl_e_for_long_messages_still_works_and_keeps_its_own_key_hint(self):
+        from tamfis_code.message_viewer import VIEWER
+        from tamfis_code.render import COLLAPSED_MESSAGES
+
+        COLLAPSED_MESSAGES.add("assistant", "word " * 5000)
+        self.assertTrue(VIEWER.toggle())
+        panel = "\n".join(VIEWER.panel_lines(100, 40))
+        self.assertIn("Assistant · full message", panel)
+        self.assertIn("Ctrl+E or Esc to show less", panel)
+
+    def test_full_output_is_not_lost_when_the_preview_is_cut(self):
+        from tamfis_code import tool_display
+
+        rows = tool_display.ran_block("x", "\n".join(str(i) for i in range(50)), width=100)
+        self.assertEqual(rows[-1][0], "more")
+        self.assertTrue(tool_display.output_was_cut("\n".join(str(i) for i in range(50))))
+        self.assertFalse(tool_display.output_was_cut("a\nb"))
 
 
 if __name__ == "__main__":

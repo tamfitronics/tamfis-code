@@ -1319,6 +1319,14 @@ async def _run_interactive_impl(
     def _expand_collapsed_message(event) -> None:
         expand_collapsed_or_end_of_line(event, console)
 
+    @bindings.add("c-t")
+    def _show_tool_transcript(event) -> None:
+        from .message_viewer import VIEWER
+        from .render import TOOL_TRANSCRIPT
+
+        VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T")
+        event.app.invalidate()
+
     # Scroll/close keys for the Ctrl+E viewer; active only while it is open, and last so
     # they win over the ordinary Esc/Up/Down behaviour.
     from .message_viewer import install_bindings as _install_viewer_bindings

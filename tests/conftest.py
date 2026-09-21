@@ -114,3 +114,21 @@ def _isolate_user_hooks(monkeypatch, tmp_path):
     from tamfis_code import hooks
 
     monkeypatch.setattr(hooks, "HOOKS_PATH", tmp_path / "hooks.toml")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_session_state(monkeypatch, tmp_path):
+    """No test may write the developer's REAL session state or config directory.
+
+    test_queued_user_message_survives_recovery isolated its checkpoint folder but enqueued
+    "prefer Kimi-K3 for NIM chat" into session 20260910 of the real ~/.config/tamfis-code/state.json --
+    one more queued instruction on every suite run (about 75 accumulated). Tests that need their own
+    state directory still set it explicitly; this is the default for every other test."""
+    from tamfis_code import config as config_module
+    from tamfis_code import state as state_module
+
+    base = tmp_path / "_config"
+    base.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(config_module, "CONFIG_DIR", base)
+    monkeypatch.setattr(state_module, "CONFIG_DIR", base)
+    monkeypatch.setattr(state_module, "STATE_PATH", base / "state.json")
