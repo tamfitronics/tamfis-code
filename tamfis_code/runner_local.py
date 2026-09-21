@@ -6283,9 +6283,20 @@ async def _run_local_agent_turn_impl(
         resume_snapshot,
         getattr(orchestration, "plan", None),
     )
-    turn_read_only = read_only or resume_plan_read_only or getattr(task_profile.task_type, "value", "") in {
-        "inspect", "audit", "plan",
-    }
+    # A stale saved task profile (often ``audit`` or ``plan``) must not
+    # downgrade a genuinely mutating active plan step.  The durable step is
+    # the authority during recovery: observational steps stay read-only, while
+    # an interrupted "start/resume/implement" step retains its execute/write
+    # tools and can actually finish instead of merely printing a command.
+    resume_plan_mutating = bool(resume_requested and not resume_plan_read_only)
+    turn_read_only = (
+        bool(read_only)
+        or resume_plan_read_only
+        or (
+            getattr(task_profile.task_type, "value", "") in {"inspect", "audit", "plan"}
+            and not resume_plan_mutating
+        )
+    )
     # A CLI/--read-only flag (or an explicit read-only objective) is an
     # absolute user promise that must never be auto-lifted mid-turn; a
     # heuristic INSPECT/AUDIT/PLAN classification is not, and can be
@@ -6293,7 +6304,7 @@ async def _run_local_agent_turn_impl(
     # turns out to request action.
     user_requested_read_only = (
         bool(read_only)
-        or resume_plan_read_only
+        or (resume_plan_read_only and not resume_plan_mutating)
         or is_explicit_read_only_request(objective)
     )
     _read_only_reject_count = 0

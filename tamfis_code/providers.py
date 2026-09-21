@@ -1365,13 +1365,7 @@ class ProviderManager:
             return str(getattr(credentials, "access_token", "") or "").strip() or None
 
         if provider_type == ProviderType.META:
-            # META_API_KEY is the deployment name; MODEL_API_KEY is Meta's
-            # documented name for the same Model API credential.
-            return (
-                os.environ.get("META_API_KEY", "").strip()
-                or os.environ.get("MODEL_API_KEY", "").strip()
-                or None
-            )
+            return os.environ.get("META_API_KEY", "").strip() or None
 
         key = os.environ.get(config.api_key_env, "").strip()
         return key or None
