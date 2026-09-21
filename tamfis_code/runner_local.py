@@ -4989,6 +4989,101 @@ def _resume_snapshot_for_turn(prior_state: Any, objective: str, resume_requested
         return None
 
 
+# A recovery suggestion may contain words such as "repair" or "resolve" even
+# when the actual saved step is explicitly read-only (for example, "Read
+# pyproject.toml and requirements.txt").  Classification must follow the
+# durable step, not the wrapper prose, otherwise a resumed audit can suddenly
+# receive write tools and drift into an unrelated repository change.
+_READ_ONLY_RESUME_STEP_RE = re.compile(
+    r"^\s*(?:read|inspect|review|audit|check|verify|validate|list|locate|"
+    r"identify|compare|examine|trace|map|inventory|summari[sz]e|analyse|analyze)\b",
+    re.IGNORECASE,
+)
+_MUTATING_RESUME_STEP_RE = re.compile(
+    r"\b(?:add|build|change|create|delete|edit|fix|implement|install|migrate|"
+    r"modify|remove|replace|rewrite|update|write|commit|push|deploy|restart)\b",
+    re.IGNORECASE,
+)
+
+
+def _resume_step_is_read_only(
+    incoming_objective: str,
+    resume_snapshot: Any,
+    plan: Any = None,
+) -> bool:
+    """Whether a machine-generated continuation must remain read-only.
+
+    This is intentionally narrow: an explicit user request to implement a
+    pending step must still be allowed to mutate.  The protection applies only
+    to Tamfis-Code's own recovery wording and to a saved step whose leading
+    action is observational, or to a resume whose saved plan is already
+    complete (validation/reporting only).
+    """
+    if not _is_machine_generated_objective(incoming_objective):
+        return False
+    candidate = resume_snapshot or plan
+    if candidate is None:
+        # No durable unfinished plan means recovery has no authority to invent
+        # a new edit task from a stale error message.
+        return True
+    step_name = ""
+    if hasattr(candidate, "resume_step_name"):
+        step_name = str(getattr(candidate, "resume_step_name") or "")
+    elif getattr(candidate, "steps", None):
+        step_name = next(
+            (
+                str(getattr(step, "name", "") or "")
+                for step in candidate.steps
+                if str(getattr(step, "status", "pending")) != "completed"
+            ),
+            "",
+        )
+    if not step_name:
+        return True
+    return bool(
+        _READ_ONLY_RESUME_STEP_RE.search(step_name)
+        and not _MUTATING_RESUME_STEP_RE.search(step_name)
+    )
+
+
+def _resume_step_contract(plan: Any) -> str:
+    """Build a short authoritative instruction for the current saved step."""
+    if plan is None:
+        return ""
+    step_name = ""
+    if hasattr(plan, "resume_step_name"):
+        step_name = str(getattr(plan, "resume_step_name") or "")
+    if not step_name and getattr(plan, "steps", None):
+        step_name = next(
+            (
+                str(getattr(step, "name", "") or "")
+                for step in plan.steps
+                if str(getattr(step, "status", "pending")) != "completed"
+            ),
+            "",
+        )
+    if not step_name:
+        return (
+            "RESUMED PLAN CONTRACT: every saved plan step is already complete. "
+            "Only perform final read-only validation/reporting; do not invent new edits."
+        )
+    observational = bool(
+        _READ_ONLY_RESUME_STEP_RE.search(step_name)
+        and not _MUTATING_RESUME_STEP_RE.search(step_name)
+    )
+    boundary = (
+        " execute_command is not available in this turn; never request it. Use only "
+        "read_file, list_directory, search_code, find_references, or get_git_info."
+        if observational else ""
+    )
+    return (
+        "RESUMED PLAN CONTRACT: the only active step is: " + step_name + ".\n"
+        "Work on this step only. Do not execute unrelated training, configuration, "
+        "deployment, or cleanup work. If the step is observational, use read-only "
+        "tools and do not modify files." + boundary
+    )
+
+
 _BARE_CONTINUE_MAX_WORDS = 5
 
 
@@ -6183,7 +6278,12 @@ async def _run_local_agent_turn_impl(
             "payload": {"content": resume_snapshot.banner()},
         })
     task_profile = orchestration.profile
-    turn_read_only = read_only or getattr(task_profile.task_type, "value", "") in {
+    resume_plan_read_only = _resume_step_is_read_only(
+        incoming_objective,
+        resume_snapshot,
+        getattr(orchestration, "plan", None),
+    )
+    turn_read_only = read_only or resume_plan_read_only or getattr(task_profile.task_type, "value", "") in {
         "inspect", "audit", "plan",
     }
     # A CLI/--read-only flag (or an explicit read-only objective) is an
@@ -6191,7 +6291,11 @@ async def _run_local_agent_turn_impl(
     # heuristic INSPECT/AUDIT/PLAN classification is not, and can be
     # corrected by the escalation path below when the objective itself
     # turns out to request action.
-    user_requested_read_only = bool(read_only) or is_explicit_read_only_request(objective)
+    user_requested_read_only = (
+        bool(read_only)
+        or resume_plan_read_only
+        or is_explicit_read_only_request(objective)
+    )
     _read_only_reject_count = 0
     selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)
     tools: list[dict[str, Any]] = (
@@ -6300,6 +6404,11 @@ async def _run_local_agent_turn_impl(
     })
     if resumed_from_checkpoint or resumed_from_legacy or _requests_autonomous_execution(incoming_objective):
         working_messages.insert(insert_at + 1, {"role": "system", "content": RESUME_EXECUTION_INSTRUCTION})
+    if resume_requested:
+        contract_plan = resume_snapshot or getattr(orchestration, "plan", None)
+        contract = _resume_step_contract(contract_plan)
+        if contract:
+            working_messages.insert(insert_at + 1, {"role": "system", "content": contract})
     # A resumed turn is governed by the mode/classification in effect now,
     # not by the stale label stored by the interrupted turn. In particular,
     # an old audit checkpoint can be resumed after the user explicitly asks
@@ -8963,6 +9072,23 @@ async def _run_local_agent_turn_impl(
             # Protocol-invalid names are answered as rejected tool calls, not
             # sent through risk classification or approval. This is the final
             # safety boundary for provider channel-marker leakage.
+            # A particularly common case is a resumed read-only plan step: a
+            # model asks for execute_command even though that tool was
+            # deliberately not advertised. Do not let it bounce on the same
+            # rejected call; explain the mode boundary and point it at the
+            # tools that are actually available.
+            invalid_names = [
+                str(call.name) for call in tool_calls
+                if call.call_id in invalid_tool_ids
+            ]
+            repeated_invalid = stuck_reason is not None
+            if repeated_invalid:
+                outcome = await _handle_stuck_loop(stuck_reason, tool_calls)
+                if outcome is not None:
+                    if outcome.status == "continue":
+                        continue
+                    return outcome
+                continue
             for invalid_call in tool_calls:
                 if invalid_call.call_id not in invalid_tool_ids:
                     continue
@@ -8986,9 +9112,16 @@ async def _run_local_agent_turn_impl(
             working_messages.append({
                 "role": "system",
                 "content": (
-                    "One or more requested tool names were invalid and were not executed. "
-                    "Retry with the exact registered tool name from the offered tool list; "
-                    "never append <|channel|> or recipient/commentary markers to it."
+                    "One or more requested tool names were invalid and were not executed: "
+                    + ", ".join(invalid_names)
+                    + ". Retry with an exact registered tool from the offered tool list; "
+                    "never append <|channel|> or recipient/commentary markers to it. "
+                    + (
+                        "This is a read-only resumed plan step: execute_command is intentionally "
+                        "unavailable. Do not request it again; use read_file, list_directory, "
+                        "search_code, find_references, or get_git_info for inspection."
+                        if turn_read_only else ""
+                    )
                 ),
             })
             _persist_turn_checkpoint()

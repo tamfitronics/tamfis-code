@@ -2119,7 +2119,12 @@ class StreamRenderer:
             path = payload.get("path", "?")
             added, removed = payload.get("lines_added", 0), payload.get("lines_removed", 0)
             mutation_id = payload.get("mutation_id", "?")
-            label = _change_kind(path)
+            # Keep the in-situ mutation update useful after the plan/tool
+            # record scrolls away: the file path is the user's anchor for
+            # deciding whether this was an intended change.  The old compact
+            # label only said "Code updated", which made the path disappear
+            # from the live transcript and forced users to open /diff.
+            label = f"{_change_kind(path)} · {path}"
             # A continuation of the "⎿ Edited path" line above it, not a separate
             # card: same information (kind, size, /diff and /revert handles).
             self.console.print(

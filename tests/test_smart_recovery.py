@@ -10,6 +10,7 @@ from tamfis_code.orchestrator.validator import changed_paths_from_evidence
 from tamfis_code.return_recap import _first_sentences, _strip_context_chain, build_return_recap
 from tamfis_code.runner_local import (
     _checkpoint_resume_objective, _is_machine_generated_objective, _is_real_resume_objective, _is_resume_request,
+    _resume_step_contract, _resume_step_is_read_only,
 )
 
 
@@ -41,6 +42,21 @@ class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
         recovered = _checkpoint_resume_objective(checkpoint)
         self.assertEqual(recovered, "Fix the TypeError in serve2.py SSE streaming")
         self.assertNotIn("Additional user context", recovered)
+
+    def test_read_only_saved_step_cannot_escalate_repair_wording(self):
+        from types import SimpleNamespace
+
+        snapshot = SimpleNamespace(
+            resume_step_name="Read pyproject.toml and requirements.txt for declared entry points and dependencies",
+        )
+        self.assertTrue(_resume_step_is_read_only(self.MACHINE[1], snapshot))
+        self.assertIn("Work on this step only", _resume_step_contract(snapshot))
+
+    def test_mutating_saved_step_remains_executable(self):
+        from types import SimpleNamespace
+
+        snapshot = SimpleNamespace(resume_step_name="Implement the fix in serve2.py")
+        self.assertFalse(_resume_step_is_read_only(self.MACHINE[1], snapshot))
 
 
 class UserStopIsNotAFailureTests(unittest.TestCase):
