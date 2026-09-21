@@ -22,6 +22,8 @@ class ClassifyCommandRiskTests(unittest.TestCase):
     def test_allowlisted_inspection_command_is_read_only(self):
         self.assertEqual(classify_command_risk("ls -la"), RISK_READ_ONLY)
         self.assertEqual(classify_command_risk("cat /etc/postgresql/17/main/pg_hba.conf"), RISK_READ_ONLY)
+        self.assertEqual(classify_command_risk("ps aux | grep train_frontier"), RISK_READ_ONLY)
+        self.assertEqual(classify_command_risk("pgrep -af train_frontier"), RISK_READ_ONLY)
 
     def test_inspection_program_write_or_exec_flags_are_not_read_only(self):
         for command in (

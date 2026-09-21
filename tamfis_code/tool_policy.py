@@ -36,6 +36,12 @@ READ_TOOLS = [
     "list_external_agent_sessions", "read_external_agent_session",
     "write_todos",
 ]
+# A read-only shell inspection surface is still useful for process/service
+# status. It is the same registered tool name, but safety.py classifies the
+# command itself and the runner rejects anything outside the read-only command
+# grammar. Advertising this constrained surface prevents models from emitting
+# an "unknown or unoffered execute_command" call during audits.
+READ_ONLY_INSPECTION_TOOLS = [*READ_TOOLS, "execute_command"]
 EDIT_TOOLS = [
     *READ_TOOLS,
     "execute_command",
@@ -57,7 +63,7 @@ def allowed_tools(profile: TaskProfile, *, read_only: bool) -> list[str]:
     if profile.is_plain_conversation:
         return []
     if read_only or profile.task_type in {TaskType.INSPECT, TaskType.AUDIT, TaskType.PLAN}:
-        return READ_TOOLS
+        return READ_ONLY_INSPECTION_TOOLS
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG, TaskType.MIXED, TaskType.QUESTION}:
         return EDIT_TOOLS
     if profile.task_type in {TaskType.TEST, TaskType.EXECUTE}:

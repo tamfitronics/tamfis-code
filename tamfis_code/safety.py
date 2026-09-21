@@ -126,6 +126,7 @@ def classify_command_risk(command: str) -> str:
 _READ_ONLY_COMMANDS = {
     "cat", "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
     "uniq", "wc", "stat", "file", "du", "tree", "realpath", "readlink",
+    "ps", "pgrep",
     "awk", "sed",
     # Live-reproduced (2026-08-30): a read-only audit turn had a real,
     # non-mutating validation command to run -- `php -l file.php` (PHP's
