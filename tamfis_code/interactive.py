@@ -1184,12 +1184,14 @@ async def _run_interactive_impl(
         resource that needs an orderly close, unlike local_pty.
         """
         nonlocal _available_update
-        # First pass shortly after start (once the prompt session exists), then every 30 minutes --
-        # a live release notice, not a poll storm. A refresh is skipped when another process refreshed
-        # the shared on-disk cache within the last 20 minutes.
+        # First pass shortly after start (once the prompt session exists), then
+        # once per minute. A release can be published while a REPL is running;
+        # a 20-minute cache gate plus a 30-minute sleep made the notification
+        # invisible for up to 50 minutes. The one-minute shared-cache gate is
+        # still bounded and prevents a process fleet from creating a poll storm.
         await asyncio.sleep(2)
         while True:
-            if cache_age_seconds() > 20 * 60:
+            if cache_age_seconds() > 60:
                 try:
                     found = await asyncio.to_thread(refresh_update_cache)
                 except Exception:
@@ -1199,7 +1201,7 @@ async def _run_interactive_impl(
                     app = getattr(session, "app", None)
                     if app is not None and getattr(app, "is_running", False):
                         app.invalidate()
-            await asyncio.sleep(1800)
+            await asyncio.sleep(60)
 
     asyncio.create_task(_poll_for_live_updates())
 
