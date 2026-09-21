@@ -141,6 +141,28 @@ _READ_ONLY_COMMANDS = {
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
 
 
+def is_process_inspection_command(command: str) -> bool:
+    """Allow only bounded process inspection in read-only shell mode."""
+    try:
+        lexer = shlex.shlex(command or "", posix=True, punctuation_chars="|;&<>")
+        lexer.whitespace_split = True
+        tokens = list(lexer)
+    except ValueError:
+        return False
+    if not tokens or any(token in {";", "&", "&&", "||", ">", ">>", "<"} for token in tokens):
+        return False
+    segments: list[list[str]] = [[]]
+    for token in tokens:
+        if token == "|":
+            if not segments[-1]:
+                return False
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    allowed = {"ps", "pgrep", "grep", "rg", "head", "tail", "sort", "uniq"}
+    return bool(segments[-1]) and all(Path(segment[0]).name in allowed for segment in segments)
+
+
 def _is_read_only_command(command: str) -> bool:
     """Conservatively recognize shell commands that only inspect state."""
     # Discard only the common stderr-to-/dev/null suffix used by discovery

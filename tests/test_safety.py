@@ -15,6 +15,7 @@ from tamfis_code.safety import (
     redact_secrets,
     revert_mutation,
     revert_transaction,
+    is_process_inspection_command,
 )
 
 
@@ -24,6 +25,12 @@ class ClassifyCommandRiskTests(unittest.TestCase):
         self.assertEqual(classify_command_risk("cat /etc/postgresql/17/main/pg_hba.conf"), RISK_READ_ONLY)
         self.assertEqual(classify_command_risk("ps aux | grep train_frontier"), RISK_READ_ONLY)
         self.assertEqual(classify_command_risk("pgrep -af train_frontier"), RISK_READ_ONLY)
+
+    def test_process_inspection_allowlist_has_no_file_read_or_control(self):
+        self.assertTrue(is_process_inspection_command("ps aux | grep train_frontier"))
+        self.assertTrue(is_process_inspection_command("pgrep -af train_frontier | head -20"))
+        self.assertFalse(is_process_inspection_command("cat /etc/shadow"))
+        self.assertFalse(is_process_inspection_command("kill 1234"))
 
     def test_inspection_program_write_or_exec_flags_are_not_read_only(self):
         for command in (

@@ -105,6 +105,7 @@ from .safety import (
     _unified_diff,
     classify_tool_call_risk,
     redact_secrets,
+    is_process_inspection_command,
 )
 from .sandbox import SandboxPolicy
 from .workspace import classify_root, detect_validation_commands, load_instruction_text, scratch_root
@@ -9928,6 +9929,27 @@ async def _run_local_agent_turn_impl(
                 tc.name, arguments, workspace_root=workspace_root,
                 extra_safe_roots=(scratch_root(session_id), *scope_roots),
             )
+            if turn_read_only and tc.name == "execute_command" and not is_process_inspection_command(
+                str(arguments.get("command") or "")
+            ):
+                result = {
+                    "success": False,
+                    "read_only_blocked": True,
+                    "error": (
+                        "Read-only execute_command is limited to process inspection: "
+                        "ps/pgrep with optional grep/rg/head/tail/sort/uniq filters. "
+                        "Use read_file/search_code/list_directory for repository inspection."
+                    ),
+                }
+                working_messages.append({
+                    "role": "tool", "tool_call_id": tc.call_id,
+                    "content": json.dumps(result),
+                })
+                renderer.handle_event({
+                    "event_type": "tool_output",
+                    "payload": {"tool": tc.name, "result": result},
+                })
+                continue
             permission_decision = _turn_permission_decisions.get(tc.call_id)
 
             if turn_read_only and risk != "read_only":
