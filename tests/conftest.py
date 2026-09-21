@@ -84,3 +84,23 @@ def _isolate_tamfis_env(monkeypatch, tmp_path):
     # construct SandboxPolicy directly with explicit kwargs, never going
     # through Config at all.
     monkeypatch.setattr(_runner_local_module, "Config", _TestConfig)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_provider_health(monkeypatch):
+    """Route health is process-global. A test that trips a circuit (or a real machine's Ollama
+    pacing counter) must not decide whether an unrelated test can resolve a provider -- that made
+    test_routing's AUTO-route test fail only in a full run ("No configured AI provider")."""
+    from tamfis_code import ollama_pacing, providers
+
+    with providers._HEALTH_LOCK:
+        saved = dict(providers._ROUTE_HEALTH)
+        providers._ROUTE_HEALTH.clear()
+    # Never let this machine's real Ollama usage decide test routing; test_ollama_pacing sets its own.
+    monkeypatch.setenv("TAMFIS_CODE_OLLAMA_WEEKLY_BUDGET", "0")
+    ollama_pacing._cache = (0.0, 0, 0)
+    yield
+    with providers._HEALTH_LOCK:
+        providers._ROUTE_HEALTH.clear()
+        providers._ROUTE_HEALTH.update(saved)
+    ollama_pacing._cache = (0.0, 0, 0)

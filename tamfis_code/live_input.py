@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import re
 import sys
 import time
@@ -23,9 +24,12 @@ from prompt_toolkit.formatted_text import ANSI, FormattedText, HTML, to_formatte
 from prompt_toolkit.styles import Style
 
 from . import state as local_state
+import logging
+from .terminal_guard import TerminalGuard, disable_focus_reporting
 from .config import Config, mode_label_for_policy, next_mode_in_cycle
 from .render import StreamRenderer
 
+_log = logging.getLogger("tamfis_code.live_input")
 _SHIFT_TAB = b"\x1b[Z"
 # Retained only for backwards-compatible imports. Ctrl+Y is no longer read
 # specially by the live listener; it is ordinary editable prompt input.
@@ -98,6 +102,27 @@ def _tip_text(session_id: Optional[int] = None, active_agents: int = 0) -> str:
     if not applicable:
         applicable = [text for _, text in _ROTATING_TIPS]
     return applicable[int(time.monotonic() // _TIP_ROTATE_SECONDS) % len(applicable)]
+
+
+_TERMINAL_NOISE_RE = re.compile(r"\x1b\[[0-9;?<>=]*[ -/]*[@-~]|\x1b[O@-Z\\-_]|\x1b|[\x00-\x08\x0b\x0c\x0e-\x1a\x1c-\x1f\x7f]")
+
+
+def strip_terminal_noise(text: str) -> str:
+    """Remove terminal control sequences/bytes that leaked into typed text.
+
+    Defence in depth only -- the primary fix is that the key decoder consumes
+    them (focus events, Shift+Tab, arrows) and that a prompt always owns the
+    tty. A control sequence must never reach the model or the scrollback as
+    ordinary text. Newlines/tabs are kept.
+    """
+    return _TERMINAL_NOISE_RE.sub("", text or "")
+
+
+def _format_ago(seconds: float) -> str:
+    total = int(seconds)
+    if total < 60:
+        return f"{total}s ago"
+    return f"{total // 60}m {total % 60}s ago"
 
 
 def _truncate(text: str, limit: int) -> str:
@@ -461,6 +486,15 @@ class LiveInputListener:
         # and a fast pause/resume race can enqueue half-typed text.
         self._prompt_exit_requested = False
         self._draft_text = ""
+        # Keyboard-ownership bookkeeping (see _supervised_input_loop): the prompt
+        # is restarted if it ends while the task is still running, and a hard
+        # terminal hang-up is told apart from a stray Ctrl+D.
+        self._terminal = TerminalGuard()
+        self._eof_times: list[float] = []
+        self._input_restarts: list[float] = []
+        self._stall_reported = False
+        self._input_exit_expected = False
+        self._loop_lag_reported = 0.0
         # A footer callback runs for every redraw and keystroke. Snapshot the
         # count once per listener instead of touching the multi-megabyte
         # session-state file from prompt-toolkit's latency-sensitive path.
@@ -479,6 +513,11 @@ class LiveInputListener:
         self.renderer.suspend_live()
         self.renderer.live_input_listener = self
         self._active = True
+        self._terminal.snapshot()
+        disable_focus_reporting()
+        from .runtime.progress import configure_execution_log
+
+        configure_execution_log()
         self._ticker_task = asyncio.create_task(self._status_ticker())
         self._schedule_prompt()
 
@@ -512,6 +551,7 @@ class LiveInputListener:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await ticker
         await self._shutdown_prompt()
+        self._terminal.restore()
         try:
             from .message_viewer import VIEWER
 
@@ -544,12 +584,59 @@ class LiveInputListener:
     async def _status_ticker(self) -> None:
         """Animate and update elapsed time even during silent provider waits."""
         try:
+            last_wake = time.monotonic()
             while self._active:
                 await asyncio.sleep(_STATUS_REFRESH_INTERVAL_SECONDS)
+                now = time.monotonic()
+                # If this 0.25s sleep took seconds, something ran synchronously on
+                # the event loop -- and the keyboard was frozen for that long.
+                lag = now - last_wake - _STATUS_REFRESH_INTERVAL_SECONDS
+                last_wake = now
+                if lag > 2.0 and now - self._loop_lag_reported > 30.0:
+                    self._loop_lag_reported = now
+                    _log.warning("event loop blocked for %.1fs (keyboard unresponsive meanwhile)", lag)
                 self._status_tick = (self._status_tick + 1) % _STATUS_TICK_PERIOD
+                self._watchdog_check()
                 self.invalidate()
         except asyncio.CancelledError:
             raise
+
+    def _watchdog_check(self) -> None:
+        """Diagnose a run that has stopped making meaningful progress.
+
+        The request-level timeouts (first byte / idle / total, runner_local) are
+        the primary defence and switch route on their own. This is the backstop
+        for the case they miss: a model request that has produced nothing at all
+        for ``provider_abort`` seconds is stopped explicitly -- with a checkpoint
+        and a `continue` -- instead of leaving a spinner running over a dead
+        request. Long tools/commands are never touched: only WAITING_PROVIDER.
+        """
+        progress = getattr(self.renderer, "progress", None)
+        if progress is None or self._interrupt_classification is not None:
+            return
+        snap = progress.snapshot()
+        if snap.state.value == "stalled" and not self._stall_reported:
+            self._stall_reported = True
+            _log.warning("watchdog: provider silent for %.0fs; awaiting route replacement", snap.idle_seconds)
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": (
+                    f"⚠ The model has not responded for {int(snap.idle_seconds)}s — "
+                    "replacing the request automatically…"
+                )},
+            })
+        elif snap.state.value not in {"stalled"} and snap.idle_seconds < 5:
+            self._stall_reported = False
+        if progress.should_abort_provider_wait():
+            _log.error("watchdog: aborting provider wait after %.0fs without progress", snap.idle_seconds)
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": (
+                    f"⚠ Provider stopped responding ({int(snap.idle_seconds)}s with no output) — "
+                    "stopping the stuck request. Your work is checkpointed; type `continue` to resume."
+                )},
+            })
+            self._request_interrupt("stall")
 
     def pause(self) -> None:
         """Synchronously request prompt shutdown before another UI reads stdin.
@@ -620,7 +707,7 @@ class LiveInputListener:
 
     def _schedule_prompt(self) -> None:
         if self._input_task is None or self._input_task.done():
-            self._input_task = asyncio.create_task(self._input_loop())
+            self._input_task = asyncio.create_task(self._supervised_input_loop())
 
     def _request_prompt_exit(self) -> None:
         session = self._prompt_session
@@ -765,6 +852,12 @@ class LiveInputListener:
                 headline_html, f"<ansiyellow>{_xml_escape(note)}</ansiyellow> ",
             )
         lines.append(headline_html)
+        try:
+            queued = max(0, self.renderer.steering_revision() - self.renderer._steering_handled_revision)
+        except Exception:
+            queued = 0
+        if queued:
+            lines.append(f" <ansigray>↳ {queued} follow-up{'s' if queued != 1 else ''} queued</ansigray>")
         pending_update = getattr(self.renderer, "pending_update_version", None)
         if pending_update:
             # Informational only: self_update.py's apply_update()/reexec()
@@ -847,6 +940,23 @@ class LiveInputListener:
         @bindings.add("escape", "[", "O")
         def _ignore_focus_out(event) -> None:
             return
+
+        @bindings.add("c-d")
+        def _ctrl_d_is_not_exit(event) -> None:
+            # prompt_toolkit's default Ctrl+D on an empty line ends the prompt with
+            # EOFError. Mid-task that used to END THE LIVE COMPOSER silently: the
+            # task kept running, the tty fell back to cooked/echo mode and every
+            # later key (Esc, focus events, Enter) was painted as "^[" / "^[[O"
+            # text while nothing read it. Ctrl+D now never exits the prompt; Esc /
+            # Ctrl+C are the (advertised) ways to stop a running task.
+            buffer = event.current_buffer
+            if buffer.text:
+                buffer.delete(1)
+                return
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": "◆ Ctrl+D does not exit while a task is running — press Esc or Ctrl+C to stop it."},
+            })
 
         @bindings.add("s-tab")
         def _cycle_running_mode(event) -> None:
@@ -1001,16 +1111,21 @@ class LiveInputListener:
                 except asyncio.CancelledError:
                     raise
                 except KeyboardInterrupt:
+                    self._input_exit_expected = True
                     self._request_interrupt("cancel")
                     return
                 except EOFError:
-                    return
+                    if self._handle_input_eof():
+                        self._input_exit_expected = True
+                        return
+                    continue
                 except Exception as exc:
                     # Defense in depth: if a future prompt_toolkit version
                     # ever does propagate this race through the coroutine
                     # instead of the loop exception handler above, still
                     # treat it as an ordinary interrupt rather than crashing.
                     if "Return value already set" in str(exc) or "Application.exit()" in str(exc):
+                        self._input_exit_expected = True
                         self._request_interrupt("cancel")
                         return
                     raise
@@ -1021,20 +1136,91 @@ class LiveInputListener:
                 forced_exit = self._prompt_exit_requested
                 self._prompt_exit_requested = False
                 if forced_exit or self._paused:
+                    self._input_exit_expected = True
                     break
                 if self._draft_text and not text.strip():
                     text, self._draft_text = self._draft_text, ""
                 self._enqueue(text)
                 if not self._active:
+                    self._input_exit_expected = True
                     break
+            else:
+                # while-condition went false: stopped/paused from outside.
+                self._input_exit_expected = True
         finally:
             loop.set_exception_handler(self._previous_loop_exception_handler)
             self._previous_loop_exception_handler = None
             if self._prompt_session is session:
                 self._prompt_session = None
+
+    async def _supervised_input_loop(self) -> None:
+        """Keep a working composer for as long as the task runs.
+
+        ``_input_loop`` used to be the whole story: any way of leaving it (EOF,
+        an exception inside prompt_toolkit, a rendering error) ended keyboard
+        ownership permanently while the task went on -- a frozen frame, cooked
+        tty, Enter and Esc dead. Any exit the listener did not itself ask for is
+        now logged, surfaced once, and the composer is restarted; if it cannot be
+        kept alive, the tty echo is muted (so keys are never painted as ``^[``)
+        and the user is told plainly instead of being shown a dead prompt.
+        """
+        try:
+            while self._active and not self._paused and self._interrupt_classification is None:
+                self._input_exit_expected = False
+                try:
+                    await self._input_loop()
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _log.error("live composer failed: %s: %s", type(exc).__name__, exc)
+                if (
+                    self._input_exit_expected
+                    or not self._active
+                    or self._paused
+                    or self._interrupt_classification is not None
+                ):
+                    break
+                now = time.monotonic()
+                self._input_restarts = [t for t in self._input_restarts if now - t < 10.0] + [now]
+                if len(self._input_restarts) > 5:
+                    _log.error("live composer could not be kept alive; giving up input for this turn")
+                    self._terminal.mute_echo()
+                    self.renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {"content": (
+                            "⚠ The message box stopped working — keys are not being read. The task is still "
+                            "running; Ctrl+C stops it. Type your follow-up at the next prompt."
+                        )},
+                    })
+                    break
+                _log.warning("live composer ended unexpectedly; restarting it")
+                await asyncio.sleep(0.1)
+        finally:
             current = asyncio.current_task()
             if self._input_task is current:
                 self._input_task = None
+
+    def _stdin_closed(self) -> bool:
+        try:
+            if getattr(sys.stdin, "closed", False):
+                return True
+            return not os.isatty(sys.stdin.fileno())
+        except Exception:
+            return True
+
+    def _handle_input_eof(self) -> bool:
+        """True when EOF means the terminal is really gone (stop the task)."""
+        now = time.monotonic()
+        self._eof_times = [t for t in self._eof_times if now - t < 3.0] + [now]
+        if self._stdin_closed() or len(self._eof_times) >= 3:
+            _log.error("terminal input closed (EOF); stopping the running task")
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": "◆ Terminal input closed — stopping the running task."},
+            })
+            self._request_interrupt("exit")
+            return True
+        return False
 
     def _handle_prompt_loop_exception(self, loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
         """Loop-level exception handler installed for the duration of each
@@ -1082,7 +1268,12 @@ class LiveInputListener:
 
         self._interrupt_classification = classification
         self._paused = True
-        self._enqueue_control(classification)
+        with contextlib.suppress(Exception):
+            self.renderer.progress.request_cancel()
+        if classification != "stall":
+            # "stall" is the watchdog's own stop, not a user instruction: there is
+            # nothing to persist for another terminal or the next turn to replay.
+            self._enqueue_control(classification)
 
         if self._interrupt_callback is not None:
             self._interrupt_callback(classification)
@@ -1168,7 +1359,7 @@ class LiveInputListener:
         return True
 
     def _enqueue(self, text: str) -> None:
-        text = text.strip()
+        text = strip_terminal_noise(text).strip()
         if text.lower() == "/update":
             pending = getattr(self.renderer, "pending_update_version", None)
             if not pending:
@@ -1206,6 +1397,10 @@ class LiveInputListener:
             if self._active and not self._paused:
                 self._schedule_prompt()
             return
+        if self._handle_status_command(text):
+            if self._active and not self._paused:
+                self._schedule_prompt()
+            return
         editing_id = self._editing_instruction_id
         self._editing_instruction_id = None
         if editing_id and local_state.edit_queued_instruction(self.session_id, editing_id, text):
@@ -1231,17 +1426,75 @@ class LiveInputListener:
             "event_type": "user_message",
             "payload": {"content": text},
         })
+        _log.info("follow-up queued id=%s session=%s chars=%d", item.id, self.session_id, len(text))
         self.renderer.handle_event({
             "event_type": "diagnostics",
             "payload": {
                 "content": (
-                    f"◆ Steering update sent {item.id}: {text} "
-                    "-- applying it to the active task now."
+                    f"↳ Follow-up queued ({item.id}): {_truncate(text, 120)} "
+                    "-- the running task picks it up at the next safe step."
                 ),
             },
         })
         if self._active and not self._paused:
             self._schedule_prompt()
+
+    def live_status_lines(self) -> list[str]:
+        """Facts about the running task, for `/status` typed mid-task.
+
+        Deliberately mechanical: state, step, provider (public product name only),
+        time since the last meaningful progress, pending tools and follow-ups. No
+        keys, no internal route identifiers, no model reasoning.
+        """
+        from .public_identity import public_model_name
+
+        progress = self.renderer.progress
+        snap = progress.snapshot()
+        steps = [
+            item for item in (getattr(self.renderer, "_plan_steps", None) or [])
+            if isinstance(item, dict) and item.get("step")
+        ]
+        active = next((i for i in steps if str(i.get("status")) == "in_progress"), None) \
+            or next((i for i in steps if str(i.get("status") or "pending") == "pending"), None)
+        step_text = _truncate(active["step"], 100) if active else _truncate(
+            self.renderer.current_activity(include_command=False), 100,
+        )
+        done = sum(1 for i in steps if str(i.get("status")) == "completed")
+        model = getattr(self.renderer, "_model", None)
+        pending = 0
+        with contextlib.suppress(Exception):
+            pending = max(0, self.renderer.steering_revision() - self.renderer._steering_handled_revision)
+        queued_total = pending
+        with contextlib.suppress(Exception):
+            queued_total = max(pending, sum(
+                1 for item in local_state.get_session_state(self.session_id).queued_user_instructions
+                if item.get("status") == "queued"
+            ))
+        lines = [
+            f"Current step: {step_text}",
+            f"State: {snap.label}",
+            f"Provider: {public_model_name(model) if model else 'TamfisGPT'}",
+            f"Last progress: {_format_ago(snap.idle_seconds)} ({snap.last_event})",
+            f"Pending tools: {snap.pending_tools}",
+            f"Queued follow-ups: {queued_total}",
+        ]
+        if steps:
+            lines.insert(1, f"Plan: {done}/{len(steps)} steps done")
+        return lines
+
+    def _handle_status_command(self, text: str) -> bool:
+        """`/status` typed into the live composer answers locally, at once.
+
+        It used to be queued as a steering message ("You: /status") and handed to
+        the model, which could not answer it while blocked on a provider call.
+        """
+        if text.lower() != "/status":
+            return False
+        for line in self.live_status_lines():
+            self.renderer.handle_event({
+                "event_type": "diagnostics", "payload": {"content": f"◆ {line}"},
+            })
+        return True
 
     def _handle_btw_command(self, text: str) -> bool:
         """Dispatch `/btw` outside the active turn's steering queue.

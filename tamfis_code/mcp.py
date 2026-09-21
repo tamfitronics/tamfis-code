@@ -15,6 +15,7 @@ import sys
 import shutil
 import tarfile
 import tempfile
+import threading
 import time
 import uuid
 import zipfile
@@ -482,6 +483,39 @@ def _unescape_partial_json_string(text: str) -> str:
         out.append(nxt)
         index += 2
     return "".join(out)
+
+
+
+async def run_blocking_bounded(fn: Callable[[], Any], timeout: float) -> Any:
+    """Run synchronous filesystem/CPU work off the event loop, bounded in time.
+
+    Tool handlers are coroutines, but several did plain blocking work directly
+    on the loop (recursive directory walks, whole-tree symbol indexing, the
+    pure-Python search fallback). While that ran the ENTIRE terminal froze --
+    keystrokes, Esc, Ctrl+C and the status clock included -- because prompt
+    input is served by the same loop. The work now runs on a daemon thread (a
+    stuck one can never block interpreter shutdown, unlike a default-executor
+    worker) and the caller gets ``asyncio.TimeoutError`` after ``timeout``.
+    """
+    loop = asyncio.get_running_loop()
+    future: "asyncio.Future[Any]" = loop.create_future()
+
+    def _settle(setter: Callable[[Any], None], value: Any) -> None:
+        if not future.done():
+            setter(value)
+
+    def _worker() -> None:
+        try:
+            value = fn()
+        except BaseException as exc:  # noqa: BLE001 - handed to the awaiting task
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(_settle, future.set_exception, exc)
+        else:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(_settle, future.set_result, value)
+
+    threading.Thread(target=_worker, name="tamfis-blocking-tool", daemon=True).start()
+    return await asyncio.wait_for(future, timeout=timeout)
 
 
 class MCPServer:
@@ -1855,7 +1889,13 @@ class MCPServer:
                     # the rest of a useful directory listing.
                     continue
 
-        visit(p, requested_depth)
+        try:
+            await run_blocking_bounded(lambda: visit(p, requested_depth), timeout=30.0)
+        except asyncio.TimeoutError:
+            return [{"error": (
+                f"Listing '{path}' took longer than 30s and was stopped. "
+                "Use a narrower path or search_code for a targeted query."
+            )}]
         # Recursive traversal is emitted in path order so the result remains
         # deterministic even when directory iteration order differs by host.
         results = sorted(results, key=lambda x: str(x.get("path", "")))
@@ -1979,10 +2019,19 @@ class MCPServer:
             # portable install must retain search functionality without a
             # host-specific binary, so use the same bounds and exclusions in
             # a small standard-library fallback.
-            return self._search_code_python(query, resolved_path, file_pattern)
+            deadline = time.monotonic() + 30.0
+            try:
+                return await run_blocking_bounded(
+                    lambda: self._search_code_python(query, resolved_path, file_pattern, deadline=deadline),
+                    timeout=35.0,
+                )
+            except asyncio.TimeoutError:
+                return [{"error": "Search timed out"}]
 
     @staticmethod
-    def _search_code_python(query: str, root: Path, file_pattern: Optional[str]) -> List[Dict[str, Any]]:
+    def _search_code_python(
+        query: str, root: Path, file_pattern: Optional[str], *, deadline: Optional[float] = None,
+    ) -> List[Dict[str, Any]]:
         try:
             matcher = re.compile(query)
         except re.error as exc:
@@ -1992,6 +2041,9 @@ class MCPServer:
             paths = [root] if root.is_file() else sorted(root.rglob("*"))
             for candidate in paths:
                 if len(matches) >= _SEARCH_POOL_LIMIT:
+                    break
+                if deadline is not None and time.monotonic() > deadline:
+                    matches.append({"truncated": True, "note": "Search stopped at its time limit; narrow the path or query."})
                     break
                 if not candidate.is_file() or candidate.stat().st_size > MAX_SEARCH_FILE_SIZE_BYTES:
                     continue
@@ -2053,12 +2105,20 @@ class MCPServer:
                     temp_index = tempfile.TemporaryDirectory(prefix="tamfis-symbol-index-")
                     self._symbol_index_dirs[root_key] = temp_index
                 indexer = CodeIndexer(root, index_path=Path(temp_index.name))
-                indexer.index()
-                definitions = [
-                    {"name": sym.name, "kind": sym.kind, "file": sym.file_path, "line": sym.line_start}
-                    for sym in indexer.search_symbol(symbol)
-                    if sym.name == symbol  # search_symbol matches substrings; only exact names are real definitions
-                ]
+
+                def _index_and_lookup() -> List[Dict[str, Any]]:
+                    indexer.index()
+                    return [
+                        {"name": sym.name, "kind": sym.kind, "file": sym.file_path, "line": sym.line_start}
+                        for sym in indexer.search_symbol(symbol)
+                        if sym.name == symbol  # search_symbol matches substrings; only exact names are real definitions
+                    ]
+
+                # Whole-tree indexing used to run synchronously on the event
+                # loop -- pointed at a large tree it froze the terminal for
+                # minutes. Bounded and off-loop now; on timeout the textual
+                # reference search below still answers.
+                definitions = await run_blocking_bounded(_index_and_lookup, timeout=20.0)
             except Exception:
                 pass  # indexing is best-effort -- the reference search below still works standalone
 
@@ -2497,6 +2557,10 @@ class MCPServer:
             command = ['git', '-C', str(p), *args]
             proc = await asyncio.create_subprocess_exec(
                 *command,
+                # Never hand a child the real TTY: a git hook or credential
+                # helper reading it would eat the user's keystrokes (see
+                # _execute_command for the full rationale).
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )

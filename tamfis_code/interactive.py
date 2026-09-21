@@ -137,6 +137,20 @@ async def _run_cancellable_local_turn(
             live_input.set_outcome_status(outcome.status)
             return outcome
 
+        if classification == "stall":
+            # The stall watchdog stopped a model request that produced nothing
+            # for far longer than any provider timeout. That is a FAILURE with a
+            # checkpoint, not a user cancellation.
+            outcome = TaskOutcome(
+                status="failed",
+                error=(
+                    "The provider stopped responding and the request was stopped. "
+                    "Your work is checkpointed -- type `continue` to resume."
+                ),
+            )
+            live_input.set_outcome_status(outcome.status)
+            return outcome
+
         outcome = TaskOutcome(
             status="cancelled",
             error="Task cancelled by user.",

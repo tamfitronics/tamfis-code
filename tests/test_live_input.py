@@ -529,7 +529,7 @@ class CtrlTInjectsFollowUpTests(_StatePatchMixin, unittest.IsolatedAsyncioTestCa
         self.assertEqual(queued[0]["text"], "also check the login page")
         self.assertEqual(queued[0]["classification"], "follow_up")
         rendered = renderer.console.file.getvalue()
-        self.assertIn("Steering update sent", rendered)
+        self.assertIn("Follow-up queued", rendered)
         self.assertIn("also check the login page", rendered)
 
     @patch("prompt_toolkit.PromptSession.prompt_async", new_callable=AsyncMock, return_value="   ")

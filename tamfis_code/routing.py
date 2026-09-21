@@ -113,7 +113,12 @@ _EXPLICIT_MUTATION_RE = re.compile(
     r"\bmake\b.{0,80}\b(?:better|faster|smarter|safer|like|resemble|changes?)\b|"
     r"\bresemble\b|\bedit\b|\bmodify\b|\brewrite\b|\brefactor\b|"
     r"\bcreate\b|\badd\b|\bremove\b|\bdelete\b|\bchange\b|"
-    r"\bwrite\b.{0,24}\bfiles?\b|\bcommit\b|\bpush\b|\brestart\b|\binstall\b|"
+    r"\bwrite\b.{0,24}\bfiles?\b|"
+    # "write a throwaway script to /tmp and run it" names no "file" but plainly
+    # creates one. Without this it classified as EXECUTE, whose tool set has no
+    # write_file, so the model could only heredoc the script through the shell.
+    r"\bwrite\b.{0,40}\b(?:scripts?|programs?|modules?|snippets?)\b|"
+    r"\bcommit\b|\bpush\b|\brestart\b|\binstall\b|"
     # "execute the instructions" / "retry automatically" are EXECUTION
     # directives (run, act, redo on failure), not requests to merely read
     # and report -- live-confirmed 2026-09: "read and executed the

@@ -25,6 +25,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import logging
 import inspect
 import json
 import os
@@ -499,6 +500,20 @@ try:
 except (TypeError, ValueError):
     STREAM_IDLE_TIMEOUT_SECONDS = 90.0
 
+# The idle bound above only helps if "activity" means the model actually SAID
+# something. A provider that keeps the connection alive with empty-delta chunks
+# (or role-only / usage-only chunks) reset that timer on every chunk and could
+# hold "Waiting for the model's next step" forever. The idle clock now moves only
+# on a chunk that carries reasoning, content or a tool-call delta, and a whole
+# request is additionally bounded by an overall deadline so even a slow drip
+# cannot run unbounded. 20 minutes is far beyond any legitimate single response.
+try:
+    STREAM_TOTAL_TIMEOUT_SECONDS = max(
+        30.0, float(os.getenv("TAMFIS_CODE_STREAM_TOTAL_TIMEOUT", "1200"))
+    )
+except (TypeError, ValueError):
+    STREAM_TOTAL_TIMEOUT_SECONDS = 1200.0
+
 # ROUTE-CHURN FIX (2026-09-19, live-reported): the idle timeout above bounds
 # the gap between chunks, but NOT the wait for the first one. The SDK's own
 # timeout is 120s (providers.py's AsyncOpenAI(timeout=120.0, max_retries=0)),
@@ -516,6 +531,49 @@ try:
     )
 except (TypeError, ValueError):
     PROVIDER_FIRST_BYTE_TIMEOUT_SECONDS = 25.0
+
+# Per-call bound for tool calls in a parallel batch. execute_command, browser
+# and ask_user_question are deliberately exempt: a shell command carries its own
+# (model/user chosen) timeout and background handoff, the browser has its own
+# navigation limits, and asking the user is waiting on a human. Everything else
+# is local read/search/index work that must finish or report failure.
+_TOOL_CALL_TIMEOUT_EXEMPT = frozenset({"execute_command", "browser", "ask_user_question"})
+try:
+    TOOL_CALL_TIMEOUT_SECONDS = max(5.0, float(os.getenv("TAMFIS_CODE_TOOL_TIMEOUT", "180")))
+except (TypeError, ValueError):
+    TOOL_CALL_TIMEOUT_SECONDS = 180.0
+
+_log_exec = logging.getLogger("tamfis_code.execution")
+
+
+async def _bounded_tool_call(
+    mcp_server: Any, name: str, arguments: dict[str, Any], *,
+    extra_kwargs: Optional[dict[str, Any]] = None,
+    timeout: Optional[float] = None,
+) -> dict[str, Any]:
+    """Run one tool call to a terminal outcome. Never raises (except for
+    cancellation), so a batch barrier can always resolve."""
+    limit = None if name in _TOOL_CALL_TIMEOUT_EXEMPT else (timeout or TOOL_CALL_TIMEOUT_SECONDS)
+    try:
+        call = mcp_server.call_tool(name, arguments, extra_kwargs=extra_kwargs)
+        if limit is None:
+            return await call
+        return await asyncio.wait_for(call, timeout=limit)
+    except asyncio.TimeoutError:
+        _log_exec.warning("tool timeout name=%s limit=%.0fs", name, limit or 0)
+        return {
+            "error": (
+                f"{name} did not finish within {limit:.0f}s and was stopped. "
+                "Narrow the path/pattern or try a smaller request."
+            ),
+            "tool": name, "success": False, "timed_out": True,
+        }
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:
+        _log_exec.warning("tool error name=%s type=%s", name, type(exc).__name__)
+        return {"error": f"{name} failed: {exc}", "tool": name, "success": False}
+
 
 def first_byte_timeout_for(messages: Any, tools: Any = None) -> float:
     """How long to wait for a route's first byte, scaled to how much it must read.
@@ -4266,6 +4324,10 @@ async def _stream_one_completion_impl(
 
     stream_error: Optional[Exception] = None
     stream_iterator = stream.__aiter__()
+    # Meaningful-output clock (see STREAM_TOTAL_TIMEOUT_SECONDS): NOT refreshed
+    # by chunks that carry no reasoning/content/tool-call delta.
+    last_meaningful_at = time.monotonic()
+    request_deadline = request_started + STREAM_TOTAL_TIMEOUT_SECONDS
     while True:
         next_chunk_task = asyncio.create_task(stream_iterator.__anext__())
         steering_task: Optional[asyncio.Task] = None
@@ -4284,11 +4346,19 @@ async def _stream_one_completion_impl(
             waiters = {next_chunk_task}
             if steering_task is not None:
                 waiters.add(steering_task)
+            _now = time.monotonic()
+            _idle_left = STREAM_IDLE_TIMEOUT_SECONDS - (_now - last_meaningful_at)
+            _total_left = request_deadline - _now
             done, _pending = await asyncio.wait(
                 waiters,
-                timeout=STREAM_IDLE_TIMEOUT_SECONDS,
+                timeout=max(0.01, min(_idle_left, _total_left)),
                 return_when=asyncio.FIRST_COMPLETED,
             )
+            if not done and _total_left < _idle_left:
+                raise asyncio.TimeoutError(
+                    f"Model response exceeded {STREAM_TOTAL_TIMEOUT_SECONDS:.0f}s overall "
+                    "(stream total timeout)"
+                )
             if not done:
                 # FIX: a message-less TimeoutError() couldn't be told apart
                 # from a permanent failure by ProviderManager.
@@ -4317,6 +4387,20 @@ async def _stream_one_completion_impl(
                 finish_reason = "live_steering"
                 break
             chunk = next_chunk_task.result()
+            if time.monotonic() - last_meaningful_at > STREAM_IDLE_TIMEOUT_SECONDS:
+                # Chunks kept arriving (keepalives / empty deltas) but none
+                # carried output: this is a stall, not a slow answer.
+                if not first_action_recorded:
+                    route_stats.record_failure(model, "stall")
+                raise asyncio.TimeoutError(
+                    f"No model output for {STREAM_IDLE_TIMEOUT_SECONDS:.0f}s "
+                    "(stream idle timeout; only empty chunks arrived)"
+                )
+            if time.monotonic() > request_deadline:
+                raise asyncio.TimeoutError(
+                    f"Model response exceeded {STREAM_TOTAL_TIMEOUT_SECONDS:.0f}s overall "
+                    "(stream total timeout)"
+                )
             usage = getattr(chunk, "usage", None)
             if usage is not None:
                 from .runtime.telemetry import record_usage
@@ -4343,6 +4427,11 @@ async def _stream_one_completion_impl(
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await next_chunk_task
         for event in normalize_stream_chunk(chunk, provider=model.split("/", 1)[0] if "/" in model else None, model=model):
+            if event.event_type.value in {"reasoning_delta", "assistant_delta"}:
+                if str(event.payload.get("content") or ""):
+                    last_meaningful_at = time.monotonic()
+            elif event.event_type.value == "tool_call_delta":
+                last_meaningful_at = time.monotonic()
             if event.event_type.value == "reasoning_delta":
                 reasoning = str(event.payload.get("content") or "")
                 if reasoning and emit:
@@ -4540,6 +4629,10 @@ async def _stream_one_completion(
         provider.value if isinstance(provider, ProviderType)
         else str(provider or current_provider() or "unknown")
     )
+    if provider_name == "ollama_cloud":
+        from . import ollama_pacing
+
+        ollama_pacing.record_request()  # direct-client paths bypass ProviderManager.chat_completion
     with span("provider.invoke", provider=provider_name, model=model, operation="stream"):
         try:
             return await _stream_one_completion_impl(
@@ -4553,6 +4646,12 @@ async def _stream_one_completion(
                 progress_callback=progress_callback,
             )
         except Exception as exc:
+            _progress = getattr(renderer, "progress", None)
+            if _progress is not None and not isinstance(exc, asyncio.CancelledError):
+                # RETRYING / RATE_LIMITED / QUOTA_EXHAUSTED until output resumes,
+                # instead of an indistinguishable "Waiting for the model".
+                with contextlib.suppress(Exception):
+                    _progress.note_provider_failure(exc)
             # Every direct-client path (planning, plan revision, recovery,
             # stream reconnection) funnels through here, and none of them used
             # to touch route health -- so a HUNG route was never demoted and
@@ -9193,10 +9292,26 @@ async def _run_local_agent_turn_impl(
 
                     fanout_task = asyncio.create_task(_fanout_background_signal())
                 try:
+                    # Structured barrier: every call reaches a terminal outcome
+                    # (success, failure OR timeout) and _bounded_tool_call never
+                    # raises, so gather() resolves exactly once when ALL calls are
+                    # settled. Bare gather() propagated the first exception, left
+                    # its siblings running unobserved, and had no bound at all on
+                    # a call that never returned -- "expected 13, resolved 12"
+                    # waited forever.
+                    _t_batch = time.monotonic()
+                    _log_exec.info("tool batch start n=%d tools=%s", len(group),
+                                   ",".join(e[0].name for e in group))
                     raw_results = await asyncio.gather(*(
-                        mcp_server.call_tool(e[0].name, e[1], extra_kwargs=dispatch_kwargs[id(e)])
+                        _bounded_tool_call(
+                            mcp_server, e[0].name, e[1], extra_kwargs=dispatch_kwargs[id(e)],
+                        )
                         for e in group
                     ))
+                    _log_exec.info("tool batch end n=%d outcomes=%s elapsed=%.1fs", len(group),
+                                   ",".join("ok" if (isinstance(r, dict) and r.get("success", True)) else "err"
+                                            for r in raw_results),
+                                   time.monotonic() - _t_batch)
                 finally:
                     if fanout_task is not None:
                         fanout_task.cancel()

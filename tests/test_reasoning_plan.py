@@ -748,7 +748,13 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
                 e["payload"].get("result", {}).get("error", "")
                 for e in renderer.events if e["event_type"] == "tool_output"
             ]
-            self.assertTrue(any("read-only mode" in error for error in rendered_errors))
+            # The shell is no longer even OFFERED in a no-edit turn (asserted above), so the model's
+            # attempt is refused at the offered-tools gate ("unoffered MCP tool") before the older
+            # read-only-mode gate is reached. Either refusal is the contract: it must be refused.
+            self.assertTrue(
+                any(("read-only mode" in error) or ("unoffered MCP tool" in error) for error in rendered_errors),
+                rendered_errors,
+            )
 
     def test_plan_is_revised_once_tool_evidence_invalidates_it(self):
         """A failed tool call is evidence that the current plan needs revision;

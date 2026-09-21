@@ -308,6 +308,11 @@ class ProviderConfig:
     # need it -- see _task_needs_paid_tier. None means this provider has
     # no meaningfully free option, so `default_model` is always used.
     free_model: Optional[str] = None
+    # Ordered pool of free models that can stand in for one another. A 429/403 on
+    # one of them parks THAT model only (see record_route_failure_for) and the very
+    # next selection moves to the next healthy member -- no waiting, no retry of the
+    # failed model. `free_model` stays the pool's preferred head for compatibility.
+    free_models: List[str] = field(default_factory=list)
 
     # Lower values are preferred by canonical automatic routing.
     priority: int = 999
@@ -483,6 +488,11 @@ _CREDIT_EXHAUSTION_MARKERS = (
     "weekly usage limit", "usage limit", "spending limit", "monthly limit",
     "purchase more credits", "used all available credits", "quota exceeded",
     "exceeded your current quota",
+    # OpenRouter's account-wide daily cap on :free models ("Rate limit exceeded:
+    # free-models-per-day"). Unlike an upstream 429 it hits EVERY free model, so
+    # rotating inside the pool is pointless -- park the provider and let NIM etc.
+    # take the turn.
+    "free-models-per-day", "free models per day",
 )
 
 
@@ -530,10 +540,20 @@ def record_route_failure_for(
     # burns turns on a route that cannot answer. Park it for 15 minutes so the
     # task uses NIM (which is free) and only returns once credit could be back.
     # NIM itself is exempt -- its 429s are rate limits that clear in seconds.
-    if provider != ProviderType.NVIDIA and _is_credit_exhaustion(status, exc):
+    credit_exhausted = provider != ProviderType.NVIDIA and _is_credit_exhaustion(status, exc)
+    if credit_exhausted:
         error_text = str(exc).lower()
         if any(marker in error_text for marker in _USAGE_LIMIT_MARKERS):
-            cooldown = max(cooldown, USAGE_LIMIT_COOLDOWN_SECONDS)
+            # Park until the provider's own stated reset ("resets in 25 minutes") instead of a
+            # flat 6 h: a weekly window that reopens in 25 minutes must not keep the route
+            # dark for hours. Unknown reset text keeps the conservative 6 h.
+            from .ollama_pacing import parse_reset_delay
+
+            reset_in = parse_reset_delay(error_text)
+            if reset_in is not None:
+                cooldown = max(cooldown, min(USAGE_LIMIT_COOLDOWN_SECONDS, reset_in + 60.0))
+            else:
+                cooldown = max(cooldown, USAGE_LIMIT_COOLDOWN_SECONDS)
         else:
             cooldown = max(cooldown, CREDIT_EXHAUSTED_COOLDOWN_SECONDS)
     # Remember, across runs, a model that did not ANSWER (a timeout or stall, or a
@@ -559,11 +579,28 @@ def record_route_failure_for(
             getattr(provider_config, "default_model", ""),
             *(getattr(provider_config, "models", ()) or ()),
         ]))
-        all_models_unhealthy = bool(configured_models) and all(
+        # A failing model with healthy SIBLINGS must not take its whole provider
+        # down: NIM rotates across its models, and OpenRouter across its free pool
+        # (a 429 upstream-limit or a 403 on one free model says nothing about the
+        # others). Account-level failures (credit / daily free cap) are excluded --
+        # those hit every sibling, so the provider is parked immediately.
+        free_pool = [
+            item for item in (
+                getattr(provider_config or ProviderManager.PROVIDERS.get(provider), "free_models", None) or ()
+            ) if item
+        ]
+        rotates_in_pool = bool(free_pool) and model in free_pool and not credit_exhausted
+        if provider == ProviderType.NVIDIA:
+            siblings = configured_models
+            rotates = True
+        else:
+            siblings = free_pool
+            rotates = rotates_in_pool
+        all_models_unhealthy = bool(siblings) and all(
             not (_route_health_is_healthy(provider, candidate))
-            for candidate in configured_models if candidate
+            for candidate in siblings if candidate
         )
-        if provider != ProviderType.NVIDIA or all_models_unhealthy:
+        if not rotates or all_models_unhealthy:
             provider_state = _ROUTE_HEALTH.setdefault((provider.value, "*"), RouteHealth())
             provider_state.failures += 1
             provider_state.last_failure = now
@@ -1060,7 +1097,25 @@ class ProviderManager:
             # so routine turns don't spend paid OpenRouter credits at all.
             # See _task_needs_paid_tier for exactly which tasks escalate
             # to `default_model` instead.
-            free_model="openrouter/free",
+            # Free pool, live-probed 2026-09-21 with a forced tool call (all returned a
+            # correct `get_weather(city="Lagos")` call, 0.5-9s): nemotron-3-super 1.0s,
+            # nemotron-3-ultra 1.7s (1M ctx), laguna-s-2.1 1.1s (coding),
+            # north-mini-code 0.5s, nex-n2.5-pro 8.9s (kept last of the named ones).
+            # `openrouter/free` is OpenRouter's own server-side juggler and is the final
+            # member. qwen3.8-27b:free and gemma-4-31b-it:free advertise tools but
+            # returned upstream 429 during the probe, so they are left out of the
+            # default order (still selectable by name). The order is a preference, not
+            # a schedule: route_stats demotes measured-slow members and per-model
+            # health skips any that just answered 429/403.
+            free_model="nvidia/nemotron-3-super-120b-a12b:free",
+            free_models=[
+                "nvidia/nemotron-3-super-120b-a12b:free",
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "poolside/laguna-s-2.1:free",
+                "cohere/north-mini-code:free",
+                "nex-agi/nex-n2.5-pro:free",
+                "openrouter/free",
+            ],
             models=[
                 # Deliberately excludes openai/* defaults.
                 "google/gemini-2.5-flash",
@@ -1071,9 +1126,17 @@ class ProviderManager:
                 "anthropic/claude-sonnet-4",
                 "openai/gpt-4.1-mini",
                 "openai/gpt-4.1-nano",
+                # The free pool (see free_models above). The retired
+                # `qwen/qwen3-coder:free` and `meta-llama/llama-3.3-70b-instruct:free`
+                # ids are gone from OpenRouter's catalog and are deliberately dropped.
+                "nvidia/nemotron-3-super-120b-a12b:free",
+                "nvidia/nemotron-3-ultra-550b-a55b:free",
+                "poolside/laguna-s-2.1:free",
+                "cohere/north-mini-code:free",
+                "nex-agi/nex-n2.5-pro:free",
+                "qwen/qwen3.8-27b:free",
+                "google/gemma-4-31b-it:free",
                 "openrouter/free",
-                "qwen/qwen3-coder:free",
-                "meta-llama/llama-3.3-70b-instruct:free",
                 # Confirmed live: present in OpenRouter's real /v1/models
                 # catalog and a real chat-completions call against it
                 # returned a genuine billing (402 insufficient credits)
@@ -1522,8 +1585,27 @@ class ProviderManager:
                     return candidate
 
         if config.free_model and not _paid_model_allowed(task_profile):
-            return config.free_model
+            return self.select_free_model(config)
         return config.default_model
+
+    @classmethod
+    def select_free_model(cls, config: ProviderConfig) -> Optional[str]:
+        """The best free-pool member that is healthy RIGHT NOW.
+
+        Costs nothing on the request path: no probe, no sleep -- just the in-memory
+        circuit state plus route_stats' remembered latency (fast/unmeasured first,
+        measured-slow after, penalised last). A member that answered 429/403 a
+        moment ago is skipped, so the next request goes straight to a working
+        model instead of retrying the failed one. When every member is cooling the
+        pool head is returned (its circuit will re-probe first)."""
+        pool = [item for item in (getattr(config, "free_models", None) or [getattr(config, "free_model", None)]) if item]
+        if not pool:
+            return getattr(config, "free_model", None)
+        ranked = route_stats.rank(pool)
+        for candidate in ranked:
+            if cls.route_is_healthy(ProviderType.OPENROUTER, candidate):
+                return candidate
+        return pool[0]
 
     def context_window_for_model(
         self, provider: ProviderType, model: str, config: Optional[ProviderConfig] = None,
@@ -1576,13 +1658,25 @@ class ProviderManager:
             _ROUTING_TELEMETRY.__dict__.update(fresh.__dict__)
 
     @staticmethod
-    def route_is_healthy(provider: ProviderType, model: str = "") -> bool:
+    def route_is_healthy(provider: ProviderType, model: str = "", *, ignore_pacing: bool = False) -> bool:
+        if provider == ProviderType.OLLAMA_CLOUD and not ignore_pacing:
+            # The weekly allowance is shared with TamfisGPT and is PACED, not run to zero (see
+            # ollama_pacing): once this machine's share is spent, automatic routing uses NIM /
+            # free OpenRouter first. Explicit --provider / /model selections do not consult this.
+            from . import ollama_pacing
+
+            if ollama_pacing.is_paced_out():
+                return False
         now = time.monotonic()
         with _HEALTH_LOCK:
             state = _ROUTE_HEALTH.get((provider.value, model or "*"))
             return state is None or state.circuit_open_until <= now
 
     def record_route_attempt(self, provider: ProviderType, model: str) -> None:
+        if provider == ProviderType.OLLAMA_CLOUD:
+            from . import ollama_pacing
+
+            ollama_pacing.record_request()
         with _HEALTH_LOCK:
             _increment(_ROUTING_TELEMETRY.provider_requests, provider.value)
 
@@ -1626,6 +1720,8 @@ class ProviderManager:
 
     def provider_health_status(self, provider: ProviderType) -> str:
         if not self.route_is_healthy(provider, "*"):
+            if self.route_is_healthy(provider, "*", ignore_pacing=True):
+                return "paced"  # healthy, but its share of the weekly allowance is spent
             return "circuit_open"
         config = self.PROVIDERS.get(provider)
         models = list(dict.fromkeys([
@@ -1711,6 +1807,18 @@ class ProviderManager:
             if self.route_is_healthy(provider, "*")
         ]
 
+        if not available:
+            # Pacing only REORDERS: if the only routes left are paced-out (Ollama's weekly
+            # budget spent), use them rather than failing the turn. Real circuit state still counts.
+            available = [
+                provider
+                for provider in self.routing_order
+                if provider in self.AUTO_PROVIDER_WEIGHTS
+                if allowed_providers is None or provider in allowed_providers
+                if self._fallback_provider_allowed(provider)
+                if provider in self.clients and self._has_valid_api_key(provider)
+                if self.route_is_healthy(provider, "*", ignore_pacing=True)
+            ]
         if not available:
             raise ValueError("No configured AI provider is available")
 
@@ -2187,7 +2295,7 @@ class ProviderManager:
             self.select_model(config, task_profile)
             if resolved == ProviderType.OLLAMA_CLOUD
             else (
-                config.free_model
+                self.select_free_model(config)
                 if config.free_model and not self.paid_fallback_enabled()
                 else self.select_model(config, task_profile)
             )

@@ -14,15 +14,29 @@ from __future__ import annotations
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tamfis_code import route_stats
 from tamfis_code.providers import ProviderManager, ProviderType
 from tamfis_code.routing import TaskProfile, TaskType, classify_task
 
 
 class OpenRouterFreeTierSelectionTests(unittest.TestCase):
+    """The default cost policy is ``economy`` (never spend on a paid model merely because a task is
+    hard), so these tests pin the policy they are about instead of inheriting whatever the environment
+    or the default happens to be: routine work is free under any policy; escalation to the paid
+    ``default_model`` is what ``quality`` (or balanced + provider fallback) exists to allow."""
+
     def setUp(self):
+        self._env = patch.dict(os.environ, {"TAMFIS_CODE_COST_POLICY": "quality"})
+        self._env.start()
+        self.addCleanup(self._env.stop)
+        # route_stats persists measured latency to disk; ranking must not depend on this machine's history.
+        self._rank = patch.object(route_stats, "rank", side_effect=lambda models, **_: list(dict.fromkeys(models)))
+        self._rank.start()
+        self.addCleanup(self._rank.stop)
         self.manager = ProviderManager()
         self.config = self.manager.PROVIDERS[ProviderType.OPENROUTER]
 
@@ -89,6 +103,21 @@ class OtherProvidersUnaffectedTests(unittest.TestCase):
         config = self.manager.PROVIDERS[ProviderType.HF]
         self.assertIsNone(config.free_model)
         self.assertEqual(self.manager.select_model(config, None), config.default_model)
+
+
+class OpenRouterEconomyPolicyTests(unittest.TestCase):
+    def test_economy_never_escalates_to_the_paid_model_however_hard_the_task(self):
+        with patch.dict(os.environ, {"TAMFIS_CODE_COST_POLICY": "economy"}):
+            manager = ProviderManager()
+            config = manager.PROVIDERS[ProviderType.OPENROUTER]
+            for request in (
+                "audit the entire repository end-to-end",
+                "fix the bug causing the crash on startup",
+                "implement a new caching layer for this module",
+            ):
+                chosen = manager.select_model(config, classify_task(request))
+                self.assertIn(chosen, config.free_models, request)
+                self.assertNotEqual(chosen, config.default_model)
 
 
 if __name__ == "__main__":

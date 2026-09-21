@@ -40,6 +40,7 @@ from .public_identity import (
 )
 from .safety import redact_secrets
 from . import tool_display as _tool_display
+from .runtime.progress import ExecState, ProgressTracker
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 
@@ -744,6 +745,8 @@ class StreamRenderer:
         self._steering_handled_revision = 0
         self._plan_steps: list[dict[str, Any]] = []
         self._task_start = time.monotonic()
+        # Meaningful-progress clock + execution state (never refreshed by redraws).
+        self.progress = ProgressTracker()
         try:
             cost_cap = load_config().session_cost_cap_usd
         except Exception:
@@ -906,6 +909,23 @@ class StreamRenderer:
             and time.monotonic() - self._reasoning_last < _THINKING_STALE_SECONDS
         )
 
+    def progress_wait_note(self) -> str:
+        """One honest phrase for a quiet state ("" while output is flowing)."""
+        snap = self.progress.snapshot()
+        idle = int(snap.idle_seconds)
+        if snap.state in {ExecState.RUNNING, ExecState.COMPLETED, ExecState.FAILED, ExecState.WAITING_TOOL}:
+            return ""  # the activity/command lines already say what is running
+        if snap.state is ExecState.WAITING_PROVIDER:
+            return f"Waiting for the model — no output for {_format_elapsed(idle)}" if idle >= 10 else ""
+        if snap.state is ExecState.STALLED:
+            return (
+                f"Provider not responding for {_format_elapsed(idle)} — "
+                "the request will be replaced automatically"
+            )
+        if snap.state in {ExecState.RETRYING, ExecState.RATE_LIMITED, ExecState.QUOTA_EXHAUSTED}:
+            return f"{snap.label} · {_format_elapsed(idle)}"
+        return snap.label
+
     def live_input_headline(self, spinner_frame: str = "", width: Optional[int] = None) -> str:
         """The one-line running status shown ABOVE the composer, Claude/Codex
         style: "⠴ Musing… (5m 45s · ↓ 12.9k tokens)".
@@ -930,6 +950,12 @@ class StreamRenderer:
             return f"{self._terminal_status} ({joined})"
         glyph = spinner_frame or "✽"
         activity = self.current_activity(include_command=False)
+        # The timer above is the WHOLE turn. When the run is quietly waiting,
+        # say what it is waiting for and for how long -- a 27-minute turn and
+        # a 27-minute silence must not look the same.
+        wait_note = self.progress_wait_note()
+        if wait_note:
+            activity = wait_note
         if width is not None:
             # The activity gives way, not the timing: "(5m 47s · ↓ 7.7k tokens · thinking)"
             # is what tells a long turn from a stuck one, so it is never cut.
@@ -1018,6 +1044,7 @@ class StreamRenderer:
     def conclude(self, status: str) -> None:
         """Clear transient activity before the terminal returns to the REPL."""
         self._flush_read_group()
+        self.progress.finish(status)
         self._round_tool_counts = {}
         self._running_command = None
         self._running_command_started = None
@@ -1664,6 +1691,7 @@ class StreamRenderer:
         event = sanitize_public_event(event)
         event_type = event.get("event_type") or event.get("event") or event.get("type")
         payload = event.get("payload") or {}
+        self.progress.observe(str(event_type or ""), payload if isinstance(payload, dict) else {})
 
         if self._read_group and not self._keeps_read_group_open(event_type, payload):
             self._flush_read_group()
@@ -2259,7 +2287,12 @@ class StreamRenderer:
             # about what the agent is doing internally. Those must keep
             # showing regardless of --debug.
             content = str(payload.get("content") or "")
-            if content.startswith("◆"):
+            if content.startswith("⚠"):
+                # Watchdog/recovery notice: always visible, and not dim -- it
+                # explains why the run paused or is switching route.
+                self._close_assistant()
+                self.console.print(f"[yellow]{escape(content)}[/yellow]")
+            elif content.startswith(("◆", "↳")):
                 self._close_assistant()
                 self.console.print(f"[dim]{escape(content)}[/dim]")
             elif self.debug and content:

@@ -39,11 +39,22 @@ class ScratchRootGrantTests(_StatePatchMixin, unittest.TestCase):
         try:
             with tempfile.TemporaryDirectory() as ws:
                 args = json.dumps({"path": str(target), "content": "print('hi')\n"})
+                # "write a throwaway script ... and run it" is an EDIT-class turn (it creates a file), so
+                # the runner first asks the model for a plan; give it one before the tool-call round.
+                plan = json.dumps({"steps": ["Write the scratch script", "Run it"]})
                 rounds = [
+                    [_chunk(_delta(content=plan))],
                     [_chunk(_delta(tool_calls=[
                         _tool_call_delta(0, call_id="call_1", name="write_file", arguments=args)
                     ]))],
-                    [_chunk(_delta(content="Wrote the scratch file."))],
+                    # ...and "run it": a changed-files turn must verify with a real execute_command.
+                    [_chunk(_delta(tool_calls=[
+                        _tool_call_delta(
+                            0, call_id="call_2", name="execute_command",
+                            arguments=json.dumps({"command": f"python3 {target}"}),
+                        )
+                    ]))],
+                    [_chunk(_delta(content="Wrote the scratch file and ran it."))],
                 ]
                 client = _FakeClient(rounds)
                 manager = _FakeManager(client)

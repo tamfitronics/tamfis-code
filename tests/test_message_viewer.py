@@ -14,13 +14,21 @@ from rich.console import Console
 
 from tamfis_code.live_input import LiveInputListener
 from tamfis_code.message_viewer import VIEWER, install_bindings, panel_ansi, viewer_rows
-from tamfis_code.render import COLLAPSED_MESSAGES, CollapsedMessageStore, StreamRenderer
+from tamfis_code.render import (
+    COLLAPSED_MESSAGES, CollapsedMessageStore, StreamRenderer, _MESSAGE_COLLAPSE_THRESHOLD,
+)
 
 from test_live_input import _config, _console
 
 
 def _plain(text: str) -> str:
     return re.sub(r"\x1b\[[0-9;]*m", "", text)
+
+
+# 1.6.76 raised the collapse threshold to 20,000 characters (long answers stopped being cut short),
+# so a message only collapses -- and only reaches the Ctrl+E viewer -- when it is longer than that.
+# "wordN " is at least 6 characters, so this many words always clears the threshold.
+OVER_THRESHOLD_WORDS = _MESSAGE_COLLAPSE_THRESHOLD // 6 + 100
 
 
 def _long(tag="A", words=600):
@@ -165,7 +173,7 @@ class ComposerIntegrationTests(_Base):
 
     def test_the_running_composer_shows_the_full_message_and_then_less(self):
         renderer = StreamRenderer(_console())
-        renderer._collapse_or_print_assistant(_long("LIVE", words=300))
+        renderer._collapse_or_print_assistant(_long("LIVE", words=OVER_THRESHOLD_WORDS))
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
         closed = self._text(listener)
         self.assertNotIn("full message", closed)
@@ -180,7 +188,7 @@ class ComposerIntegrationTests(_Base):
     def test_the_viewer_takes_the_room_of_the_pinned_plan(self):
         renderer = StreamRenderer(_console())
         renderer._plan_steps = [{"step": "Read the file", "status": "in_progress"}]
-        renderer._collapse_or_print_assistant(_long("LIVE", words=300))
+        renderer._collapse_or_print_assistant(_long("LIVE", words=OVER_THRESHOLD_WORDS))
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
         self.assertIn("Plan progress", self._text(listener))
         VIEWER.toggle()
@@ -191,7 +199,7 @@ class LegacyPrintPathTests(_Base):
     def test_the_printing_expansion_no_longer_claims_a_show_less_it_cannot_do(self):
         console = _console()
         renderer = StreamRenderer(console)
-        renderer._collapse_or_print_assistant(_long())
+        renderer._collapse_or_print_assistant(_long(words=OVER_THRESHOLD_WORDS))
         self.assertTrue(renderer.expand_next_collapsed_message())
         self.assertNotIn("show less", console.file.getvalue())
 

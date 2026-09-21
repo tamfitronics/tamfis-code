@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -67,6 +68,11 @@ def test_repository_index_reuses_fingerprint(tmp_path: Path):
     assert loaded is not None
     assert loaded.fingerprint == first.fingerprint
     (tmp_path / "x.py").write_text("print('y')\n", encoding="utf-8")
+    # The fingerprint is metadata-based (size + mtime) so unchanged files are never re-read. A rewrite
+    # of the same size inside one filesystem timestamp tick is indistinguishable by design, so make the
+    # edit a real, later one -- exactly what an editor save is.
+    stat = (tmp_path / "x.py").stat()
+    os.utime(tmp_path / "x.py", ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
     second = index.build()
     assert second.fingerprint != first.fingerprint
 
