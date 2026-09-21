@@ -41,6 +41,7 @@ from .public_identity import (
 from .safety import redact_secrets
 from . import tool_display as _tool_display
 from .runtime.progress import ExecState, ProgressTracker
+from .provider_protocols import is_tool_call_placeholder
 
 _TOOL_ANNOUNCE_RE = re.compile(r"Using tool:\s*(.+?)\.\.\.\s*$")
 
@@ -1679,6 +1680,10 @@ class StreamRenderer:
         if self._assistant_open:
             self._flush_assistant(force=True)
             rendered_markdown = self._assistant_buffer.strip()
+            if is_tool_call_placeholder(rendered_markdown):
+                # The model echoed the "[tool call]" placeholder from its history: no visible panel.
+                rendered_markdown = ""
+                self._assistant_buffer = ""
             if self._box_open:
                 if rendered_markdown:
                     # With the interactive prompt-toolkit listener attached,

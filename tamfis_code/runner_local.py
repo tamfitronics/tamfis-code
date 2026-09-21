@@ -84,6 +84,7 @@ from .orchestrator.planner import create_plan, extract_phase_outline, merge_phas
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
 from .provider_protocols import (
+    is_tool_call_placeholder,
     normalize_stream_chunk,
     normalize_tool_call,
     provider_requires_single_tool_call,
@@ -3163,6 +3164,8 @@ async def _recover_empty_continuation(
                             "event_type": "assistant_delta",
                             "payload": {"content": novel},
                         })
+            if is_tool_call_placeholder(content):
+                content = ""   # the model echoed our history placeholder; it is not a reply
             if content.strip() or calls:
                 return content, calls, resolved_provider, config, client, model
         except Exception as exc:  # provider-specific failures are handled below

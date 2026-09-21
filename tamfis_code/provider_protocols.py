@@ -13,6 +13,17 @@ _SINGLE_TOOL_CALL_ERROR_MARKERS = (
 )
 
 
+TOOL_CALL_PLACEHOLDER = "[tool call]"
+_PLACEHOLDER_ECHO_RE = re.compile(r"^\s*\[?\s*tool[ _-]?calls?\s*\]?\s*$", re.IGNORECASE)
+
+
+def is_tool_call_placeholder(text: object) -> bool:
+    """True when ``text`` is only the request-side placeholder for an assistant turn that made tool calls
+    without saying anything. Models see it in their history and echo it back as if it were a reply, which
+    rendered as an empty "Assistant" panel reading "[tool call]" (owner report 2026-09-21)."""
+    return isinstance(text, str) and bool(_PLACEHOLDER_ECHO_RE.match(text))
+
+
 def normalize_tool_call(
     raw_name: Any,
     raw_arguments: Any = "",
@@ -201,7 +212,7 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
         )
         if not has_content:
             if message.get("tool_calls"):
-                message = {**message, "content": "[tool call]"}
+                message = {**message, "content": TOOL_CALL_PLACEHOLDER}
             else:
                 return None
 
