@@ -8967,8 +8967,12 @@ async def _run_local_agent_turn_impl(
             combined_text = describe_batch(_turn_batch)
             await suspend_live_async_if_active(renderer)
             orchestrator.waiting_for_approval(f"Approve {len(_risky_batch_actions)} actions")
+            _batch_static = _decision_for_policy(_effective_approval_policy(), _turn_batch.highest_risk, interactive)
             renderer.handle_event({
-                "event_type": "approval_required",
+                "event_type": (
+                    "approval_auto" if _batch_static in {"approve_once", "approve_session"}
+                    else "approval_required"
+                ),
                 "payload": {
                     "command": combined_text, "risk_level": _turn_batch.highest_risk,
                     "working_directory": workspace_root,
@@ -9847,8 +9851,18 @@ async def _run_local_agent_turn_impl(
                 # requested cwd when it names one; only bare commands with
                 # no cwd concept fall back to the session's launch root.
                 approval_cwd = arguments.get("cwd") if isinstance(arguments, dict) else None
+                _approval_policy_now = (
+                    "ask" if permission_decision is not None and permission_decision.action == "ask"
+                    else _effective_approval_policy()
+                )
+                _static_decision = _decision_for_policy(_approval_policy_now, risk, interactive)
                 renderer.handle_event({
-                    "event_type": "approval_required",
+                    # A call the policy approves outright is announced, not "requested": only a real
+                    # prompt gets the boxed card (and the WAITING_USER state).
+                    "event_type": (
+                        "approval_auto" if _static_decision in {"approve_once", "approve_session"}
+                        else "approval_required"
+                    ),
                     "payload": {
                         "command": display_command, "risk_level": risk,
                         "working_directory": approval_cwd or workspace_root, "reason": reason,

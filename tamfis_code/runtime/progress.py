@@ -98,7 +98,7 @@ _PROGRESS_EVENTS = frozenset({
     "routing_started", "model_selected", "provider_request_started",
     "tool_call_requested", "tool_output", "file_mutation", "plan_created",
     "plan_updated", "plan_step_started", "plan_step_completed", "user_message",
-    "approval_required", "context_rollover",
+    "approval_required", "approval_auto", "context_rollover",
 })
 _RESUMING_EVENTS = frozenset({
     "tool_call_requested", "tool_output", "file_mutation", "provider_request_started",

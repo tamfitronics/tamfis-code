@@ -65,7 +65,13 @@ class RunnerPermissionRaceTests(_StatePatchMixin, unittest.TestCase):
             self.assertIn("def add", target.read_text())
             # The approval card is unchanged: the race speeds the decision up,
             # it does not remove the audit trail.
+            # Under policy "auto" nobody is being asked, so the audit-trail event is the compact
+            # "approval_auto" announcement (rendered as one line) rather than the boxed
+            # "approval_required" prompt card -- but it must still be emitted.
             self.assertTrue(any(
+                event.get("event_type") == "approval_auto" for event in renderer.events
+            ))
+            self.assertFalse(any(
                 event.get("event_type") == "approval_required" for event in renderer.events
             ))
             self.assertTrue(any(

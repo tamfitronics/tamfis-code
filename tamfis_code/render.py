@@ -2099,6 +2099,20 @@ class StreamRenderer:
             _render_result_block(self.console, ok=ok, label=f"exit {exit_code}", content=body)
             return
 
+        if event_type == "approval_auto":
+            # The active policy already decided this call without asking (e.g. mode "auto" and a
+            # non-dangerous risk). It used to render the same boxed "Approval required" card as a
+            # real prompt and then run at once -- which read as the CLI being blocked on the user.
+            self._close_assistant()
+            auto_command = _bounded_preview(redact_secrets(str(payload.get("command") or "")))
+            self.console.print(
+                f"[dim]⏵⏵ auto · risk: {escape(str(payload.get('risk_level', '?')))} · {escape(auto_command)}[/dim]"
+            )
+            auto_diff = payload.get("diff")
+            if auto_diff:
+                print_unified_diff(self.console, str(auto_diff), title="Proposed change", max_lines=80)
+            return
+
         if event_type == "approval_required":
             self._close_assistant()
             # payload["command"] is the command TEXT (a plain string), not

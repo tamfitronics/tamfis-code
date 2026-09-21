@@ -232,8 +232,11 @@ class TestRepositorySnapshotIndex:
         index = RepositoryIndex(tmp_path, tmp_path / ".snapshot.json")
         index.build()
 
-        time.sleep(0.001)
         keep.write_text("two\n")
+        # Same size as before, so only mtime can tell the two apart. A 1 ms sleep is inside one
+        # filesystem timestamp tick under load; make the edit a genuinely later one (an editor save).
+        stat = keep.stat()
+        os.utime(keep, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
         gone.unlink()
         assert index.changed_files() == ["keep.py"]
         assert index.removed_files() == ["gone.py"]
