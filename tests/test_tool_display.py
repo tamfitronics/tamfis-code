@@ -153,9 +153,9 @@ class ScrollbackRecordTests(unittest.TestCase):
         lines = _out(console).splitlines()
         self.assertEqual(lines[1], "  └ line 1")
         self.assertEqual(lines[2], "    line 2")
-        self.assertEqual(lines[3], "    … +134 lines (Ctrl+T for full output)")
+        self.assertEqual(lines[3], "    … +134 lines (Ctrl+O for full output)")
         self.assertEqual(len(lines), 4)
-        (kind, full), = TOOL_TRANSCRIPT.entries()                        # what Ctrl+T shows
+        (kind, full), = TOOL_TRANSCRIPT.entries()                        # what Ctrl+O shows
         self.assertEqual(kind, "tool")
         self.assertIn("$ journalctl -u x", full)
         self.assertIn("line 1\n", full)
@@ -166,7 +166,7 @@ class ScrollbackRecordTests(unittest.TestCase):
         _call(renderer, "execute_command", {"command": "ls"},
               {"stdout": "a\nb\nc\nd\n", "stderr": "", "return_code": 0})
         text = _out(console)
-        self.assertNotIn("Ctrl+T", text)
+        self.assertNotIn("Ctrl+O", text)
         self.assertEqual(text.splitlines()[1:], ["  └ a", "    b", "    c", "    d"])
 
     def test_a_failing_command_says_so_and_uses_the_error_role(self):
@@ -287,7 +287,7 @@ class ScrollbackRecordTests(unittest.TestCase):
 
 
 class TranscriptViewerTests(unittest.TestCase):
-    """Ctrl+T shows full tool output in the same viewer Ctrl+E uses for long messages -- which is unchanged."""
+    """Ctrl+O shows full tool output in the same viewer Ctrl+E uses for long messages -- which is unchanged."""
 
     def setUp(self):
         from tamfis_code.message_viewer import VIEWER
@@ -305,19 +305,19 @@ class TranscriptViewerTests(unittest.TestCase):
         from tamfis_code.render import TOOL_TRANSCRIPT
 
         TOOL_TRANSCRIPT.add("tool", "$ ls\n\n" + "\n".join(f"row {i}" for i in range(300)))
-        self.assertTrue(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T"))
+        self.assertTrue(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+O"))
         panel = "\n".join(VIEWER.panel_lines(100, 40))
         self.assertIn("Tool output · full transcript", panel)
-        self.assertIn("Ctrl+T or Esc to show less", panel)
+        self.assertIn("Ctrl+O or Esc to show less", panel)
         self.assertIn("row 0", panel)
-        self.assertTrue(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T"))
+        self.assertTrue(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+O"))
         self.assertFalse(VIEWER.is_open)
 
     def test_nothing_to_show_is_a_no_op(self):
         from tamfis_code.message_viewer import VIEWER
         from tamfis_code.render import TOOL_TRANSCRIPT
 
-        self.assertFalse(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T"))
+        self.assertFalse(VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+O"))
         self.assertFalse(VIEWER.is_open)
 
     def test_ctrl_e_for_long_messages_still_works_and_keeps_its_own_key_hint(self):
@@ -341,3 +341,46 @@ class TranscriptViewerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TranscriptKeyIsNotTheSshClientsTests(unittest.IsolatedAsyncioTestCase):
+    """Owner report 2026-09-21: Termius (SSH client) takes Ctrl+T for a new tab, so the hint's key never reached
+    the app. The hint advertises Ctrl+O, and both keys open the viewer."""
+
+    def test_the_hint_names_ctrl_o_not_ctrl_t(self):
+        from tamfis_code.tool_display import TRANSCRIPT_HINT, TRANSCRIPT_KEY
+
+        self.assertEqual(TRANSCRIPT_KEY, "Ctrl+O")
+        self.assertIn("Ctrl+O", TRANSCRIPT_HINT)
+        self.assertNotIn("Ctrl+T", TRANSCRIPT_HINT)
+
+    async def test_the_live_composer_binds_ctrl_o_and_keeps_ctrl_t_as_an_alias(self):
+        from unittest.mock import patch
+
+        from prompt_toolkit.key_binding import KeyBindings
+
+        from tamfis_code.live_input import LiveInputListener
+        from test_live_input import _config, _console
+
+        recorded: list[tuple] = []
+        real_add = KeyBindings.add
+
+        def spy(self, *keys, **kwargs):
+            recorded.append(keys)
+            return real_add(self, *keys, **kwargs)
+
+        class Stop(Exception):
+            pass
+
+        listener = LiveInputListener(
+            session_id=1, renderer=StreamRenderer(_console()), cli_config=_config(),
+        )
+        with patch.object(KeyBindings, "add", spy), \
+             patch("prompt_toolkit.PromptSession", side_effect=Stop):
+            try:
+                await listener._input_loop()
+            except Stop:
+                pass
+        flat = {key for keys in recorded for key in keys}
+        self.assertIn("c-o", flat)
+        self.assertIn("c-t", flat)

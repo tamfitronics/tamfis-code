@@ -1068,15 +1068,16 @@ class LiveInputListener:
                 pass
             event.app.invalidate()
 
-        @bindings.add("c-t")
+        @bindings.add("c-o")
+        @bindings.add("c-t")   # quiet alias: Termius and some terminals keep Ctrl+T for themselves
         def _toggle_tool_transcript(event) -> None:
-            # Ctrl+T pages through the FULL output of finished tool calls -- what a block's
-            # "… +N lines (Ctrl+T for full output)" refers to. Ctrl+E (long messages) is untouched.
+            # Ctrl+O pages through the FULL output of finished tool calls -- what a block's
+            # "… +N lines (Ctrl+O for full output)" refers to. Ctrl+E (long messages) is untouched.
             try:
                 from .message_viewer import VIEWER
                 from .render import TOOL_TRANSCRIPT
 
-                VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+T")
+                VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+O")
             except Exception:
                 pass
             event.app.invalidate()

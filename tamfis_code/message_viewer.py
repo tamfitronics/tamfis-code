@@ -63,7 +63,7 @@ class MessageViewer:
 
     # -- state -------------------------------------------------------------------
     def toggle(self, store: Any = None, *, key: str = "Ctrl+E") -> bool:
-        """Open the newest collapsed message (Ctrl+E) or tool output (Ctrl+T), or close the viewer if
+        """Open the newest collapsed message (Ctrl+E) or tool output (Ctrl+O), or close the viewer if
         it is open. False (and nothing changes) when there is nothing to show."""
         if self.is_open:
             self.close()

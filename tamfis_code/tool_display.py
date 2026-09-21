@@ -336,14 +336,17 @@ def summarize_result(
 #     │ … +1 lines
 #     └ ● tamfisseo.service - TamfisSEO Pro v3 - Enterprise SEO Automation
 #          Loaded: loaded (/etc/systemd/system/tamfisseo.service; enabled)
-#       … +134 lines (Ctrl+T for full output)
+#       … +134 lines (Ctrl+O for full output)
 #
 # Pure functions again: they return plain text (with a role per line) and the renderer only
-# decides colours. The "(Ctrl+T …)" hint is only ever emitted for output that was actually cut,
-# and the full output is what Ctrl+T shows (see render.TOOL_TRANSCRIPT).
+# decides colours. The "(Ctrl+O …)" hint is only ever emitted for output that was actually cut,
+# and the full output is what Ctrl+O shows (see render.TOOL_TRANSCRIPT).
 # ---------------------------------------------------------------------------------------------
 
-TRANSCRIPT_HINT = "Ctrl+T for full output"
+# Ctrl+O, not Ctrl+T: the Termius SSH client (the owner's) takes Ctrl+T for a new tab, so the key never
+# reached the app. Ctrl+T stays bound as a quiet alias for terminals that pass it through.
+TRANSCRIPT_KEY = "Ctrl+O"
+TRANSCRIPT_HINT = f"{TRANSCRIPT_KEY} for full output"
 _MAX_COMMAND_LINES = 3
 _PREVIEW_LINES_WHEN_CUT = 2
 _SHOW_ALL_UP_TO = 4

@@ -270,8 +270,8 @@ class CollapsedMessageStore:
 
 
 COLLAPSED_MESSAGES = CollapsedMessageStore()
-# Full output of finished tool calls (commands), newest last: what Ctrl+T pages through when a block
-# says "… +N lines (Ctrl+T for full output)". Separate from COLLAPSED_MESSAGES (Ctrl+E, long
+# Full output of finished tool calls (commands), newest last: what Ctrl+O pages through when a block
+# says "… +N lines (Ctrl+O for full output)". Separate from COLLAPSED_MESSAGES (Ctrl+E, long
 # assistant/user messages), which is unchanged.
 TOOL_TRANSCRIPT = CollapsedMessageStore(retention=30)
 _TRANSCRIPT_ENTRY_MAX_CHARS = 200_000
@@ -1453,7 +1453,7 @@ class StreamRenderer:
             • Ran <command>
               │ <wrapped continuation>
               └ <output preview>
-                … +N lines (Ctrl+T for full output)
+                … +N lines (Ctrl+O for full output)
         """
         seen_output = False
         for role, text in rows:
@@ -1489,7 +1489,7 @@ class StreamRenderer:
                 _tool_display.ran_block(command, output, width=width, exit_code=code, failed=failed),
                 failed=failed,
             )
-            # Everything, not just the preview: what Ctrl+T shows.
+            # Everything, not just the preview: what Ctrl+O shows.
             full = f"$ {redact_secrets(command)}\n\n{redact_secrets(output) if output else '(no output)'}"
             if len(full) > _TRANSCRIPT_ENTRY_MAX_CHARS:
                 full = full[:_TRANSCRIPT_ENTRY_MAX_CHARS] + "\n… (output truncated)"
