@@ -1111,6 +1111,11 @@ class LiveInputListener:
             reserve_space_for_menu=0,
             style=composer_style(),
             auto_suggest=_LiveProgressAutoSuggest(self.renderer),
+            # The running composer is a live status area, not part of the conversation: without this its last
+            # frame (rules, tip, and the "esc to interrupt" footer) stayed in the scrollback after the task
+            # ended and after every follow-up Enter, so a finished session still read "esc to interrupt"
+            # and stale composer copies piled up between messages (owner paste 2026-09-21).
+            erase_when_done=True,
         )
         force_bottom_toolbar_visible(session)
         self._prompt_session = session

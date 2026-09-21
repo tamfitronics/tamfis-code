@@ -2238,16 +2238,8 @@ def _is_resume_request(text: str) -> bool:
 # every later resume as "Additional user context: ...", snowballing until the real task (fix the TypeError in
 # serve2.py) was buried under "Repair the failed plan step ... continue from the saved checkpoint and resolve:
 # execution cancelled by user ..." (owner report 2026-09-21).
-_MACHINE_OBJECTIVE_RE = re.compile(
-    r"^\s*(?:continue\s+from\s+the\s+saved\s+checkpoint|repair\s+the\s+failed\s+plan\s+step|"
-    r"continue\s+the\s+active\s+plan\s+with|continue\s+the\s+interrupted\s+task|"
-    r"resume\s+at\s+step\s+\d+|/retry\b)",
-    re.IGNORECASE,
-)
-
-
 def _is_machine_generated_objective(text: str) -> bool:
-    return bool(_MACHINE_OBJECTIVE_RE.match(text or ""))
+    return bool(local_state.MACHINE_OBJECTIVE_RE.match(text or ""))
 
 
 def _is_real_resume_objective(text: str) -> bool:
@@ -2273,7 +2265,8 @@ def _checkpoint_resume_objective(checkpoint: dict[str, Any]) -> str:
     sequence of real user instructions in order and de-duplicate it.
     """
     messages = list(checkpoint.get("messages") or [])
-    stored = str(checkpoint.get("objective") or "").strip()
+    # A checkpoint written before machine wording was filtered may hold a snowballed chain.
+    stored = local_state.clean_objective_chain(str(checkpoint.get("objective") or "")).strip()
 
     # Anchor at the user message that created this checkpoint, then cross
     # backwards only over unfinished assistant work (tool calls, narrated
@@ -7682,6 +7675,8 @@ async def _run_local_agent_turn_impl(
                 progress_callback=_remember_stream_delta,
                 session_id=session_id,
             )
+            if content.strip() or tool_calls:
+                local_state.record_route_served(session_id)   # a working route just answered: heals "route down"
             # Do not wait for the next tool round/final answer: if the process
             # is interrupted immediately after a provider stream completes,
             # its latest assistant text is already durable.

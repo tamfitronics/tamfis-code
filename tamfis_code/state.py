@@ -484,6 +484,9 @@ class SessionState:
     # failed over -- a route switch was visible only as a scrolling-through
     # debug diagnostic. Bounded (see ROUTE_EVENT_LIMIT) because it is durable.
     route_events: list[dict] = field(default_factory=list)
+    # When a model request last COMPLETED on this session. An "exhaustion" route event recorded earlier than
+    # this has since been served by a working route, so the footer must not keep saying "route down".
+    last_route_served_at: str = ""
     # Per-provider response-time samples for THIS session, newest last:
     # {provider: [seconds, ...]}. The in-process registry in providers.py
     # cannot answer "why is this session slow" after a restart, and it mixes
@@ -807,6 +810,68 @@ def _enforce_state_caps(state: SessionState) -> None:
     }
 
 
+# Wording the composer pre-fills as a next-message suggestion and the recovery machinery uses. Submitted, it
+# was once stored as the user's OBJECTIVE and re-appended on every resume ("...Additional user context:
+# continue from the saved checkpoint and resolve: ... Additional user context: ..."), burying the real task.
+MACHINE_OBJECTIVE_RE = re.compile(
+    r"^\s*(?:continue\s+from\s+the\s+saved\s+checkpoint|repair\s+the\s+failed\s+plan\s+step|"
+    r"continue\s+the\s+active\s+plan\s+with|continue\s+the\s+interrupted\s+task|"
+    r"resume\s+at\s+step\s+\d+|/retry\b)",
+    re.IGNORECASE,
+)
+_BARE_RESUME_RE = re.compile(r"^\s*(?:please\s+)?(?:continue|resume|proceed|go\s+on|keep\s+going|retry)\b[\s.!]*\S*[\s.!]*$", re.IGNORECASE)
+_CONTEXT_SEPARATOR_RE = re.compile(r"\s*Additional user context:\s*", re.IGNORECASE)
+
+
+def clean_objective_chain(text: str) -> str:
+    """``text`` with the machine-generated segments of an "Additional user context" chain removed.
+
+    A genuine clarification appended by a person is kept; recovery/suggestion wording and bare resume
+    phrases are dropped; duplicates collapse. Returns the input unchanged when it holds no chain."""
+    raw = str(text or "")
+    if not raw.strip():
+        return raw
+    parts = [p.strip() for p in _CONTEXT_SEPARATOR_RE.split(raw)]
+    kept: list[str] = []
+    seen: set[str] = set()
+    for index, part in enumerate(parts):
+        if not part or MACHINE_OBJECTIVE_RE.match(part) or (index and _BARE_RESUME_RE.match(part)):
+            continue
+        key = part.casefold()
+        if key not in seen:
+            seen.add(key)
+            kept.append(part)
+    if not kept:
+        return ""
+    return "\n\nAdditional user context: ".join(kept)
+
+
+def _clean_row_objectives(row: dict[str, Any]) -> dict[str, Any]:
+    """Repair machine-polluted objective fields of one stored session row (idempotent, pure)."""
+    row = dict(row)
+    checkpoint = row.get("turn_checkpoint")
+    if isinstance(checkpoint, dict) and checkpoint.get("objective"):
+        cleaned = clean_objective_chain(checkpoint["objective"])
+        if cleaned != checkpoint["objective"]:
+            row["turn_checkpoint"] = {**checkpoint, "objective": cleaned}
+    task = row.get("active_task")
+    if isinstance(task, dict) and task.get("objective"):
+        cleaned = clean_objective_chain(task["objective"])
+        if cleaned != task["objective"]:
+            row["active_task"] = {**task, "objective": cleaned}
+    plans = row.get("saved_plans")
+    if isinstance(plans, list):
+        fixed = []
+        for plan in plans:
+            if isinstance(plan, dict) and plan.get("objective"):
+                cleaned = clean_objective_chain(plan["objective"])
+                if cleaned != plan["objective"]:
+                    plan = {**plan, "objective": cleaned or plan["objective"]}
+            fixed.append(plan)
+        row["saved_plans"] = fixed
+    return row
+
+
 def _clip_strings(value: Any, limit: int) -> Any:
     """Copy of ``value`` with every string longer than ``limit`` cut to head + a marker."""
     if isinstance(value, str):
@@ -852,7 +917,7 @@ def _slim_checkpoints(checkpoints: list[dict[str, Any]], keep_ledgers: int) -> l
 
 def _compact_row(row: dict[str, Any], *, cold: bool) -> dict[str, Any]:
     """Size-bound one stored session row (a dict, as persisted). Pure: returns the compacted row."""
-    row = dict(row)
+    row = _clean_row_objectives(row)
     if isinstance(row.get("modified_files"), list):
         row["modified_files"] = _budget_revert_bodies(
             row["modified_files"], COLD_REVERT_BODY_BUDGET_CHARS if cold else REVERT_BODY_BUDGET_CHARS,
@@ -2174,6 +2239,28 @@ def record_route_event(
         return
 
 
+ROUTE_SERVED_MIN_INTERVAL_SECONDS = 30.0
+
+
+def record_route_served(session_id: int) -> None:
+    """Note that a model request just completed on this session (rate-limited: at most one write per
+    ROUTE_SERVED_MIN_INTERVAL_SECONDS). Never raises."""
+    try:
+        state = get_session_state(session_id)
+        previous = _parse_route_timestamp(state.last_route_served_at)
+        if previous is not None and (datetime.now(timezone.utc) - previous).total_seconds() < ROUTE_SERVED_MIN_INTERVAL_SECONDS:
+            # Skip the write only while nothing needs healing: an exhaustion recorded after the last
+            # "served" mark must always be followed by a fresh mark.
+            exhaustions = [e for e in (state.route_events or []) if e.get("kind") == "exhaustion"]
+            latest = _parse_route_timestamp(exhaustions[-1].get("at")) if exhaustions else None
+            if latest is None or previous >= latest:
+                return
+        state.last_route_served_at = _now()
+        put_session_state(state)
+    except Exception:
+        return
+
+
 def record_route_error(
     session_id: int, *, provider: str, model: str = "", error: str = "",
 ) -> None:
@@ -2626,6 +2713,17 @@ def route_status_compact(
     failovers = _recent_route_events(diag.get("failovers") or [], window_seconds)
     exhausted_recent = _recent_route_events([diag.get("last_exhaustion") or {}], window_seconds)
     last_exhaustion = exhausted_recent[0] if exhausted_recent and exhausted_recent[0] else {}
+    if last_exhaustion:
+        # A request that COMPLETED after the exhaustion proves a working route took over: "route down" is
+        # then false (owner report 2026-09-21: the footer said "⟳ route down · credits" under a run that
+        # had just completed).
+        try:
+            served = _parse_route_timestamp(get_session_state(session_id).last_route_served_at)
+            exhausted_at = _parse_route_timestamp(last_exhaustion.get("at"))
+            if served is not None and exhausted_at is not None and served >= exhausted_at:
+                last_exhaustion = {}
+        except Exception:
+            pass
     # Cooling routes are deliberately NOT surfaced here. A failed request
     # briefly opens a provider's 30s health circuit as part of NORMAL
     # self-healing, so "cooling" fires constantly (e.g. nvidia + ollama_cloud

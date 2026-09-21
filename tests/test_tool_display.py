@@ -384,3 +384,31 @@ class TranscriptKeyIsNotTheSshClientsTests(unittest.IsolatedAsyncioTestCase):
         flat = {key for keys in recorded for key in keys}
         self.assertIn("c-o", flat)
         self.assertIn("c-t", flat)
+
+
+class RunningComposerLeavesNoStaleFrameTests(unittest.IsolatedAsyncioTestCase):
+    """Owner paste 2026-09-21: finished tasks and every follow-up Enter left a copy of the running composer
+    (rules, tip, "esc to interrupt" footer) in the scrollback. The running composer must erase itself when done."""
+
+    async def test_the_live_composer_is_erased_when_it_ends(self):
+        from unittest.mock import patch
+
+        from test_live_input import _config, _console
+        from tamfis_code.live_input import LiveInputListener
+
+        seen = {}
+
+        class Stop(Exception):
+            pass
+
+        def fake_session(*args, **kwargs):
+            seen.update(kwargs)
+            raise Stop
+
+        listener = LiveInputListener(session_id=1, renderer=StreamRenderer(_console()), cli_config=_config())
+        with patch("prompt_toolkit.PromptSession", fake_session):
+            try:
+                await listener._input_loop()
+            except Stop:
+                pass
+        self.assertTrue(seen.get("erase_when_done"))

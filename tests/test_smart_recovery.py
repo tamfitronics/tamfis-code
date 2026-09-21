@@ -117,3 +117,46 @@ class RecapTextTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PollutedObjectiveRepairTests(unittest.TestCase):
+    """Existing checkpoints written before machine wording was filtered are repaired, not just future ones."""
+
+    SNOWBALL = (
+        "Fix the TypeError in serve2.py streaming\n\nAdditional user context: Repair the failed plan step, then "
+        "revalidate it: Read pyproject.toml\n\nAdditional user context: continue from the saved checkpoint and "
+        "resolve: execution cancelled by user\n\nAdditional user context: continue from the saved checkpoint and "
+        "resolve: execution cancelled by user\n\nAdditional user context: continue"
+    )
+
+    def test_the_chain_collapses_to_the_real_task(self):
+        self.assertEqual(state_module.clean_objective_chain(self.SNOWBALL), "Fix the TypeError in serve2.py streaming")
+
+    def test_a_genuine_clarification_survives(self):
+        text = "Fix the login bug\n\nAdditional user context: it only happens on Safari\n\nAdditional user context: continue"
+        self.assertEqual(
+            state_module.clean_objective_chain(text),
+            "Fix the login bug\n\nAdditional user context: it only happens on Safari",
+        )
+
+    def test_clean_text_is_unchanged_and_the_repair_is_idempotent(self):
+        clean = "Add a login page"
+        self.assertEqual(state_module.clean_objective_chain(clean), clean)
+        once = state_module.clean_objective_chain(self.SNOWBALL)
+        self.assertEqual(state_module.clean_objective_chain(once), once)
+
+    def test_a_stored_row_is_repaired_everywhere_the_objective_lives(self):
+        row = {
+            "turn_checkpoint": {"objective": self.SNOWBALL, "status": "interrupted"},
+            "active_task": {"objective": self.SNOWBALL},
+            "saved_plans": [{"id": "p", "objective": self.SNOWBALL, "steps": []}],
+        }
+        fixed = state_module._clean_row_objectives(row)
+        for value in (fixed["turn_checkpoint"]["objective"], fixed["active_task"]["objective"],
+                      fixed["saved_plans"][0]["objective"]):
+            self.assertEqual(value, "Fix the TypeError in serve2.py streaming")
+        self.assertEqual(fixed["turn_checkpoint"]["status"], "interrupted")
+
+    def test_the_resume_objective_of_a_polluted_checkpoint_is_the_real_task(self):
+        checkpoint = {"objective": self.SNOWBALL, "messages": []}
+        self.assertEqual(_checkpoint_resume_objective(checkpoint), "Fix the TypeError in serve2.py streaming")
