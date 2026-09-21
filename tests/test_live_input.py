@@ -154,7 +154,7 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         ).__pt_formatted_text__()
         rendered = "".join(fragment[1] for fragment in fragments)
 
-        self.assertIn("↑ Install v9.9.9 · click or Ctrl+U", rendered)
+        self.assertIn("↑ Install v9.9.9 · Ctrl+U or /update", rendered)
         clickable = [fragment for fragment in fragments if len(fragment) == 3]
         self.assertTrue(clickable)
         self.assertTrue(all(fragment[2] is handler for fragment in clickable))

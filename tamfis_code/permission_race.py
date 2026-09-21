@@ -53,6 +53,8 @@ WINNER_NONE = "none"
 DEFAULT_AUTO_WINDOW_MS = 0
 ZERO_STOP_AUTO_WINDOW_MS = 500
 DEFAULT_CLASSIFIER_TIMEOUT_S = 2.5
+# How long the decision waits for losing racers to finish cancelling before moving on.
+CANCEL_GRACE_SECONDS = 5.0
 
 # The approval families that mean "yes" at the UI.
 _APPROVE_DECISIONS = frozenset({"approve_once", "approve", "approve_session", "allow"})
@@ -314,8 +316,13 @@ async def race_permission(
             task.cancel()
         if pending:
             # Await the cancellations so no "task was destroyed but it is
-            # pending" warning can escape into the user's terminal.
-            await asyncio.gather(*pending, return_exceptions=True)
+            # pending" warning can escape into the user's terminal -- but BOUNDED: a racer that
+            # ignores cancellation (a prompt app tearing down, a classifier stuck in a client call)
+            # used to block this await forever, i.e. the approved tool never ran and the run sat on
+            # "Reviewing the tool result…" indefinitely. The decision is already made; move on.
+            _done, _stuck = await asyncio.wait(pending, timeout=CANCEL_GRACE_SECONDS)
+            for _task in _stuck:
+                _task.add_done_callback(lambda t: t.cancelled() or t.exception())  # never "exception was never retrieved"
 
     if implied is not None:
         return RaceOutcome(implied, WINNER_POLICY, elapsed(), detail)

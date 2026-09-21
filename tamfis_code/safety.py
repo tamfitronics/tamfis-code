@@ -31,6 +31,11 @@ READ_ONLY_TOOLS = {
     "read_file", "list_directory", "search_code", "find_references", "get_git_info",
     "ask_user_question", "inspect_artifact",
     "list_external_agent_sessions", "read_external_agent_session",
+    # write_todos only edits the session's own task-state ledger (never a workspace file) and
+    # tool_policy OFFERS it in every non-plain turn. Missing from this table it fell through to the
+    # unknown-tool default, so it was rated "dangerous" (an approval prompt for a to-do list, even in
+    # auto mode) and, in a read-only turn, was offered and then refused ("not available in read-only mode").
+    "write_todos",
 }
 MUTATING_FILE_TOOLS = {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"}
 

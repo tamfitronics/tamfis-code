@@ -1218,15 +1218,32 @@ class MCPServer:
             handler=self._write_todos,
         )
 
+    @staticmethod
+    def _coerce_todos(todos: Any) -> List[Any]:
+        """Models send `todos` as a real list, a JSON *string* of one, or a single object. A string
+        used to be iterated character by character, matched nothing, and silently CLEARED the list."""
+        if isinstance(todos, str):
+            text = todos.strip()
+            try:
+                todos = json.loads(text) if text else []
+            except ValueError:
+                # not JSON: treat each non-empty line as one open task
+                todos = [{"task": line.strip("-*• \t")} for line in text.splitlines() if line.strip("-*• \t")]
+        if isinstance(todos, dict):
+            todos = todos.get("todos") if isinstance(todos.get("todos"), list) else [todos]
+        return list(todos) if isinstance(todos, (list, tuple)) else []
+
     async def _write_todos(self, todos: List[Dict[str, Any]]) -> str:
         cleaned: List[Dict[str, Any]] = []
-        for item in todos[:50]:
-            if not isinstance(item, dict):
+        for item in self._coerce_todos(todos)[:50]:
+            if not isinstance(item, dict):   # a stray string inside a list is dropped (contract)
                 continue
-            task_text = str(item.get("task") or "").strip()
+            # accept the Claude-style {"content","status"} shape as well as {"task","completed"}
+            task_text = str(item.get("task") or item.get("content") or "").strip()
             if not task_text:
                 continue
-            cleaned.append({"task": task_text[:300], "completed": bool(item.get("completed"))})
+            done = bool(item.get("completed")) or str(item.get("status") or "").lower() in {"completed", "done"}
+            cleaned.append({"task": task_text[:300], "completed": done})
         if self.session_id is not None:
             try:
                 from . import state as local_state
@@ -1673,7 +1690,31 @@ class MCPServer:
                         return matches
         return matches
 
+    def _written_earlier_this_session(self, path: str) -> bool:
+        """True when the session's mutation ledger says this session wrote ``path`` (it has since been
+        deleted or moved outside the session)."""
+        if self.session_id is None:
+            return False
+        try:
+            from . import state as local_state
+
+            wanted = str(self._resolve_in_workspace(path)) if self.workspace_root else str(path)
+            return any(
+                str(entry.get("path")) in {wanted, str(path)}
+                for entry in local_state.get_session_state(self.session_id).modified_files
+            )
+        except Exception:
+            return False
+
     def _not_found_hint(self, path: str) -> str:
+        if self._written_earlier_this_session(path):
+            # The generic hint below ("use list_directory or search_code to find the right path")
+            # sent a model that had written this file round the same read/list loop indefinitely.
+            return (
+                " This session wrote that file earlier, but it no longer exists (deleted or moved outside "
+                "this session). Do not keep searching for it: recreate it with write_file only if it is "
+                "still needed, otherwise continue without it."
+            )
         suggestions = self._suggest_similar_paths(path)
         if suggestions:
             return f" Found '{Path(path).name}' at: {', '.join(suggestions)}."

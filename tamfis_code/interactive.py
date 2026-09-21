@@ -1112,8 +1112,11 @@ async def _run_interactive_impl(
         "Shift+Tab cycles mode. Ctrl+D or Ctrl+C exits.[/dim]\n"
     )
 
-    from .self_update import check_update_available
-    _available_update = check_update_available()
+    from .self_update import cache_age_seconds, cached_update_available, refresh_update_cache
+    # Answered from the on-disk cache: instant and offline, so a launch never waits on the network
+    # (this used to be a blocking HTTP call of up to 3 s on every start). The background poll below
+    # refreshes the cache and updates the footer chip if a release was published since.
+    _available_update = cached_update_available()
     if _available_update:
         render_update_notice(console, current=__version__, available=_available_update)
 
@@ -1143,17 +1146,22 @@ async def _run_interactive_impl(
         resource that needs an orderly close, unlike local_pty.
         """
         nonlocal _available_update
+        # First pass shortly after start (once the prompt session exists), then every 30 minutes --
+        # a live release notice, not a poll storm. A refresh is skipped when another process refreshed
+        # the shared on-disk cache within the last 20 minutes.
+        await asyncio.sleep(2)
         while True:
-            await asyncio.sleep(1800)  # 30 minutes -- a live release notice, not a poll storm
-            try:
-                found = await asyncio.to_thread(check_update_available)
-            except Exception:
-                continue
-            if found and found != _available_update:
-                _available_update = found
-                app = getattr(session, "app", None)
-                if app is not None and getattr(app, "is_running", False):
-                    app.invalidate()
+            if cache_age_seconds() > 20 * 60:
+                try:
+                    found = await asyncio.to_thread(refresh_update_cache)
+                except Exception:
+                    found = None
+                if found and found != _available_update:
+                    _available_update = found
+                    app = getattr(session, "app", None)
+                    if app is not None and getattr(app, "is_running", False):
+                        app.invalidate()
+            await asyncio.sleep(1800)
 
     asyncio.create_task(_poll_for_live_updates())
 
@@ -1369,7 +1377,7 @@ async def _run_interactive_impl(
             )),
             active_agents=idle_active_agents,
             update_version=_available_update,
-            update_handler=_click_available_update if _available_update else None,
+            update_handler=None,   # keyboard-only: a clickable chip needs mouse capture, which steals the wheel
         ),
         auto_suggest=_NextMessageAutoSuggest(
             lambda: last_response_text,
@@ -1395,7 +1403,7 @@ async def _run_interactive_impl(
         # something prompt_toolkit exposes, and unconditionally enabling it
         # from the start would cost every ordinary, already-up-to-date
         # session its normal mouse text selection for no benefit.
-        mouse_support=bool(_available_update),
+        mouse_support=False,
     )
     force_bottom_toolbar_visible(session)
 

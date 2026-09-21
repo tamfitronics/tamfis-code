@@ -31,7 +31,8 @@ REPO = Path(__file__).resolve().parents[1]
 class FakeProvider:
     """OpenAI-compatible SSE server: round 1 = one tool call, then it hangs."""
 
-    def __init__(self):
+    def __init__(self, first_tool=None):
+        self.first_tool = first_tool          # (name, arguments dict) instead of the default list_directory
         self.requests = []
         self.port = 0
         self._loop = asyncio.new_event_loop()
@@ -87,7 +88,8 @@ class FakeProvider:
         base = {"id": "c", "object": "chat.completion.chunk", "model": "m"}
         if not any(m.get("role") == "tool" for m in msgs):
             await send({**base, "choices": [{"index": 0, "delta": {"role": "assistant", "content": ""}, "finish_reason": None}]})
-            await send({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": "list_directory", "arguments": json.dumps({"path": "."})}}]}, "finish_reason": None}]})
+            tool_name, tool_args = self.first_tool or ("list_directory", {"path": "."})
+            await send({**base, "choices": [{"index": 0, "delta": {"tool_calls": [{"index": 0, "id": "call_1", "type": "function", "function": {"name": tool_name, "arguments": json.dumps(tool_args)}}]}, "finish_reason": None}]})
             await send({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}]})
             writer.write(b"11\r\ndata: [DONE]\n\n\r\n0\r\n\r\n")
             await writer.drain()
@@ -99,9 +101,11 @@ class FakeProvider:
 
 @unittest.skipIf(pty is None or not sys.platform.startswith("linux"), "needs a POSIX pty")
 class RealTerminalIncidentTest(unittest.TestCase):
+    FIRST_TOOL = None
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=str(REPO))  # not /tmp: see release notes
-        self.provider = FakeProvider()
+        self.provider = FakeProvider(first_tool=self.first_tool())
         self.provider.start()
         base = Path(self.tmp.name)
         (base / "home").mkdir()
@@ -120,6 +124,9 @@ class RealTerminalIncidentTest(unittest.TestCase):
             os.chdir(base / "ws")
             os.execvpe(sys.executable, [sys.executable, "-m", "tamfis_code", "--new-session", "--approval", "auto"], env)
         fcntl.ioctl(self.fd, termios.TIOCSWINSZ, struct.pack("HHHH", 40, 120, 0, 0))
+
+    def first_tool(self):
+        return self.FIRST_TOOL
 
     def tearDown(self):
         try:
@@ -204,6 +211,53 @@ class RealTerminalIncidentTest(unittest.TestCase):
         self.assertNotIn(b"^[", bytes(self.out))
         self.assertFalse(self.echo_on())
         self.assertIn("❯".encode(), bytes(self.out))
+
+
+class ComposerSurvivesAnApprovalGateTest(RealTerminalIncidentTest):
+    """Live report 2026-09-21: after an approval gate the composer was dead -- Enter did nothing, keys
+    were echoed as text and follow-ups were never sent. Cause: the gate pauses the composer, and a stale
+    "programmatic exit" marker made the restarted composer treat the user's FIRST Enter as a teardown."""
+
+    def first_tool(self):
+        # Outside the workspace and outside the tamfis-code source tree (writes into a source tree are
+        # rated dangerous and would wait on a human prompt), named by the user in the request.
+        self._outside = Path(tempfile.mkdtemp(prefix="tamfis-approval-"))
+        self.target = self._outside / "target.txt"
+        return ("write_file", {"path": str(self.target), "content": "x\n"})
+
+    def tearDown(self):
+        import shutil
+
+        shutil.rmtree(getattr(self, "_outside", ""), ignore_errors=True)
+        super().tearDown()
+
+    def test_incident_sequence_keeps_the_composer_alive(self):  # replaced below
+        self.skipTest("covered by test_follow_up_after_an_approval_gate_reaches_the_model")
+
+    def test_follow_up_after_an_approval_gate_reaches_the_model(self):
+        self.assertTrue(self.expect("❯".encode(), 60), "no idle prompt")
+        self.pump(1)
+        self.out.clear()
+        os.write(self.fd, f"create the file {self.target} with one line\r".encode())
+        deadline = time.time() + 60
+        while time.time() < deadline and len(self.provider.requests) < 2:
+            self.pump(0.5)
+        self.assertEqual(len(self.provider.requests), 2, "the tool call never completed / no continuation request")
+        self.pump(2)   # the composer has been paused and resumed around the tool's approval by now
+        self.assertFalse(self.echo_on(), "tty in echo mode right after the approval gate")
+
+        before = len(self.provider.requests)
+        os.write(self.fd, b"Also inspect the gateway.")
+        self.pump(0.5)
+        os.write(self.fd, b"\r")
+        self.assertTrue(self.expect(b"Follow-up queued", 10), "Enter was not acknowledged after the approval")
+        deadline = time.time() + 30
+        while time.time() < deadline and len(self.provider.requests) <= before:
+            self.pump(0.5)
+        self.assertGreater(len(self.provider.requests), before, "the follow-up never reached the model")
+        self.assertIn("Also inspect the gateway.", json.dumps(self.provider.requests[-1]))
+        self.assertFalse(self.echo_on(), "the tty went cooked after the user's first Enter")
+        self.assertNotIn(b"^[", bytes(self.out))
 
 
 if __name__ == "__main__":

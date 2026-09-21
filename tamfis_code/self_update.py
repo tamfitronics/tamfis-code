@@ -21,39 +21,155 @@ import sysconfig
 import hashlib
 import json
 import tempfile
+import time
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 from pathlib import Path
 from typing import Optional, Tuple
 
 from . import __version__
+from . import config as _config
 
 DEFAULT_REPO_PATH = Path(
     os.environ.get("TAMFIS_CODE_REPO") or Path(__file__).resolve().parents[1]
 ).expanduser()
 _VERSION_RE = re.compile(r'^version\s*=\s*"([^"]+)"', re.MULTILINE)
 RELEASE_BASE = "https://gpt.tamfitronics.com/releases/tamfis-code"
+_SEMVER_RE = re.compile(r"\d+\.\d+\.\d+")
+_SHA_RE = re.compile(r"[a-f0-9]{64}")
+
+# How long a remembered answer is trusted before the network is asked again. The in-memory copy is
+# short so a long-lived session notices a release published while it runs; the on-disk copy lets every
+# new process alert INSTANTLY (no network, no startup delay) and be refreshed in the background.
+MEMORY_TTL_SECONDS = 10 * 60
+DISK_TTL_SECONDS = 6 * 60 * 60
+ONESHOT_NOTICE_INTERVAL_SECONDS = 24 * 60 * 60
+
 _release = None
+_release_at = 0.0
 
 
-def _remote_release():
-    global _release
-    if _release is not None:
-        return _release
+def _valid_release(info) -> bool:
+    """Same checks for a network answer and a cached one: a tampered or truncated cache file must
+    never be able to point the updater at an arbitrary URL."""
+    if not isinstance(info, dict):
+        return False
+    url = str(info.get("url", ""))
+    return bool(
+        _SEMVER_RE.fullmatch(str(info.get("version", "")))
+        and url.startswith(RELEASE_BASE + "/") and url.endswith(".whl")
+        and _SHA_RE.fullmatch(str(info.get("sha256", "")))
+    )
+
+
+def _fetch_manifest(timeout: float = 3.0):
     try:
-        with urlopen(Request(RELEASE_BASE + "/latest.json", headers={"User-Agent": "Tamfis-Code/" + __version__, "Accept": "application/json"}), timeout=3) as response:
+        with urlopen(Request(RELEASE_BASE + "/latest.json", headers={"User-Agent": "Tamfis-Code/" + __version__, "Accept": "application/json"}), timeout=timeout) as response:
             info = json.loads(response.read(16384))
-        if not re.fullmatch(r"\d+\.\d+\.\d+", info.get("version", "")):
-            return None
-        url = info.get("url", "")
-        if not url.startswith(RELEASE_BASE + "/") or not url.endswith(".whl"):
-            return None
-        if not re.fullmatch(r"[a-f0-9]{64}", info.get("sha256", "")):
-            return None
-        _release = info
-        return info
     except (OSError, ValueError, TypeError, AttributeError):
         return None
+    return info if _valid_release(info) else None
+
+
+def _cache_path() -> Path:
+    return _config.CONFIG_DIR / "update_check.json"
+
+
+def _read_cache() -> dict:
+    try:
+        data = json.loads(_cache_path().read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _write_cache(**changes) -> None:
+    try:
+        data = _read_cache()
+        data.update(changes)
+        path = _cache_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass  # an update hint must never be able to break the CLI
+
+
+def _remote_release(*, force: bool = False):
+    """The published release manifest. Cached in memory only briefly (see MEMORY_TTL_SECONDS): it
+    used to be remembered for the life of the process, so the REPL's "check every 30 minutes" poll
+    could never see a release published after startup. A transient network failure keeps the last
+    known answer rather than reporting "no update"."""
+    global _release, _release_at
+    now = time.monotonic()
+    if not force and _release is not None and now - _release_at < MEMORY_TTL_SECONDS:
+        return _release
+    info = _fetch_manifest()
+    if info is not None:
+        _release, _release_at = info, now
+        _write_cache(release=info, checked_at=time.time())
+    return info if info is not None else _release
+
+
+def cached_release():
+    """The last manifest this machine saw, from disk. No network -- safe at startup and in one-shot
+    commands. None when nothing valid is cached."""
+    info = _read_cache().get("release")
+    return info if _valid_release(info) else None
+
+
+def cache_age_seconds() -> float:
+    """Seconds since the manifest was last fetched from the network (inf when never)."""
+    try:
+        checked = float(_read_cache().get("checked_at", 0))
+    except (TypeError, ValueError):
+        return float("inf")
+    return max(0.0, time.time() - checked) if checked > 0 else float("inf")
+
+
+def cache_is_stale() -> bool:
+    try:
+        return time.time() - float(_read_cache().get("checked_at", 0)) > DISK_TTL_SECONDS
+    except (TypeError, ValueError):
+        return True
+
+
+def _newest(versions) -> Optional[str]:
+    versions = [v for v in versions if v]
+    newest = max(versions, key=_parse_version) if versions else None
+    return newest if newest and _parse_version(newest) > _parse_version(__version__) else None
+
+
+def cached_update_available(repo_path: Optional[Path] = None) -> Optional[str]:
+    """Like check_update_available but answered from the on-disk cache only (instant, offline)."""
+    checkout = _repo_version(repo_path or DEFAULT_REPO_PATH)
+    release = cached_release()
+    return _newest([checkout, release["version"] if release else None])
+
+
+def refresh_update_cache() -> Optional[str]:
+    """Ask the network now (bypassing the memory cache) and remember the answer on disk. Blocking:
+    run it in a thread. Returns the newest available version, if any."""
+    _remote_release(force=True)
+    return cached_update_available()
+
+
+def should_notify_oneshot() -> Optional[str]:
+    """The newer version to mention on a one-shot command (ask/agent/...), at most once a day, from
+    the cache only. None when up to date, nothing is cached, or it was already mentioned recently."""
+    available = cached_update_available()
+    if not available:
+        return None
+    try:
+        last = float(_read_cache().get("oneshot_notified_at", 0))
+    except (TypeError, ValueError):
+        last = 0.0
+    return available if time.time() - last > ONESHOT_NOTICE_INTERVAL_SECONDS else None
+
+
+def mark_oneshot_notified() -> None:
+    _write_cache(oneshot_notified_at=time.time())
 
 
 def update_instructions() -> str:
@@ -106,8 +222,7 @@ def check_update_available(repo_path: Optional[Path] = None) -> Optional[str]:
         remote = _remote_release()
         if remote:
             versions.append(remote["version"])
-    newest = max(versions, key=_parse_version) if versions else None
-    return newest if newest and _parse_version(newest) > _parse_version(__version__) else None
+    return _newest(versions)
 
 
 def apply_update(repo_path: Optional[Path] = None) -> Tuple[bool, str]:

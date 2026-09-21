@@ -104,3 +104,13 @@ def _isolate_provider_health(monkeypatch):
         providers._ROUTE_HEALTH.clear()
         providers._ROUTE_HEALTH.update(saved)
     ollama_pacing._cache = (0.0, 0, 0)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_user_hooks(monkeypatch, tmp_path):
+    """tests/test_hooks.py writes ``HOOKS_PATH``. Unpatched, that is the REAL
+    ~/.config/tamfis-code/hooks.toml: every suite run left a ``post_tool_use: echo hi`` hook in the
+    developer's real config, which then ran after every tool call in their real sessions."""
+    from tamfis_code import hooks
+
+    monkeypatch.setattr(hooks, "HOOKS_PATH", tmp_path / "hooks.toml")

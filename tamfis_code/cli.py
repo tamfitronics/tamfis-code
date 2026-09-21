@@ -213,6 +213,8 @@ def cli(
 
     ctx.ensure_object(dict)
     ctx.obj["config"] = config
+    if ctx.invoked_subcommand and ctx.invoked_subcommand != "update" and config.output_mode == "text":
+        _announce_update_once(sys.argv[1:])   # one-shot commands never reach the REPL's own notice
     ctx.obj["workspace_root"] = workspace_root
 
     if ctx.invoked_subcommand is None:
@@ -3052,6 +3054,29 @@ def index_cmd(path: str, search: str, kind: str, stats: bool):
 # on it, since it was disconnected from the real streaming path. Superseded
 # by StreamRenderer's live token/rate display (render.py), which records real
 # per-task estimates as assistant_delta events arrive.
+
+
+def _announce_update_once(argv: list[str]) -> None:
+    """One dim line, on stderr, when a newer release is known -- for the commands that never reach the
+    interactive prompt (ask / agent / audit / ...). Cache-only (no network, no delay), at most once a
+    day, only on a real terminal, and never for machine-readable output or `update` itself."""
+    try:
+        if any(a in {"--output-mode", "--version", "update", "--help", "-h"} or a.startswith("--output-mode=") for a in argv):
+            return
+        if not sys.stderr.isatty():
+            return
+        from .self_update import mark_oneshot_notified, should_notify_oneshot
+
+        available = should_notify_oneshot()
+        if available:
+            print(
+                f"\x1b[2m↑ Tamfis-Code {available} is available (you have {__version__}). "
+                "Run `tamfis-code update`.\x1b[0m",
+                file=sys.stderr,
+            )
+            mark_oneshot_notified()
+    except Exception:
+        pass  # an update hint must never break a command
 
 
 def main() -> None:

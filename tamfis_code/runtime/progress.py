@@ -83,12 +83,18 @@ class StallPolicy:
 
     provider_warn: float = 45.0
     provider_abort: float = 240.0
+    # Nothing at all (no token, no tool start/finish, no event) for this long while NOT waiting on
+    # the model, a tool or the user. Every legitimate operation in that gap (context compaction,
+    # planning, hooks) is bounded by its own timeouts well under this; a run silent for longer than
+    # that is wedged. A 260-minute "Reviewing the tool result..." was exactly this case.
+    silent_abort: float = 600.0
 
     @classmethod
     def from_env(cls) -> "StallPolicy":
         warn = _env_seconds("TAMFIS_CODE_STALL_WARN_SECONDS", cls.provider_warn, minimum=5.0)
         abort = _env_seconds("TAMFIS_CODE_STALL_ABORT_SECONDS", cls.provider_abort, minimum=10.0)
-        return cls(provider_warn=warn, provider_abort=max(abort, warn + 5.0))
+        silent = _env_seconds("TAMFIS_CODE_SILENT_ABORT_SECONDS", cls.silent_abort, minimum=30.0)
+        return cls(provider_warn=warn, provider_abort=max(abort, warn + 5.0), silent_abort=max(silent, abort))
 
 
 # Events that are real execution activity. Anything not listed (diagnostics,
@@ -234,6 +240,17 @@ class ProgressTracker:
             idle_seconds=self.idle_seconds(),
             pending_tools=self.pending_tools,
             last_event=self.last_event,
+        )
+
+    def should_abort_silent(self) -> bool:
+        """True when the run has produced no activity for ``silent_abort`` seconds while it is not
+        waiting on the provider (covered above), a tool (own timeouts) or the user."""
+        return (
+            self._terminal is None
+            and not self._cancelling
+            and self._awaiting is None
+            and self.pending_tools == 0
+            and self.idle_seconds() >= self.policy.silent_abort
         )
 
     def should_abort_provider_wait(self) -> bool:

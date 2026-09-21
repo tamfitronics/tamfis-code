@@ -2494,7 +2494,7 @@ def render_update_notice(console: Console, *, current: str, available: str) -> N
     console.print(Panel(
         Group(version_line, Text(""), detail, Text(""), action),
         title=Text("Update available"),
-        subtitle=Text("Click the footer action, press Ctrl+U, or type /update"),
+        subtitle=Text("Press Ctrl+U or type /update"),
         border_style="yellow",
         expand=False,
         padding=(0, 1),

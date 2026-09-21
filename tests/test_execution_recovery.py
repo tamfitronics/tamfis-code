@@ -393,6 +393,7 @@ class ListenerRecoveryTests(_StatePatch):
             if len(runs) < 3:
                 return  # e.g. old `except EOFError: return`
             listener._input_exit_expected = True
+            listener._paused = True                    # third run ends deliberately (a real stop pauses first)
 
         listener._input_loop = flaky
         await asyncio.wait_for(listener._supervised_input_loop(), timeout=5)
@@ -411,18 +412,37 @@ class ListenerRecoveryTests(_StatePatch):
         mute.assert_called_once()
         self.assertIn("message box stopped working", renderer.console.file.getvalue())
 
-    async def test_expected_exit_is_not_restarted(self):
+    async def test_a_deliberate_stop_is_not_restarted(self):
         listener, _ = _listener()
         listener._active = True
         runs = []
 
-        async def once():
+        async def stopped_by_pause():
             runs.append(1)
+            listener._paused = True                    # a real deliberate stop pauses / deactivates first
             listener._input_exit_expected = True
 
-        listener._input_loop = once
+        listener._input_loop = stopped_by_pause
         await asyncio.wait_for(listener._supervised_input_loop(), timeout=5)
         self.assertEqual(runs, [1])
+
+    async def test_an_exit_that_claims_to_be_deliberate_but_left_the_task_running_is_restarted(self):
+        """The dead-composer-after-an-approval bug: the loop ended 'expected' (a stale programmatic-exit
+        marker) while the task was still running and nobody had paused it -- no composer for the rest
+        of the turn, and the user's message was dropped."""
+        listener, _ = _listener()
+        listener._active = True
+        runs = []
+
+        async def stale_marker():
+            runs.append(1)
+            listener._input_exit_expected = True
+            if len(runs) == 2:
+                listener._active = False               # the turn ends
+
+        listener._input_loop = stale_marker
+        await asyncio.wait_for(listener._supervised_input_loop(), timeout=5)
+        self.assertEqual(len(runs), 2)
 
     async def test_single_eof_keeps_the_prompt_but_hangup_stops_the_task(self):
         listener, _ = _listener()
@@ -462,6 +482,33 @@ class ListenerRecoveryTests(_StatePatch):
         listener._watchdog_check()
         self.assertEqual(seen, ["stall"])
         self.assertIn("type `continue`", " ".join(renderer.console.file.getvalue().split()))
+
+    async def test_watchdog_stops_a_run_that_went_silent_between_a_tool_and_the_next_request(self):
+        listener, renderer = _listener(12)
+        clock = _Clock()
+        renderer.progress = ProgressTracker(StallPolicy(5, 20, 100), clock=clock)
+        seen = []
+        listener._interrupt_callback = seen.append
+        renderer.progress.observe("tool_call_requested", {"name": "write_todos"})
+        renderer.progress.observe("tool_output", {})       # tool done; no provider request ever starts
+        clock.now += 60
+        listener._watchdog_check()
+        self.assertEqual(seen, [])                          # not yet
+        clock.now += 60
+        listener._watchdog_check()
+        self.assertEqual(seen, ["stall"])
+        self.assertIn("looks stuck", " ".join(renderer.console.file.getvalue().split()))
+
+    async def test_silent_watchdog_never_fires_while_waiting_on_the_user_or_a_tool(self):
+        _t, clock = _tracker()
+        tracker = ProgressTracker(StallPolicy(5, 20, 100), clock=clock)
+        tracker.observe("approval_required", {})
+        clock.now += 10_000
+        self.assertFalse(tracker.should_abort_silent())     # an open approval prompt may wait for a human
+        tracker.observe("tool_output", {})
+        tracker.observe("tool_call_requested", {})
+        clock.now += 10_000
+        self.assertFalse(tracker.should_abort_silent())     # a running tool has its own timeouts
 
     async def test_watchdog_leaves_a_running_tool_alone(self):
         listener, renderer = _listener(11)

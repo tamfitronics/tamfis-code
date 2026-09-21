@@ -297,7 +297,7 @@ def idle_bottom_toolbar(
         f"{suggestion_hint}"
     )
     chip = (
-        f"<update-action>↑ Install v{update_version} · click or Ctrl+U</update-action>"
+        f"<update-action>↑ Install v{update_version} · Ctrl+U or /update</update-action>"
         if update_version else _right_chip(session_id, resolved_agents)
     )
     if not update_version:
@@ -596,10 +596,27 @@ class LiveInputListener:
                     self._loop_lag_reported = now
                     _log.warning("event loop blocked for %.1fs (keyboard unresponsive meanwhile)", lag)
                 self._status_tick = (self._status_tick + 1) % _STATUS_TICK_PERIOD
+                self._trace_tty_mode()
                 self._watchdog_check()
                 self.invalidate()
         except asyncio.CancelledError:
             raise
+
+    def _trace_tty_mode(self) -> None:
+        """Log (on change only) whether the tty is in raw/no-echo mode. A composer that believes it
+        is running while the tty is cooked is the "dead Enter / ^[ painted as text" failure; this
+        makes the moment it flips visible in the execution log."""
+        try:
+            import termios
+
+            fd = sys.stdin.fileno()
+            echo = bool(termios.tcgetattr(fd)[3] & termios.ECHO)
+        except Exception:
+            return
+        if echo != getattr(self, "_last_tty_echo", None):
+            self._last_tty_echo = echo
+            _log.info("tty echo=%s (composer_running=%s paused=%s)", echo,
+                      bool(self._prompt_session is not None), self._paused)
 
     def _watchdog_check(self) -> None:
         """Diagnose a run that has stopped making meaningful progress.
@@ -627,6 +644,17 @@ class LiveInputListener:
             })
         elif snap.state.value not in {"stalled"} and snap.idle_seconds < 5:
             self._stall_reported = False
+        if progress.should_abort_silent():
+            _log.error("watchdog: no activity for %.0fs; stopping the wedged run", snap.idle_seconds)
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": (
+                    f"⚠ No activity for {int(snap.idle_seconds) // 60} minutes — the run looks stuck, so it "
+                    "was stopped. Your work is checkpointed; type `continue` to resume."
+                )},
+            })
+            self._request_interrupt("stall")
+            return
         if progress.should_abort_provider_wait():
             _log.error("watchdog: aborting provider wait after %.0fs without progress", snap.idle_seconds)
             self.renderer.handle_event({
@@ -652,6 +680,7 @@ class LiveInputListener:
         as the y/n approval gate "not responding"/"freezing" in manual mode,
         the mode that actually stops to ask.
         """
+        _log.info("composer pause() requested")
         self._paused = True
         self._request_prompt_exit()
         self._cancel_prompt()
@@ -661,6 +690,7 @@ class LiveInputListener:
         the terminal before returning. Use this (not `pause`) whenever a new
         PromptSession/Application is about to be opened right after -- e.g.
         immediately before an approval gate prompt."""
+        _log.info("composer pause_async() begin")
         self._paused = True
         self._request_prompt_exit()
         self._cancel_prompt()
@@ -668,9 +698,13 @@ class LiveInputListener:
         if task is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await task
+        _log.info("composer pause_async() released the terminal")
 
     def resume(self) -> None:
+        _log.info("composer resume() active=%s task_alive=%s", self._active,
+                  bool(self._input_task is not None and not self._input_task.done()))
         self._paused = False
+        self._prompt_exit_requested = False
         if not self._active:
             return
         task = self._input_task
@@ -707,6 +741,7 @@ class LiveInputListener:
 
     def _schedule_prompt(self) -> None:
         if self._input_task is None or self._input_task.done():
+            _log.info("composer starting a new input loop")
             self._input_task = asyncio.create_task(self._supervised_input_loop())
 
     def _request_prompt_exit(self) -> None:
@@ -1099,6 +1134,12 @@ class LiveInputListener:
 
         try:
             while self._active and not self._paused:
+                # The marker belongs to ONE prompt instance. pause() sets it and then cancels the
+                # task, which pre-empts the line below that would clear it -- so it used to survive
+                # into the NEXT composer (the one restarted after an approval gate), which then
+                # treated the user's first Enter as a teardown: the message was dropped, the composer
+                # exited and the tty was left in echo mode. Every new prompt starts clean.
+                self._prompt_exit_requested = False
                 try:
                     with responsive_patch_stdout(raw=True):
                         text = await session.prompt_async(
@@ -1167,19 +1208,28 @@ class LiveInputListener:
         try:
             while self._active and not self._paused and self._interrupt_classification is None:
                 self._input_exit_expected = False
+                _log.info("composer input loop begin")
                 try:
                     await self._input_loop()
                 except asyncio.CancelledError:
                     raise
                 except Exception as exc:
                     _log.error("live composer failed: %s: %s", type(exc).__name__, exc)
+                _log.info("composer input loop ended expected=%s active=%s paused=%s interrupt=%s",
+                          self._input_exit_expected, self._active, self._paused, self._interrupt_classification)
                 if (
-                    self._input_exit_expected
-                    or not self._active
+                    not self._active
                     or self._paused
                     or self._interrupt_classification is not None
                 ):
                     break
+                if self._input_exit_expected:
+                    # The loop ended for a reason it considered deliberate, yet the task is still
+                    # running and nobody paused it: there would be no composer for the rest of the
+                    # turn. Restart it (a deliberate stop always pauses or deactivates first).
+                    _log.warning("composer ended 'expectedly' while the task is still active; restarting it")
+                    await asyncio.sleep(0.05)
+                    continue
                 now = time.monotonic()
                 self._input_restarts = [t for t in self._input_restarts if now - t < 10.0] + [now]
                 if len(self._input_restarts) > 5:

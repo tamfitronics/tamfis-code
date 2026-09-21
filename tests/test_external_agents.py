@@ -373,7 +373,7 @@ class ExternalSessionRenderingTests(unittest.TestCase):
         self.assertIn("v1.0.0", rendered)
         self.assertIn("v1.1.0", rendered)
         self.assertIn("Install & restart", rendered)
-        self.assertIn("Click the footer action, press Ctrl+U, or type /update", rendered)
+        self.assertIn("Press Ctrl+U or type /update", rendered)
 
 
 if __name__ == "__main__":
