@@ -83,6 +83,7 @@ from .orchestrator.validator import validate_completion, verified_no_change_comp
 from .orchestrator.planner import create_plan, extract_phase_outline, merge_phase_plans, MAX_PLAN_PHASES
 from .runtime.budgets import RuntimeBudgets
 from .tool_policy import allowed_tools
+from .orchestrator.validator import changed_paths_from_evidence
 from .provider_protocols import (
     is_tool_call_placeholder,
     normalize_stream_chunk,
@@ -2232,11 +2233,29 @@ def _is_resume_request(text: str) -> bool:
     return bool(_RESUME_REQUEST_RE.match(text.strip()))
 
 
+# Next-message suggestions the composer pre-fills (interactive.next_message_suggestion) and the recovery
+# machinery's own wording. Submitted once, they used to be treated as the user's OBJECTIVE and carried into
+# every later resume as "Additional user context: ...", snowballing until the real task (fix the TypeError in
+# serve2.py) was buried under "Repair the failed plan step ... continue from the saved checkpoint and resolve:
+# execution cancelled by user ..." (owner report 2026-09-21).
+_MACHINE_OBJECTIVE_RE = re.compile(
+    r"^\s*(?:continue\s+from\s+the\s+saved\s+checkpoint|repair\s+the\s+failed\s+plan\s+step|"
+    r"continue\s+the\s+active\s+plan\s+with|continue\s+the\s+interrupted\s+task|"
+    r"resume\s+at\s+step\s+\d+|/retry\b)",
+    re.IGNORECASE,
+)
+
+
+def _is_machine_generated_objective(text: str) -> bool:
+    return bool(_MACHINE_OBJECTIVE_RE.match(text or ""))
+
+
 def _is_real_resume_objective(text: str) -> bool:
     lowered = text.strip().lower()
     return bool(
         lowered
         and not _is_resume_request(text)
+        and not _is_machine_generated_objective(text)
         and not lowered.startswith(("active_plan=", "plan_"))
         and lowered not in {
             "understand", "inspect", "plan", "execute", "repair", "validate", "report", "completed",
@@ -6001,7 +6020,7 @@ async def _run_local_agent_turn_impl(
         messages, session_id=session_id,
     )
     incoming_objective = _latest_user_text(messages)
-    resume_requested = _is_resume_request(incoming_objective)
+    resume_requested = _is_resume_request(incoming_objective) or _is_machine_generated_objective(incoming_objective)
     prior_state = (
         _select_resume_state(session_id, workspace_root)
         if resume_requested else local_state.get_session_state(session_id)
@@ -6101,7 +6120,14 @@ async def _run_local_agent_turn_impl(
     # context while still reclassifying for what's actually being asked now.
     objective = (
         recovered_objective
-        if recovered_objective and recovered_objective.strip().casefold() == incoming_objective.strip().casefold()
+        # A resume phrase ("continue", "continue from the saved checkpoint and resolve: ...") adds no
+        # instruction of its own; appending it as "Additional user context" on every resume is what
+        # snowballed the objective into "...Additional user context: continue from the saved checkpoint
+        # and resolve: ... Additional user context: continue from ...".
+        if recovered_objective and (
+            recovered_objective.strip().casefold() == incoming_objective.strip().casefold()
+            or not _is_real_resume_objective(incoming_objective)
+        )
         else (
             f"{recovered_objective}\n\nAdditional user context: {incoming_objective}"
             if recovered_objective else incoming_objective
@@ -6916,6 +6942,28 @@ async def _run_local_agent_turn_impl(
             )
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": caveat}})
             content += caveat
+        elif (
+            not turn_read_only
+            and not any_mutation
+            and _looks_like_change_request(_latest_user_text(messages))
+            and not verified_no_change_completion(
+                tool_records=[item.to_dict() for item in (orchestrator.run.tool_records if orchestrator.run else [])],
+                final_text=content,
+            )
+        ) and (evidenced_paths := changed_paths_from_evidence(
+            [item.to_dict() for item in (orchestrator.run.tool_records if orchestrator.run else [])],
+            str(getattr(orchestrator, "workspace_root", "") or ""),
+        )):
+            # The gate accepts a successful `git diff`/`git status` as proof the change exists, so a blanket
+            # "No files were changed" warning contradicted a report that had just verified the diff (owner
+            # report 2026-09-21). Say what is actually true: this turn wrote nothing, the change was
+            # already in the working tree.
+            note = (
+                "\n\nℹ This turn made no edits itself; the change described above was already in the "
+                "working tree (confirmed with git): " + ", ".join(evidenced_paths[:5]) + "."
+            )
+            renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": note}})
+            content += note
         elif (
             not turn_read_only
             and not any_mutation

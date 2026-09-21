@@ -538,6 +538,13 @@ async def _wait_for_background_reinjection(session_id: int, prompt_session: Prom
         await asyncio.sleep(0.5)
 
 
+_COMPLETION_GATE_ERROR_RE = re.compile(
+    r"completion needs more verified work|required a code change|no successful file mutation|"
+    r"use\s+`?/retry`?|response is retained",
+    re.IGNORECASE,
+)
+
+
 def next_message_suggestion(
     answer: Optional[str], previous_objective: Optional[str] = None,
     *, state: Optional[Any] = None,
@@ -619,6 +626,12 @@ def next_message_suggestion(
             # otherwise enforces everywhere else.
             from .public_identity import redact_routing_text
             error = redact_routing_text(checkpoint.get("last_error") or "").strip()
+            if error and _COMPLETION_GATE_ERROR_RE.search(error):
+                # The completion check's own message ("Completion needs more verified work ... use /retry")
+                # is a verdict about the run, not a task. Pasting it into the user's message box made the
+                # next turn "resolve" the verdict -- and read as a resume of a stale plan (owner report
+                # 2026-09-21). The one grounded action after such a stop is the command that reruns it.
+                return "/retry"
             if error:
                 return f"Continue from the saved checkpoint and resolve: {error}"[:240]
             return "Continue the interrupted task from the latest saved checkpoint"

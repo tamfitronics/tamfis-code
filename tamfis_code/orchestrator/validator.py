@@ -53,6 +53,23 @@ _VERIFIED_NO_CHANGE_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Structured / terse ways a finished report says "nothing needed changing" -- the shape models actually
+# produce for a validation pass ("Changes\n • None required; the scripts are valid", "Changes: none",
+# "nothing to fix"). Owner report 2026-09-21: a run that executed `bash -n` over every script (exit 0) and
+# reported "None required" was FAILED with "the request required a code change" because only the phrases
+# above counted. These are looser than _VERIFIED_NO_CHANGE_RE, so they are only honoured with proof: a
+# command that really ran and succeeded (see verified_no_change_completion).
+_TERSE_NO_CHANGE_RE = re.compile(
+    r"^[#*>\s-]*(?:changes?(?:\s+(?:made|required))?|modifications?|edits?)\W*\n(?:[ \t]*\n)*[ \t]*[-•*]?[ \t]*"
+    r"(?:none|no\s+(?:changes?|edits?|modifications?|fix(?:es)?)|nothing|n/a)\b|"
+    r"\b(?:changes?|modifications?|edits?)\s*[:\-–]\s*(?:none|nothing|n/a)\b|"
+    r"\bnone\s+(?:required|needed|necessary)\b|"
+    r"\bnothing\s+(?:to\s+(?:fix|change|do|update|repair)|needed|required|was\s+(?:wrong|broken))\b|"
+    r"\bno\s+(?:fix(?:es)?|edits?|modifications?|changes?|updates?)\s+(?:were\s+|are\s+|was\s+|is\s+)?"
+    r"(?:needed|required|necessary|made|applied)\b",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 _MUTATION_CLAIM_RE = re.compile(
     r"\b(?:i\s+(?:have\s+)?(?:updated|changed|edited|rewritten|replaced|implemented|fixed)|"
     r"changes?\s+(?:made|applied)|(?:updated|rewritten|modified)\s+(?:the\s+)?(?:file|code|worker|configuration)|"
@@ -219,9 +236,21 @@ def verified_no_change_completion(
     inspection or validation must have succeeded, no mutating tool may have
     been attempted, and the latest command (if any) must be green.
     """
-    if not _VERIFIED_NO_CHANGE_RE.search(final_text or ""):
+    text = final_text or ""
+    strict = bool(_VERIFIED_NO_CHANGE_RE.search(text))
+    terse = not strict and bool(_TERSE_NO_CHANGE_RE.search(text))
+    if not strict and not terse:
         return False
     if any(item.get("tool_name") in _MUTATING_TOOLS for item in tool_records):
+        return False
+    if terse and not _claims_no_mutation_only(text):
+        return False
+    if terse and not any(
+        item.get("tool_name") == "execute_command" and item.get("success") is True
+        and item.get("exit_code") in (None, 0)
+        for item in tool_records
+    ):
+        # "Nothing needed changing" is a claim about the code, so it needs a check that actually ran green.
         return False
     if not any(
         item.get("tool_name") in _VALIDATION_EVIDENCE_TOOLS
@@ -235,6 +264,19 @@ def verified_no_change_completion(
         if latest.get("success") is not True or latest.get("exit_code") not in (None, 0):
             return False
     return True
+
+
+def changed_paths_from_evidence(tool_records: list[dict[str, Any]], workspace_root: str) -> list[str]:
+    """Paths that a successful git diff/status command in ``tool_records`` proves are changed on disk --
+    the same evidence validate_completion accepts for "mutation recorded", so callers that warn about a
+    missing edit agree with the gate instead of contradicting it."""
+    return sorted(str(path) for path in _successful_changed_paths(tool_records, workspace_root))
+
+
+def _claims_no_mutation_only(final_text: str) -> bool:
+    """True when the report does not ALSO claim to have changed something (a contradictory report is
+    not an honest no-op)."""
+    return not _claims_mutation(final_text)
 
 
 def _claims_completed_inspection(final_text: str) -> bool:

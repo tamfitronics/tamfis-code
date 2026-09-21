@@ -168,7 +168,10 @@ class BindingTests(_Base):
 
 class ComposerIntegrationTests(_Base):
     def _text(self, listener, width=100):
-        with patch("shutil.get_terminal_size", return_value=os.terminal_size((width, 40))):
+        # A frozen clock: the composer's tip line rotates with elapsed time, so two renders taken
+        # seconds apart (a slow CI host) differed in the tip alone and failed the equality check.
+        with patch("shutil.get_terminal_size", return_value=os.terminal_size((width, 40))), \
+             patch("time.monotonic", return_value=1000.0):
             return "".join(t for _s, t in listener._composer_message().__pt_formatted_text__())
 
     def test_the_running_composer_shows_the_full_message_and_then_less(self):

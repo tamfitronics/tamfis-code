@@ -779,20 +779,32 @@ class AgentOrchestrator:
             pass
         return report
 
+    _USER_STOP_RE = re.compile(
+        r"\b(?:cancel+ed|stopped|interrupted|paused)\b[^.\n]{0,40}\b(?:by\s+(?:the\s+)?user|user\s+request)\b|"
+        r"\buser[- ](?:cancel+ed|interrupted|stopped)\b|\bexecution\s+cancel+ed\b",
+        re.IGNORECASE,
+    )
+
     def fail(self, error: str) -> None:
+        # A user's own Esc/Ctrl+C is not a failure of the step it interrupted. Marking that step "failed"
+        # made the next-message box offer "Repair the failed plan step ..." and later turns treat the cut-off
+        # step as broken work to fix (owner report 2026-09-21); it is simply not finished yet.
+        user_stop = bool(self._USER_STOP_RE.search(error or ""))
         if self.run is not None:
             self.run.runtime.fail(error)
             if self.run.plan is not None:
                 for step in self.run.plan.steps:
                     if step.status == "in_progress":
-                        step.status = "failed"
+                        step.status = "pending" if user_stop else "failed"
                 self._sync_plan_progress()
             self.transition(AgentPhase.FAILED, action=error)
         local_state.checkpoint(self.session_id, reason="orchestrator_failed", summary=error[-1000:])
+        prior_failures = list((local_state.get_session_state(self.session_id).task_state or {}).get("failures") or [])
         local_state.task_checkpoint(
-            self.session_id, reason="task_failed", next_action="diagnose and resume",
-            phase=AgentPhase.FAILED.value, status="failed",
-            failures=list((local_state.get_session_state(self.session_id).task_state or {}).get("failures") or []) + [{"category": classify_failure(error), "error": error[-1200:]}],
+            self.session_id, reason="task_stopped" if user_stop else "task_failed",
+            next_action="resume where it stopped" if user_stop else "diagnose and resume",
+            phase=AgentPhase.FAILED.value, status="interrupted" if user_stop else "failed",
+            failures=prior_failures if user_stop else prior_failures + [{"category": classify_failure(error), "error": error[-1200:]}],
         )
         try:
             self.save_task_ledger(status="failed", next_action="diagnose and resume")

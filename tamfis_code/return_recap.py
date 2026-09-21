@@ -36,7 +36,10 @@ def _clip(text: str, limit: int) -> str:
 
 
 def _first_sentences(text: str, limit: int) -> str:
-    text = re.sub(r"[#*`>_|]+", "", " ".join(str(text or "").split()))
+    text = " ".join(str(text or "").split())
+    text = re.sub(r"[#>|]+|`|\*\*", "", text)     # markdown marks only; identifiers (_decode, token_id) stay intact
+    text = re.sub(r"^(?:summary|overview)\s*[:\-•]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"\s+[-•]\s+", " ", text)
     picked = ""
     for sentence in re.split(r"(?<=[.!?])\s+", text):
         if not sentence:
@@ -47,6 +50,12 @@ def _first_sentences(text: str, limit: int) -> str:
         if len(picked) >= limit * 0.6:
             break
     return _clip(picked or text, limit)
+
+
+def _strip_context_chain(objective: str) -> str:
+    """The first sentence of a "<task>\\n\\nAdditional user context: ..." chain -- the original task."""
+    head = re.split(r"\s*Additional user context:", str(objective or ""), maxsplit=1)[0]
+    return head.strip() or str(objective or "")
 
 
 def _next_step(state: Any, session_id: int, last_answer: str) -> str:
@@ -93,11 +102,17 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
     plan = next((p for p in reversed(state.saved_plans or []) if p.get("id") == state.active_plan_id), None)
     objective = ""
     if plan and plan.get("objective"):
-        objective = str(plan["objective"])
+        objective = _strip_context_chain(str(plan["objective"]))
     elif (state.active_task or {}).get("objective") and state.execution_status not in {"completed", "idle"}:
-        objective = str(state.active_task["objective"])
+        objective = _strip_context_chain(str(state.active_task["objective"]))
     elif turns:
-        objective = turns[-1]["objective"]
+        # The latest turn a person actually wrote: a submitted "Repair the failed plan step ..." or
+        # "Continue from the saved checkpoint ..." suggestion is machinery, not the task.
+        from .runner_local import _is_machine_generated_objective, _is_resume_request
+
+        human = [t["objective"] for t in turns if not _is_machine_generated_objective(t["objective"])
+                 and not _is_resume_request(t["objective"])]
+        objective = _strip_context_chain(human[-1] if human else turns[-1]["objective"])
     else:
         objective = state.session_title or ""
 

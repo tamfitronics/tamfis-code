@@ -198,6 +198,20 @@ class NextMessageSuggestionTests(unittest.TestCase):
             "Continue from the saved checkpoint and resolve: provider disconnected",
         )
 
+    def test_a_completion_gate_stop_suggests_retry_not_its_own_error_text(self):
+        """Owner report 2026-09-21: after "Completion needs more verified work ..." the message box was
+        pre-filled with "Continue from the saved checkpoint and resolve: Completion needs more ...", which
+        was then submitted, read as a resume, and re-ran a stale plan."""
+        state = SimpleNamespace(
+            turn_checkpoint={"status": "failed", "last_error": (
+                "Completion needs more verified work before it can be reported: The request required a code "
+                "change, but no successful file mutation was recorded.. The response is retained; use "
+                "`/retry` to continue from this checkpoint.")},
+            saved_plans=[], active_plan_id=None, unresolved_issues=[],
+            validation_results=[], modified_files=[],
+        )
+        self.assertEqual(next_message_suggestion(None, state=state), "/retry")
+
     def test_interrupted_checkpoint_error_never_leaks_the_real_backend_name(self):
         """FIX: turn_checkpoint's last_error is a raw internal message
         persisted straight from runner_local.py (e.g. "Provider streaming
