@@ -271,7 +271,7 @@ class CollapsedMessageStore:
 
 COLLAPSED_MESSAGES = CollapsedMessageStore()
 # Full output of finished tool calls (commands), newest last: what Ctrl+T pages through when a block
-# says "… +N lines (ctrl + t to view transcript)". Separate from COLLAPSED_MESSAGES (Ctrl+E, long
+# says "… +N lines (Ctrl+T for full output)". Separate from COLLAPSED_MESSAGES (Ctrl+E, long
 # assistant/user messages), which is unchanged.
 TOOL_TRANSCRIPT = CollapsedMessageStore(retention=30)
 _TRANSCRIPT_ENTRY_MAX_CHARS = 200_000
@@ -1453,7 +1453,7 @@ class StreamRenderer:
             • Ran <command>
               │ <wrapped continuation>
               └ <output preview>
-                … +N lines (ctrl + t to view transcript)
+                … +N lines (Ctrl+T for full output)
         """
         seen_output = False
         for role, text in rows:

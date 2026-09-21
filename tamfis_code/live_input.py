@@ -1071,7 +1071,7 @@ class LiveInputListener:
         @bindings.add("c-t")
         def _toggle_tool_transcript(event) -> None:
             # Ctrl+T pages through the FULL output of finished tool calls -- what a block's
-            # "… +N lines (ctrl + t to view transcript)" refers to. Ctrl+E (long messages) is untouched.
+            # "… +N lines (Ctrl+T for full output)" refers to. Ctrl+E (long messages) is untouched.
             try:
                 from .message_viewer import VIEWER
                 from .render import TOOL_TRANSCRIPT

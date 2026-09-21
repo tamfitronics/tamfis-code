@@ -153,7 +153,7 @@ class ScrollbackRecordTests(unittest.TestCase):
         lines = _out(console).splitlines()
         self.assertEqual(lines[1], "  └ line 1")
         self.assertEqual(lines[2], "    line 2")
-        self.assertEqual(lines[3], "    … +134 lines (ctrl + t to view transcript)")
+        self.assertEqual(lines[3], "    … +134 lines (Ctrl+T for full output)")
         self.assertEqual(len(lines), 4)
         (kind, full), = TOOL_TRANSCRIPT.entries()                        # what Ctrl+T shows
         self.assertEqual(kind, "tool")
@@ -166,7 +166,7 @@ class ScrollbackRecordTests(unittest.TestCase):
         _call(renderer, "execute_command", {"command": "ls"},
               {"stdout": "a\nb\nc\nd\n", "stderr": "", "return_code": 0})
         text = _out(console)
-        self.assertNotIn("ctrl + t", text)
+        self.assertNotIn("Ctrl+T", text)
         self.assertEqual(text.splitlines()[1:], ["  └ a", "    b", "    c", "    d"])
 
     def test_a_failing_command_says_so_and_uses_the_error_role(self):

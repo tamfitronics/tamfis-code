@@ -336,14 +336,14 @@ def summarize_result(
 #     │ … +1 lines
 #     └ ● tamfisseo.service - TamfisSEO Pro v3 - Enterprise SEO Automation
 #          Loaded: loaded (/etc/systemd/system/tamfisseo.service; enabled)
-#       … +134 lines (ctrl + t to view transcript)
+#       … +134 lines (Ctrl+T for full output)
 #
 # Pure functions again: they return plain text (with a role per line) and the renderer only
-# decides colours. The "(ctrl + t …)" hint is only ever emitted for output that was actually cut,
+# decides colours. The "(Ctrl+T …)" hint is only ever emitted for output that was actually cut,
 # and the full output is what Ctrl+T shows (see render.TOOL_TRANSCRIPT).
 # ---------------------------------------------------------------------------------------------
 
-TRANSCRIPT_HINT = "ctrl + t to view transcript"
+TRANSCRIPT_HINT = "Ctrl+T for full output"
 _MAX_COMMAND_LINES = 3
 _PREVIEW_LINES_WHEN_CUT = 2
 _SHOW_ALL_UP_TO = 4
