@@ -160,3 +160,27 @@ class PollutedObjectiveRepairTests(unittest.TestCase):
     def test_the_resume_objective_of_a_polluted_checkpoint_is_the_real_task(self):
         checkpoint = {"objective": self.SNOWBALL, "messages": []}
         self.assertEqual(_checkpoint_resume_objective(checkpoint), "Fix the TypeError in serve2.py streaming")
+
+
+class CleanerKeepsWhatAPersonWroteTests(unittest.TestCase):
+    def test_words_a_person_added_to_a_suggestion_survive(self):
+        text = ("pleae continue /home/x/prompt.docx\n\nAdditional user context: continue the interrupted task from the "
+                "latest saved checkpoint; you were here and also check /tmp/tamfis-code for what you prepared\n\n"
+                "Additional user context: continue the interrupted task from the latest saved checkpoint")
+        cleaned = state_module.clean_objective_chain(text)
+        self.assertIn("also check /tmp/tamfis-code for what you prepared", cleaned)
+        self.assertNotIn("continue the interrupted task", cleaned.lower())
+
+    def test_an_objective_that_is_only_machinery_is_left_alone_not_blanked(self):
+        only = ("Repair the failed plan step, then revalidate it: inspect the file\n\n"
+                "Additional user context: continue from the saved checkpoint and resolve: x")
+        self.assertEqual(state_module.clean_objective_chain(only), only)
+        row = {"active_task": {"objective": only}}
+        self.assertEqual(state_module._clean_row_objectives(row)["active_task"]["objective"], only)
+
+    def test_a_slash_command_objective_keeps_its_own_text(self):
+        self.assertEqual(
+            state_module.clean_objective_chain(
+                "/background\n\nAdditional user context: continue from the saved checkpoint and resolve: blocked"),
+            "/background",
+        )

@@ -823,26 +823,48 @@ _BARE_RESUME_RE = re.compile(r"^\s*(?:please\s+)?(?:continue|resume|proceed|go\s
 _CONTEXT_SEPARATOR_RE = re.compile(r"\s*Additional user context:\s*", re.IGNORECASE)
 
 
+# The composer's fixed suggestion whose text a person may have EXTENDED before pressing Enter
+# ("Continue the interrupted task from the latest saved checkpoint; also check /tmp/x for what you prepared").
+# Only the fixed prefix is machinery; what follows is the user's own instruction and must survive.
+_FIXED_SUGGESTION_PREFIX_RE = re.compile(
+    r"^\s*continue\s+the\s+interrupted\s+task\s+from\s+the\s+latest\s+saved\s+checkpoint[\s;:,.\-]*", re.IGNORECASE,
+)
+
+
+def _human_part(segment: str) -> str:
+    """The person-written part of one chain segment, or "" when it is only machinery."""
+    segment = segment.strip()
+    match = _FIXED_SUGGESTION_PREFIX_RE.match(segment)
+    if match:
+        rest = segment[match.end():].strip()
+        return rest if len(rest) >= 12 and not MACHINE_OBJECTIVE_RE.match(rest) else ""
+    if MACHINE_OBJECTIVE_RE.match(segment):
+        return ""   # "...resolve: <error text>", "Repair the failed plan step ...: <step>", "/retry"
+    return segment
+
+
 def clean_objective_chain(text: str) -> str:
     """``text`` with the machine-generated segments of an "Additional user context" chain removed.
 
-    A genuine clarification appended by a person is kept; recovery/suggestion wording and bare resume
-    phrases are dropped; duplicates collapse. Returns the input unchanged when it holds no chain."""
+    A genuine clarification appended by a person is kept (including their own words appended to a
+    suggestion); recovery/suggestion wording and bare resume phrases are dropped; duplicates collapse.
+    Returns the input unchanged when nothing human is left -- an objective is never blanked."""
     raw = str(text or "")
     if not raw.strip():
         return raw
-    parts = [p.strip() for p in _CONTEXT_SEPARATOR_RE.split(raw)]
+    parts = [p for p in _CONTEXT_SEPARATOR_RE.split(raw)]
     kept: list[str] = []
     seen: set[str] = set()
     for index, part in enumerate(parts):
-        if not part or MACHINE_OBJECTIVE_RE.match(part) or (index and _BARE_RESUME_RE.match(part)):
+        human = _human_part(part)
+        if not human or (index and _BARE_RESUME_RE.match(human)):
             continue
-        key = part.casefold()
+        key = human.casefold()
         if key not in seen:
             seen.add(key)
-            kept.append(part)
+            kept.append(human)
     if not kept:
-        return ""
+        return raw
     return "\n\nAdditional user context: ".join(kept)
 
 
