@@ -182,6 +182,39 @@ MODELS: dict[str, ModelRecord] = {
         ("repository_search", "multi_file_edit", "debugging", "tool_heavy_execution"),
         "frontier", "medium",
     ),
+    # Meta Model API frontier routes. The API is OpenAI-compatible but paid;
+    # these are explicit-only in providers.py and are never part of the free
+    # automatic pool.
+    "muse-spark-1.3": ModelRecord(
+        "muse-spark-1.3", "meta",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1_048_576,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "high",
+    ),
+    "muse-spark-1.2": ModelRecord(
+        "muse-spark-1.2", "meta",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1_048_576,
+        ("repository_audit", "multi_file_edit", "debugging", "planning"),
+        "frontier", "high",
+    ),
+    "muse-spark-1.1": ModelRecord(
+        "muse-spark-1.1", "meta",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1_048_576,
+        ("repository_search", "debugging", "planning"),
+        "high", "high",
+    ),
+    "muse-spark-1.3-contributor": ModelRecord(
+        "muse-spark-1.3-contributor", "meta",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1_048_576,
+        ("repository_audit", "multi_file_edit", "debugging", "planning", "tool_heavy_execution"),
+        "frontier", "high",
+    ),
+    "muse-spark-1.2-contributor": ModelRecord(
+        "muse-spark-1.2-contributor", "meta",
+        ModelCapabilities(parallel_tool_calls=True, long_context=True), 1_048_576,
+        ("repository_audit", "multi_file_edit", "debugging", "planning"),
+        "frontier", "high",
+    ),
 }
 
 

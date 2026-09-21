@@ -158,6 +158,7 @@ class ProviderType(str, Enum):
     HF = "hf"
     NVIDIA = "nvidia"
     OPENROUTER = "openrouter"
+    META = "meta"
     LOCAL = "local"
     AUTO = "auto"
 
@@ -677,6 +678,7 @@ class ProviderManager:
         ProviderType.GROK,
         ProviderType.TAMFIS,
         ProviderType.TIER_IV,
+        ProviderType.META,
     )
 
     # Mirror TamfisGPT Remote's live weights for providers this standalone
@@ -1173,6 +1175,30 @@ class ProviderManager:
             structured_output=True,
             long_context=True,
         ),
+        # Meta Model API (OpenAI-compatible). Meta currently does not publish
+        # a zero-cost lane; keep this frontier route explicit-only so a key
+        # in .env never silently spends money during AUTO/free routing.
+        ProviderType.META: ProviderConfig(
+            name="Meta Model API",
+            base_url=os.environ.get("META_BASE_URL", "https://api.meta.ai/v1").rstrip("/"),
+            api_key_env="META_API_KEY",
+            default_model=os.environ.get("META_MODEL", "muse-spark-1.3"),
+            models=[
+                "muse-spark-1.3",
+                "muse-spark-1.2",
+                "muse-spark-1.1",
+                "muse-spark-1.3-contributor",
+                "muse-spark-1.2-contributor",
+            ],
+            priority=8,
+            weight=0,
+            reasoning_supported=True,
+            context_window=1_048_576,
+            coding_quality=5,
+            tool_calling=True,
+            structured_output=True,
+            long_context=True,
+        ),
     }
 
     def __init__(self, *, runtime_mode: str = "standalone") -> None:
@@ -1337,6 +1363,15 @@ class ProviderManager:
             except Exception:
                 credentials = None
             return str(getattr(credentials, "access_token", "") or "").strip() or None
+
+        if provider_type == ProviderType.META:
+            # META_API_KEY is the deployment name; MODEL_API_KEY is Meta's
+            # documented name for the same Model API credential.
+            return (
+                os.environ.get("META_API_KEY", "").strip()
+                or os.environ.get("MODEL_API_KEY", "").strip()
+                or None
+            )
 
         key = os.environ.get(config.api_key_env, "").strip()
         return key or None
