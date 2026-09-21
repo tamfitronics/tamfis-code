@@ -199,6 +199,16 @@ def _is_read_only_command(command: str) -> bool:
 def _is_read_only_command_segment(argv: list[str]) -> bool:
     """Classify one command in an already-tokenized shell pipeline."""
     executable = Path(argv[0]).name
+    if executable == "xargs":
+        # Permit the common bounded inspection form (`... | xargs grep ...`)
+        # only when xargs has no options and delegates to one of the same
+        # read-only commands we would accept directly. Rejecting xargs flags
+        # keeps batching/termination semantics conservative and, in
+        # particular, does not make `xargs php -l` or arbitrary nested
+        # execution read-only by accident.
+        if len(argv) < 2 or argv[1].startswith("-"):
+            return False
+        return _is_read_only_command_segment(argv[1:])
     if executable == "git":
         return (
             len(argv) > 1

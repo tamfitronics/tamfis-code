@@ -25,6 +25,16 @@ class ClassifyCommandRiskTests(unittest.TestCase):
         self.assertEqual(classify_command_risk("cat /etc/postgresql/17/main/pg_hba.conf"), RISK_READ_ONLY)
         self.assertEqual(classify_command_risk("ps aux | grep train_frontier"), RISK_READ_ONLY)
         self.assertEqual(classify_command_risk("pgrep -af train_frontier"), RISK_READ_ONLY)
+        self.assertEqual(
+            classify_command_risk("find /home/tamgpt -type f -name '*.py' | grep -i token | head -10"),
+            RISK_READ_ONLY,
+        )
+        self.assertEqual(classify_command_risk("git status"), RISK_READ_ONLY)
+        self.assertEqual(classify_command_risk("git diff --check"), RISK_READ_ONLY)
+        self.assertEqual(
+            classify_command_risk("find . -name '*.py' -type f | xargs grep -l 'tokenize|Encoding' | head -10"),
+            RISK_READ_ONLY,
+        )
 
     def test_process_inspection_allowlist_has_no_file_read_or_control(self):
         self.assertTrue(is_process_inspection_command("ps aux | grep train_frontier"))

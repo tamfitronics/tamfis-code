@@ -102,10 +102,11 @@ from .permissions import decide_permission
 from .runner import TaskOutcome, _decision_for_policy, resolve_approval_decision_async
 from .safety import (
     READ_ONLY_TOOLS,
+    RISK_READ_ONLY,
     _unified_diff,
+    classify_command_risk,
     classify_tool_call_risk,
     redact_secrets,
-    is_process_inspection_command,
 )
 from .sandbox import SandboxPolicy
 from .workspace import classify_root, detect_validation_commands, load_instruction_text, scratch_root
@@ -6332,10 +6333,10 @@ async def _run_local_agent_turn_impl(
     )
     _read_only_reject_count = 0
     selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)
-    # A resumed checkpoint may need a live PID/process check to reconcile a
-    # durable job, but ordinary audits and questions must not receive shell
-    # execution at all. The runner still enforces the process-inspection
-    # grammar in safety.py and rejects every other command.
+    # A resumed checkpoint may need a bounded shell inspection to reconcile a
+    # durable job. The runner still enforces safety.py's read-only command
+    # allowlist and rejects every command that can write, execute nested code,
+    # redirect output, or use shell control.
     if turn_read_only and resume_requested and "execute_command" not in selected_tool_names:
         selected_tool_names = [*selected_tool_names, "execute_command"]
     tools: list[dict[str, Any]] = (
@@ -9942,16 +9943,20 @@ async def _run_local_agent_turn_impl(
                 tc.name, arguments, workspace_root=workspace_root,
                 extra_safe_roots=(scratch_root(session_id), *scope_roots),
             )
-            if turn_read_only and tc.name == "execute_command" and not is_process_inspection_command(
-                str(arguments.get("command") or "")
+            if (
+                turn_read_only
+                and tc.name == "execute_command"
+                and classify_command_risk(str(arguments.get("command") or "")) != RISK_READ_ONLY
             ):
                 result = {
                     "success": False,
                     "read_only_blocked": True,
                     "error": (
-                        "Read-only execute_command is limited to process inspection: "
-                        "ps/pgrep with optional grep/rg/head/tail/sort/uniq filters. "
-                        "Use read_file/search_code/list_directory for repository inspection."
+                        "Read-only execute_command accepts only commands proven non-mutating "
+                        "by the local safety allowlist (for example find/grep/rg/cat, "
+                        "git status/diff/log, and ps/pgrep inspection). Do not use shell "
+                        "control, redirection, command substitution, writes, or execution; "
+                        "use read_file/search_code/list_directory when they are a better fit."
                     ),
                 }
                 working_messages.append({
