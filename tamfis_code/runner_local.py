@@ -5081,8 +5081,10 @@ def _resume_step_contract(plan: Any) -> str:
         and not _MUTATING_RESUME_STEP_RE.search(step_name)
     )
     boundary = (
-        " execute_command is not available in this turn; never request it. Use only "
-        "read_file, list_directory, search_code, find_references, or get_git_info."
+        " execute_command is available only for safe read-only inspection in this turn "
+        "(for example `ps` or `pgrep`); never use it for writes, interpreters, process "
+        "control, daemonization, or training launches. The other read-only tools are "
+        "read_file, list_directory, search_code, find_references, and get_git_info."
         if observational else ""
     )
     return (
