@@ -1415,7 +1415,7 @@ async def _run_interactive_impl(
     )
     force_bottom_toolbar_visible(session)
 
-    async def _answer_side_question(question: str) -> str:
+    async def _answer_side_question(question: str, *, followup: bool = False) -> str:
         """Answer `/btw` through an isolated, read-only provider request.
 
         A fresh provider manager keeps key rotation, message history, tool
@@ -1446,15 +1446,24 @@ async def _run_interactive_impl(
             if active_objective else
             f"The active workspace is {workspace.workspace_root}."
         )
+        if followup:
+            system_prompt = (
+                "The user just sent a follow-up message while their coding task is still running. Reply "
+                "in at most 4 short sentences, in the user's language: (1) say what you understood they "
+                "want; (2) say whether it extends, changes or contradicts the running task; (3) say it "
+                "will be applied at the running task's next safe step while the task continues. If it is "
+                "ambiguous, risky or destructive, ask ONE clear question instead and say they can answer "
+                "by typing, or press Esc to stop the task. Never claim to have done anything yourself: "
+                "you cannot edit files or run tools here. " + context_line
+            )
+        else:
+            system_prompt = (
+                "Answer this quick side question concisely. It is separate from the active "
+                "coding task: do not claim to edit files, run tools, or change the main task. "
+                + context_line
+            )
         messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Answer this quick side question concisely. It is separate from the active "
-                    "coding task: do not claim to edit files, run tools, or change the main task. "
-                    + context_line
-                ),
-            },
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": question},
         ]
         side_manager = ProviderManager(runtime_mode="standalone")

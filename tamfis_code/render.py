@@ -1883,9 +1883,10 @@ class StreamRenderer:
             content = str(payload.get("content") or "").strip()
             if not content:
                 return
-            title = "BTW" + (f" · {question[:60]}" if question else "")
+            is_followup = payload.get("kind") == "followup"
+            title = ("Follow-up" if is_followup else "BTW") + (f" · {question[:60]}" if question else "")
             self.console.print(Panel(
-                Markdown(content), title=Text(title), border_style="magenta",
+                Markdown(content), title=Text(title), border_style="cyan" if is_followup else "magenta",
                 expand=False, padding=(0, 1),
             ))
             return

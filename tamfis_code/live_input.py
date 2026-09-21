@@ -11,6 +11,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import difflib
+import inspect
 import os
 import re
 import sys
@@ -1464,6 +1466,10 @@ class LiveInputListener:
             if self._active and not self._paused:
                 self._schedule_prompt()
             return
+        if self._handle_live_slash_command(text):
+            if self._active and not self._paused:
+                self._schedule_prompt()
+            return
         editing_id = self._editing_instruction_id
         self._editing_instruction_id = None
         if editing_id and local_state.edit_queued_instruction(self.session_id, editing_id, text):
@@ -1499,6 +1505,7 @@ class LiveInputListener:
                 ),
             },
         })
+        self._start_followup_ack(text)
         if self._active and not self._paused:
             self._schedule_prompt()
 
@@ -1558,6 +1565,103 @@ class LiveInputListener:
                 "event_type": "diagnostics", "payload": {"content": f"◆ {line}"},
             })
         return True
+
+    # Commands the live composer can honour at once. Anything else that is shaped like a slash command is
+    # kept OUT of the model's follow-up stream (the model used to receive the literal text "/diff" as
+    # prose, so the command silently did nothing) and is deferred to run as a command when the task ends.
+    _LIVE_STOP_COMMANDS = {"/stop": "cancel", "/cancel": "cancel", "/pause": "pause"}
+
+    def _handle_live_slash_command(self, text: str) -> bool:
+        """A `/command` typed mid-task is never silent and never becomes model prose.
+
+        Runs at once when it can (stop/pause, /help, /queue), otherwise says so and queues it as a
+        *command* for the moment the task finishes. Text that merely looks like a path or a sentence
+        (``/home/x/y.py``, ``/ what about``) is not a command and flows through as a follow-up.
+        """
+        parts = text.split(None, 1)
+        head = parts[0].lower() if parts else ""
+        if not re.fullmatch(r"/[a-z][a-z0-9_-]*", head):
+            return False
+
+        def note(content: str) -> None:
+            self.renderer.handle_event({"event_type": "diagnostics", "payload": {"content": f"◆ {content}"}})
+
+        if head in self._LIVE_STOP_COMMANDS:
+            classification = self._LIVE_STOP_COMMANDS[head]
+            note("Stopping the task now…" if classification == "cancel" else "Pausing the task at the next safe step…")
+            self._request_interrupt(classification)
+            return True
+        if head == "/help":
+            note("While a task runs: /status, /btw <question>, /model, /queue, /stop, /pause, /update run at once; "
+                 "any other /command is queued and runs when the task finishes. Plain messages steer the task.")
+            return True
+        if head == "/queue":
+            items = [
+                i for i in local_state.get_session_state(self.session_id).queued_user_instructions
+                if i.get("status") == "queued" and str(i.get("text") or "").strip()
+            ]
+            if not items:
+                note("Nothing is queued.")
+            for item in items[:10]:
+                note(f"queued {item.get('id')} ({item.get('classification')}): {_truncate(str(item.get('text')), 100)}")
+            return True
+
+        from .interactive import SLASH_COMMANDS
+
+        known = {name.lower() for name, _ in SLASH_COMMANDS}
+        if head not in known:
+            close = difflib.get_close_matches(head, sorted(known), n=1)
+            note(f"Unknown command {head}" + (f" -- did you mean {close[0]}?" if close else ". Type /help for what works mid-task."))
+            return True
+        item = local_state.enqueue_instruction(self.session_id, text, classification="command", priority=50)
+        note(f"{head} can't run inside a running task. Queued ({item.id}): it runs as soon as the task finishes.")
+        return True
+
+    # ---- immediate acknowledgement of a mid-task follow-up (a concurrent branch, not a wait) ----
+
+    _FOLLOWUP_ACK_TIMEOUT_SECONDS = 45.0
+
+    def _start_followup_ack(self, text: str) -> None:
+        """Answer a mid-task follow-up straight away from a side branch.
+
+        The main task only sees the follow-up at its next safe step, which can be minutes away; until
+        then the user got a one-line "queued" and silence. This branch reads the follow-up beside the
+        running task's state and says what it understood, how it will be applied and whether it
+        changes the plan -- asking one question when it is ambiguous -- while the task keeps going.
+        Best effort: any failure leaves just the "queued" line.
+        """
+        if self._side_question_callback is None or os.environ.get("TAMFIS_CODE_FOLLOWUP_ACK", "1").strip().lower() in {"0", "false", "no", "off"}:
+            return
+        task = asyncio.create_task(self._answer_followup(text))
+        self._btw_tasks.add(task)
+        task.add_done_callback(self._btw_tasks.discard)
+
+    async def _call_side_callback(self, question: str, *, followup: bool) -> str:
+        callback = self._side_question_callback
+        assert callback is not None
+        try:
+            accepts = "followup" in inspect.signature(callback).parameters
+        except (TypeError, ValueError):
+            accepts = False
+        result = callback(question, followup=True) if (followup and accepts) else callback(question)  # type: ignore[call-arg]
+        return await result
+
+    async def _answer_followup(self, text: str) -> None:
+        status = "\n".join(self.live_status_lines()[:8])
+        question = f"The user's follow-up message:\n{text}\n\nWhat the running task is doing right now:\n{status}"
+        try:
+            answer = (await asyncio.wait_for(
+                self._call_side_callback(question, followup=True), timeout=self._FOLLOWUP_ACK_TIMEOUT_SECONDS,
+            )).strip()
+            if answer:
+                self.renderer.handle_event({
+                    "event_type": "side_question_answer",
+                    "payload": {"question": text, "content": answer, "kind": "followup"},
+                })
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log.info("follow-up acknowledgement unavailable: %s", exc)
 
     def _handle_btw_command(self, text: str) -> bool:
         """Dispatch `/btw` outside the active turn's steering queue.
