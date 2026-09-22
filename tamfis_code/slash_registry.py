@@ -99,6 +99,11 @@ ALIAS_REWRITES: dict[str, tuple[str, str]] = {
     "/release-notes": ("/version", "show the version"),
     "/plugin": ("/plugins", "list plugins"),
     "/queued": ("/queue", "show or append queued instructions"),
+    "/continue": ("/resume", "resume a saved session"),
+    "/ps": ("/tasks", "list background tasks"),
+    "/task": ("/tasks", "list background tasks"),
+    "/memories": ("/memory", "show durable memory and instructions"),
+    "/reasoning": ("/effort", "set reasoning effort"),
 }
 
 

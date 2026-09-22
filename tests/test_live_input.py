@@ -6,7 +6,7 @@ import unittest
 from io import StringIO
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock, patch
+from unittest.mock import AsyncMock, Mock, call, patch
 
 from rich.console import Console
 from prompt_toolkit.document import Document
@@ -87,6 +87,38 @@ class LiveProgressSuggestionTests(unittest.TestCase):
         suggest = _LiveProgressAutoSuggest(renderer)
         self.assertIsNotNone(suggest.get_suggestion(None, Document("")))
         self.assertIsNone(suggest.get_suggestion(None, Document("already typing")))
+
+
+class InFlightCommandTests(_StatePatchMixin, unittest.TestCase):
+    def test_live_listener_has_a_command_completer(self):
+        renderer = StreamRenderer(_console())
+        completer = Mock()
+        listener = LiveInputListener(
+            session_id=1, renderer=renderer, cli_config=_config(),
+            command_completer=completer,
+        )
+        self.assertIs(listener._command_completer, completer)
+
+    def test_exit_and_quit_are_immediate_interrupt_commands(self):
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config())
+        with patch.object(listener, "_request_interrupt") as interrupt:
+            self.assertTrue(listener._handle_live_slash_command("/exit"))
+            self.assertTrue(listener._handle_live_slash_command("/quit"))
+            self.assertTrue(listener._handle_live_slash_command("/interrupt"))
+        self.assertEqual([call.args[0] for call in interrupt.call_args_list], ["exit", "exit", "cancel"])
+
+    def test_non_immediate_command_is_queued_as_a_command_not_model_prose(self):
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config())
+        self.assertTrue(listener._handle_live_slash_command("/diff"))
+        queued = [
+            item for item in state_module.get_session_state(1).queued_user_instructions
+            if item.get("status") == "queued"
+        ]
+        self.assertEqual(len(queued), 1)
+        self.assertEqual(queued[0]["text"], "/diff")
+        self.assertEqual(queued[0]["classification"], "command")
 
 
 class ShiftTabCyclesModeTests(unittest.TestCase):

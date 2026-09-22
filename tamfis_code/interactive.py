@@ -120,6 +120,7 @@ async def _run_cancellable_local_turn(
         cli_config=config,
         interrupt_callback=_interrupt,
         side_question_callback=side_question_callback,
+        command_completer=_SlashCommandCompleter(),
     )
     live_input.start()
 
@@ -187,6 +188,7 @@ async def _run_remote_turn_with_live_ui(
         renderer=renderer,
         cli_config=config,
         side_question_callback=side_question_callback,
+        command_completer=_SlashCommandCompleter(),
     )
     live_input.start()
     try:
@@ -284,7 +286,7 @@ message>             while a task is running: type a message and press Enter
                       submits the line; omit it to send raw keystrokes)
 /pty read <id>        show output produced since the last /pty read
 /pty kill <id>        terminate a background terminal
-/exit                quit (also: /quit, Ctrl+D, Ctrl+C)
+/exit                quit (also: /quit, /interrupt, Ctrl+D, Ctrl+C)
 
 Not yet implemented in this pass: /notifications.
 """
@@ -343,6 +345,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/pty", "manage a persistent background terminal"),
     ("/exit", "quit"),
     ("/quit", "quit"),
+    ("/interrupt", "interrupt the active task immediately"),
     ("/run", "explicit shell command"),
     ("/shell", "explicit shell command"),
     ("/chat", "conversational/read-only coding assistance"),
@@ -390,11 +393,35 @@ class _SlashCommandCompleter(Completer):
             )
         }
 
+    _ARGUMENT_OPTIONS: dict[str, tuple[tuple[str, str], ...]] = {
+        "/mode": (
+            ("manual", "ask before risky actions"),
+            ("accept-edits", "approve safe edits, ask for dangerous actions"),
+            ("auto", "auto-approve except immutable server safeguards"),
+            ("plan", "read-only planning mode"),
+        ),
+        "/effort": tuple((level, f"reasoning effort: {level}") for level in ("low", "medium", "high", "auto")),
+        "/model": (
+            ("list", "list provider model groups"),
+            ("auto", "automatic selection"),
+            ("smart", "quick tasks"),
+            ("pro", "everyday coding"),
+            ("ultra", "complex work"),
+            ("ultima", "frontier reasoning"),
+        ),
+        "/queue": (("show", "show queued instructions"),),
+        "/pty": (("start", "start a persistent terminal"), ("list", "list persistent terminals"), ("read", "read terminal output"), ("send", "send terminal input"), ("kill", "stop a terminal")),
+    }
+
     def get_completions(self, document, complete_event):
         text = document.text_before_cursor
-        if text.lower().startswith("/model "):
-            prefix = text[len("/model "):]
-            for option, description in self._model_options.items():
+        command, separator, argument = text.partition(" ")
+        if separator and command.lower() in self._ARGUMENT_OPTIONS:
+            options = self._ARGUMENT_OPTIONS[command.lower()]
+            if command.lower() == "/model":
+                options = tuple(self._model_options.items())
+            prefix = argument
+            for option, description in options:
                 if option.lower().startswith(prefix.lower()) and option.lower() != prefix.lower():
                     yield Completion(option, start_position=-len(prefix), display_meta=description)
             return
@@ -1757,7 +1784,7 @@ async def _run_interactive_impl(
             last_response_text = slash_ctx.last_response_text
             if registry_handled:
                 continue
-        if text.lower() in ("/exit", "/quit", "/detach"):
+        if text.lower() in ("/exit", "/quit", "/interrupt", "/detach"):
             # No task submitted through this REPL outlives this process's
             # lifetime any differently based on which of these three the
             # user types -- background durability comes from `--bg` /

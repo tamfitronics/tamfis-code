@@ -6860,6 +6860,28 @@ async def _run_local_agent_turn_impl(
             root for root in scope_roots
             if root != Path(tempfile.gettempdir())
         ]
+        planning_state = local_state.get_session_state(session_id)
+        intent_preview = " ".join(str(objective).split())[:240]
+        queued_count = sum(
+            1 for item in (planning_state.queued_user_instructions or [])
+            if item.get("status") == "queued"
+        )
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": f"Intent understood before planning: {intent_preview}"},
+        })
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {
+                "content": (
+                    "Current task status checked before plan display: "
+                    f"phase={planning_state.current_phase or 'idle'}, "
+                    f"execution={planning_state.execution_status or 'idle'}, "
+                    f"queued={queued_count}, "
+                    f"checkpoint={'yes' if planning_state.turn_checkpoint else 'no'}"
+                ),
+            },
+        })
         planning_reconnaissance = _build_planning_reconnaissance(
             workspace_root, planning_roots, objective,
         )

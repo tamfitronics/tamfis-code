@@ -459,12 +459,14 @@ class LiveInputListener:
         cli_config: Config,
         interrupt_callback: Optional[Callable[[str], None]] = None,
         side_question_callback: Optional[Callable[[str], Awaitable[str]]] = None,
+        command_completer: Any = None,
     ) -> None:
         self.session_id = session_id
         self.renderer = renderer
         self.cli_config = cli_config
         self._interrupt_callback = interrupt_callback
         self._side_question_callback = side_question_callback
+        self._command_completer = command_completer
         self._interrupt_classification: Optional[str] = None
         self._is_tty = bool(getattr(sys.stdin, "isatty", lambda: False)())
         self._input_task: Optional[asyncio.Task] = None
@@ -1107,6 +1109,7 @@ class LiveInputListener:
         # Codex's layout, not a framed box with everything under it.
         session = PromptSession(
             key_bindings=bindings,
+            completer=self._command_completer,
             show_frame=False,
             reserve_space_for_menu=0,
             style=composer_style(),
@@ -1575,7 +1578,10 @@ class LiveInputListener:
     # Commands the live composer can honour at once. Anything else that is shaped like a slash command is
     # kept OUT of the model's follow-up stream (the model used to receive the literal text "/diff" as
     # prose, so the command silently did nothing) and is deferred to run as a command when the task ends.
-    _LIVE_STOP_COMMANDS = {"/stop": "cancel", "/cancel": "cancel", "/pause": "pause"}
+    _LIVE_STOP_COMMANDS = {
+        "/stop": "cancel", "/cancel": "cancel", "/pause": "pause",
+        "/interrupt": "cancel", "/exit": "exit", "/quit": "exit",
+    }
 
     def _handle_live_slash_command(self, text: str) -> bool:
         """A `/command` typed mid-task is never silent and never becomes model prose.
@@ -1594,7 +1600,10 @@ class LiveInputListener:
 
         if head in self._LIVE_STOP_COMMANDS:
             classification = self._LIVE_STOP_COMMANDS[head]
-            note("Stopping the task now…" if classification == "cancel" else "Pausing the task at the next safe step…")
+            note(
+                "Stopping the task now…" if classification in {"cancel", "exit"}
+                else "Pausing the task at the next safe step…"
+            )
             self._request_interrupt(classification)
             return True
         if head == "/help":

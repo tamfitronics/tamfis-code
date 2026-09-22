@@ -83,6 +83,7 @@ class DispatchTests(_Isolated, unittest.TestCase):
             "/history": "/resume", "/sessions": "/resume", "/chats": "/resume", "/branch": "/fork",
             "/cost": "/usage", "/pwd": "/cwd", "/q": "/exit", "/?": "/help",
             "/rewind": "/undo", "/diagnostics": "/debug", "/release-notes": "/version", "/plugin": "/plugins",
+            "/continue": "/resume", "/ps": "/tasks", "/task": "/tasks", "/memories": "/memory", "/reasoning": "/effort",
         }
         for alias, target in cases.items():
             with self.subTest(alias=alias):

@@ -569,33 +569,40 @@ package manager, test runner, deployment system, or operating system.
 
 NON-NEGOTIABLE RULES
 
-1. Start from the supplied deterministic reconnaissance. Do not start from model priors or conventional project layouts.
-2. Never invent a file, directory, manifest, script, command, service, migration,
+1. First understand the user's intent from the exact objective: identify the
+   requested outcome, explicit constraints, affected scope, and acceptance
+   evidence. Preserve those requirements throughout the plan.
+2. Reconcile that intent with the supplied current-state/repository evidence
+   before drafting or displaying any plan. If evidence conflicts with the
+   request, surface the conflict as an assumption or risk; do not silently
+   substitute a generic workflow.
+3. Start from the supplied deterministic reconnaissance. Do not start from model priors or conventional project layouts.
+4. Never invent a file, directory, manifest, script, command, service, migration,
    route, module, framework, package manager, or test runner.
-3. A path may appear only when it is present in the authoritative reconnaissance
+5. A path may appear only when it is present in the authoritative reconnaissance
    or is an explicitly supplied authorised root.
-4. A command may appear only when it is listed as a verified command in the
+6. A command may appear only when it is listed as a verified command in the
    authoritative reconnaissance or explicitly requested by the user.
-5. Do not assume that pyproject.toml, package.json, pytest, npm, Alembic, Docker,
+7. Do not assume that pyproject.toml, package.json, pytest, npm, Alembic, Docker,
    Git, tests, migrations, src, app, frontend, or backend exist.
-6. Do not include provider selection, generic methodology, or vague steps such as
+8. Do not include provider selection, generic methodology, or vague steps such as
    'inspect the repository', 'look for bugs', 'ensure dependencies', or 'run
    tests'. Name the verified target and purpose.
-6a. Keep "action" a single short imperative line (roughly 12 words), the way a
+8a. Keep "action" a single short imperative line (roughly 12 words), the way a
    terse engineering checklist reads -- not a full sentence explaining itself.
    "purpose" is separate and is not shown next to the action, so do not repeat
    it inside "action".
-6b. Never pad the plan with recon bookskeeping that repeats earlier steps:
+8b. Never pad the plan with recon bookkeeping that repeats earlier steps:
    if a step already inventories a root, do not add another step to "read
    metadata" for files inside that same root, and never spend a step on
    "report findings" or "plan next steps" -- reporting is not plan work.
-7. When evidence is insufficient, plan a bounded read-only inventory of an
+9. When evidence is insufficient, plan a bounded read-only inventory of an
    authorised root or a verified path. Do not fill gaps with guesses.
-8. For multi-root work, keep each root explicit. Never collapse the common parent
+10. For multi-root work, keep each root explicit. Never collapse the common parent
    into a workspace target and never rewrite a supplied absolute path.
-9. Put execution or mutation after evidence gathering. Put validation after the
+11. Put execution or mutation after evidence gathering. Put validation after the
    intended change. Audits remain read-only unless the objective requests fixes.
-10. Use between 2 and {MAX_REASONING_PLAN_STEPS} steps.
+12. Use between 2 and {MAX_REASONING_PLAN_STEPS} steps.
 
 Return ONLY one JSON object with this exact shape:
 
@@ -683,6 +690,18 @@ def build_reasoning_plan_prompt(
         "objective": objective,
         "task_type": getattr(profile.task_type, "value", str(profile.task_type)),
         "requires_validation": bool(getattr(profile, "requires_validation", False)),
+        "intent_contract": {
+            "user_request": objective,
+            "task_type": getattr(profile.task_type, "value", str(profile.task_type)),
+            "requires_tools": bool(getattr(profile, "requires_tools", False)),
+            "requires_repository_context": bool(getattr(profile, "requires_repository_context", False)),
+            "requires_validation": bool(getattr(profile, "requires_validation", False)),
+            "instruction": (
+                "Before drafting steps, restate the requested outcome, constraints, "
+                "scope, and acceptance evidence internally from this exact request. "
+                "Do not replace it with a generic inspect/execute/test template."
+            ),
+        },
         "authoritative_reconnaissance": {
             "authorised_roots": [str(root) for root in evidence.roots],
             "discovered_paths": [

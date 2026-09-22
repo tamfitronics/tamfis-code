@@ -350,6 +350,9 @@ class BuildReasoningPlanPromptTests(unittest.TestCase):
         self.assertIn("Python", user_content)
         self.assertIn("Django", user_content)
         self.assertIn("pytest -q", user_content)
+        self.assertIn("intent_contract", user_content)
+        self.assertIn("Do not replace it with a generic inspect/execute/test template", user_content)
+        self.assertIn("First understand the user's intent", messages[0]["content"])
 
     def test_evidence_summary_is_included_for_a_revision_and_asks_for_grounding(self):
         messages = build_reasoning_plan_prompt(
