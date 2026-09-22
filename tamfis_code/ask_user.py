@@ -21,6 +21,7 @@ pure so they are unit-testable; only `ask_questions` touches the terminal.
 """
 from __future__ import annotations
 
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
@@ -85,6 +86,29 @@ def _coerce_option(raw: Any) -> Optional[Option]:
     return None
 
 
+def _option_items(raw: Any) -> list[Any]:
+    """Normalize provider/MCP argument variants without splitting strings.
+
+    Some tool-call adapters preserve an array argument as the JSON text
+    ``["yes", "no"]``. Iterating that text directly creates one menu row per
+    character, which is especially confusing in the approval gate. A plain
+    string remains one option; only a valid JSON array is expanded.
+    """
+    if isinstance(raw, str):
+        text = raw.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, list):
+                return decoded
+        return [raw]
+    if isinstance(raw, (list, tuple)):
+        return list(raw)
+    return []
+
+
 def normalize_questions(
     questions: Any = None, question: Any = None, options: Any = None,
 ) -> list[Question]:
@@ -117,7 +141,7 @@ def normalize_questions(
             raise ValueError("every question needs non-empty `question` text.")
         opts: list[Option] = []
         seen: set[str] = set()
-        for raw in (item.get("options") or item.get("choices") or []):
+        for raw in _option_items(item.get("options") or item.get("choices") or []):
             option = _coerce_option(raw)
             if option is None or option.label.casefold() in seen:
                 continue

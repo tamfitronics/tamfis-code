@@ -57,6 +57,14 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(len(parsed), 1)
         self.assertEqual([o.label for o in parsed[0].options], ["staging", "prod"])
 
+    def test_json_encoded_option_arrays_stay_as_whole_clickable_options(self):
+        parsed = au.normalize_questions(question="Continue?", options='["Yes", "No"]')
+        self.assertEqual([o.label for o in parsed[0].options], ["Yes", "No"])
+
+    def test_plain_string_option_stays_one_option(self):
+        parsed = au.normalize_questions(question="Environment?", options="staging")
+        self.assertEqual([o.label for o in parsed[0].options], ["staging"])
+
     def test_a_question_without_options_is_allowed_as_free_text(self):
         parsed = au.normalize_questions(question="What should the release be called?")
         self.assertEqual(parsed[0].options, [])
