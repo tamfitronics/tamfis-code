@@ -84,6 +84,15 @@ _RESTRICTIVE_SCOPE_RE = re.compile(
     r"(?:is|:)\s*(?P<named_path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)",
     re.IGNORECASE,
 )
+# Natural-language boundary correction commonly sent while a task is already
+# running: "you have no business with /home; only /home/finitron". Treat the
+# final explicit path as the sole directory target instead of allowing the
+# earlier broad path to win merely because it is the launch root.
+_RESTRICTIVE_CORRECTION_RE = re.compile(
+    r"\bno\s+business\s+with\s+/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+"
+    r".*?\bonly\s+(?P<path>/(?:[A-Za-z0-9._~+\-]+/)*[A-Za-z0-9._~+\-]+)",
+    re.IGNORECASE,
+)
 _RESTRICTIVE_RELATIVE_SCOPE_RE = re.compile(
     rf"\b{_RESTRICTIVE_SCOPE_VERB}\s+{_RESTRICTIVE_SCOPE_PREP}"
     r"(?P<path>(?!/)[A-Za-z0-9._~+\-]+(?:/[A-Za-z0-9._~+\-]+)*)",
@@ -112,11 +121,12 @@ def explicit_absolute_targets(objective: str) -> tuple[Path, ...]:
     targets: list[Path] = []
     seen: set[str] = set()
     scrubbed = _URL_RE.sub(" ", objective or "")
+    correction_paths = [match.group("path") for match in _RESTRICTIVE_CORRECTION_RE.finditer(scrubbed)]
     restrictive_paths = [
         match.group("path") or match.group("named_path")
         for match in _RESTRICTIVE_SCOPE_RE.finditer(scrubbed)
     ]
-    raw_paths = restrictive_paths or _ABSOLUTE_PATH_RE.findall(scrubbed)
+    raw_paths = correction_paths or restrictive_paths or _ABSOLUTE_PATH_RE.findall(scrubbed)
     for raw in raw_paths:
         candidate = _existing_path(raw)
         # Terminal hints, pasted transcripts, and pasted error logs commonly

@@ -98,6 +98,18 @@ def test_restrictive_relative_directory_scope_is_resolved_from_launch_root(tmp_p
     assert result.roots == (focused.resolve(),)
 
 
+def test_natural_language_scope_correction_selects_only_the_final_explicit_root(tmp_path: Path):
+    broad = _project(tmp_path / "home")
+    focused = _project(broad / "finitron")
+    objective = f"You have no business with {broad}; only {focused}"
+    result = resolve_workspace_targets(
+        launch_root=broad,
+        objective=objective,
+        allowed_roots=[broad],
+    )
+    assert result.roots == (focused.resolve(),)
+
+
 def test_pasted_status_hint_is_not_an_absolute_target(tmp_path: Path):
     current = _project(tmp_path / "tamfisseo")
     assert explicit_absolute_targets("ready · /status for session, task, cwd") == ()

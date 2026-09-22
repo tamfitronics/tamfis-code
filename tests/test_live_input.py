@@ -120,6 +120,24 @@ class InFlightCommandTests(_StatePatchMixin, unittest.TestCase):
         self.assertEqual(queued[0]["text"], "/diff")
         self.assertEqual(queued[0]["classification"], "command")
 
+    def test_scope_correction_interrupts_and_queues_narrowed_restart(self):
+        target = Path(self.tmp.name) / "finitron"
+        target.mkdir()
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config())
+        listener._active = True
+        with patch.object(listener, "_request_interrupt") as interrupt:
+            self.assertTrue(listener._handle_live_scope_correction(
+                f"You have no business with {self.tmp.name}; only {target}"
+            ))
+        interrupt.assert_called_once_with("cancel")
+        queued = [
+            item for item in state_module.get_session_state(1).queued_user_instructions
+            if item.get("status") == "queued"
+        ]
+        self.assertEqual(queued[0]["classification"], "follow_up")
+        self.assertEqual(queued[0]["priority"], 150)
+
 
 class ShiftTabCyclesModeTests(unittest.TestCase):
     @patch("tamfis_code.live_input._active_agent_count")

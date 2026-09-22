@@ -1479,6 +1479,8 @@ class LiveInputListener:
             if self._active and not self._paused:
                 self._schedule_prompt()
             return
+        if self._handle_live_scope_correction(text):
+            return
         editing_id = self._editing_instruction_id
         self._editing_instruction_id = None
         if editing_id and local_state.edit_queued_instruction(self.session_id, editing_id, text):
@@ -1641,6 +1643,40 @@ class LiveInputListener:
             return True
         item = local_state.enqueue_instruction(self.session_id, text, classification="command", priority=50)
         note(f"{head} can't run inside a running task. Queued ({item.id}): it runs as soon as the task finishes.")
+        return True
+
+    def _handle_live_scope_correction(self, text: str) -> bool:
+        """Stop before the next tool call when the user narrows the workspace.
+
+        Scope is fixed for a running turn; a steering message cannot safely
+        shrink already-created tool authority. A clear ``only /path``
+        correction is queued for the next turn and interrupts this one first.
+        """
+        if not self._active or self._paused:
+            return False
+        if not re.search(r"\b(?:only|just|confine|restrict|limit)\s+/(?:\S+)", text, re.IGNORECASE):
+            return False
+        try:
+            from .runtime.workspace_authority import explicit_absolute_targets
+
+            targets = explicit_absolute_targets(text)
+        except Exception:
+            return False
+        if len(targets) != 1 or not targets[0].is_dir():
+            return False
+        item = local_state.enqueue_instruction(
+            self.session_id, text, classification="follow_up", priority=150,
+        )
+        self.renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {
+                "content": (
+                    f"◆ Workspace scope narrowed to {targets[0]}. "
+                    f"Stopping this turn ({item.id}); the correction will restart in the narrowed scope."
+                )
+            },
+        })
+        self._request_interrupt("cancel")
         return True
 
     # ---- immediate acknowledgement of a mid-task follow-up (a concurrent branch, not a wait) ----
