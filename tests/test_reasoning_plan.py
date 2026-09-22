@@ -25,7 +25,12 @@ from tamfis_code.orchestrator.planner import (
 )
 from tamfis_code.providers import ProviderType
 from tamfis_code.routing import TaskProfile, TaskType
-from tamfis_code.runner_local import _attempt_reasoning_plan, run_local_agent_turn
+from tamfis_code.runner_local import (
+    _attempt_reasoning_plan,
+    _plan_message_content,
+    _resume_plan_message_content,
+    run_local_agent_turn,
+)
 
 
 class ParseReasoningPlanTests(unittest.TestCase):
@@ -365,6 +370,12 @@ class BuildReasoningPlanPromptTests(unittest.TestCase):
     def test_no_evidence_summary_omits_the_revision_language(self):
         messages = build_reasoning_plan_prompt("fix the crash", self._profile(), {})
         self.assertNotIn("REVISION", messages[-1]["content"])
+
+    def test_stopped_plan_rendering_is_safe_when_no_plan_was_produced(self):
+        rendered = _plan_message_content(None, heading="TASK PLAN")
+        resumed = _resume_plan_message_content(None)
+        self.assertIn("No executable plan", rendered)
+        self.assertIn("no executable plan is available", resumed)
 
 
 def _delta(content=None, tool_calls=None):

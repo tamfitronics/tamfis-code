@@ -5216,6 +5216,12 @@ def _resume_plan_message_content(plan: Any) -> str:
     """The plan handed to the model on a resume: what is DONE (with its
     evidence), what is next, and what remains -- so it continues instead of
     re-deriving where the task stands."""
+    if plan is None or not getattr(plan, "steps", None):
+        return (
+            "TASK PLAN (RESUMED): no executable plan is available because the "
+            "previous planning attempt stopped before producing one. Reconcile "
+            "the user's objective and current workspace state before proceeding."
+        )
     first_open = next(
         (step.index for step in plan.steps if step.status != "completed"), None,
     )
@@ -5242,6 +5248,9 @@ def _resume_plan_message_content(plan: Any) -> str:
 
 def _plan_message_content(plan: Any, *, heading: str) -> str:
     lines = [heading]
+    if plan is None or not getattr(plan, "steps", None):
+        lines.append("No executable plan was produced; inspect the current state before proceeding.")
+        return "\n".join(lines)
     lines += [f"{step.index}. {step.name}" for step in plan.steps]
     if plan.assumptions:
         lines.append("Assumptions: " + "; ".join(plan.assumptions))

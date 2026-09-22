@@ -213,7 +213,7 @@ def merge_phase_plans(objective: str, phase_plans: list[tuple[str, ExecutionPlan
     components: list[str] = []
 
     for phase_name, plan in phase_plans:
-        if not plan.steps:
+        if plan is None or not getattr(plan, "steps", None):
             continue
         phase_index = len(phase_names) + 1
         phase_names.append(phase_name)
