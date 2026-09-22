@@ -363,6 +363,27 @@ class ResolveLocalWorkspaceTests(unittest.TestCase):
         self.assertEqual(reconciled.execution_status, "interrupted")
         self.assertIsNone(reconciled.running_action)
 
+    def test_does_not_reuse_a_quiet_running_session_with_a_live_owner(self):
+        # A provider wait or approval prompt can be quiet longer than the
+        # timestamp liveness window. A live PID must keep ownership with the
+        # first terminal instead of letting a second one reuse its row.
+        import os
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(cwd=Path(proj), discover=False)
+            state_module.save_session_state(
+                first.session_id, execution_status="running", owner_pid=os.getpid(),
+            )
+            data = state_module._load_raw()
+            data[str(first.session_id)]["updated_at"] = (
+                datetime.now(timezone.utc) - timedelta(hours=1)
+            ).isoformat()
+            state_module._save_raw(data)
+            second = resolve_local_workspace(cwd=Path(proj), discover=False)
+
+        self.assertNotEqual(first.session_id, second.session_id)
+
     def test_force_new_supersedes_stale_task_but_preserves_checkpoint(self):
         from datetime import datetime, timedelta, timezone
 

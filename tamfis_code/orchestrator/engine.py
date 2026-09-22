@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path, PurePath
+import os
 import re
 from typing import Any, Callable, Optional
 
@@ -70,6 +71,7 @@ class AgentOrchestrator:
             execution_status="failed" if phase == AgentPhase.FAILED else (
                 "completed" if phase == AgentPhase.COMPLETED else "running"
             ),
+            owner_pid=None if phase in {AgentPhase.FAILED, AgentPhase.COMPLETED} else os.getpid(),
             running_action={"purpose": action or phase.value, "phase": phase.value},
         )
         self.emit({"event_type": f"orchestrator_{phase.value}", "payload": {"phase": phase.value, "action": action}})
@@ -101,6 +103,7 @@ class AgentOrchestrator:
             self.session_id,
             active_task={"objective": objective, "task_type": profile.task_type.value, "complexity": profile.complexity},
             current_phase=AgentPhase.UNDERSTAND.value, execution_status="running",
+            owner_pid=os.getpid(),
         )
         if restored:
             names = [step["name"] for step in restore.steps]

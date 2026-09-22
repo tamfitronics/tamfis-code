@@ -2542,35 +2542,22 @@ def _workspace_roots_related(candidate_root: str, current_root: str) -> bool:
 def _select_resume_state(session_id: int, workspace_root: str):
     """Find the best durable context for an explicit resume request.
 
-    Restarting from a project subdirectory can legitimately select a
-    different local session than the interrupted parent-workspace turn. A
-    related-workspace search is allowed only for explicit resume wording,
-    preventing ordinary new messages from inheriting another thread.
+    Resume context is pinned to ``session_id``.  A previous implementation
+    searched every related workspace session for a checkpoint whenever the
+    incoming text looked like ``continue``/``resume``.  That made two
+    terminals in the same project cross-talk: the second terminal could
+    resume whichever sibling session had the newest checkpoint, even though
+    its own session id was different.  Explicit ``tamfis-code resume [id]``
+    already switches the interactive ``WorkspaceContext`` and reloads that
+    session's history, so there is no safe reason for this lower-level turn
+    runner to borrow context from another id.
+
+    The workspace arguments remain part of the signature for callers and
+    diagnostics, but are deliberately not used to widen ownership.  A
+    subdirectory restart must select the intended session explicitly through
+    the resume picker or ``resume [id]``.
     """
-    current = local_state.get_session_state(session_id)
-    candidates = []
-    for candidate_id in local_state.all_known_session_ids():
-        candidate = local_state.get_session_state(candidate_id)
-        if candidate.is_swarm_child or not _workspace_roots_related(candidate.workspace_root, workspace_root):
-            continue
-        has_context = bool(
-            candidate.turn_checkpoint or candidate.conversation_history
-            or candidate.conversation_summary or candidate.completed_actions
-            or candidate.context_checkpoints or candidate.active_task
-        )
-        if has_context:
-            candidates.append(candidate)
-    if not candidates:
-        return current
-    # A real interrupted checkpoint always beats an inferred legacy summary;
-    # within each class, use actual update time rather than numeric session id.
-    return max(candidates, key=lambda state: (
-        bool(
-            state.turn_checkpoint
-            and _is_real_resume_objective(str(state.turn_checkpoint.get("objective") or ""))
-        ),
-        state.updated_at or "",
-    ))
+    return local_state.get_session_state(session_id)
 
 
 def _legacy_resume_messages(state, incoming_objective: str) -> tuple[list[dict[str, Any]], str]:

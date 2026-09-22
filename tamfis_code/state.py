@@ -449,6 +449,11 @@ class SessionState:
     active_task: Optional[dict[str, Any]] = None
     current_phase: str = "idle"
     execution_status: str = "idle"
+    # PID of the process currently executing this session's turn. This is a
+    # live ownership lease, not a user-visible identity: it prevents a quiet
+    # provider/approval wait from being mistaken for a stale session and
+    # reused by a second terminal.
+    owner_pid: Optional[int] = None
     inspected_files: dict[str, dict[str, Any]] = field(default_factory=dict)
     discovered_symbols: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
     discovered_services: list[dict[str, Any]] = field(default_factory=list)
@@ -745,6 +750,25 @@ def is_session_actively_running(state: SessionState) -> bool:
     """
     if state.execution_status != "running":
         return False
+    # A live owner process is stronger evidence than the wall-clock lease.
+    # Provider calls, approval prompts, and long tool commands can all be
+    # quiet for longer than SESSION_LIVENESS_WINDOW; treating that silence as
+    # stale lets a second terminal reuse the first terminal's state row.
+    # Terminal transitions clear owner_pid, while a crashed process leaves a
+    # PID that no longer exists and therefore still falls through to the
+    # timestamp-based stale-session recovery below.
+    owner_pid = getattr(state, "owner_pid", None)
+    if owner_pid:
+        try:
+            os.kill(int(owner_pid), 0)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            return True
+        except (OSError, ValueError, TypeError):
+            pass
+        else:
+            return True
     if not state.updated_at:
         return False
     try:
@@ -2837,6 +2861,7 @@ def start_action(session_id: int, *, action_type: str, purpose: str,
     state.running_action = asdict(action)
     state.pending_actions.append(asdict(action))
     state.execution_status = "running"
+    state.owner_pid = os.getpid()
     put_session_state(state)
     return action
 
@@ -2883,6 +2908,8 @@ def finish_action(session_id: int, action_id: str, *, status: str, summary: str 
     if state.running_action and state.running_action.get("id") == action_id:
         state.running_action = None
     state.execution_status = "idle" if state.running_action is None else "running"
+    if state.running_action is None:
+        state.owner_pid = None
     put_session_state(state)
 
 

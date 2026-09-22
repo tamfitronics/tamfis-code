@@ -15,7 +15,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from tamfis_code.runner_local import _workspace_roots_related
+from tamfis_code import state as state_module
+from tamfis_code.runner_local import _select_resume_state, _workspace_roots_related
 
 
 class WorkspaceRootsRelatedTests(unittest.TestCase):
@@ -62,3 +63,57 @@ class WorkspaceRootsRelatedTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SessionPinnedResumeTests(unittest.TestCase):
+    """A resume-shaped turn must never borrow another terminal's state."""
+
+    def setUp(self):
+        self._originals = (state_module.CONFIG_DIR, state_module.STATE_PATH)
+        self.tmp = tempfile.TemporaryDirectory()
+        base = Path(self.tmp.name)
+        state_module.CONFIG_DIR = base / ".config"
+        state_module.STATE_PATH = state_module.CONFIG_DIR / "state.json"
+
+    def tearDown(self):
+        state_module.CONFIG_DIR, state_module.STATE_PATH = self._originals
+        self.tmp.cleanup()
+
+    def test_continue_cannot_select_newer_checkpoint_from_another_session(self):
+        root = Path(self.tmp.name) / "project"
+        root.mkdir()
+        state_module.save_session_state(10, workspace_root=str(root), execution_status="idle")
+        state_module.save_session_state(
+            11,
+            workspace_root=str(root),
+            execution_status="interrupted",
+            turn_checkpoint={"status": "interrupted", "objective": "other terminal task"},
+            conversation_history=[{"role": "user", "content": "other terminal task"}],
+        )
+
+        selected = _select_resume_state(10, str(root))
+
+        self.assertEqual(selected.session_id, 10)
+        self.assertIsNone(selected.turn_checkpoint)
+        self.assertEqual(selected.conversation_history, [])
+
+    def test_current_session_checkpoint_remains_available(self):
+        root = Path(self.tmp.name) / "project"
+        root.mkdir()
+        state_module.save_session_state(
+            10,
+            workspace_root=str(root),
+            execution_status="interrupted",
+            turn_checkpoint={"status": "interrupted", "objective": "this terminal task"},
+        )
+        state_module.save_session_state(
+            11,
+            workspace_root=str(root),
+            execution_status="interrupted",
+            turn_checkpoint={"status": "interrupted", "objective": "other terminal task"},
+        )
+
+        selected = _select_resume_state(10, str(root))
+
+        self.assertEqual(selected.session_id, 10)
+        self.assertEqual(selected.turn_checkpoint["objective"], "this terminal task")
