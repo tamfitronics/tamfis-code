@@ -26,6 +26,7 @@ from .mcp import MCPServer
 
 DEFAULT_EXPOSED_TOOLS = frozenset({
     "read_file", "list_directory", "search_code", "find_references", "get_git_info",
+    "list_agent_types",
 })
 
 

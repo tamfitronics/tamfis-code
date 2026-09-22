@@ -18,6 +18,17 @@ from tamfis_code.mcp import MCPServer, _parse_duckduckgo_html
 
 
 @pytest.mark.asyncio
+async def test_agent_inventory_is_registered_and_read_only(tmp_path):
+    server = MCPServer(workspace_root=str(tmp_path))
+    assert "list_agent_types" in server.tools
+    result = await server.call_tool("list_agent_types", {})
+    assert result["success"] is True
+    assert {item["name"] for item in result["result"]["built_in"]} >= {
+        "code_analyzer", "test_generator", "doc_generator",
+    }
+
+
+@pytest.mark.asyncio
 async def test_channel_marked_unknown_tool_is_rejected_before_external_dispatch(tmp_path):
     server = MCPServer(workspace_root=str(tmp_path))
     result = await server.call_tool(

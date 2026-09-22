@@ -33,7 +33,7 @@ from .routing import TaskProfile, TaskType
 READ_TOOLS = [
     "list_directory", "search_code", "find_references", "read_file", "read_archive",
     "get_git_info", "ask_user_question", "inspect_artifact", "save_memory",
-    "list_external_agent_sessions", "read_external_agent_session",
+    "list_external_agent_sessions", "read_external_agent_session", "list_agent_types",
     "write_todos",
 ]
 # Keep ordinary read-only turns strictly read-only. A resumed machine-generated

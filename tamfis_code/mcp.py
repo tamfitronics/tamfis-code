@@ -1156,6 +1156,17 @@ class MCPServer:
         )
 
         self.register_tool(
+            name="list_agent_types",
+            description=(
+                "List built-in and configured subagent types available to this workspace. "
+                "Use an exact returned name as agent_type when delegating; never invent a tool "
+                "name such as review_agent. Read-only."
+            ),
+            parameters={"type": "object", "properties": {}},
+            handler=self._list_agent_types,
+        )
+
+        self.register_tool(
             name="ask_user_question",
             description=(
                 "Stop and ask the person at the terminal a real decision, with concrete options "
@@ -1349,6 +1360,21 @@ class MCPServer:
             "cwd": record["cwd"], "updated_at": record["updated_at"],
             "brief": external_agents.continuation_brief(record),
         }
+
+    async def _list_agent_types(self) -> Dict[str, Any]:
+        from .agent_definitions import load_agent_definitions
+        from .agents import AgentManager
+
+        built_in = AgentManager().list_agents()
+        configured = [
+            {
+                "name": definition.name,
+                "description": definition.description,
+                "source": definition.source,
+            }
+            for definition in load_agent_definitions(self.workspace_root)
+        ]
+        return {"built_in": built_in, "configured": configured}
 
     def register_tool(self, name: str, description: str,
                       parameters: Dict[str, Any], handler: Callable):

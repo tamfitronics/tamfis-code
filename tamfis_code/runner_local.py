@@ -4931,6 +4931,48 @@ SWARM_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+DELEGATE_AGENT_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "delegate_agent",
+        "description": (
+            "Delegate one focused sub-objective to a separate Tamfis-Code agent session. "
+            "Use this for a genuine independent review, research, test, or code-analysis task; "
+            "the result is returned to the current task. This is read-only by default. "
+            "Set mutate=true only when the current approval policy explicitly permits unattended "
+            "edits. For multiple independent objectives use delegate_parallel_tasks instead. "
+            "Use an agent_type only when that named type is listed by /agent-types or configured "
+            "in .tamfis/agents/*.md."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "objective": {"type": "string", "description": "The single focused sub-objective"},
+                "agent_type": {
+                    "type": "string",
+                    "description": "Optional configured named agent type, such as reviewer or planner",
+                },
+                "mutate": {
+                    "type": "boolean",
+                    "description": "Allow the delegated agent to edit files; defaults to false",
+                },
+            },
+            "required": ["objective"],
+        },
+    },
+}
+
+
+_PROVIDER_AGENT_TOOL_ALIASES = {
+    "review_agent": "delegate_agent",
+    "review agent": "delegate_agent",
+    "code_review_agent": "delegate_agent",
+    "security_review_agent": "delegate_agent",
+    "research_agent": "delegate_agent",
+    "test_agent": "delegate_agent",
+}
+
+
 def _parse_swarm_tasks(raw_tasks: list[Any]) -> tuple[list[str], list[Optional[str]]]:
     """Split delegate_parallel_tasks's `tasks` argument (each item either a
     plain string or an {"objective", "agent_type"} object, per
@@ -6446,6 +6488,7 @@ async def _run_local_agent_turn_impl(
         tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA, READ_BACKGROUND_JOB_TOOL_SCHEMA]
         if allow_swarm_tool and not turn_read_only and cli_config is not None and cli_config.enable_subagent_delegation:
             tools = [*tools, SWARM_TOOL_SCHEMA]
+            tools = [*tools, DELEGATE_AGENT_TOOL_SCHEMA]
 
     working_messages = list(orchestration.context.messages if orchestration.context else messages)
     # Resolve workspace authority before planning or repository inspection.
@@ -9172,6 +9215,11 @@ async def _run_local_agent_turn_impl(
             )
             tc.name = normalized_name
             tc.arguments = normalized_arguments
+            if (
+                tc.name.casefold() in _PROVIDER_AGENT_TOOL_ALIASES
+                and "delegate_agent" in offered_tool_names
+            ):
+                tc.name = _PROVIDER_AGENT_TOOL_ALIASES[tc.name.casefold()]
             if tc.name not in offered_tool_names:
                 invalid_tool_ids.add(tc.call_id)
 
@@ -9987,7 +10035,7 @@ async def _run_local_agent_turn_impl(
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                 continue
 
-            if tc.name == "delegate_parallel_tasks":
+            if tc.name in {"delegate_parallel_tasks", "delegate_agent"}:
                 # Not a filesystem/shell tool either -- no per-call workspace
                 # scope or approval gate applies to the call itself
                 # (mutation_policy_allows_swarm is the gate here, checked
@@ -10009,10 +10057,23 @@ async def _run_local_agent_turn_impl(
                     working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(blocked)})
                     renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": blocked}})
                     continue
-                sub_tasks, sub_agent_types = _parse_swarm_tasks(arguments.get("tasks") or [])
+                if tc.name == "delegate_agent":
+                    objective = str(arguments.get("objective") or "").strip()
+                    sub_tasks = [objective] if objective else []
+                    sub_agent_types = [str(arguments.get("agent_type") or "").strip() or None] if objective else []
+                else:
+                    sub_tasks, sub_agent_types = _parse_swarm_tasks(arguments.get("tasks") or [])
                 mutate = bool(arguments.get("mutate", False))
-                if len(sub_tasks) < 2:
-                    result = {"success": False, "error": "delegate_parallel_tasks requires at least 2 independent tasks."}
+                minimum_tasks = 1 if tc.name == "delegate_agent" else 2
+                if len(sub_tasks) < minimum_tasks:
+                    result = {
+                        "success": False,
+                        "error": (
+                            "delegate_agent requires a non-empty objective."
+                            if tc.name == "delegate_agent"
+                            else "delegate_parallel_tasks requires at least 2 independent tasks."
+                        ),
+                    }
                 else:
                     suspend_live_if_active(renderer)
                     try:
@@ -10239,6 +10300,8 @@ async def _run_local_agent_turn_impl(
                         mcp_server.tool_schemas_openai(names=selected_tool_names)
                         if selected_tool_names else []
                     )
+                    if allow_swarm_tool and cli_config is not None and cli_config.enable_subagent_delegation:
+                        tools.extend([SWARM_TOOL_SCHEMA, DELEGATE_AGENT_TOOL_SCHEMA])
                     # Re-dispatch THIS call with the lifted restriction:
                     # fall through to the normal permission flow below.
                 else:

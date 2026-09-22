@@ -55,6 +55,9 @@ _DISPLAY_NAMES = {
     "ask_user_question": "Ask",
     "list_external_agent_sessions": "Sessions",
     "read_external_agent_session": "Session",
+    "list_agent_types": "Agents",
+    "delegate_agent": "Agent",
+    "delegate_parallel_tasks": "Swarm",
 }
 
 # Read-only tools that are GROUPED into one collapsed line when consecutive:
