@@ -109,7 +109,14 @@ def _remote_release(*, force: bool = False):
     if info is not None:
         _release, _release_at = info, now
         _write_cache(release=info, checked_at=time.time())
-    return info if info is not None else _release
+    # A valid disk manifest is still authoritative when the short network
+    # probe fails (offline laptop, transient DNS, or a restricted shell).
+    # Without this fallback, `/update` incorrectly reported an installed old
+    # version as current even though the cached release was newer.
+    if info is not None:
+        return info
+    cached = cached_release()
+    return cached if cached is not None else _release
 
 
 def cached_release():

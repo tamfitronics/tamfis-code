@@ -97,6 +97,12 @@ class DetectionTests(_Base):
             self.assertEqual(self_update.refresh_update_cache(), newer)
             self.assertEqual(self_update.refresh_update_cache(), newer)       # second fetch fails
 
+    def test_check_uses_valid_disk_manifest_when_network_is_unavailable(self):
+        newer = _bump()
+        self_update._write_cache(release=_manifest(newer), checked_at=time.time())
+        with patch.object(self_update, "urlopen", side_effect=OSError("offline")):
+            self.assertEqual(self_update.check_update_available(), newer)
+
     def test_memory_cache_avoids_refetching_within_its_ttl(self):
         fake = _urlopen_returning(_manifest(_bump()))
         with patch.object(self_update, "urlopen", fake):
