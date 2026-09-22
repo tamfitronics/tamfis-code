@@ -1718,10 +1718,9 @@ async def _generate_and_validate_title(session_id: int, objective: str) -> tuple
         )
         if accepted:
             return accepted, model_used, ""
-        print(
+        _title_debug(
             f"[title] attempt {attempt}/{_TITLE_MAX_VALIDATION_ATTEMPTS} rejected "
-            f"({reason}): {title!r}",
-            file=sys.stderr,
+            f"({reason}): {title!r}"
         )
         if attempt >= _TITLE_MAX_VALIDATION_ATTEMPTS:
             return "", model_used, "invalid_response"
@@ -1764,13 +1763,13 @@ async def _generate_session_title(
     try:
         from .providers import ProviderManager, ProviderType
     except Exception as exc:
-        print(f"[title] providers unavailable, title not generated: {_redacted(str(exc))}", file=sys.stderr)
+        _title_debug(f"[title] providers unavailable, title not generated: {_redacted(str(exc))}")
         return "", "", "routing_failure"
 
     try:
         manager = ProviderManager()
     except Exception as exc:
-        print(f"[title] routing unavailable, title not generated: {_redacted(str(exc))}", file=sys.stderr)
+        _title_debug(f"[title] routing unavailable, title not generated: {_redacted(str(exc))}")
         return "", "", "routing_failure"
 
     # NIM only, one model per attempt (see _TITLE_NIM_MODELS). Pinning
@@ -1834,11 +1833,10 @@ async def _generate_session_title(
                 chunks.append(str(chunk or ""))
         except Exception as exc:
             last_reason = "provider_error"
-            print(
+            _title_debug(
                 f"[title] attempt {attempt}/{total_attempts} "
                 f"failed ({type(exc).__name__}: {_redacted(str(exc))[:120]}), "
-                "trying next preferred route",
-                file=sys.stderr,
+                "trying next preferred route"
             )
             continue
         content = "".join(chunks).strip()
@@ -1850,17 +1848,15 @@ async def _generate_session_title(
             model_used = model
             break
         last_reason = "empty_response"
-        print(
+        _title_debug(
             f"[title] attempt {attempt}/{total_attempts}: "
-            "empty response, trying next preferred route",
-            file=sys.stderr,
+            "empty response, trying next preferred route"
         )
 
     if not content:
-        print(
+        _title_debug(
             f"[title] no title after {total_attempts} preferred "
-            f"routes ({last_reason})",
-            file=sys.stderr,
+            f"routes ({last_reason})"
         )
         return "", "", last_reason
     stripped = content.strip("\"'\u201c\u201d \t")
@@ -2072,6 +2068,12 @@ _TRIVIAL_ACTIVITY_LABELS = frozenset({
     "thanks", "thank you", "ty", "continue", "go on", "proceed", "sure",
     "hi", "hello", "hey", "test", "nice", "great", "cool", "wtf", "why",
 })
+
+
+def _title_debug(message: str) -> None:
+    """Keep automatic title-routing diagnostics out of normal CLI output."""
+    if os.environ.get("TAMFIS_CODE_DEBUG", "").lower() in {"1", "true", "yes"}:
+        print(message, file=sys.stderr)
 
 
 def _redacted(text: str) -> str:

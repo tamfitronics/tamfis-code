@@ -374,7 +374,7 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         import io
         state_module.save_session_state(1, workspace_root="/a")
         err = io.StringIO()
-        with contextlib.redirect_stderr(err):
+        with patch.dict("os.environ", {"TAMFIS_CODE_DEBUG": "1"}), contextlib.redirect_stderr(err):
             calls = self._upgrade(ConnectionError("boom"))
         self.assertIn("[title]", err.getvalue())
         # One route raising must not abort the chain: every preferred route
@@ -385,6 +385,16 @@ class UpgradeSessionTitleWithAiTests(_StateDirFixture, unittest.TestCase):
         self.assertEqual(
             state_module.get_session_state(1).title_fallback_reason, "provider_error",
         )
+
+    def test_provider_failure_details_are_hidden_from_normal_cli_output(self):
+        import contextlib
+        import io
+        state_module.save_session_state(1, workspace_root="/a")
+        err = io.StringIO()
+        with patch.dict("os.environ", {"TAMFIS_CODE_DEBUG": ""}), contextlib.redirect_stderr(err):
+            self._upgrade(ConnectionError("Error code: 503 - service temporarily overloaded"))
+        self.assertNotIn("Error code: 503", err.getvalue())
+        self.assertNotIn("trying next preferred route", err.getvalue())
 
 
 class DisplayFallbackTests(_StateDirFixture, unittest.TestCase):
