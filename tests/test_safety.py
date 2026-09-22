@@ -55,7 +55,7 @@ class ClassifyCommandRiskTests(unittest.TestCase):
         ):
             with self.subTest(command=command):
                 self.assertNotEqual(classify_command_risk(command), RISK_READ_ONLY)
-        self.assertEqual(classify_command_risk("pytest -q"), RISK_MEDIUM)
+        self.assertEqual(classify_command_risk("pytest -q"), RISK_READ_ONLY)
 
     def test_php_syntax_check_only_flag_is_read_only(self):
         """Live-reproduced (2026-08-30): a read-only audit turn needed to
@@ -84,6 +84,23 @@ class ClassifyCommandRiskTests(unittest.TestCase):
             classify_command_risk("python3 -m compileall /home/finitron"),
             RISK_READ_ONLY,
         )
+
+    def test_python_pytest_validation_is_read_only_in_audit_mode(self):
+        self.assertEqual(
+            classify_command_risk("python3 -m pytest tests/test_frontier.py -v 2>&1 | head -50"),
+            RISK_READ_ONLY,
+        )
+        self.assertEqual(
+            classify_command_risk("python3 -m pytest tests/test_frontier.py -v"),
+            RISK_READ_ONLY,
+        )
+        self.assertNotEqual(
+            classify_command_risk("python3 -m pytest -c malicious.ini"),
+            RISK_READ_ONLY,
+        )
+        self.assertEqual(classify_command_risk("pytest tests/test_frontier.py -vv"), RISK_READ_ONLY)
+        self.assertEqual(classify_command_risk("python3 -m unittest discover -v"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("pytest --rootdir /tmp tests"), RISK_READ_ONLY)
 
     def test_find_piped_to_xargs_php_lint_remains_unsupported(self):
         # Deliberately NOT supported, same conservative stance this file

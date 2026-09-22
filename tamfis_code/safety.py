@@ -126,7 +126,7 @@ def classify_command_risk(command: str) -> str:
 _READ_ONLY_COMMANDS = {
     "cat", "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
     "uniq", "wc", "stat", "file", "du", "tree", "realpath", "readlink",
-    "ps", "pgrep",
+    "ps", "pgrep", "pytest",
     "awk", "sed", "python", "python3",
     # Live-reproduced (2026-08-30): a read-only audit turn had a real,
     # non-mutating validation command to run -- `php -l file.php` (PHP's
@@ -139,6 +139,18 @@ _READ_ONLY_COMMANDS = {
     "php", "bash", "sh",
 }
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
+_BLOCKED_TEST_OPTIONS = (
+    "-c", "--confcutdir", "--rootdir", "--basetemp", "--override-ini", "--pdb", "--trace",
+)
+
+
+def _is_safe_test_arguments(arguments: list[str]) -> bool:
+    """Allow normal test selection/reporting without changing test authority."""
+    return not any(
+        arg in _BLOCKED_TEST_OPTIONS
+        or arg.startswith(tuple(f"{item}=" for item in _BLOCKED_TEST_OPTIONS[1:]))
+        for arg in arguments
+    )
 
 
 def is_process_inspection_command(command: str) -> bool:
@@ -223,6 +235,8 @@ def _is_read_only_command_segment(argv: list[str]) -> bool:
                 for arg in argv[2:]
             )
         )
+    if executable == "pytest":
+        return _is_safe_test_arguments(argv[1:])
     if executable not in _READ_ONLY_COMMANDS:
         return False
     if executable == "find" and any(
@@ -254,6 +268,13 @@ def _is_read_only_command_segment(argv: list[str]) -> bool:
         # else -- any other flag (or no -l at all) actually runs the script.
         return len(argv) == 3 and argv[1] == "-l" and not argv[2].startswith("-")
     if executable in {"python", "python3"}:
+        if argv[1:3] in (["-m", "pytest"], ["-m", "unittest"]):
+            # Running the repository's declared tests is allowed during a
+            # read-only audit. Pytest may create caches/bytecode, but it does
+            # not authorize edits to the user's source tree. Reject options
+            # that redirect collection, alter config, open a debugger, or
+            # otherwise turn this into an arbitrary execution mode.
+            return _is_safe_test_arguments(argv[3:])
         # `compileall` parses Python files and writes only interpreter cache
         # files; it does not import or execute application code. Treat the
         # quiet validation form as read-only so a repository audit does not
