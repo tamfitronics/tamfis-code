@@ -7640,6 +7640,8 @@ async def _run_local_agent_turn_impl(
     _round_window_size = max_rounds
     _turn_started_at = local_state._now()   # stop requests older than this belong to a previous run
     provider_exhaustion_recoveries = 0
+    previous_invalid_tool_signature: tuple[str, ...] = ()
+    invalid_tool_repeats = 0
     while True:
         _round += 1
         if _round >= max_rounds:
@@ -9231,6 +9233,49 @@ async def _run_local_agent_turn_impl(
                 str(call.name) for call in tool_calls
                 if call.call_id in invalid_tool_ids
             ]
+            invalid_signature = tuple(sorted(invalid_names))
+            if invalid_signature == previous_invalid_tool_signature:
+                invalid_tool_repeats += 1
+            else:
+                previous_invalid_tool_signature = invalid_signature
+                invalid_tool_repeats = 1
+            # An unavailable internal/provider tool is a protocol failure,
+            # not a recoverable workspace action. Re-feeding the same error
+            # to the model can produce the visible "Review Agent" loop seen
+            # with providers that emit internal labels as tool names. Stop
+            # after one correction attempt and preserve the checkpoint.
+            if invalid_tool_repeats >= 2:
+                safe_error = {
+                    "success": False,
+                    "error": (
+                        "The provider repeatedly requested an unavailable tool. "
+                        "No tool was executed; retry this turn or choose a different route."
+                    ),
+                }
+                for invalid_call in tool_calls:
+                    if invalid_call.call_id not in invalid_tool_ids:
+                        continue
+                    working_messages.append({
+                        "role": "tool",
+                        "tool_call_id": invalid_call.call_id,
+                        "content": json.dumps(safe_error),
+                    })
+                    renderer.handle_event({
+                        "event_type": "tool_output",
+                        "payload": {"tool": "unavailable provider tool", "result": safe_error},
+                    })
+                message = (
+                    "The provider repeatedly requested an unavailable internal tool; "
+                    "the turn was stopped before any tool ran. Retry the request or "
+                    "switch provider/model."
+                )
+                _persist_turn_checkpoint(status="interrupted", last_error=message)
+                orchestrator.fail(message)
+                renderer.handle_event({
+                    "event_type": "ai_task_failed",
+                    "payload": {"error": message},
+                })
+                return TaskOutcome(status="failed", error=message)
             repeated_invalid = stuck_reason is not None
             if repeated_invalid:
                 outcome = await _handle_stuck_loop(stuck_reason, tool_calls)
@@ -9257,7 +9302,16 @@ async def _run_local_agent_turn_impl(
                 })
                 renderer.handle_event({
                     "event_type": "tool_output",
-                    "payload": {"tool": invalid_call.name, "result": result},
+                    "payload": {
+                        # Keep provider-internal labels out of the terminal;
+                        # the model still receives the precise structured
+                        # error above and can correct itself once.
+                        "tool": "unavailable provider tool",
+                        "result": {
+                            "success": False,
+                            "error": "The provider requested an unavailable tool; nothing was executed.",
+                        },
+                    },
                 })
             working_messages.append({
                 "role": "system",
