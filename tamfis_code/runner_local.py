@@ -110,6 +110,7 @@ from .safety import (
     redact_secrets,
 )
 from .sandbox import SandboxPolicy
+from .timeouts import adaptive_command_timeout
 from .workspace import classify_root, detect_validation_commands, load_instruction_text, scratch_root
 from .workspace_access import ensure_workspace_access
 from .runtime.workspace_authority import (
@@ -157,6 +158,68 @@ MAX_AGENT_ROUND_EXTENSIONS = 1000
 # responsive while architecture, debugging, and multi-component tasks get the
 # provider's deeper reasoning mode. Operators can still pin low/medium/high.
 DEFAULT_REASONING_EFFORT = os.environ.get("TAMFIS_CODE_REASONING_EFFORT", "auto").strip().lower()
+
+
+def _requires_prechange_review(task_profile: Optional[TaskProfile], objective: str) -> bool:
+    """Require a human checkpoint before complex code mutations.
+
+    Ordinary edits remain autonomous.  Complex/debug/multi-component work is
+    different: auto approval may approve a tool call, but it must not bypass
+    a final review of the requested scope and proposed approach.
+    """
+    if task_profile is None or task_profile.task_type not in {
+        TaskType.EDIT, TaskType.DEBUG, TaskType.MIXED,
+    }:
+        return False
+    if complexity_at_least(task_profile.complexity, ComplexityLevel.COMPLEX):
+        return True
+    # Keep a conservative fallback for classifiers that under-rate a request
+    # which explicitly names several implementation surfaces.
+    references = re.findall(r"(?:^|\s)([./][\w./-]+\.(?:py|ts|tsx|js|jsx|rs|go|java|sql))\b", objective or "")
+    return len(set(references)) >= 3
+
+
+def _is_code_mutation_call(tool_name: str, arguments: dict[str, Any], risk: str) -> bool:
+    if tool_name in {
+        "edit_file", "write_file", "delete_file", "extract_archive", "repackage_archive",
+    }:
+        return True
+    return tool_name == "execute_command" and risk != RISK_READ_ONLY
+
+
+async def _ask_prechange_review(
+    console: Console, renderer: StreamRenderer, *, summary: str,
+) -> str:
+    """Show a clickable pre-change review and return the selected action."""
+    from . import ask_user
+
+    questions = ask_user.normalize_questions([{
+        "header": "Code review",
+        "question": (
+            "This is a complex code change. Review the request and proposed approach before "
+            "any mutation: " + summary
+        ),
+        "options": [
+            {"label": "Proceed with plan (Recommended)", "description": "Allow the reviewed code changes to begin."},
+            {"label": "Inspect more first", "description": "Keep the workspace unchanged and gather more evidence."},
+            {"label": "Revise the plan", "description": "Pause mutations so the approach can be corrected."},
+            {"label": "Cancel changes", "description": "Stop this change request without modifying code."},
+        ],
+    }])
+    await suspend_live_async_if_active(renderer)
+    try:
+        answers = await ask_user.ask_questions(console, questions)
+    finally:
+        resume_live_if_active(renderer)
+    answer = answers[0] if answers else None
+    selected = (answer.values[0] if answer and answer.values else "").casefold()
+    if "proceed" in selected:
+        return "proceed"
+    if "inspect" in selected:
+        return "inspect"
+    if "revise" in selected:
+        return "revise"
+    return "cancel"
 
 
 def _audit_evidence_targets(records: list[ToolEnvelope]) -> set[str]:
@@ -1537,6 +1600,21 @@ def _scope_tool_arguments(
             else:
                 external_paths.append(cwd)
 
+        # A read-only validation command may be launched from the common
+        # parent while naming one or more absolute files/directories inside
+        # the explicitly authorised project scope (for example
+        # `python3 -m compileall -q /home/finitron/...`). The parent cwd is
+        # not an external data target in that case; anchor execution in the
+        # one authorised root instead of manufacturing a forced escalation.
+        if (
+            not any(_is_within(cwd, root) for root in scope_roots)
+            and absolute_operands
+            and len(operand_roots) == 1
+            and all(any(_is_within(candidate, root) for root in scope_roots) for candidate in absolute_operands)
+        ):
+            cwd = next(iter(operand_roots))
+            scoped["cwd"] = str(cwd)
+
         if not any(_is_within(cwd, root) for root in scope_roots):
             external_paths.append(cwd)
 
@@ -1546,6 +1624,14 @@ def _scope_tool_arguments(
 
         scoped["cwd"] = str(cwd)
         scoped["command"] = command
+        # Normalize this before the approval/risk pass as well as before
+        # dispatch.  Otherwise the panel still shows the generic 60/120s
+        # timeout even though the handler would later know this is a package
+        # validation workload.
+        if command:
+            scoped["timeout"] = adaptive_command_timeout(
+                command, cwd, scoped.get("timeout", 60)
+            )
         if external_paths:
             _mark_external_scope(scoped, external_paths)
             # Commands crossing scope run outside the workspace sandbox only
@@ -6909,6 +6995,9 @@ async def _run_local_agent_turn_impl(
     recent_tool_signatures: list[tuple[tuple[str, str], ...]] = []
     any_mutation = False
     any_code_mutation = False  # a change to something a command could verify (not prose-only)
+    prechange_review_required = _requires_prechange_review(task_profile, objective)
+    prechange_review_granted = False
+    prechange_review_blocked_round = -1
     rollover_count = 0
     compaction_count = 0
     replanned_after_evidence = False
@@ -9203,6 +9292,16 @@ async def _run_local_agent_turn_impl(
             _tc_args, _tc_malformed_reason = parse_tool_call_arguments(_tc.arguments)
             if _tc_malformed_reason is not None:
                 _turn_malformed_ids.add(_tc.call_id)
+            else:
+                # Scope and workload normalization must precede approval
+                # calculation.  The later dispatch pass repeats this safely,
+                # but doing it here prevents false dangerous approvals for a
+                # command whose absolute targets are inside the authorized
+                # project and prevents a short interactive timeout in the UI.
+                _tc_args, _scope_preview_error = _scope_tool_arguments(
+                    _tc.name, _tc_args, workspace_root=workspace_root,
+                    scope_roots=scope_roots, attachment_paths=attachment_paths,
+                )
             _turn_batch_args[_tc.call_id] = _tc_args
             _turn_permission_decisions[_tc.call_id] = decide_permission(
                 _tc.name, _tc_args, workspace_root=workspace_root,
@@ -9949,6 +10048,62 @@ async def _run_local_agent_turn_impl(
                 tc.name, arguments, workspace_root=workspace_root,
                 extra_safe_roots=(scratch_root(session_id), *scope_roots),
             )
+
+            # Auto approval is for routine permitted operations.  It must not
+            # silently authorize the first mutation in a complex code task:
+            # pause on a clickable review screen after reconnaissance/plan
+            # generation, let the user critique the scope or approach, and
+            # only then enter the mutation/approval path.
+            if (
+                prechange_review_required
+                and not prechange_review_granted
+                and _is_code_mutation_call(tc.name, arguments, risk)
+            ):
+                if prechange_review_blocked_round != _round:
+                    prechange_review_blocked_round = _round
+                    plan = orchestrator.run.plan if orchestrator.run is not None else None
+                    plan_steps = [str(step.name) for step in (plan.steps if plan is not None else [])[:5]]
+                    summary = (
+                        f"Request type: {task_profile.task_type.value}; complexity: "
+                        f"{task_profile.complexity.value}. "
+                        + ("Proposed steps: " + "; ".join(plan_steps) if plan_steps else "No reviewed plan is available yet.")
+                    )
+                    if not interactive:
+                        decision = "cancel"
+                    else:
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {"content": "Complex code change detected; requesting pre-change review before mutation."},
+                        })
+                        decision = await _ask_prechange_review(console, renderer, summary=summary)
+                    if decision == "proceed":
+                        prechange_review_granted = True
+                    else:
+                        refusal = {
+                            "success": False,
+                            "prechange_review_required": True,
+                            "error": (
+                                "Mutation paused pending pre-change review. "
+                                + (
+                                    "An interactive review is required; rerun with a terminal to choose an option."
+                                    if not interactive else
+                                    "Inspect more, revise the plan, or choose Proceed with plan in the review screen."
+                                )
+                            ),
+                        }
+                        working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(refusal)})
+                        renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": refusal}})
+                        if decision == "cancel":
+                            return TaskOutcome(status="denied", error="Changes cancelled at pre-change review.")
+                        working_messages.append({
+                            "role": "system",
+                            "content": (
+                                "The pre-change review did not authorize mutation. Continue with read-only "
+                                "inspection or revise the proposed plan; do not retry the blocked mutation "
+                                "until the user chooses Proceed with plan."
+                            ),
+                        })
+                        continue
             if (
                 turn_read_only
                 and tc.name == "execute_command"

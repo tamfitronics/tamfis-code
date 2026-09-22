@@ -12,6 +12,7 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 
 from .workspace import _project_metadata
+from .timeouts import adaptive_command_timeout
 
 try:
     import click
@@ -56,6 +57,7 @@ class TestEnforcer:
 
     def _run_cmd(self, cmd: List[str], cwd: Optional[Path] = None, timeout: int = 120) -> Dict[str, Any]:
         cwd = cwd or self.workspace_root
+        timeout = adaptive_command_timeout(" ".join(cmd), cwd, timeout)
         try:
             start = time.time()
             result = subprocess.run(

@@ -217,6 +217,7 @@ class AgentOrchestrator:
         for the "here is the new plan" banner; this only handles state.
         """
         assert self.run is not None
+        plan.deduplicate_steps()
         if not self.run.runtime.record_plan_revision():
             # Same reasoning as mark_repair's extension below: a genuinely
             # evolving task can legitimately need more than

@@ -26,6 +26,7 @@ from rich.panel import Panel
 
 from .render import resume_live_if_active, suspend_live_if_active
 from .sandbox import SandboxPolicy, build_sandbox_command
+from .timeouts import adaptive_command_timeout
 # MCP commands can be invoked without constructing a ProviderManager (for
 # example, `tamfis-code tools list`). Reuse the canonical project `.env`
 # loader here so TAMGPT_MCP_CONFIG and TAMFIS_MONOREPO_ROOT are available in
@@ -2503,6 +2504,11 @@ class MCPServer:
             return {"error": str(e), "success": False}
         if not run_dir.is_dir():
             return {"error": f"cwd '{cwd}' is not a directory", "success": False}
+
+        # Validation and test commands are package workloads, not interactive
+        # shell snippets.  Raise a model-supplied short default (for example
+        # 120s) to the workload-aware package floor before wait_for() starts.
+        timeout = adaptive_command_timeout(command, run_dir, timeout)
 
         # Training and frontier jobs are durable, stateful workloads. Killing
         # one merely because the foreground wait ended, then launching a

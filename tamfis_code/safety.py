@@ -127,7 +127,7 @@ _READ_ONLY_COMMANDS = {
     "cat", "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
     "uniq", "wc", "stat", "file", "du", "tree", "realpath", "readlink",
     "ps", "pgrep",
-    "awk", "sed",
+    "awk", "sed", "python", "python3",
     # Live-reproduced (2026-08-30): a read-only audit turn had a real,
     # non-mutating validation command to run -- `php -l file.php` (PHP's
     # syntax-check-only flag, does not execute the script) and `bash -n
@@ -169,6 +169,10 @@ def _is_read_only_command(command: str) -> bool:
     # commands. Every other redirection/control/substitution construct is
     # treated as mutating/unknown and therefore not allowed in read-only mode.
     normalized = re.sub(r"(?:^|\s)2?>\s*/dev/null(?:\s|$)", " ", command).strip()
+    # Merging stderr into stdout is harmless for an inspection/validation
+    # command; it must not turn an otherwise safe command into a shell
+    # redirection failure.
+    normalized = re.sub(r"(?:^|\s)2>&1(?:\s|$)", " ", normalized).strip()
     if not normalized or "`" in normalized:
         return False
     if "$(`" in normalized or "$(" in normalized or "${" in normalized:
@@ -249,6 +253,17 @@ def _is_read_only_command_segment(argv: list[str]) -> bool:
         # -l lints without executing: exactly `php -l <one file>`, nothing
         # else -- any other flag (or no -l at all) actually runs the script.
         return len(argv) == 3 and argv[1] == "-l" and not argv[2].startswith("-")
+    if executable in {"python", "python3"}:
+        # `compileall` parses Python files and writes only interpreter cache
+        # files; it does not import or execute application code. Treat the
+        # quiet validation form as read-only so a repository audit does not
+        # trigger an unnecessary dangerous approval prompt.
+        return (
+            len(argv) >= 4
+            and argv[1:3] == ["-m", "compileall"]
+            and "-q" in argv[3:]
+            and not any(arg in {"-c", "-i"} for arg in argv[3:])
+        )
     if executable in {"bash", "sh"}:
         # -n parses without executing. Reject if combined with -c (inline
         # script text, arbitrary) or -i (interactive) even though -n is

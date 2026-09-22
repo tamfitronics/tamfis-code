@@ -75,6 +75,16 @@ class ClassifyCommandRiskTests(unittest.TestCase):
         self.assertNotEqual(classify_command_risk("bash -n -c 'rm -rf /'"), RISK_READ_ONLY)
         self.assertNotEqual(classify_command_risk("bash deploy.sh"), RISK_READ_ONLY)
 
+    def test_python_compileall_validation_is_read_only(self):
+        self.assertEqual(
+            classify_command_risk("python3 -m compileall -q /home/finitron"),
+            RISK_READ_ONLY,
+        )
+        self.assertNotEqual(
+            classify_command_risk("python3 -m compileall /home/finitron"),
+            RISK_READ_ONLY,
+        )
+
     def test_find_piped_to_xargs_php_lint_remains_unsupported(self):
         # Deliberately NOT supported, same conservative stance this file
         # already takes on `find -exec` -- xargs's sub-command is arbitrary

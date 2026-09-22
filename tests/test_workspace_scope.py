@@ -132,6 +132,24 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             self.assertIn(str(root.resolve()), scoped["_tamfis_external_scope_paths"])
             self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
 
+    def test_absolute_compile_targets_inside_scope_do_not_escalate_from_parent_cwd(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "finitron")
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {
+                    "command": f"python3 -m compileall -q {project}",
+                    "cwd": str(root.parent),
+                },
+                workspace_root=str(root.parent),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(project.resolve()))
+            self.assertNotIn("_tamfis_external_scope_paths", scoped)
+            self.assertNotIn("sandbox_permissions", scoped)
+
     def test_command_absolute_operand_outside_scope_requires_escalation(self):
         with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as outside:
             root = Path(ws)

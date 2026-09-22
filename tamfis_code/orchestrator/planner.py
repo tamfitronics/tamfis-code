@@ -112,6 +112,19 @@ class ExecutionPlan:
         for index, step in enumerate(self.steps, start=1):
             step.index = index
 
+    def deduplicate_steps(self) -> None:
+        """Drop repeated action items while preserving their first status/evidence."""
+        unique: list[PlanStep] = []
+        seen: set[str] = set()
+        for step in self.steps:
+            key = " ".join(step.name.split()).casefold()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(step)
+        self.steps = unique
+        self._reindex()
+
     def add_step(self, name: str, *, after: int | None = None, evidence: list[str] | None = None) -> PlanStep:
         step = PlanStep(0, name.strip(), evidence=list(evidence or []))
         if not step.name:
@@ -787,6 +800,7 @@ def parse_reasoning_plan(
     )
 
     accepted: list[PlanStep] = []
+    accepted_names: set[str] = set()
     for raw_step in raw_steps[:MAX_REASONING_PLAN_STEPS]:
         candidate = _parse_step_candidate(raw_step)
         if candidate is None:
@@ -817,6 +831,15 @@ def parse_reasoning_plan(
             # therefore uses the strict evidence path above.
             rendered_name = " ".join(name.split())
             validated_evidence = []
+
+        # Providers occasionally repeat a validation action verbatim (often
+        # after a continuation/retry).  Repeating it in the visible plan
+        # creates a fake extra step and can make an already-completed check
+        # appear pending again.
+        step_key = " ".join(rendered_name.split()).casefold()
+        if step_key in accepted_names:
+            continue
+        accepted_names.add(step_key)
 
         accepted.append(
             PlanStep(
