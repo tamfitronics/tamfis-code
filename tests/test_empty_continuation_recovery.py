@@ -6,6 +6,7 @@ from tamfis_code.providers import ProviderType
 from tamfis_code.runner_local import (
     EMPTY_CONTINUATION_INSTRUCTION,
     _empty_continuation_messages,
+    _looks_like_unverified_inspection,
     _normalise_tool_result,
     _recover_empty_continuation,
     _same_provider_recovery_models,
@@ -125,6 +126,28 @@ def test_glyph_prefixed_edit_error_is_not_treated_as_a_success():
 
     assert result["success"] is False
     assert "old_string not found" in result["error"]
+
+
+def test_workspace_prefixed_read_remains_successful_evidence(tmp_path):
+    workspace = tmp_path / "finitron"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("confirmed", encoding="utf-8")
+    result = _normalise_tool_result(
+        "read_file",
+        {"path": "finitron/README.md"},
+        {"success": True, "result": "confirmed"},
+        str(workspace),
+    )
+    assert result["success"] is True
+
+
+def test_unverified_inspection_summary_is_detected():
+    assert _looks_like_unverified_inspection(
+        "Examined the Finitron repository and confirmed the model architecture."
+    )
+    assert not _looks_like_unverified_inspection(
+        "The read_file result is summarized above."
+    )
 
 
 def test_successful_retry_clears_prior_stale_edit_failure(tmp_path):

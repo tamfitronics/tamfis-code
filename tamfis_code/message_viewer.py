@@ -32,6 +32,11 @@ _RESET = "\x1b[0m"
 _CYAN = "\x1b[36m"
 _DIM = "\x1b[90m"
 
+# The clickable show-more/less chip (see chip_fragments below). The style class
+# lives in composer_style() so both composers render it consistently.
+MORE_CHIP_STYLE = "class:more-lines-chip"
+MORE_CHIP_DIM_STYLE = "class:more-lines-chip-dim"
+
 
 def viewer_rows(terminal_rows: int) -> int:
     """Body rows for the viewer: the composer (status, tip, rules, input, footer) needs
@@ -146,6 +151,137 @@ class MessageViewer:
 
 
 VIEWER = MessageViewer()
+
+
+# ---------------------------------------------------------------------------
+# Clickable "Show more lines / Show less lines" chip
+# ---------------------------------------------------------------------------
+# prompt_toolkit formatted-text fragments accept an optional third element: a
+# mouse handler called when that fragment is clicked (Application must have
+# mouse_support on). The collapsed-output hint inside a tool block lives in
+# Rich scrollback and can never be clickable, so the chip is drawn in the
+# prompt_toolkit-rendered composer area instead -- the same place the pinned
+# plan and the Ctrl+E viewer live.
+
+
+def pending_expansion_count() -> int:
+    """How many collapsed messages + tool transcripts can still be expanded
+    (the number the chip advertises). Best-effort: rendering must never
+    depend on the stores importing cleanly."""
+    try:
+        from .render import COLLAPSED_MESSAGES, TOOL_TRANSCRIPT
+
+        return COLLAPSED_MESSAGES.pending() + TOOL_TRANSCRIPT.pending()
+    except Exception:
+        return 0
+
+
+def mouse_capture_active() -> bool:
+    """Whether prompt_toolkit mouse tracking should be on right now.
+
+    Mouse capture is deliberately NOT always-on: while tracking is enabled the
+    terminal hands wheel events to the application instead of scrolling its
+    native scrollback, which is exactly the trade-off the idle prompt's
+    keyboard-only update chip avoided (see interactive.py's mouse_support
+    comment). It is only worth paying while there is something clickable:
+    the viewer is open, or collapsed output is pending so the chip is shown.
+    A session with nothing collapsed keeps its native wheel."""
+    return VIEWER.is_open or pending_expansion_count() > 0
+
+
+def _invalidate_app() -> None:
+    """Redraw the active prompt after a chip click (best-effort: a click
+    arriving while no prompt_toolkit application owns the terminal is a
+    no-op, not an error)."""
+    try:
+        from prompt_toolkit.application import get_app
+
+        get_app().invalidate()
+    except Exception:
+        pass
+
+
+def _open_viewer_click(mouse_event: Any) -> None:
+    from prompt_toolkit.mouse_events import MouseEventType
+
+    if getattr(mouse_event, "event_type", None) != MouseEventType.MOUSE_UP:
+        return
+    if VIEWER.is_open:
+        return
+    try:
+        from .render import TOOL_TRANSCRIPT
+
+        if TOOL_TRANSCRIPT.pending():
+            VIEWER.toggle(TOOL_TRANSCRIPT, key="Ctrl+O")
+        else:
+            VIEWER.toggle(key="Ctrl+E")
+    except Exception:
+        return
+    _invalidate_app()
+
+
+def _close_viewer_click(mouse_event: Any) -> None:
+    from prompt_toolkit.mouse_events import MouseEventType
+
+    if getattr(mouse_event, "event_type", None) != MouseEventType.MOUSE_UP:
+        return
+    if not VIEWER.is_open:
+        return
+    VIEWER.close()
+    _invalidate_app()
+
+
+def chip_fragments() -> list[tuple[str, str, Any]]:
+    """The show-more/less chip as prompt_toolkit fragments with mouse
+    handlers, or [] when there is nothing to expand and the viewer is closed.
+
+    Closed + pending:  ▸ Show more lines (N) · Ctrl+O   (click opens the viewer)
+    Open:              ▾ Show less lines · Ctrl+O or Esc (click closes it)
+
+    Fragments are (style, text, handler) triples; the handler sits on every
+    part of the chip so the whole row is one click target."""
+    if VIEWER.is_open:
+        label = "▾ Show less lines"
+        hint = " · Ctrl+O or Esc"
+        handler = _close_viewer_click
+    else:
+        count = pending_expansion_count()
+        if count <= 0:
+            return []
+        label = f"▸ Show more lines ({count})"
+        hint = " · Ctrl+O"
+        handler = _open_viewer_click
+    return [
+        (MORE_CHIP_STYLE, " ", handler),
+        (MORE_CHIP_STYLE, label, handler),
+        (MORE_CHIP_DIM_STYLE, hint, handler),
+    ]
+
+
+def wheel_scroll(delta: int, event: Any) -> None:
+    """Shared wheel handler for both composers.
+
+    While the viewer is open the wheel scrolls it (the natural expectation
+    inside a modal content surface). While mouse capture is on for the chip
+    but the viewer is closed, wheel events are swallowed: feeding the default
+    Up/Down would drive history recall / cursor movement under the user's
+    hand, and the terminal scrollback is still reachable via Shift+PgUp and
+    friends. Never raises -- a wheel event must not break the composer."""
+    try:
+        if VIEWER.is_open:
+            # Warm the render cache first: _max_offset() is derived from
+            # _cache_lines, which is only filled by panel_lines() during a
+            # draw. Without this the first wheel ticks after opening clamp
+            # to 0 and appear dead.
+            if VIEWER._cache_key is None:
+                import shutil
+
+                size = shutil.get_terminal_size(fallback=(80, 24))
+                VIEWER.panel_lines(size.columns, size.lines)
+            VIEWER.scroll(delta)
+            _invalidate_app()
+    except Exception:
+        pass
 
 
 def panel_ansi(columns: Optional[int] = None, terminal_rows: Optional[int] = None) -> str:

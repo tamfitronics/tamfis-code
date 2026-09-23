@@ -85,6 +85,25 @@ class ClassifyCommandRiskTests(unittest.TestCase):
             RISK_READ_ONLY,
         )
 
+    def test_read_only_python_profile_report_is_allowed(self):
+        command = (
+            "python3 -c \"from finitron.frontier.config import get_profile, estimate_parameters; "
+            "cfg = get_profile('finitron-frontier-100b-spec'); print(cfg); print(estimate_parameters(cfg))\""
+        )
+        self.assertEqual(classify_command_risk(command), RISK_READ_ONLY)
+
+    def test_python_inline_mutation_primitives_are_not_read_only(self):
+        self.assertNotEqual(
+            classify_command_risk("python3 -c \"from pathlib import Path; Path('x').write_text('bad')\""),
+            RISK_READ_ONLY,
+        )
+
+    def test_sequential_read_only_report_commands_are_allowed(self):
+        self.assertEqual(
+            classify_command_risk("grep -n '100b' docs/FRONTIER.md; echo ---; grep -c '' docs/FRONTIER.md"),
+            RISK_READ_ONLY,
+        )
+
     def test_python_pytest_validation_is_read_only_in_audit_mode(self):
         self.assertEqual(
             classify_command_risk("python3 -m pytest tests/test_frontier.py -v 2>&1 | head -50"),

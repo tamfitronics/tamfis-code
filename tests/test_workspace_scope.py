@@ -150,6 +150,38 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             self.assertNotIn("_tamfis_external_scope_paths", scoped)
             self.assertNotIn("sandbox_permissions", scoped)
 
+    def test_relative_command_from_parent_uses_single_project_scope_with_scratch_roots(self):
+        """Infrastructure roots must not make a project command use /home."""
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "finitron")
+            scratch = Path(tempfile.gettempdir()) / "tamfis-code-test-scratch" / "516"
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {"command": "mkdir -p teachers students data configs", "cwd": str(root)},
+                workspace_root=str(root),
+                scope_roots=[project.resolve(), Path(tempfile.gettempdir()).resolve(), scratch.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertEqual(scoped["cwd"], str(project.resolve()))
+            self.assertNotIn("_tamfis_external_scope_paths", scoped)
+
+    def test_absolute_parent_prefix_is_repaired_to_the_single_project_root(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "finitron")
+            (project / "configs").mkdir()
+            requested = root / "configs" / "mixture_weights.yaml"
+            scoped, error = _scope_tool_arguments(
+                "write_file",
+                {"path": str(requested), "content": "weights"},
+                workspace_root=str(root),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertEqual(scoped["path"], str(project / "configs" / "mixture_weights.yaml"))
+            self.assertNotIn("_tamfis_external_scope_paths", scoped)
+
     def test_command_absolute_operand_outside_scope_requires_escalation(self):
         with tempfile.TemporaryDirectory() as ws, tempfile.TemporaryDirectory() as outside:
             root = Path(ws)

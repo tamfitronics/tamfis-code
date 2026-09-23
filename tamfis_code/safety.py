@@ -14,6 +14,7 @@ both of those jobs locally -- that's what this module is for.
 from __future__ import annotations
 
 import difflib
+import ast
 import re
 import shlex
 import uuid
@@ -127,7 +128,7 @@ _READ_ONLY_COMMANDS = {
     "cat", "find", "rg", "grep", "ls", "pwd", "head", "tail", "sort",
     "uniq", "wc", "stat", "file", "du", "tree", "realpath", "readlink",
     "ps", "pgrep", "pytest",
-    "awk", "sed", "python", "python3",
+    "awk", "sed", "echo", "printf", "python", "python3",
     # Live-reproduced (2026-08-30): a read-only audit turn had a real,
     # non-mutating validation command to run -- `php -l file.php` (PHP's
     # syntax-check-only flag, does not execute the script) and `bash -n
@@ -151,6 +152,57 @@ def _is_safe_test_arguments(arguments: list[str]) -> bool:
         or arg.startswith(tuple(f"{item}=" for item in _BLOCKED_TEST_OPTIONS[1:]))
         for arg in arguments
     )
+
+
+_READ_ONLY_PYTHON_MODULE_BLOCKLIST = frozenset({
+    "os", "subprocess", "shutil", "socket", "requests", "httpx", "urllib",
+    "pathlib", "tempfile", "sqlite3",
+})
+_READ_ONLY_PYTHON_CALL_BLOCKLIST = frozenset({
+    "open", "eval", "exec", "compile", "__import__", "system", "popen",
+    "run", "call", "check_call", "check_output", "remove", "unlink",
+    "rename", "replace", "write_text", "write_bytes", "mkdir", "rmdir",
+    "makedirs", "copy", "copy2", "move", "install",
+})
+
+
+def _is_safe_python_inline(source: str) -> bool:
+    """Recognise bounded Python inspection/report snippets.
+
+    ``python -c`` is not inherently read-only.  This gate permits the common
+    audit shape (imports, calculations, assignments, and printed results) but
+    rejects filesystem/network/process/package mutation primitives before the
+    command can enter a read-only turn.  Syntax errors remain medium risk and
+    are handled by the normal command path.
+    """
+    if not source or len(source) > 12000:
+        return False
+    try:
+        tree = ast.parse(source, mode="exec")
+    except SyntaxError:
+        return False
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            modules = (
+                [alias.name for alias in node.names]
+                if isinstance(node, ast.Import)
+                else [node.module or ""]
+            )
+            if any(
+                module == blocked or module.startswith(blocked + ".")
+                for module in modules
+                for blocked in _READ_ONLY_PYTHON_MODULE_BLOCKLIST
+            ):
+                return False
+        if isinstance(node, ast.Call):
+            name = node.func.id if isinstance(node.func, ast.Name) else (
+                node.func.attr if isinstance(node.func, ast.Attribute) else ""
+            )
+            if name in _READ_ONLY_PYTHON_CALL_BLOCKLIST:
+                return False
+        if isinstance(node, ast.Attribute) and node.attr in _READ_ONLY_PYTHON_CALL_BLOCKLIST:
+            return False
+    return True
 
 
 def _is_safe_find_exec(command: str) -> bool:
@@ -246,11 +298,11 @@ def _is_read_only_command(command: str) -> bool:
         return False
     if ";" in argv and _is_safe_find_exec(normalized):
         return True
-    if any(token in {"||", ";", "&", "&&", "<", ">", "<<", ">>"} for token in argv):
+    if any(token in {"||", "&", "&&", "<", ">", "<<", ">>"} for token in argv):
         return False
     segments: list[list[str]] = [[]]
     for token in argv:
-        if token == "|":
+        if token in {"|", ";"}:
             if not segments[-1]:
                 return False
             segments.append([])
@@ -319,6 +371,8 @@ def _is_read_only_command_segment(argv: list[str]) -> bool:
         # else -- any other flag (or no -l at all) actually runs the script.
         return len(argv) == 3 and argv[1] == "-l" and not argv[2].startswith("-")
     if executable in {"python", "python3"}:
+        if len(argv) == 3 and argv[1] == "-c":
+            return _is_safe_python_inline(argv[2])
         if argv[1:3] in (["-m", "pytest"], ["-m", "unittest"]):
             # Running the repository's declared tests is allowed during a
             # read-only audit. Pytest may create caches/bytecode, but it does

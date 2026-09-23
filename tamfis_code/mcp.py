@@ -1862,6 +1862,48 @@ class MCPServer:
         if not p.is_absolute():
             p = base / p
         resolved = p.resolve()
+        # Models often include the workspace directory name in a relative
+        # path after seeing it in a listing (for example, ``finitron/README.md``
+        # while the active workspace is already ``/home/finitron``).  Do not
+        # turn that valid workspace-relative reference into the impossible
+        # ``/home/finitron/finitron/README.md``.  Only accept the de-prefixed
+        # form when it resolves inside an authorised root and the requested
+        # spelling does not, so ordinary nested directories remain unchanged.
+        if self.workspace_root and not Path(clean_path_argument(path)).is_absolute():
+            relative = Path(clean_path_argument(path))
+            base_resolved = base.resolve()
+            if relative.parts and relative.parts[0] == base_resolved.name:
+                candidate = (base_resolved.joinpath(*relative.parts[1:])).resolve()
+                roots = self.allowed_workspace_roots or {base_resolved}
+                candidate_allowed = any(
+                    candidate == root or root in candidate.parents
+                    for root in roots
+                )
+                if candidate_allowed and not resolved.exists() and candidate.exists():
+                    resolved = candidate
+        # The same duplication can arrive as an absolute path when a model
+        # combines the workspace shown by the UI with a path already prefixed
+        # by that workspace name (``/home/finitron/finitron/README.md``).
+        # Normalize one duplicated root component before invoking bounded
+        # recovery.  This is safe because the candidate must already exist
+        # beneath an authorised workspace root; genuinely ambiguous files
+        # still go through the explicit ambiguity diagnostic.
+        if self.workspace_root and Path(clean_path_argument(path)).is_absolute():
+            base_resolved = base.resolve()
+            raw_resolved = Path(clean_path_argument(path)).resolve()
+            try:
+                relative_parts = raw_resolved.relative_to(base_resolved).parts
+            except ValueError:
+                relative_parts = ()
+            if relative_parts and relative_parts[0] == base_resolved.name:
+                candidate = (base_resolved.joinpath(*relative_parts[1:])).resolve()
+                roots = self.allowed_workspace_roots or {base_resolved}
+                candidate_allowed = any(
+                    candidate == root or root in candidate.parents
+                    for root in roots
+                )
+                if candidate_allowed and not resolved.exists() and candidate.exists():
+                    resolved = candidate
         if self.workspace_root:
             roots = self.allowed_workspace_roots or {base.resolve()}
             if not any(resolved == root or root in resolved.parents for root in roots):

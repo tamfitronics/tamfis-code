@@ -440,6 +440,16 @@ ready, or `/plan` again to revise the objective first). This is the one
 explicit approval checkpoint between "here's the plan" and anything
 actually touching the workspace — Claude Code's Plan Mode equivalent.
 
+## Show more / show less lines
+
+Long tool output prints as a collapsed block (`… +N lines (Ctrl+O for full output)`).
+Besides the Ctrl+O/Ctrl+E keys, a clickable **▸ Show more lines (N)** chip renders in
+the composer, directly above the input, whenever collapsed output is waiting: click
+it to open the full content in the scrollable viewer, and click the chip again (**▾
+Show less lines**) to close it. While the viewer is open the mouse wheel scrolls the
+viewer; when nothing is collapsed the terminal keeps its native wheel scrolling, so
+everyday sessions are unaffected.
+
 ## Images
 
 One-shot `ask`/`chat`/`audit`/`agent`/`exec` accept `--attach <path>`

@@ -3,7 +3,8 @@
 (session-awareness audit, Phase 17 follow-up)."""
 import unittest
 
-from tamfis_code.render import BRANDED_PROVIDER_LABEL, _format_diagnostics_line
+from tamfis_code.public_identity import public_model_name
+from tamfis_code.render import _format_diagnostics_line
 
 
 class FormatDiagnosticsLineTests(unittest.TestCase):
@@ -18,8 +19,12 @@ class FormatDiagnosticsLineTests(unittest.TestCase):
         self.assertIn("context rescanned (git_head_changed)", line)
 
     def test_provider_and_model_shown_as_branded_label_not_raw_backend(self):
+        # Since the finitron tier rename (bfe5a21), routes render as product
+        # tier names (finitron-*), not the older TamfisGPT brand string.
+        # The contract this test guards: the raw backend provider/model ids
+        # must never leak into the user-visible diagnostics line.
         line = _format_diagnostics_line({"provider": "deepseek", "model": "deepseek-v3", "completion_status": "completed"})
-        self.assertIn(BRANDED_PROVIDER_LABEL, line)
+        self.assertIn(public_model_name("deepseek-v3"), line)
         self.assertNotIn("deepseek", line)
 
     def test_tool_call_failures_counted(self):

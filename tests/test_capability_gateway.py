@@ -12,6 +12,7 @@ from tamfis_code.capability_gateway import (
 )
 from tamfis_code.mcp import MCPServer
 from tamfis_code.mcp_client import MCPTransportError
+from tamfis_code.runner_local import _scope_tool_arguments
 
 
 @pytest.mark.asyncio
@@ -22,6 +23,26 @@ async def test_gateway_discovers_and_executes_existing_native_mcp_tool(tmp_path)
     result = await gateway.execute(ExecutionRequest("native.list_agent_types", {}))
     assert result.error is None
     assert result.output["built_in"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_writes_the_scope_normalized_project_path(tmp_path):
+    """The unified gateway must receive the corrected path, not /home/foo."""
+    project = tmp_path / "finitron"
+    (project / "configs").mkdir(parents=True)
+    arguments, error = _scope_tool_arguments(
+        "write_file",
+        {"path": str(tmp_path / "configs" / "mixture_weights.yaml"), "content": "x"},
+        workspace_root=str(tmp_path),
+        scope_roots=[project],
+    )
+    assert error is None
+    gateway = TamfisCodeCapabilityGateway(
+        MCPServer(workspace_root=str(tmp_path), allowed_workspace_roots=[str(project)])
+    )
+    result = await gateway.call_tool("write_file", arguments)
+    assert result["success"] is True
+    assert (project / "configs" / "mixture_weights.yaml").read_text() == "x"
 
 
 def test_gateway_filters_side_effects_without_exposing_everything():

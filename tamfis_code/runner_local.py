@@ -1728,12 +1728,27 @@ def _scope_tool_arguments(
             if matched_root is not None:
                 operand_roots.add(matched_root)
 
-        if (
-            len(scope_roots) == 1
-            and cwd == workspace
-            and workspace != scope_roots[0]
-        ):
-            cwd = _scope_root_directory(scope_roots[0])
+        # The runner appends infrastructure roots (/tmp and the per-session
+        # scratch directory) after resolving the project scope.  Do not let
+        # those safe roots disable the single-project cwd normalization: a
+        # task launched from /home with /home/finitron as its only project
+        # must execute a relative `mkdir`, `pytest`, or `git` command in
+        # /home/finitron, not repeatedly retry it against the parent /home.
+        project_roots = [
+            root for root in scope_roots
+            if root != workspace
+            and root != Path(tempfile.gettempdir()).resolve()
+            # Do not exclude real projects merely because tests or a user
+            # project happen to live under /tmp.  The runner appends the
+            # exact /tmp root and exact per-session scratch root, so only
+            # those infrastructure entries need filtering here.
+            and not (
+                root.parent.parent == Path(tempfile.gettempdir()).resolve()
+                and root.parent.name.startswith("tamfis-code-")
+            )
+        ]
+        if cwd == workspace and len(project_roots) == 1:
+            cwd = _scope_root_directory(project_roots[0])
             scoped["cwd"] = str(cwd)
 
         if (
@@ -1837,6 +1852,28 @@ def _scope_tool_arguments(
         scoped[path_key] = str(requested)
         _mark_external_scope(scoped, [requested])
         return scoped, None
+
+    # Models sometimes retain the launch parent (/home) in an absolute path
+    # after the turn has been narrowed to its only project (/home/finitron).
+    # If the same relative path exists under that one project root, repair
+    # the unambiguous workspace-prefix mistake before treating it as an
+    # external write.  Do not apply this to multi-project scopes or arbitrary
+    # paths; those remain explicit and approval-gated.
+    project_roots = [
+        root for root in scope_roots
+        if root != workspace
+        and root != Path(tempfile.gettempdir()).resolve()
+        and not (
+            root.parent.parent == Path(tempfile.gettempdir()).resolve()
+            and root.parent.name.startswith("tamfis-code-")
+        )
+    ]
+    if requested.is_relative_to(workspace) and len(project_roots) == 1:
+        relative = requested.relative_to(workspace)
+        candidate = _scope_root_directory(project_roots[0]) / relative
+        if candidate.exists() or candidate.parent.is_dir():
+            scoped[path_key] = str(candidate.resolve())
+            return scoped, None
 
     if not any(_is_within(requested, root) for root in scope_roots):
         scoped[path_key] = str(requested)
@@ -3254,6 +3291,23 @@ def _semantic_tool_failure(tool_name: str, arguments: dict[str, Any], result: di
             candidate = Path(requested)
             if not candidate.is_absolute():
                 candidate = Path(workspace_root) / candidate
+            # Keep semantic validation consistent with MCPServer's guarded
+            # path resolver. A model may echo the workspace directory name
+            # from a listing (``finitron/README.md``) even though the active
+            # root is already ``/home/finitron``. The tool can successfully
+            # resolve that spelling, so this second check must not turn the
+            # successful read into false evidence by checking the doubled
+            # path again.
+            candidate = candidate.resolve()
+            root = Path(workspace_root).expanduser().resolve()
+            requested_path = Path(requested)
+            if (
+                not Path(requested).is_absolute()
+                and requested_path.parts
+                and requested_path.parts[0] == root.name
+                and not candidate.exists()
+            ):
+                candidate = root.joinpath(*requested_path.parts[1:]).resolve()
             try:
                 if not candidate.exists():
                     return f"File not found: {candidate}"
@@ -4321,6 +4375,20 @@ def _looks_like_unverified_operation_result(text: str) -> bool:
     return bool(_UNVERIFIED_OPERATION_RESULT_RE.search(text or ""))
 
 
+_UNVERIFIED_INSPECTION_RE = re.compile(
+    r"\b(?:examined|reviewed|inspected|audited|analysed|analyzed)\s+"
+    r"(?:the\s+)?(?:[\w.-]+\s+){0,3}(?:repository|repo|codebase|project|code|configuration|configs?)\b|"
+    r"\b(?:the\s+)?(?:repository|repo|codebase|project)\s+"
+    r"(?:contains|implements|includes|has)\b",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_unverified_inspection(text: str) -> bool:
+    """Reject a prose inspection claim when no real read/tool backs it."""
+    return bool(_UNVERIFIED_INSPECTION_RE.search(text or ""))
+
+
 @dataclass
 class _StreamedToolCall:
     call_id: str = ""
@@ -4889,7 +4957,16 @@ async def _stream_one_completion_impl(
         next_chunk_task = asyncio.create_task(stream_iterator.__anext__())
         steering_task: Optional[asyncio.Task] = None
         wait_for_steering = getattr(renderer, "wait_for_steering", None)
-        if emit and callable(wait_for_steering) and not steering_deferred:
+        # Steering responsiveness must not depend on `emit`. Tool tasks buffer
+        # their streamed answer (`emit=False` at the call site) so nothing is
+        # printed mid-round, but the user can still type a live follow-up
+        # while this exact request hangs -- and with the watcher gated on
+        # `emit` that follow-up was silently ignored until the watchdog's
+        # stall abort (up to STREAM_IDLE_TIMEOUT_SECONDS later), or lost
+        # entirely when the request outlived the 30s test budget. The watcher
+        # now exists on every streamed request; `emit` keeps controlling only
+        # whether deltas reach the renderer.
+        if callable(wait_for_steering) and not steering_deferred:
             steering_task = asyncio.create_task(wait_for_steering())
         try:
             # FIX: bounds the gap between two consecutive chunks, not the
@@ -9597,6 +9674,11 @@ async def _run_local_agent_turn_impl(
             if tools and (
                 _looks_like_fabricated_tool_result(content)
                 or (not any_mutation and _looks_like_unverified_operation_result(content))
+                or (
+                    orchestrator.run is not None
+                    and not any(record.success for record in orchestrator.run.tool_records)
+                    and _looks_like_unverified_inspection(content)
+                )
             ):
                 working_messages.append({"role": "assistant", "content": content})
                 working_messages.append({"role": "system", "content": FABRICATED_RESULT_CORRECTION})

@@ -243,6 +243,42 @@ class SnapshotTests(_IsolatedState, unittest.TestCase):
         self.assertEqual(record.exit_code, 0)
         self.assertEqual(record.stdout, "")
 
+    def test_resume_merges_same_objective_evidence_from_durable_history(self):
+        """A failover checkpoint must not hide an earlier successful write."""
+        first = self._interrupt_after(516, done=1)
+        write = {
+            "type": "tool",
+            "tool_call_id": "write-516",
+            "tool_name": "write_file",
+            "arguments": {"path": "/tmp/src/data.py"},
+            "purpose": f"Execute write_file for: {OBJECTIVE[:160]}",
+            "success": True,
+            "files_changed": ["/tmp/src/data.py"],
+            "completed_at": "2026-09-23T09:00:00+00:00",
+        }
+        state_module.save_session_state(
+            516,
+            completed_actions=[write],
+            turn_checkpoint={
+                "objective": OBJECTIVE,
+                "status": "interrupted",
+                "tool_records": [{
+                    "type": "tool",
+                    "tool_call_id": "todo-516",
+                    "tool_name": "write_todos",
+                    "success": True,
+                }],
+            },
+        )
+        snapshot = load_resume_snapshot(516)
+        self.assertEqual(
+            {record["tool_call_id"] for record in snapshot.tool_records},
+            {"todo-516", "write-516"},
+        )
+        resumed = AgentOrchestrator(session_id=516, workspace_root="/tmp", emit=lambda e: None)
+        resumed.begin(objective=OBJECTIVE, messages=[], read_only=False, restore=snapshot)
+        self.assertTrue(any(record.success and record.tool_name == "write_file" for record in resumed.run.tool_records))
+
 
 class BareContinueTests(unittest.TestCase):
     def test_a_bare_continue_is_recognised(self):

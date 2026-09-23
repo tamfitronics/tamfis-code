@@ -107,7 +107,9 @@ class ViewerStateTests(_Base):
         store.add("assistant", _long(words=2000))
         VIEWER.toggle(store)
         lines = VIEWER.panel_lines(100, 30)
-        self.assertIn("Ctrl+E or Esc to show less", _plain(lines[-2]))
+        # The chip adds a clickable "Show less lines" affordance to the hint.
+        self.assertIn("Ctrl+E or Esc", _plain(lines[-2]))
+        self.assertIn("Show less lines", _plain(lines[-2]))
         self.assertEqual(lines[0], "")
         self.assertEqual(lines[-1], "")
         self.assertLessEqual(len(lines) - 4, viewer_rows(30))
@@ -170,9 +172,11 @@ class ComposerIntegrationTests(_Base):
     def _text(self, listener, width=100):
         # A frozen clock: the composer's tip line rotates with elapsed time, so two renders taken
         # seconds apart (a slow CI host) differed in the tip alone and failed the equality check.
+        # Fragments may carry a third (mouse-handler) element -- the clickable
+        # show-more/less chip -- so unpack with *rest, not a fixed pair.
         with patch("shutil.get_terminal_size", return_value=os.terminal_size((width, 40))), \
              patch("time.monotonic", return_value=1000.0):
-            return "".join(t for _s, t in listener._composer_message().__pt_formatted_text__())
+            return "".join(t for _s, t, *rest in listener._composer_message().__pt_formatted_text__())
 
     def test_the_running_composer_shows_the_full_message_and_then_less(self):
         renderer = StreamRenderer(_console())
@@ -183,7 +187,9 @@ class ComposerIntegrationTests(_Base):
         VIEWER.toggle()
         opened = self._text(listener)
         self.assertIn("LIVE-start", opened)
-        self.assertIn("Ctrl+E or Esc to show less", opened)
+        # The clickable chip's label and the footer hint both advertise show-less.
+        self.assertIn("Ctrl+E or Esc", opened)
+        self.assertIn("Show less lines", opened)
         self.assertTrue(opened.rstrip().endswith("❯"))
         VIEWER.toggle()
         self.assertEqual(self._text(listener), closed)

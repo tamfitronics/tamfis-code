@@ -93,6 +93,82 @@ def _normalise_steps(raw_steps: list[Any]) -> list[dict[str, Any]]:
     return steps
 
 
+def _record_identity(record: dict[str, Any]) -> tuple[Any, ...]:
+    """Return a stable identity for a checkpoint/completed-action record.
+
+    Provider retries can write the same result more than once.  Prefer the
+    provider/tool id, but retain a deterministic fallback for older state
+    files that predate that field.
+    """
+    return (
+        record.get("tool_call_id")
+        or record.get("mutation_id")
+        or record.get("id")
+        or (
+            record.get("tool_name"),
+            record.get("completed_at"),
+            (record.get("arguments") or {}).get("path"),
+            (record.get("arguments") or {}).get("command"),
+        )
+    )
+
+
+def _same_objective_record(record: dict[str, Any], objective: str) -> bool:
+    """Whether a durable action was recorded for this resumed objective.
+
+    Tool records historically stored the objective in ``purpose`` as a
+    bounded prefix (``Execute ... for: <objective[:160]>``).  Matching that
+    prefix lets us recover evidence across a provider failover while keeping
+    records from unrelated plans out of the resumed turn.
+    """
+    if not objective:
+        return False
+    purpose = str(record.get("purpose") or "")
+    stored_objective = str(record.get("objective") or "")
+    needle = " ".join(objective.split()).casefold()
+    if not needle:
+        return False
+    for candidate in (purpose, stored_objective):
+        haystack = " ".join(candidate.split()).casefold()
+        if haystack and (needle[:160] in haystack or needle[:96] in haystack):
+            return True
+    return False
+
+
+def _resume_tool_records(
+    checkpoint_records: list[Any],
+    completed_actions: list[Any],
+    objective: str,
+) -> list[dict[str, Any]]:
+    """Merge checkpoint records with verified same-task durable history.
+
+    A checkpoint is deliberately rewritten during failover.  It can therefore
+    contain only the latest route's failed call even though earlier routes
+    successfully read or mutated files.  ``completed_actions`` is the durable
+    evidence ledger; restore its same-objective successful tool records and
+    deduplicate them by tool-call identity.
+    """
+    merged: list[dict[str, Any]] = [
+        item for item in checkpoint_records if isinstance(item, dict)
+    ]
+    for item in completed_actions:
+        if not isinstance(item, dict) or item.get("type") != "tool":
+            continue
+        if item.get("success") is not True or not _same_objective_record(item, objective):
+            continue
+        merged.append(item)
+
+    result: list[dict[str, Any]] = []
+    seen: set[tuple[Any, ...]] = set()
+    for item in merged:
+        identity = _record_identity(item)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        result.append(item)
+    return result
+
+
 def load_resume_snapshot(session_id: int) -> Optional[ResumeSnapshot]:
     """The resumable state of `session_id`'s latest plan, or None when there is
     nothing to resume (no plan, or every step already completed)."""
@@ -123,18 +199,25 @@ def load_resume_snapshot(session_id: int) -> Optional[ResumeSnapshot]:
         ledger_next = ""
     checkpoint = state.turn_checkpoint if isinstance(state.turn_checkpoint, dict) else {}
     checkpoint_records = checkpoint.get("tool_records") or []
-    if not checkpoint_records:
-        # Backward-compatible recovery for checkpoints written before tool
-        # records became first-class checkpoint data.  completed_actions is
-        # already durable and still contains the same ToolEnvelope fields.
-        checkpoint_records = [
-            item for item in (state.completed_actions or [])
-            if isinstance(item, dict) and item.get("type") == "tool"
-        ]
+    # A later failover checkpoint may contain only its own failed/partial
+    # records.  Merge the durable, objective-matched ledger so validation can
+    # see successful work from earlier routes without importing unrelated
+    # session history.
+    objective = str(
+        checkpoint.get("objective")
+        or plan.get("objective")
+        or getattr(state, "active_task", None) and state.active_task.get("objective")
+        or ""
+    )
+    checkpoint_records = _resume_tool_records(
+        checkpoint_records,
+        state.completed_actions or [],
+        objective,
+    )
     return ResumeSnapshot(
         session_id=session_id,
         plan_id=str(plan.get("id") or ""),
-        objective=str(plan.get("objective") or ""),
+        objective=objective or str(plan.get("objective") or ""),
         steps=steps,
         static=static,
         task_state=dict(state.task_state or {}),

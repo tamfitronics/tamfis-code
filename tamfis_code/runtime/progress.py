@@ -81,11 +81,14 @@ class StallPolicy:
     the watchdog; they only report as WAITING_TOOL.
     """
 
-    provider_warn: float = 45.0
-    # A dead provider must not hold an interactive task for four minutes.
-    # Request-level timeouts and route fallback should normally resolve first;
-    # this watchdog is the last-resort bound when cancellation is ineffective.
-    provider_abort: float = 90.0
+    # Free/queued providers can legitimately spend more than 45 seconds in
+    # prefill or capacity scheduling before the first tool call.  This is a
+    # diagnostic threshold, not a route replacement deadline.
+    provider_warn: float = 90.0
+    # Request-level first-byte/idle/recovery timeouts perform provider
+    # failover.  This watchdog is only a last-resort bound if those controls
+    # fail to regain control; do not cancel a still-recovering route at 90s.
+    provider_abort: float = 300.0
     # Nothing at all (no token, no tool start/finish, no event) for this long while NOT waiting on
     # the model, a tool or the user. Every legitimate operation in that gap (context compaction,
     # planning, hooks) is bounded by its own timeouts well under this; a run silent for longer than

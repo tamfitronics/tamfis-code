@@ -332,7 +332,7 @@ class OversizedWriteIsSplitBeforeTheLimitTests(_StatePatchMixin, unittest.TestCa
                 if event.get("event_type") == "diagnostics"
             ]
             self.assertTrue(
-                any("one response can carry" in text for text in diagnostics),
+                any("truncated at the output token limit" in text for text in diagnostics),
                 f"the split must be explained, not silent: {diagnostics}",
             )
             self.assertTrue(

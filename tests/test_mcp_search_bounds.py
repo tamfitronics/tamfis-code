@@ -102,6 +102,28 @@ class ListDirectoryBoundsTests(unittest.TestCase):
             self.assertNotIn("1: one", result)
             self.assertNotIn("4: four", result)
 
+    def test_read_file_accepts_workspace_prefixed_relative_path(self):
+        """A listing may expose ``workspace/file`` even though the tool's
+        workspace root is already ``workspace``; do not resolve it twice."""
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws) / "finitron"
+            root.mkdir()
+            (root / "README.md").write_text("# Finitron\nconfirmed\n")
+            server = MCPServer(workspace_root=str(root))
+            result = _run(server._read_file("finitron/README.md"))
+            self.assertIn("# Finitron", result)
+            self.assertNotIn("multiple possible files", result)
+
+    def test_read_file_normalizes_absolute_duplicate_workspace_prefix(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws) / "finitron"
+            root.mkdir()
+            (root / "README.md").write_text("# Finitron\nconfirmed\n")
+            server = MCPServer(workspace_root=str(root))
+            result = _run(server._read_file(str(root / "finitron" / "README.md")))
+            self.assertIn("# Finitron", result)
+            self.assertNotIn("multiple possible files", result)
+
 
 class SearchCodePagingTests(unittest.TestCase):
     """A broad query must not dump every match into one tool result, and must

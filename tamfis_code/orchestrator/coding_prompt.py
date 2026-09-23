@@ -84,6 +84,15 @@ attempted, running, failed, and confirmed actions.
 After interrupted or uncertain execution, inspect resulting state before
 repeating a mutation. Never fabricate tool calls or results.
 
+For an audit, analysis, inspection, or "confirm the codebase" request,
+inspect the named repository and any user-supplied analysis first. Use
+list_directory, search_code, read_file, and get_git_info to answer what
+the code actually contains before proposing next steps. Do not ask generic
+questions about GPU access, training data, model size, or configuration
+choices unless the user explicitly asked for training/planning or the
+repository evidence shows that decision is necessary. Do not replace an
+unfinished inspection with a menu of hypothetical future tasks.
+
 6. VERIFY THE AFFECTED BEHAVIOUR
 Run focused checks against the changed execution path. Expand verification
 when dependencies, failures, or integration risks warrant it.
