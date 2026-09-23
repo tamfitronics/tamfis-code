@@ -645,7 +645,8 @@ class MCPServer:
                 "`content` is gone. To change only part of an existing file, use edit_file "
                 "instead so the rest of the file (and any concurrent, unrelated edits) survives. "
                 "For an existing source file, the live agent must first diagnose/read it and provide "
-                "expected_sha256; unverified full replacement is refused. "
+                "expected_sha256 and explicitly select mode=\"overwrite\"; ordinary writes never "
+                "replace existing source code. "
                 "Use the extension the language and project actually use -- never '.txt' for code. "
                 "For a LARGE document, NEVER send it in one call: your arguments are bounded by "
                 "your own output token limit, and a call much over roughly 6,000 characters of "
@@ -661,11 +662,11 @@ class MCPServer:
                     "content": {"type": "string", "description": "File content"},
                     "mode": {
                         "type": "string",
-                        "enum": ["write", "append"],
+                        "enum": ["write", "append", "overwrite"],
                         "description": (
                             "'write' (default) replaces the file; 'append' adds `content` to "
-                            "the end of the existing file -- use it to continue a large "
-                            "document in a second call."
+                            "the end of the existing file; 'overwrite' is required for an "
+                            "explicit, hash-verified full replacement of existing source code."
                         ),
                     },
                     "expected_sha256": {
@@ -1919,6 +1920,14 @@ class MCPServer:
         append = str(mode or "write").strip().lower() == "append"
         p = self._resolve_in_workspace(path)
         original_content = p.read_text(encoding="utf-8", errors="ignore") if p.is_file() else None
+        source_replacement = original_content is not None and self._is_source_file(p) and not append
+        if source_replacement and str(mode or "write").strip().lower() != "overwrite":
+            return (
+                f"❌ Refused destructive replacement of existing source file '{path}'. "
+                "Use edit_file with an exact unique old_string for a patch, or explicitly "
+                "request mode=overwrite together with expected_sha256 after diagnostics; "
+                "no existing code was changed."
+            )
         if not append:
             guard_error = self._reject_unverified_source_replacement(
                 p, original_content, aliases.pop("expected_sha256", None), operation="write"
@@ -1978,6 +1987,7 @@ class MCPServer:
         if full_content is not None and old_string is None:
             return await self._write_file(
                 path, content=full_content,
+                mode=aliases.pop("mode", None),
                 expected_sha256=aliases.pop("expected_sha256", None),
             )
         if old_string is None or new_string is None:

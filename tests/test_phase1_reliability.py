@@ -64,6 +64,7 @@ async def test_edit_file_content_alias_performs_full_atomic_replacement(tmp_path
     result = await server._edit_file(
         "functions.php",
         content=content,
+        mode="overwrite",
         expected_sha256=hashlib.sha256("<?php\necho 'old';\n".encode()).hexdigest(),
     )
 
@@ -106,7 +107,8 @@ async def test_live_agent_refuses_unverified_source_replacement(tmp_path: Path):
     server = MCPServer(workspace_root=str(tmp_path), session_id=42)
     result = await server._write_file("module.py", content="def replace():\n    return 2\n")
 
-    assert "Refused unverified" in result
+    assert "Refused" in result
+    assert "no existing code was changed" in result
     assert target.read_text(encoding="utf-8") == "def keep():\n    return 1\n"
 
 
@@ -120,6 +122,7 @@ async def test_live_agent_allows_source_replacement_only_for_matching_diagnostic
     result = await server._write_file(
         "module.py",
         content="def replace():\n    return 2\n",
+        mode="overwrite",
         expected_sha256=hashlib.sha256(original.encode()).hexdigest(),
     )
 
