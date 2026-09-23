@@ -779,6 +779,15 @@ class _NextMessageAutoSuggest(AutoSuggest):
         return Suggestion(value) if value else None
 
 
+def composer_placeholder(buffer: Any) -> Any:
+    """Show the faint composer hint only when no ghost suggestion is active."""
+    from .live_input import MESSAGE_PLACEHOLDER
+
+    return "" if getattr(buffer, "suggestion", None) is not None else HTML(
+        f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"
+    )
+
+
 def _seed_next_message_suggestion(
     session: PromptSession,
     answer: Optional[str],
@@ -1514,7 +1523,11 @@ async def _run_interactive_impl(
             lambda: suggestion_state,
         ),
         style=composer_style(),
-        placeholder=HTML(f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"),
+        # prompt-toolkit renders placeholder text even when an empty buffer
+        # has a seeded AutoSuggest value. Return no placeholder in that case;
+        # otherwise the faint prompt is painted behind the suggested-next
+        # message and looks like leaked input/output.
+        placeholder=lambda: composer_placeholder(session.default_buffer),
         reserve_space_for_menu=8,
         # prompt-toolkit supplies a real dynamic Frame around the entire
         # multiline editor. This is the composer box the previous prompt-only

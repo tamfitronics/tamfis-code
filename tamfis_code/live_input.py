@@ -150,6 +150,13 @@ def composer_rule_html() -> str:
     return f"<ansigray>{'─' * width}</ansigray>"
 
 
+def composer_placeholder(buffer: Any) -> Any:
+    """Show the faint composer hint only when no ghost suggestion is active."""
+    return "" if getattr(buffer, "suggestion", None) is not None else HTML(
+        f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"
+    )
+
+
 def _right_chip(session_id: Optional[int] = None, active_agents: int = 0) -> str:
     # ansibrightblack (the ghost-text/auto-suggestion color -- deliberately
     # dim) renders as unreadable-to-invisible against some terminal themes'
@@ -1196,7 +1203,9 @@ class LiveInputListener:
             show_frame=False,
             reserve_space_for_menu=0,
             style=composer_style(),
-            placeholder=HTML(f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"),
+            # Hide the placeholder while an in-flight suggested follow-up is
+            # being shown in the empty buffer. Both otherwise render at once.
+            placeholder=lambda: composer_placeholder(session.default_buffer),
             auto_suggest=_LiveProgressAutoSuggest(self.renderer),
             # The running composer is a live status area, not part of the conversation: without this its last
             # frame (rules, tip, and the "esc to interrupt" footer) stayed in the scrollback after the task

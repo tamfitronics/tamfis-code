@@ -25,6 +25,7 @@ from tamfis_code.live_input import (
     _right_align,
     _right_chip,
     composer_style,
+    composer_placeholder,
     force_bottom_toolbar_visible,
     idle_bottom_toolbar,
     live_next_message_suggestion,
@@ -287,6 +288,16 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         session = PromptSession(placeholder=MESSAGE_PLACEHOLDER)
         self.assertEqual(session.placeholder, MESSAGE_PLACEHOLDER)
         self.assertIn("Ask Tamfis-Code", MESSAGE_PLACEHOLDER)
+
+    def test_message_box_placeholder_yields_to_live_suggestion(self):
+        from prompt_toolkit.auto_suggest import Suggestion
+        from prompt_toolkit.buffer import Buffer
+        from tamfis_code.live_input import MESSAGE_PLACEHOLDER
+
+        buffer = Buffer()
+        self.assertIn(MESSAGE_PLACEHOLDER, str(composer_placeholder(buffer)))
+        buffer.suggestion = Suggestion("Continue the verified task")
+        self.assertEqual(composer_placeholder(buffer), "")
 
     def test_rules_span_the_terminal_width(self):
         from tamfis_code.live_input import composer_rule_html
