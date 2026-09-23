@@ -49,6 +49,7 @@ _STDOUT_BATCH_INTERVAL_SECONDS = 0.01
 # The composer and Assistant message container deliberately share the full
 # terminal width, matching Claude Code's message layout.
 _COMPOSER_MAX_WIDTH = None
+MESSAGE_PLACEHOLDER = "Ask Tamfis-Code to assist you with anything…"
 
 # Claude Code's own bottom-toolbar phrasing for the three MODE_CYCLE stops
 # that actually change what gets auto-approved -- "manual" (/mode's "ask")
@@ -1195,6 +1196,7 @@ class LiveInputListener:
             show_frame=False,
             reserve_space_for_menu=0,
             style=composer_style(),
+            placeholder=HTML(f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"),
             auto_suggest=_LiveProgressAutoSuggest(self.renderer),
             # The running composer is a live status area, not part of the conversation: without this its last
             # frame (rules, tip, and the "esc to interrupt" footer) stayed in the scrollback after the task

@@ -1757,6 +1757,28 @@ class MCPServer:
         if not roots:
             return None, []
 
+        # Prefer the already-named parent directory. This is both faster than
+        # walking a workspace rooted at /home and handles a common agent error
+        # where a status/log prefix is invented (`moe_pretraining.status`) but
+        # the discovered directory contains the canonical `status` file. Only
+        # a unique direct child is accepted; no arbitrary sibling is chosen.
+        try:
+            requested_parent = requested_path.parent
+            if not requested_parent.is_absolute():
+                requested_parent = (Path(self.workspace_root or os.getcwd()) / requested_parent)
+            requested_parent = requested_parent.resolve()
+            if self._is_allowed_read_path(requested_parent) and requested_parent.is_dir():
+                direct_files = sorted(
+                    (item.resolve() for item in requested_parent.iterdir() if item.is_file()),
+                    key=lambda item: str(item),
+                )
+                tail = requested_name.rsplit(".", 1)[-1] if "." in requested_name else ""
+                direct_tail = [item for item in direct_files if tail and item.name == tail]
+                if len(direct_tail) == 1:
+                    return direct_tail[0], []
+        except OSError:
+            pass
+
         suffix_matches: list[Path] = []
         basename_matches: list[Path] = []
         seen: set[Path] = set()

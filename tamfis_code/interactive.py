@@ -1205,6 +1205,12 @@ async def _run_interactive_impl(
     if _available_update:
         render_update_notice(console, current=__version__, available=_available_update)
 
+    # The live update poll starts before the first task renderer is created.
+    # Keep this explicitly nullable so a release discovered while the REPL is
+    # idle updates shared state instead of killing the poller with an
+    # UnboundLocalError.
+    renderer: Optional[StreamRenderer] = None
+
     async def _poll_for_live_updates() -> None:
         """Keep _available_update current for the rest of this REPL's
         process lifetime, not just the one check made above before the
@@ -1245,6 +1251,13 @@ async def _run_interactive_impl(
                     found = None
                 if found and found != _available_update:
                     _available_update = found
+                    # Keep the active task renderer in sync as well as the
+                    # idle toolbar closure.  A release discovered after
+                    # startup used to invalidate the prompt without setting
+                    # this field, so live sessions never showed the update
+                    # notice while a task was running.
+                    if renderer is not None:
+                        renderer.pending_update_version = found
                     app = getattr(session, "app", None)
                     if app is not None and getattr(app, "is_running", False):
                         app.invalidate()
@@ -1296,7 +1309,7 @@ async def _run_interactive_impl(
         config.approval_policy = next_mode_in_cycle(config.approval_policy)
         event.app.invalidate()
 
-    @bindings.add("c-u")
+    @bindings.add("c-u", eager=True)
     def _install_available_update(event) -> None:
         # Registered unconditionally (not gated on _available_update at
         # REPL-startup time) so a release published mid-session -- found by
@@ -1421,20 +1434,37 @@ async def _run_interactive_impl(
     from .message_viewer import install_bindings as _install_viewer_bindings
 
     _install_viewer_bindings(bindings)
+    # Wheel events scroll the open viewer and are inert otherwise; registered
+    # last so they beat the default mouse bindings' Up/Down feed.
+    from .live_input import install_wheel_scrolling
+
+    install_wheel_scrolling(bindings)
 
     def _prompt_message() -> Any:
         # Keep the editable line clean, like Codex/Claude Code: mode and
         # status live in prompt-toolkit's persistent toolbar *below* the
         # message box instead of consuming space before every message.
         # While a long message is open (Ctrl+E) it is drawn above the input.
-        from .message_viewer import panel_ansi
+        from .message_viewer import chip_fragments, panel_ansi
 
         viewer = panel_ansi()
-        if not viewer:
+        chip = chip_fragments()
+        if not viewer and not chip:
             return message_prompt()
         from prompt_toolkit.formatted_text import ANSI, FormattedText, to_formatted_text
 
-        return FormattedText(list(to_formatted_text(ANSI(viewer))) + list(to_formatted_text(message_prompt())))
+        from .live_input import _clickable_chip_fragments
+
+        fragments = []
+        if viewer:
+            fragments.extend(to_formatted_text(ANSI(viewer)))
+        if chip:
+            # The chip renders as its own line above the input; the clickable
+            # fragments carry the identical text so coordinates line up.
+            fragments.extend(_clickable_chip_fragments(chip))
+            fragments.append(("", "\n"))
+        fragments.extend(to_formatted_text(message_prompt()))
+        return FormattedText(fragments)
 
     # multiline=True is essential for bracketed terminal paste: embedded
     # newlines remain part of one objective instead of submitting the first
@@ -1460,6 +1490,8 @@ async def _run_interactive_impl(
     # provider plumbing, standalone or not. _SlashCommandCompleter's default
     # (five tiers) is used unconditionally now.
     model_options = dict(_SlashCommandCompleter()._model_options)
+    from .live_input import MESSAGE_PLACEHOLDER
+
     session: PromptSession = PromptSession(
         history=_prompt_history(history_path, console), multiline=True, key_bindings=bindings,
         completer=_SlashCommandCompleter(custom_commands, model_options), complete_while_typing=True,
@@ -1482,6 +1514,7 @@ async def _run_interactive_impl(
             lambda: suggestion_state,
         ),
         style=composer_style(),
+        placeholder=HTML(f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"),
         reserve_space_for_menu=8,
         # prompt-toolkit supplies a real dynamic Frame around the entire
         # multiline editor. This is the composer box the previous prompt-only

@@ -280,6 +280,14 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertIn("esc to interrupt", footer_lines[1])
         self.assertNotIn("Tip:", footer_lines[1])
 
+    def test_message_box_placeholder_is_dim_and_actionable(self):
+        from prompt_toolkit import PromptSession
+        from tamfis_code.live_input import MESSAGE_PLACEHOLDER
+
+        session = PromptSession(placeholder=MESSAGE_PLACEHOLDER)
+        self.assertEqual(session.placeholder, MESSAGE_PLACEHOLDER)
+        self.assertIn("Ask Tamfis-Code", MESSAGE_PLACEHOLDER)
+
     def test_rules_span_the_terminal_width(self):
         from tamfis_code.live_input import composer_rule_html
 

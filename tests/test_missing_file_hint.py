@@ -67,6 +67,14 @@ class MissingFileHintTests(unittest.TestCase):
         self.assertIn("Resolved requested path", message)
         self.assertIn("def handle", message)
 
+    def test_missing_prefixed_status_name_recovers_canonical_status_sibling(self):
+        target = self.ws / "training_queue_state" / "status"
+        target.parent.mkdir(parents=True)
+        target.write_text("complete\n")
+        message = self._read(self._server(8), "training_queue_state/moe_pretraining.status")
+        self.assertIn("Resolved requested path", message)
+        self.assertIn("complete", message)
+
     def test_ambiguous_tree_matches_never_choose_arbitrarily(self):
         for package in ("one", "two"):
             target = self.ws / "packages" / package / "handler.py"
