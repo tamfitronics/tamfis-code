@@ -20,6 +20,7 @@ from tamfis_code.render import StreamRenderer
 from tamfis_code.tool_policy import EDIT_TOOLS, EXECUTE_TOOLS, READ_TOOLS, allowed_tools
 from tamfis_code.routing import TaskProfile, TaskType
 from tamfis_code.workspace import build_system_prompt
+from tamfis_code.runner_local import _prechange_review_applies
 
 
 def _profile(task_type: TaskType) -> TaskProfile:
@@ -27,6 +28,20 @@ def _profile(task_type: TaskType) -> TaskProfile:
         task_type=task_type, complexity="medium", requires_tools=True,
         requires_repository_context=True, requires_long_context=False,
         requires_validation=True, preferred_quality_tier="standard",
+    )
+
+
+def test_read_only_turn_does_not_open_mutation_review_prompt():
+    complex_profile = TaskProfile(
+        task_type=TaskType.MIXED, complexity="very_complex", requires_tools=True,
+        requires_repository_context=True, requires_long_context=True,
+        requires_validation=True, preferred_quality_tier="frontier",
+    )
+    assert not _prechange_review_applies(
+        complex_profile,
+        "inventory the repository and then implement the proposed changes",
+        interactive=True,
+        turn_read_only=True,
     )
 
 

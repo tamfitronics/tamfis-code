@@ -181,6 +181,21 @@ def _requires_prechange_review(task_profile: Optional[TaskProfile], objective: s
     return len(set(references)) >= 3
 
 
+def _prechange_review_applies(
+    task_profile: Optional[TaskProfile],
+    objective: str,
+    *,
+    interactive: bool,
+    turn_read_only: bool,
+) -> bool:
+    """Return whether the mutation checkpoint can be shown for this turn."""
+    return (
+        interactive
+        and not turn_read_only
+        and _requires_prechange_review(task_profile, objective)
+    )
+
+
 def _is_code_mutation_call(tool_name: str, arguments: dict[str, Any], risk: str) -> bool:
     if tool_name in {
         "edit_file", "write_file", "delete_file", "extract_archive", "repackage_archive",
@@ -7622,7 +7637,16 @@ async def _run_local_agent_turn_impl(
     # callers cannot answer it; their explicit approval policy and sandbox
     # remain authoritative rather than silently converting a valid autonomous
     # run into an unexplained cancellation.
-    prechange_review_required = interactive and _requires_prechange_review(task_profile, objective)
+    # Read-only/audit/plan turns must never open a mutation-review prompt.
+    # The review is only meaningful when mutation is actually authorized for
+    # this turn; otherwise a model's stray write request produced a confusing
+    # "Code review" screen before the read-only executor rejected it.
+    prechange_review_required = _prechange_review_applies(
+        task_profile,
+        objective,
+        interactive=interactive,
+        turn_read_only=turn_read_only,
+    )
     prechange_review_granted = False
     prechange_review_blocked_round = -1
     rollover_count = 0
