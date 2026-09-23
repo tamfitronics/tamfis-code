@@ -35,7 +35,13 @@ from tamfis_code.render import StreamRenderer
 from tamfis_code.runtime.progress import (
     ExecState, ProgressTracker, StallPolicy, classify_provider_failure,
 )
-from tamfis_code.terminal_guard import FOCUS_REPORTING_OFF, TerminalGuard, disable_focus_reporting
+from tamfis_code.terminal_guard import (
+    FOCUS_REPORTING_OFF,
+    MOUSE_REPORTING_OFF,
+    TerminalGuard,
+    disable_focus_reporting,
+    disable_mouse_reporting,
+)
 
 
 class _Clock:
@@ -53,7 +59,8 @@ def _tracker(warn=45.0, abort=240.0):
 
 class ProgressStateMachineTests(unittest.TestCase):
     def test_default_provider_abort_is_bounded_for_interactive_tasks(self):
-        self.assertEqual(StallPolicy().provider_abort, 90.0)
+        self.assertEqual(StallPolicy().provider_warn, 90.0)
+        self.assertEqual(StallPolicy().provider_abort, 300.0)
 
     def test_waiting_provider_becomes_stalled_then_abortable(self):
         tracker, clock = _tracker(warn=45, abort=240)
@@ -360,6 +367,14 @@ class TerminalGuardTests(unittest.TestCase):
         pipe = SimpleNamespace(isatty=lambda: False, write=lambda s: self.fail("wrote to a pipe"), flush=lambda: None)
         disable_focus_reporting(pipe)
 
+    def test_disable_mouse_reporting_resets_all_supported_modes_only_to_a_tty(self):
+        tty = SimpleNamespace(isatty=lambda: True, written=[], flush=lambda: None)
+        tty.write = tty.written.append
+        disable_mouse_reporting(tty)
+        self.assertEqual(tty.written, [MOUSE_REPORTING_OFF])
+        pipe = SimpleNamespace(isatty=lambda: False, write=lambda s: self.fail("wrote to a pipe"), flush=lambda: None)
+        disable_mouse_reporting(pipe)
+
     def test_guard_mutes_and_restores_echo_on_a_real_pty(self):
         import os
         import pty
@@ -501,7 +516,7 @@ class ListenerRecoveryTests(_StatePatch):
         clock.now += 6
         listener._watchdog_check()
         self.assertEqual(seen, [])
-        self.assertIn("has not responded", renderer.console.file.getvalue())
+        self.assertIn("active route is still waiting", renderer.console.file.getvalue())
         clock.now += 30
         listener._watchdog_check()
         self.assertEqual(seen, ["stall"])

@@ -27,7 +27,7 @@ from prompt_toolkit.styles import Style
 
 from . import state as local_state
 import logging
-from .terminal_guard import TerminalGuard, disable_focus_reporting
+from .terminal_guard import TerminalGuard, disable_focus_reporting, disable_mouse_reporting
 from .config import Config, mode_label_for_policy, next_mode_in_cycle
 from .render import StreamRenderer
 
@@ -156,6 +156,47 @@ def _right_chip(session_id: Optional[int] = None, active_agents: int = 0) -> str
     # of this toolbar's left-side status already uses, so the chip stays
     # visually secondary without disappearing.
     return f"<ansigray>{_tip_text(session_id, active_agents)}</ansigray>"
+
+
+def _clickable_chip_fragments(chip: list[tuple[str, str, Any]]) -> list[tuple[str, str, Any]]:
+    """The show-more/less chip as real clickable fragments, aligned to where
+    `chip_html` rendered it in the composer's HTML (one line directly above
+    the input rule). prompt_toolkit calls a fragment's third element when the
+    user clicks it -- the main composers intentionally keep mouse support off
+    so native terminal selection/copy remains available during streaming."""
+    if not chip:
+        return []
+    # The HTML placeholder drew " ", label, hint on one line; rebuild that
+    # exact line so the click coordinates line up with what is on screen.
+    return [(style, text, handler) for style, text, handler in chip]
+
+
+def install_wheel_scrolling(bindings: Any) -> None:
+    """Route wheel events to the message viewer while it is open.
+
+    Registered on BOTH composers (idle prompt and mid-task). While the viewer
+    is closed the handler deliberately swallows wheel events instead of
+    feeding Up/Down: the main composer leaves mouse input to the terminal, so
+    forwarding wheel ticks to Up/Down would drive history recall / cursor
+    movement under the user's hand. Native scrollback stays reachable via the
+    terminal's own wheel/selection handling. Never raises -- a wheel event
+    must not break the composer."""
+    from prompt_toolkit.keys import Keys
+
+    def _wheel(direction: int):
+        def _handler(event) -> None:
+            from .message_viewer import wheel_scroll
+
+            wheel_scroll(direction, event)
+            event.app.invalidate()
+
+        return _handler
+
+    try:
+        bindings.add(Keys.ScrollUp)(_wheel(-1))
+        bindings.add(Keys.ScrollDown)(_wheel(1))
+    except Exception:  # pragma: no cover - very old prompt_toolkit
+        pass
 
 
 def _right_align(left_html: str, right_html: str, *, min_gap: int = 2) -> str:
@@ -362,6 +403,12 @@ def composer_style() -> Style:
         # several SSH themes render it indistinguishably from the composer
         # background. Bright-black is the portable ANSI "ghost text" color.
         "auto-suggestion": "fg:ansibrightblack italic",
+        # Clickable show-more/less chip (message_viewer.chip_fragments):
+        # secondary dim text like the rest of the footer, brightening on the
+        # focused/underlined state is unnecessary -- the chip is always shown
+        # with its affordance in the label itself ("Show more lines (N)").
+        "more-lines-chip": "fg:ansicyan",
+        "more-lines-chip-dim": "fg:ansibrightblack",
     })
 
 
@@ -519,6 +566,9 @@ class LiveInputListener:
         self._active = True
         self._terminal.snapshot()
         disable_focus_reporting()
+        # Repair mouse capture left behind by an interrupted previous prompt
+        # before this composer decides whether the current render needs it.
+        disable_mouse_reporting()
         from .runtime.progress import configure_execution_log
 
         configure_execution_log()
@@ -554,8 +604,14 @@ class LiveInputListener:
         if ticker is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await ticker
-        await self._shutdown_prompt()
-        self._terminal.restore()
+        try:
+            await self._shutdown_prompt()
+        finally:
+            # Prompt-toolkit normally cleans this up, but cancellation during
+            # redraw can bypass its renderer cleanup. Always return native
+            # terminal selection to the user.
+            disable_mouse_reporting()
+            self._terminal.restore()
         try:
             from .message_viewer import VIEWER
 
@@ -642,8 +698,8 @@ class LiveInputListener:
             self.renderer.handle_event({
                 "event_type": "diagnostics",
                 "payload": {"content": (
-                    f"⚠ The model has not responded for {int(snap.idle_seconds)}s — "
-                    "replacing the request automatically…"
+                    f"⚠ No model output for {int(snap.idle_seconds)}s — "
+                    "the active route is still waiting; automatic failover remains enabled."
                 )},
             })
         elif snap.state.value not in {"stalled"} and snap.idle_seconds < 5:
@@ -919,11 +975,34 @@ class LiveInputListener:
             tip_room = max(20, shutil.get_terminal_size(fallback=(80, 24)).columns - 2)
             lines.append(f" <ansigray>{_xml_escape(_truncate(tip, tip_room))}</ansigray>")
         lines.append(composer_rule_html())
+        # The clickable show-more/less chip rides directly above the input
+        # rule, the one prompt_toolkit-rendered surface that can carry mouse
+        # handlers (the tool block's own "… +N lines" hint is Rich scrollback
+        # and can never be clickable). Empty when nothing is collapsed and the
+        # viewer is closed, so the row costs nothing normally.
+        try:
+            from .message_viewer import chip_fragments as _chip_fragments
+
+            chip = _chip_fragments()
+        except Exception:
+            chip = []
+        # The chip is appended as CLICKABLE fragments (style, text, mouse
+        # handler) after the HTML body -- plain HTML cannot carry a mouse
+        # handler, and the tool block's own "… +N lines" hint lives in Rich
+        # scrollback where clicks can never reach it. The chip sits on its
+        # own line directly above the input rule; when the viewer is open it
+        # renders first (the ANSI panel), then the chip.
         composer = HTML("\n".join(lines) + "\n<ansicyan><b>❯</b></ansicyan> ")
+        chip_frags = _clickable_chip_fragments(chip)
+        if chip_frags:
+            chip_frags.append(("", "\n"))
         viewer = panel_ansi()
         if viewer:
             # The full message (Ctrl+E) sits above the status; Ctrl+E/Esc closes it.
-            return FormattedText(list(to_formatted_text(ANSI(viewer))) + list(to_formatted_text(composer)))
+            viewer_frags = list(to_formatted_text(ANSI(viewer)))
+            return FormattedText(viewer_frags + chip_frags + list(to_formatted_text(composer)))
+        if chip_frags:
+            return FormattedText(chip_frags + list(to_formatted_text(composer)))
         return composer
 
     def _bottom_toolbar(self):
@@ -1030,7 +1109,7 @@ class LiveInputListener:
                 return
             event.current_buffer.auto_up(count=1)
 
-        @bindings.add("c-u")
+        @bindings.add("c-u", eager=True)
         def _queue_available_update(event) -> None:
             # During a live task, updating immediately would abandon the
             # current provider/tool boundary. Queue the command instead; the
@@ -1102,6 +1181,9 @@ class LiveInputListener:
         from .message_viewer import install_bindings as _install_viewer_bindings
 
         _install_viewer_bindings(bindings)
+        # Wheel events (the viewer's scroll, inert otherwise) must beat the
+        # default mouse bindings' Up/Down feed, so they register last too.
+        install_wheel_scrolling(bindings)
 
         # The running composer is the same as the idle one: the input between
         # two plain rules, the running status and tip ABOVE it, the mode line
@@ -1119,6 +1201,12 @@ class LiveInputListener:
             # ended and after every follow-up Enter, so a finished session still read "esc to interrupt"
             # and stale composer copies piled up between messages (owner paste 2026-09-21).
             erase_when_done=True,
+            # Keep the in-flight composer keyboard-only so native terminal
+            # drag-select/copy remains available for streamed errors. A
+            # clarification/approval prompt is a separate deliberate mouse
+            # capture and cleans up in ask_user.py; the main composer must
+            # never steal selection just because a transcript chip exists.
+            mouse_support=False,
         )
         force_bottom_toolbar_visible(session)
         self._prompt_session = session

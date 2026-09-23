@@ -29,6 +29,8 @@ from typing import Any, Callable, Optional, Sequence
 from prompt_toolkit.keys import Keys
 from prompt_toolkit.mouse_events import MouseEventType
 
+from .terminal_guard import disable_mouse_reporting
+
 MAX_QUESTIONS = 4
 MAX_OPTIONS = 6
 _MAX_LABEL_CHARS = 60
@@ -353,7 +355,13 @@ async def _run_selector(state: SelectorState, *, input: Any = None, output: Any 
         key_bindings=bindings, full_screen=False, mouse_support=True,
         input=input, output=output,
     )
-    result = await application.run_async()
+    try:
+        result = await application.run_async()
+    finally:
+        # Approval/clarification uses mouse capture intentionally, but an
+        # interrupted Application must not leave the parent terminal unable
+        # to drag-select and copy text.
+        disable_mouse_reporting()
     return result if result else ("skip", [])
 
 

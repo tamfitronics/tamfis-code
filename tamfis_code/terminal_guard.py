@@ -22,6 +22,14 @@ import sys
 from typing import Any, Optional
 
 FOCUS_REPORTING_OFF = "\x1b[?1004l"
+# DEC mouse modes that prompt-toolkit/terminal clients may enable.  A prompt
+# can be cancelled while a redraw is in progress, leaving one of these modes
+# active in the user's shell; the terminal then sends mouse events to the
+# application instead of allowing native drag-selection/copy.
+MOUSE_REPORTING_OFF = (
+    "\x1b[?1000l\x1b[?1002l\x1b[?1003l"
+    "\x1b[?1005l\x1b[?1006l\x1b[?1015l"
+)
 
 
 def disable_focus_reporting(stream: Any = None) -> None:
@@ -31,6 +39,24 @@ def disable_focus_reporting(stream: Any = None) -> None:
         if stream is None or not stream.isatty():
             return
         stream.write(FOCUS_REPORTING_OFF)
+        stream.flush()
+    except Exception:
+        pass
+
+
+def disable_mouse_reporting(stream: Any = None) -> None:
+    """Reset every mouse-reporting mode Tamfis-Code may have enabled.
+
+    This is intentionally safe to call at both startup and teardown.  Startup
+    repairs a terminal left dirty by a killed/crashed prompt; teardown makes
+    normal exits and clarification/approval prompts return native terminal
+    selection to the user.
+    """
+    stream = stream if stream is not None else sys.__stdout__
+    try:
+        if stream is None or not stream.isatty():
+            return
+        stream.write(MOUSE_REPORTING_OFF)
         stream.flush()
     except Exception:
         pass
@@ -94,6 +120,9 @@ class TerminalGuard:
             return False
 
     def restore(self) -> None:
+        # Do this even when no termios snapshot exists: a prompt can enable
+        # mouse reporting before snapshot/restore reaches its normal path.
+        disable_mouse_reporting()
         fd = self._resolve_fd()
         saved, self._saved = self._saved, None
         was_muted, self._muted = self._muted, False

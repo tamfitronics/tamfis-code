@@ -51,6 +51,44 @@ class MissingFileHintTests(unittest.TestCase):
         self.assertIn("find the right path", message)
         self.assertNotIn("wrote that file earlier", message)
 
+    def test_missing_nested_path_recovers_a_unique_tree_match(self):
+        target = self.ws / "src" / "deep" / "module.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("answer = 42\n")
+        message = self._read(self._server(8), "src/module.py")
+        self.assertIn("Resolved requested path", message)
+        self.assertIn("answer = 42", message)
+
+    def test_missing_path_with_unique_basename_recovers_deep_file(self):
+        target = self.ws / "packages" / "feature" / "handler.py"
+        target.parent.mkdir(parents=True)
+        target.write_text("def handle():\n    return True\n")
+        message = self._read(self._server(8), "handler.py")
+        self.assertIn("Resolved requested path", message)
+        self.assertIn("def handle", message)
+
+    def test_ambiguous_tree_matches_never_choose_arbitrarily(self):
+        for package in ("one", "two"):
+            target = self.ws / "packages" / package / "handler.py"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(package)
+        message = self._read(self._server(8), "handler.py")
+        self.assertIn("multiple possible files", message)
+        self.assertIn("packages/one/handler.py", message)
+        self.assertIn("packages/two/handler.py", message)
+        self.assertNotIn("Resolved requested path", message)
+
+    def test_recovery_does_not_escape_an_allowed_scope(self):
+        outside = self.ws.parent / "outside.py"
+        outside.write_text("secret = True\n")
+        scoped = MCPServer(
+            workspace_root=str(self.ws),
+            allowed_workspace_roots=[str(self.ws)],
+        )
+        message = self._read(scoped, "outside.py")
+        self.assertNotIn("secret = True", message)
+        self.assertIn("not found", message)
+
     def test_a_different_session_did_not_write_it_so_it_gets_no_such_claim(self):
         target = self.ws / "other.txt"
         target.write_text("x\n")

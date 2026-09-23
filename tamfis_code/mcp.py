@@ -266,6 +266,14 @@ def _page_search_matches(
 MAX_SEARCH_FILE_SIZE_BYTES = 2_000_000
 MAX_SEARCH_MATCH_CHARS = 500
 
+# A missing read path gets one bounded discovery pass before it is reported as
+# absent.  These limits are deliberately independent from search_code: a
+# typo/missing-prefix recovery must stay cheap even in a large monorepo and
+# must never turn read_file into an unbounded filesystem crawl.
+MAX_READ_RECOVERY_DEPTH = 12
+MAX_READ_RECOVERY_FILES = 30_000
+MAX_READ_RECOVERY_CANDIDATES = 8
+
 # How much of a still-running (or already-finished) background job's own
 # output read_background_job returns per call -- same bounded-tail idea as
 # the rest of this module's output caps, so polling a chatty long-running
@@ -1629,8 +1637,31 @@ class MCPServer:
             except (TypeError, ValueError):
                 return "Error: read_file line_start and line_end must be positive integers"
         p = self._resolve_readable_input(path)
+        resolved_note = ""
         if not p.exists():
-            return f"Error: File '{path}' not found.{self._not_found_hint(path)}"
+            # Preserve the established, high-confidence typo diagnostic. It
+            # is more useful than silently selecting a same-basename file and
+            # keeps callers that already know how to repair this response
+            # compatible with the deeper discovery pass below.
+            corrected = self._correct_path_typos(path)
+            if corrected and self._is_allowed_read_path(Path(corrected)):
+                return f"Error: File '{path}' not found. Did you mean '{corrected}'?"
+            recovered, candidates = self._recover_missing_read_path(path)
+            if recovered is not None:
+                p = recovered
+                resolved_note = (
+                    f"[Resolved requested path '{path}' to workspace file "
+                    f"'{self._display_workspace_path(p)}' after bounded tree discovery.]\n"
+                )
+            elif candidates:
+                rendered = ", ".join(f"'{item}'" for item in candidates)
+                return (
+                    f"Error: File '{path}' was not found at that exact path and the workspace "
+                    f"search found multiple possible files: {rendered}. Do not guess; retry "
+                    "read_file with one of these exact paths."
+                )
+            else:
+                return f"Error: File '{path}' not found.{self._not_found_hint(path)}"
         if not p.is_file():
             return f"Error: '{path}' is not a file"
         # A null byte anywhere in the first 8000 bytes is the same
@@ -1660,7 +1691,7 @@ class MCPServer:
         default_page_lines = 800
         requested_page = offset is not None or limit is not None
         if not requested_page and len(lines) <= default_page_lines:
-            return content
+            return resolved_note + content
         try:
             start = max(1, int(offset or 1))
             page_size = min(2000, max(1, int(limit or default_page_lines)))
@@ -1679,7 +1710,105 @@ class MCPServer:
             f" Continue with offset={end + 1}, limit={page_size}."
             if end < len(lines) else " End of file."
         )
-        return f"[Showing lines {start}-{max(end, start)} of {len(lines)}.{continuation}]\n{numbered}"
+        return resolved_note + f"[Showing lines {start}-{max(end, start)} of {len(lines)}.{continuation}]\n{numbered}"
+
+    def _display_workspace_path(self, path: Path) -> str:
+        """Render a recovered path without leaking an unrelated host path."""
+        base = Path(self.workspace_root).expanduser().resolve() if self.workspace_root else Path.cwd().resolve()
+        try:
+            return str(path.resolve().relative_to(base))
+        except ValueError:
+            return str(path)
+
+    def _is_allowed_read_path(self, path: Path) -> bool:
+        try:
+            resolved = path.expanduser().resolve()
+            roots = self._recovery_roots()
+            return any(resolved == root or root in resolved.parents for root in roots)
+        except OSError:
+            return False
+
+    def _recovery_roots(self) -> list[Path]:
+        base = Path(self.workspace_root).expanduser().resolve() if self.workspace_root else Path.cwd().resolve()
+        roots = self.allowed_workspace_roots or {base}
+        return sorted(
+            {root.resolve() for root in roots if root.exists() and root.is_dir()},
+            key=lambda item: str(item),
+        )
+
+    def _recover_missing_read_path(self, requested: str) -> tuple[Optional[Path], list[str]]:
+        """Find a missing read path using the already-authorised workspace tree.
+
+        Recovery is intentionally conservative: an exact relative suffix wins
+        only when unique; otherwise a basename match may be used only when it
+        is unique. Ambiguous matches are returned to the caller so the model
+        must choose an exact path rather than silently reading the wrong file.
+        Symlinks and excluded/generated directories stay inside the same
+        allowed roots and are never followed outside the scope.
+        """
+        requested_path = Path(str(requested).strip()).expanduser()
+        requested_name = requested_path.name
+        if not requested_name or requested_name in {".", ".."}:
+            return None, []
+        requested_parts = tuple(part for part in requested_path.parts if part not in {"", ".", "..", "/"})
+        if not requested_parts:
+            return None, []
+        roots = self._recovery_roots()
+        if not roots:
+            return None, []
+
+        suffix_matches: list[Path] = []
+        basename_matches: list[Path] = []
+        seen: set[Path] = set()
+        visited_files = 0
+        for root in roots:
+            try:
+                root_depth = len(root.parts)
+                for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
+                    current_path = Path(current)
+                    depth = len(current_path.parts) - root_depth
+                    if depth >= MAX_READ_RECOVERY_DEPTH:
+                        dirnames[:] = []
+                    else:
+                        dirnames[:] = [
+                            name for name in dirnames
+                            if name not in self._PATH_SUGGESTION_SKIP_DIRS
+                            and name not in EXCLUDED_DIR_NAMES
+                            and not name.endswith(".egg-info")
+                        ]
+                    for filename in filenames:
+                        visited_files += 1
+                        if visited_files > MAX_READ_RECOVERY_FILES:
+                            break
+                        candidate = (current_path / filename).resolve()
+                        if candidate in seen or not candidate.is_file():
+                            continue
+                        if not any(candidate == allowed or allowed in candidate.parents for allowed in roots):
+                            continue
+                        seen.add(candidate)
+                        relative_parts = tuple(candidate.relative_to(root).parts) if candidate.is_relative_to(root) else ()
+                        if filename == requested_name:
+                            basename_matches.append(candidate)
+                            if relative_parts and len(relative_parts) >= len(requested_parts):
+                                if relative_parts[-len(requested_parts):] == requested_parts:
+                                    suffix_matches.append(candidate)
+                    if visited_files > MAX_READ_RECOVERY_FILES:
+                        break
+            except OSError:
+                continue
+
+        def unique(paths: list[Path]) -> list[Path]:
+            return list(dict.fromkeys(paths))
+
+        suffix_matches = unique(suffix_matches)
+        basename_matches = unique(basename_matches)
+        if len(suffix_matches) == 1:
+            return suffix_matches[0], []
+        candidates = suffix_matches if suffix_matches else basename_matches
+        if len(candidates) == 1:
+            return candidates[0], []
+        rendered = [self._display_workspace_path(item) for item in candidates[:MAX_READ_RECOVERY_CANDIDATES]]
+        return None, rendered
 
     def _resolve_readable_input(self, path: str) -> Path:
         """Resolve a workspace file or one exact, user-supplied attachment.

@@ -1,9 +1,10 @@
 """An installed app must tell the user a newer release exists -- instantly, offline, without capturing the mouse.
 
 * The alert comes from the on-disk cache, so a launch never waits on the network.
-* It must NOT turn on terminal mouse tracking: with tracking on, the mouse wheel is delivered to the app
-  instead of scrolling the terminal's scrollback (jumpy scrolling, wheel turned into Up/Down history keys).
-  The idle prompt used to enable it whenever an update was pending, to make a footer chip clickable.
+  * It must NOT turn on terminal mouse tracking: with tracking on, the mouse wheel is delivered to the app
+  instead of scrolling the terminal's scrollback (jumpy scrolling, wheel turned into Up/Down history keys),
+  and native drag-select/copy of streamed errors stops working. The main composers are keyboard-only;
+  only the deliberate clarification/approval prompt captures the mouse temporarily.
 """
 import json
 import os
