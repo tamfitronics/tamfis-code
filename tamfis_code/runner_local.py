@@ -11087,7 +11087,10 @@ async def _run_local_agent_turn_impl(
                         "by the local safety allowlist (for example find/grep/rg/cat, "
                         "git status/diff/log, and ps/pgrep inspection). Do not use shell "
                         "control, redirection, command substitution, writes, or execution; "
-                        "use read_file/search_code/list_directory when they are a better fit."
+                        "use read_file/search_code/list_directory when they are a better fit. "
+                        "A blocked command is not evidence that a path is missing: inspect the "
+                        "workspace tree first, then search the discovered paths and read the "
+                        "matching file directly. Do not retry the same rejected pipeline."
                     ),
                 }
                 working_messages.append({
