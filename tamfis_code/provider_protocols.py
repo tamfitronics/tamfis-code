@@ -281,13 +281,45 @@ def system_messages_first(messages: list[dict[str, Any]]) -> list[dict[str, Any]
             changed = True
         return {**message, "tool_calls": repaired_calls} if changed else message
 
-    remainder = [
+    # A provider failover can receive a checkpoint assembled between the
+    # assistant tool-call message and its result.  It is also possible for
+    # context compaction to retain the result while eliding the assistant
+    # message.  OpenAI-compatible APIs reject such a request with errors like
+    # ``tool call id ... not found in previous tool calls``.  Do not replay an
+    # orphaned result: it is not executable conversation state and replaying
+    # it cannot add evidence.  This is request-only sanitisation; the durable
+    # transcript remains available for audit/resume.
+    repaired_remainder = [
         repaired
         for message in messages
         if message.get("role") != "system"
         for repaired in [_provider_safe_message(message)]
         if repaired is not None
     ]
+    remainder: list[dict[str, Any]] = []
+    pending_tool_call_ids: set[str] = set()
+    for message in repaired_remainder:
+        role = message.get("role")
+        if role == "assistant":
+            calls = message.get("tool_calls") or []
+            pending_tool_call_ids = {
+                str(call.get("id"))
+                for call in calls
+                if isinstance(call, dict) and call.get("id")
+            }
+            remainder.append(message)
+            continue
+        if role == "tool":
+            call_id = str(message.get("tool_call_id") or "")
+            if call_id not in pending_tool_call_ids:
+                # Never send a tool result without its matching assistant
+                # call.  The model can issue a fresh call on the next round.
+                continue
+            pending_tool_call_ids.discard(call_id)
+            remainder.append(message)
+            continue
+        pending_tool_call_ids.clear()
+        remainder.append(message)
     combined_text = "\n\n".join(text for text in system_texts if text.strip())
     if not combined_text:
         return remainder

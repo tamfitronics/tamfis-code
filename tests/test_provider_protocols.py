@@ -215,3 +215,24 @@ def test_system_messages_first_keeps_valid_tool_arguments_unchanged():
     result = system_messages_first([{"role": "assistant", "content": "", "tool_calls": [call]}])
     assert result[0]["content"] == "[tool call]"
     assert result[0]["tool_calls"][0]["function"]["arguments"] == '{"path":"README.md"}'
+
+
+def test_system_messages_first_drops_orphaned_tool_results_for_failover_replay():
+    result = system_messages_first([
+        {"role": "user", "content": "continue"},
+        {"role": "tool", "tool_call_id": "chatcmpl-tool-orphan", "content": "stale"},
+        {"role": "assistant", "content": "fresh answer"},
+    ])
+    assert [message["role"] for message in result] == ["user", "assistant"]
+    assert all(message.get("tool_call_id") != "chatcmpl-tool-orphan" for message in result)
+
+
+def test_system_messages_first_preserves_tool_results_with_matching_call():
+    result = system_messages_first([
+        {"role": "assistant", "content": "[tool call]", "tool_calls": [{
+            "id": "call-1", "type": "function",
+            "function": {"name": "read_file", "arguments": "{}"},
+        }]},
+        {"role": "tool", "tool_call_id": "call-1", "content": "ok"},
+    ])
+    assert result[1]["tool_call_id"] == "call-1"
