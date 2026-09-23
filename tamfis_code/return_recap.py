@@ -188,15 +188,25 @@ def render_return_recap(console: Any, recap: ReturnRecap) -> None:
     console.print(Rule(Text("Conversation recap", style="dim"), style="dim", characters="─"))
     import textwrap
 
-    width = max(40, int(getattr(console, "width", 100) or 100) - 2)
+    console_width = max(40, int(getattr(console, "width", 100) or 100))
     for label, value in (("Objective", recap.objective), ("Where it stands", recap.standing), ("Next", recap.next_step)):
-        head = f"  {label}: "
-        lines = textwrap.wrap(value, width=width, initial_indent=head, subsequent_indent=" " * len(head)) or [head]
-        first, rest = lines[0][len(head):], lines[1:]
-        text = Text(head, style="bold") + Text(first, style="dim" if value == NO_NEXT_STEP else "")
-        for line in rest:
-            text.append("\n" + line, style="dim" if value == NO_NEXT_STEP else "")
-        console.print(text, highlight=False, soft_wrap=True)
+        # Wrap the value *inside* the available width. The previous renderer
+        # wrapped the already-prefixed line at the full console width, then
+        # Rich wrapped it a second time and introduced table-like `│` glyphs
+        # plus continuation text under the label column. Keep one stable
+        # left-aligned key/value layout instead.
+        head = f"  {label}:"
+        value_width = max(20, console_width - len(head) - 1)
+        lines = textwrap.wrap(
+            str(value or ""), width=value_width,
+            break_long_words=True, break_on_hyphens=False,
+        ) or [""]
+        value_style = "dim" if value == NO_NEXT_STEP else ""
+        text = Text(head, style="bold") + Text(" " + lines[0], style=value_style)
+        continuation_indent = " " * (len(head) + 1)
+        for line in lines[1:]:
+            text.append("\n" + continuation_indent + line, style=value_style)
+        console.print(text, highlight=False, soft_wrap=False, overflow="fold")
     console.print()
 
 

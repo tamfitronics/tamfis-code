@@ -13,6 +13,7 @@ from .context import ContextBundle, build_context_bundle
 from .planner import ExecutionPlan, PlanStep, create_plan
 from .protocols import AgentPhase, ToolEnvelope, classify_failure
 from .validator import ValidationReport, validate_completion
+from .production import DeliveryPolicy, build_delivery_policy, completion_is_evidence_bound
 from ..workspace import load_instruction_text
 from ..runtime import ExecutionController, GuardDecision, ObservationDecision
 from ..runtime.resume import ResumeSnapshot
@@ -45,6 +46,7 @@ class OrchestrationRun:
     # instead of starting from a fresh template. See begin(restore=...).
     plan_restored: bool = False
     runtime: ExecutionController = field(default_factory=ExecutionController)
+    delivery_policy: DeliveryPolicy | None = None
 
     def __post_init__(self) -> None:
         # Durable checkpoints and older callers serialize enum values as
@@ -135,6 +137,11 @@ class AgentOrchestrator:
         )
         profile = classify_task(canonical_objective, read_only=read_only)
         self.run = OrchestrationRun(self.session_id, canonical_objective, profile, runtime=ExecutionController(self.budgets))
+        self.run.delivery_policy = build_delivery_policy(
+            read_only=read_only,
+            requires_validation=profile.requires_validation,
+            complexity=str(profile.complexity),
+        )
         restored = restore is not None and restore.resume_index is not None
         local_state.save_session_state(
             self.session_id,
@@ -158,6 +165,7 @@ class AgentOrchestrator:
             local_state.update_task_state(
                 self.session_id, task_id=str(self.session_id), objective=canonical_objective,
                 status="running", phase=AgentPhase.UNDERSTAND.value,
+                delivery_policy=self.run.delivery_policy.to_dict(),
                 **carried,
                 plan=names,
                 completed_steps=[s["name"] for s in restore.steps if s["status"] == "completed"],
@@ -168,6 +176,7 @@ class AgentOrchestrator:
             local_state.update_task_state(
                 self.session_id, task_id=str(self.session_id), objective=objective,
                 status="running", phase=AgentPhase.UNDERSTAND.value,
+                delivery_policy=self.run.delivery_policy.to_dict(),
                 plan=[], completed_steps=[], pending_steps=[], blocked_steps=[],
                 assumptions=[], decisions=[], files_read=[], files_modified=[],
                 artifacts_created=[], commands_run=[], tests=[], failures=[],
@@ -257,11 +266,26 @@ class AgentOrchestrator:
         non-step parts (assumptions, risks, validation criteria) from what the
         ledger kept, falling back to the template's for a legacy record."""
         template = create_plan(objective, profile)
-        static = restore.static or {}
+
+        # ``create_plan`` legitimately returns ``None`` for a plain
+        # conversation.  A saved plan can still reach this path when a
+        # provider/failover resume carries an older interrupted plan whose
+        # current objective now classifies as conversation.  Never let a
+        # missing template turn resume into ``NoneType has no attribute
+        # assumptions`` (or the equivalent for another static field).
+        static = restore.static if isinstance(restore.static, dict) else {}
+
+        def restored_list(key: str) -> list[Any]:
+            value = static.get(key)
+            if isinstance(value, (list, tuple)) and value:
+                return list(value)
+            fallback = getattr(template, key, []) if template is not None else []
+            return list(fallback or [])
+
         return ExecutionPlan(
             objective=objective,
-            assumptions=list(static.get("assumptions") or template.assumptions),
-            components=list(static.get("components") or template.components),
+            assumptions=restored_list("assumptions"),
+            components=restored_list("components"),
             steps=[
                 PlanStep(
                     index=position, name=step["name"], status=step["status"],
@@ -269,9 +293,9 @@ class AgentOrchestrator:
                 )
                 for position, step in enumerate(restore.steps, start=1)
             ],
-            validation_criteria=list(static.get("validation_criteria") or template.validation_criteria),
-            risks=list(static.get("risks") or template.risks),
-            phase_names=list(static.get("phase_names") or []),
+            validation_criteria=restored_list("validation_criteria"),
+            risks=restored_list("risks"),
+            phase_names=restored_list("phase_names"),
         )
 
     def replace_plan(self, plan: ExecutionPlan) -> None:
@@ -581,6 +605,10 @@ class AgentOrchestrator:
                 "validation_criteria": list(self.run.plan.validation_criteria or []),
                 "risks": list(self.run.plan.risks or []),
                 "phase_names": list(self.run.plan.phase_names or []),
+                "delivery_policy": (
+                    self.run.delivery_policy.to_dict()
+                    if self.run.delivery_policy is not None else {}
+                ),
             }
         else:
             # A task with no plan has no plan steps. The ledger is keyed by
@@ -590,6 +618,8 @@ class AgentOrchestrator:
             ledger.plan_steps = []
             ledger.current_step_index = 0
             ledger.plan_static = {}
+            if self.run.delivery_policy is not None:
+                ledger.plan_static = {"delivery_policy": self.run.delivery_policy.to_dict()}
         # Reuses the same modified_files list safety.py's record_mutation
         # already maintains per session -- a real recap needs to show real
         # changed files, not a second, separately-tracked copy that could
@@ -851,6 +881,23 @@ class AgentOrchestrator:
 
     def complete(self, *, final_text: str, any_mutation: bool) -> ValidationReport:
         report = self.validate(final_text=final_text, any_mutation=any_mutation)
+        if self.run is not None and self.run.delivery_policy is not None:
+            observed_evidence = sum(1 for record in self.run.tool_records if record.success)
+            if not completion_is_evidence_bound(
+                self.run.delivery_policy,
+                evidence_count=observed_evidence,
+                passed=report.passed,
+            ):
+                report.passed = False
+                report.severity = "error"
+                report.unresolved.append(
+                    "Completion requires at least one observed verification result."
+                )
+                report.checks.append({
+                    "name": "evidence_bound_completion",
+                    "passed": False,
+                    "detail": "No successful tool/verification evidence was observed.",
+                })
         if self.run is not None and self.run.plan is not None:
             for step in self.run.plan.steps:
                 step.status = "completed" if report.passed else (

@@ -11,7 +11,7 @@ from rich.console import Console
 
 from tamfis_code import state as st
 from tamfis_code.return_recap import (
-    NO_NEXT_STEP, away_threshold_seconds, build_return_recap, print_return_recap, render_return_recap,
+    NO_NEXT_STEP, ReturnRecap, away_threshold_seconds, build_return_recap, print_return_recap, render_return_recap,
 )
 
 
@@ -76,6 +76,21 @@ class RecapTests(unittest.TestCase):
         self.assertIn("Conversation recap", out)
         self.assertIn("Objective: Do a thing", out)
         self.assertIn(f"Next: {NO_NEXT_STEP}", out)
+
+    def test_render_keeps_wrapped_values_left_aligned_without_table_glyphs(self):
+        recap = ReturnRecap(
+            objective="the bulk batch feature incorrectly aborts when fewer eligible posts are found than requested",
+            standing="Validation completed successfully and updated class-tab-engine.php",
+            next_step="Review the verified diff, then commit only the intended changes",
+            files=[],
+        )
+        console = Console(file=io.StringIO(), width=72)
+        render_return_recap(console, recap)
+        out = console.file.getvalue()
+        self.assertNotIn("│", out)
+        self.assertIn("  Objective: the bulk batch feature", out)
+        self.assertIn("  Where it stands:", out)
+        self.assertIn("  Next: Review the verified diff", out)
 
     def test_the_away_threshold_is_configurable_and_can_be_disabled(self):
         with patch.dict(os.environ, {"TAMFIS_CODE_AWAY_RECAP_MINUTES": "0"}):
