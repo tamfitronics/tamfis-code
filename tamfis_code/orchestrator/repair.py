@@ -58,7 +58,16 @@ def choose_repair(*, tool_name: str, result: dict[str, Any] | str, attempt: int)
     if failure == FailureClass.SHELL_QUOTING_ERROR:
         return RepairDecision(failure, "switch to native write_file/edit_file; do not retry shell source construction", True, True)
     if failure == FailureClass.FILE_NOT_FOUND:
-        return RepairDecision(failure, "refresh workspace inventory and resolve the canonical path", attempt < 2)
+        return RepairDecision(
+            failure,
+            (
+                "inspect the workspace tree and search for the requested file, then retry "
+                "with one exact canonical path; never repeat the guessed path or declare "
+                "the file absent after one miss"
+            ),
+            attempt < 2,
+            True,
+        )
     if failure == FailureClass.PERMISSION_DENIED:
         return RepairDecision(
             failure,

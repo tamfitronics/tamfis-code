@@ -132,7 +132,7 @@ class FailureDiagnosisNudgeTests(_StatePatchMixin, unittest.TestCase):
                 workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
             ))
 
-            guidance = "refresh workspace inventory and resolve the canonical path"
+            guidance = "inspect the workspace tree and search for the requested file"
             self.assertTrue(
                 any(
                     event["event_type"] == "diagnostics"
@@ -147,6 +147,14 @@ class FailureDiagnosisNudgeTests(_StatePatchMixin, unittest.TestCase):
                     for call in client.calls for message in call.get("messages", [])
                 ),
                 "expected failure-specific repair guidance in the next model request",
+            )
+            self.assertTrue(
+                any(
+                    message.get("role") == "system"
+                    and "Do not repeat the same tool call" in str(message.get("content"))
+                    for call in client.calls for message in call.get("messages", [])
+                ),
+                "missing-file recovery must force a different, evidence-based tool action",
             )
 
 
