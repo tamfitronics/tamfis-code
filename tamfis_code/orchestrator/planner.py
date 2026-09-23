@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 from ..routing import ComplexityLevel, TaskProfile, TaskType, complexity_at_least
+from .coding_prompt import CODING_ORCHESTRATION_INSTRUCTIONS, PLATFORM_SAFETY_INSTRUCTIONS, CODING_PROMPT_VERSION
 
 MAX_REASONING_PLAN_STEPS = 8
 MAX_ASSUMPTIONS = 6
@@ -649,9 +650,13 @@ the real per-phase steps are drafted separately, one call per phase.
 
 
 def _reasoning_plan_system_prompt(*, allow_multi_phase: bool) -> str:
+    shared = (
+        f"Tamfis Code coding orchestration contract ({CODING_PROMPT_VERSION}):\n"
+        f"{PLATFORM_SAFETY_INSTRUCTIONS}\n\n{CODING_ORCHESTRATION_INSTRUCTIONS}"
+    )
     if not allow_multi_phase:
-        return _REASONING_PLAN_SYSTEM
-    return _REASONING_PLAN_SYSTEM + "\n\n" + _REASONING_PLAN_MULTI_PHASE_ADDENDUM
+        return shared + "\n\n" + _REASONING_PLAN_SYSTEM
+    return shared + "\n\n" + _REASONING_PLAN_SYSTEM + "\n\n" + _REASONING_PLAN_MULTI_PHASE_ADDENDUM
 
 
 def reasoning_plan_system_prompt() -> str:

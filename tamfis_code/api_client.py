@@ -385,15 +385,27 @@ class RemoteAPIClient:
         model: str = "auto", provider: Optional[str] = None,
         attachments: Optional[list[dict[str, Any]]] = None,
     ) -> dict[str, Any]:
+        # Import lazily: workspace.py imports this client, while the prompt
+        # module is part of the orchestrator package that workspace uses.
+        # Keeping the lookup at the request boundary avoids an import cycle at
+        # CLI startup.
+        from .orchestrator.coding_prompt import CODING_PROMPT_VERSION
+
         # Identify CLI-originated work so the shared Remote service can
         # apply tamfis-code preferences without changing web/chat routing.
         body: dict[str, Any] = {
             "objective": objective,
             "mode": mode,
             "source_client": "tamfis-code",
+            # Lets a compatible remote service select the same orchestration
+            # contract. The local execution path assembles this contract at
+            # its model boundary; older servers safely ignore this metadata.
+            "coding_prompt_version": CODING_PROMPT_VERSION if mode in {"coding", "agent", "execute", "plan", "audit"} else None,
             "model": model or "auto",
             "attachments": attachments or [],
         }
+        if body["coding_prompt_version"] is None:
+            del body["coding_prompt_version"]
         if provider:
             body["provider"] = provider
         if task_id:

@@ -10,6 +10,7 @@ from ..routing import TaskProfile
 from ..workspace import build_system_prompt, discover_local_repository
 from ..openhands.skills import skill_prompt
 from .compression import CacheBoundary, signature_view
+from .coding_prompt import assemble_coding_messages, CODING_PROMPT_VERSION
 
 # Elastic-injection caps (Stage 3): how many recently inspected files may
 # contribute a signature view, and how large each view may be. Small on
@@ -84,6 +85,7 @@ def build_context_bundle(
     recent_tools = state.completed_actions[-8:]
     layers = {
         "policy": static_prefix,
+        "coding_prompt_version": CODING_PROMPT_VERSION,
         "skills": skills,
         "objective": objective,
         "workspace_summary": repository,
@@ -125,7 +127,18 @@ def build_context_bundle(
     # single turn -- the fingerprint/goal/validation evidence changes on
     # every request, and caching is prefix-based.
     volatile_parts = [part for part in (skills, supplemental, signature_text) if part]
-    boundary = CacheBoundary(static_prefix, "\n\n".join(volatile_parts))
+    # The old workspace prompt is retained as the repository/runtime evidence
+    # layer for compatibility.  The shared prompt module supplies the
+    # platform and orchestration layers before it, making precedence explicit
+    # for every provider and every resume/fallback that reuses this bundle.
+    static_messages, prompt_sections = assemble_coding_messages(
+        repository_instructions=static_prefix,
+        session_context="\n\n".join(volatile_parts),
+        conversation_messages=(),
+    )
+    static_prompt = "\n\n".join(str(message["content"]) for message in static_messages[:3])
+    boundary = CacheBoundary(static_prompt, static_messages[3]["content"])
+    layers["prompt_sections"] = [section.name for section in prompt_sections]
     layers["cache_boundary"] = {
         "static_chars": len(boundary.static_prefix),
         "volatile_chars": len(boundary.volatile_suffix),

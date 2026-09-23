@@ -48,6 +48,8 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIsNotNone(run.plan)
             self.assertIsNotNone(run.context)
             self.assertIn("workspace_summary", run.context.layers)
+            self.assertEqual(run.context.layers["coding_prompt_version"], "coding-orchestration-v1")
+            self.assertIn("coding orchestration contract", run.context.messages[0]["content"])
             self.assertEqual(run.phase, AgentPhase.PLAN)
 
     def test_huge_objective_is_not_duplicated_unbounded_into_the_system_prompt(self):

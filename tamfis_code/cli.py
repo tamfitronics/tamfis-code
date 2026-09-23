@@ -52,6 +52,8 @@ from .tasks import find_recent_task
 from .workspace import WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository, find_resumable_session, list_resumable_local_sessions, resolve_local_workspace, resolve_workspace
 from .local_chat import _PROVIDER_ALIASES
 from .public_identity import PUBLIC_MODEL_ALIASES, PUBLIC_MODEL_AUTO, public_model_name, redact_routing_text
+from .orchestrator.coding_prompt import assemble_coding_messages, prompt_diagnostic
+from .workspace import build_system_prompt
 
 # Derived from the real alias table (local_chat.py) rather than hand-typed,
 # so a --provider Choice list can't silently drift out of sync with what
@@ -1259,6 +1261,31 @@ def context_command(ctx: click.Context, refresh: bool):
     console.print(f"Indexed     {context.get('indexed_file_count', 0)} files")
     for path in context.get("instruction_files", []):
         console.print(f"  instruction: {path}")
+
+
+@cli.command(name="prompt-diagnostics")
+@click.option("--session", "session_id_opt", type=int, default=None,
+              help="Use a specific local session when assembling checkpoint context.")
+@click.pass_context
+def prompt_diagnostics_command(ctx: click.Context, session_id_opt: Optional[int]):
+    """Show safe coding-prompt metadata without exposing private prompt data."""
+    config: Config = ctx.obj["config"]
+    root: Path = ctx.obj["workspace_root"]
+    console = Console(no_color=not config.colour)
+    matching = [sid for sid in local_state.all_known_session_ids()
+                if local_state.get_session_state(sid).workspace_root == str(root)]
+    session_id = session_id_opt if session_id_opt is not None else (matching[-1] if matching else 0)
+    repository_prompt = build_system_prompt(session_id, root)
+    messages, sections = assemble_coding_messages(
+        repository_instructions=repository_prompt,
+        session_context="diagnostic-only: checkpoint contents omitted",
+        conversation_messages=[{"role": "user", "content": "[current request redacted]"}],
+    )
+    report = prompt_diagnostic(messages, sections)
+    report["workspace"] = str(root)
+    report["session_id"] = session_id
+    report["note"] = "Content is bounded and redacted; secrets, private payloads, and hidden reasoning are not shown."
+    console.print_json(data=report)
 
 
 @cli.command(name="reports")
