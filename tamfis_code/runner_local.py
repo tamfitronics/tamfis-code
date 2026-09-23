@@ -5177,6 +5177,23 @@ async def _stream_one_completion(
     from .runtime.telemetry import current_provider, span
 
     effective_provider = provider or current_provider()
+    # Every provider request must enter the progress state machine here, at
+    # the one funnel shared by the primary request, planning, reconnects and
+    # cross-provider failover. Previously only the main round loop emitted
+    # this event, so planning/fallback calls looked like a silent RUNNING
+    # task and the watchdog stopped a live fallback chain after 600 seconds.
+    with contextlib.suppress(Exception):
+        renderer.handle_event({
+            "event_type": "provider_request_started",
+            "payload": {
+                "provider": (
+                    effective_provider.value
+                    if isinstance(effective_provider, ProviderType)
+                    else str(effective_provider or "unknown")
+                ),
+                "model": model,
+            },
+        })
     bounded_messages, context_trimmed, context_before, context_after = (
         _prepare_direct_provider_messages(
             messages, provider=effective_provider, model=model, tools=tools,
@@ -8589,11 +8606,6 @@ async def _run_local_agent_turn_impl(
             "event_type": "model_selected",
             "payload": {"provider": resolved_provider.value, "model": resolved_model},
         })
-        renderer.handle_event({
-            "event_type": "provider_request_started",
-            "payload": {"provider": resolved_provider.value, "model": resolved_model, "round": _round + 1},
-        })
-
         checkpoint_partial_parts.clear()
         last_checkpoint_at = 0.0
         _persist_turn_checkpoint()

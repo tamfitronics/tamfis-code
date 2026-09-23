@@ -30,6 +30,7 @@ from tamfis_code import state as state_module
 from tamfis_code.config import Config
 from tamfis_code.live_input import LiveInputListener, strip_terminal_noise
 from tamfis_code.mcp import run_blocking_bounded
+from tamfis_code.providers import ProviderType
 from tamfis_code.render import StreamRenderer
 from tamfis_code.runtime.progress import (
     ExecState, ProgressTracker, StallPolicy, classify_provider_failure,
@@ -75,6 +76,26 @@ class ProgressStateMachineTests(unittest.TestCase):
         tracker.observe("reasoning_delta", {"content": "hm"})
         self.assertEqual(tracker.idle_seconds(), 0)
         self.assertEqual(tracker.state(), ExecState.RUNNING)
+
+    def test_stream_funnel_marks_planning_and_fallback_requests_as_provider_waits(self):
+        """Every direct stream, including planning/failover streams, must
+        enter WAITING_PROVIDER before it can look silent to the watchdog."""
+        renderer = SimpleNamespace(events=[])
+        renderer.handle_event = renderer.events.append
+
+        async def fake_stream(*args, **kwargs):
+            return "ok", [], "stop"
+
+        with patch.object(runner_local, "_stream_one_completion_impl", new=fake_stream):
+            asyncio.run(runner_local._stream_one_completion(
+                object(), model="test-model", messages=[{"role": "user", "content": "x"}],
+                tools=[], renderer=renderer, provider=ProviderType.NVIDIA,
+            ))
+
+        started = [event for event in renderer.events if event.get("event_type") == "provider_request_started"]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(started[0]["payload"]["provider"], "nvidia")
+        self.assertEqual(started[0]["payload"]["model"], "test-model")
 
     def test_tool_batch_counts_down_to_running(self):
         tracker, _ = _tracker()
