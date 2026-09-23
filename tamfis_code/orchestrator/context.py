@@ -136,8 +136,21 @@ def build_context_bundle(
         session_context="\n\n".join(volatile_parts),
         conversation_messages=(),
     )
-    static_prompt = "\n\n".join(str(message["content"]) for message in static_messages[:3])
-    boundary = CacheBoundary(static_prompt, static_messages[3]["content"])
+    # ``assemble_coding_messages`` deliberately preserves provider message
+    # shape and may omit empty context layers.  The old fixed ``[3]`` access
+    # assumed platform, coding, repository, and session messages would always
+    # exist; with an empty optional layer the valid list has only three items,
+    # causing every substantial orchestration request to fail before the
+    # provider was called.  The first two messages are the stable application
+    # and repository prefix; everything after them is volatile per-turn state.
+    stable_count = min(2, len(static_messages))
+    static_prompt = "\n\n".join(
+        str(message.get("content") or "") for message in static_messages[:stable_count]
+    )
+    volatile_prompt = "\n\n".join(
+        str(message.get("content") or "") for message in static_messages[stable_count:]
+    )
+    boundary = CacheBoundary(static_prompt, volatile_prompt)
     layers["prompt_sections"] = [section.name for section in prompt_sections]
     layers["cache_boundary"] = {
         "static_chars": len(boundary.static_prefix),

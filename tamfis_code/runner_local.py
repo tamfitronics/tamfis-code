@@ -2527,7 +2527,42 @@ def _supported_keyword_arguments(method: Any, wanted: dict[str, Any]) -> dict[st
 
 def _is_resume_request(text: str) -> bool:
     """Whether a new prompt explicitly asks to continue prior work."""
-    return bool(_RESUME_REQUEST_RE.match(text.strip()))
+    stripped = text.strip()
+    match = _RESUME_REQUEST_RE.match(stripped)
+    if not match:
+        return False
+
+    # A prefix-only match made every new objective beginning with ``continue``
+    # inherit an old checkpoint.  Keep only suffixes that explicitly describe
+    # checkpoint/plan continuation; substantive suffixes are new objectives.
+    remainder = stripped[match.end():].strip(" \t:,.\u2013-")
+    if not remainder:
+        return True
+    normalized = remainder.casefold()
+    continuation_suffixes = (
+        "from the saved checkpoint",
+        "from saved checkpoint",
+        "from the latest saved checkpoint",
+        "from the latest checkpoint",
+        "latest saved checkpoint",
+        "latest checkpoint",
+        "saved checkpoint",
+        "the interrupted task",
+        "the saved task",
+        "the active plan",
+        "the plan",
+        "with step",
+        "steps",
+        "with steps",
+        "with the next step",
+        "with 1",
+        "with 2",
+        "with 3",
+        "with 4",
+        "with 5",
+        "with 6",
+    )
+    return normalized.startswith(continuation_suffixes)
 
 
 # Next-message suggestions the composer pre-fills (interactive.next_message_suggestion) and the recovery
@@ -4613,7 +4648,10 @@ def _select_public_group_model(
     if not eligible:
         return None
     if provider == ProviderType.NVIDIA:
-        selected = route_stats.rank(eligible)[0]
+        # Route statistics are best-effort bookkeeping.  Keep the filtered
+        # preference list as a safe fallback if ranking returns no rows.
+        ranked = route_stats.rank(eligible)
+        selected = (ranked or eligible)[0]
     else:
         selected = random.choice(eligible)
     normalize = getattr(manager, "normalize_model_for_endpoint", None)
@@ -5618,6 +5656,17 @@ def _resume_snapshot_for_turn(prior_state: Any, objective: str, resume_requested
         return load_resume_snapshot(prior_session_id)
     except Exception:
         return None
+
+
+def _completed_saved_plan(state: Any) -> Optional[dict[str, Any]]:
+    """Return the latest fully completed persisted plan, if one exists."""
+    for plan in reversed(list(getattr(state, "saved_plans", None) or [])):
+        if not isinstance(plan, dict):
+            continue
+        steps = [step for step in (plan.get("steps") or []) if isinstance(step, dict)]
+        if steps and all(str(step.get("status") or "").casefold() == "completed" for step in steps):
+            return plan
+    return None
 
 
 # A recovery suggestion may contain words such as "repair" or "resolve" even
@@ -6977,6 +7026,25 @@ async def _run_local_agent_turn_impl(
     # step keeps its status) and its durable task record instead of resetting
     # them, which is what made a resumed task be re-evaluated from scratch.
     resume_snapshot = _resume_snapshot_for_turn(prior_state, objective, resume_requested)
+    if (
+        resume_requested
+        and _is_machine_generated_objective(incoming_objective)
+        and resume_snapshot is None
+        and _completed_saved_plan(prior_state) is not None
+    ):
+        # A provider can finish the final step and fail while reporting it.
+        # Do not replay the recovery wrapper as a fresh coding request or
+        # attempt to address a non-existent next step.
+        summary = "The saved plan is already complete; no further work was started."
+        renderer.handle_event({
+            "event_type": "diagnostics",
+            "payload": {"content": summary},
+        })
+        renderer.handle_event({
+            "event_type": "ai_task_completed",
+            "payload": {"status": "completed", "summary": summary, "validation": {"passed": True}},
+        })
+        return TaskOutcome(status="completed", summary=summary)
     orchestration = orchestrator.begin(
         objective=objective, messages=messages, read_only=read_only,
         restore=resume_snapshot,
@@ -7016,10 +7084,18 @@ async def _run_local_agent_turn_impl(
     # heuristic INSPECT/AUDIT/PLAN classification is not, and can be
     # corrected by the escalation path below when the objective itself
     # turns out to request action.
+    # A prior interactive audit/plan mode can pass ``read_only=True`` into a
+    # follow-up that explicitly requests delivery (for example, ``git add``
+    # and ``git commit``).  That request must reach the ordinary permission /
+    # approval path instead of being rejected by the shell inspection guard.
+    # An explicit read-only/no-edit instruction remains absolute; a CLI-level
+    # mode with a contradictory mutation request is still surfaced through
+    # the normal escalation path rather than silently auto-approved.
+    explicit_read_only_request = is_explicit_read_only_request(objective)
     user_requested_read_only = (
-        inferred_read_only
-        or (resume_plan_read_only and not resume_plan_mutating)
-        or is_explicit_read_only_request(objective)
+        explicit_read_only_request
+        or (read_only and not interactive)
+        or (resume_plan_read_only and not resume_plan_mutating and not is_mutation_request(objective))
     )
     _read_only_reject_count = 0
     selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)

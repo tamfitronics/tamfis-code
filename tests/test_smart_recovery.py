@@ -10,7 +10,8 @@ from tamfis_code.orchestrator.validator import changed_paths_from_evidence
 from tamfis_code.return_recap import _first_sentences, _strip_context_chain, build_return_recap
 from tamfis_code.runner_local import (
     _checkpoint_resume_objective, _is_machine_generated_objective, _is_real_resume_objective, _is_resume_request,
-    _enum_wire_value, _normalize_provider_type, _resume_instruction_for_model, _resume_step_contract, _resume_step_is_read_only,
+    _completed_saved_plan, _enum_wire_value, _normalize_provider_type, _resume_instruction_for_model,
+    _resume_step_contract, _resume_step_is_read_only,
 )
 
 
@@ -31,6 +32,23 @@ class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
         self.assertTrue(_is_real_resume_objective("Fix the TypeError in serve2.py streaming"))
         self.assertFalse(_is_real_resume_objective("clear"))
         self.assertFalse(_is_real_resume_objective("/clear"))
+
+    def test_continue_with_a_new_objective_is_not_a_checkpoint_resume(self):
+        self.assertFalse(_is_resume_request("continue full finitron codebase improvement"))
+        self.assertTrue(_is_resume_request("Continue the interrupted task from the latest saved checkpoint"))
+        self.assertTrue(_is_resume_request("continue with steps 1 and 2"))
+
+    def test_completed_saved_plan_is_detected_without_indexing_a_next_step(self):
+        from types import SimpleNamespace
+
+        plan = {"id": "plan-1", "steps": [
+            {"step": "Inspect files", "status": "completed"},
+            {"step": "Run tests", "status": "completed"},
+        ]}
+        self.assertEqual(_completed_saved_plan(SimpleNamespace(saved_plans=[plan])), plan)
+        self.assertIsNone(_completed_saved_plan(SimpleNamespace(saved_plans=[{
+            "steps": [{"step": "Run tests", "status": "pending"}],
+        }])))
 
 
     def test_a_submitted_suggestion_does_not_replace_or_snowball_the_real_task(self):

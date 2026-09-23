@@ -48,7 +48,8 @@ class OrchestratorTests(unittest.TestCase):
             self.assertIsNotNone(run.plan)
             self.assertIsNotNone(run.context)
             self.assertIn("workspace_summary", run.context.layers)
-            self.assertEqual(run.context.layers["coding_prompt_version"], "coding-orchestration-v1")
+            from tamfis_code.orchestrator.coding_prompt import CODING_PROMPT_VERSION
+            self.assertEqual(run.context.layers["coding_prompt_version"], CODING_PROMPT_VERSION)
             self.assertIn("coding orchestration contract", run.context.messages[0]["content"])
             self.assertEqual(run.phase, AgentPhase.PLAN)
 
