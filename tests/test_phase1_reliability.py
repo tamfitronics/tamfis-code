@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 from pathlib import Path
 
 import pytest
@@ -92,3 +93,31 @@ async def test_atomic_write_replaces_existing_file_without_temp_leak(tmp_path: P
     assert result.startswith("✅")
     assert target.read_text(encoding="utf-8") == "after"
     assert not list(tmp_path.glob(".data.txt.*.tmp"))
+
+
+@pytest.mark.asyncio
+async def test_live_agent_refuses_unverified_source_replacement(tmp_path: Path):
+    target = tmp_path / "module.py"
+    target.write_text("def keep():\n    return 1\n", encoding="utf-8")
+    server = MCPServer(workspace_root=str(tmp_path), session_id=42)
+    result = await server._write_file("module.py", content="def replace():\n    return 2\n")
+
+    assert "Refused unverified" in result
+    assert target.read_text(encoding="utf-8") == "def keep():\n    return 1\n"
+
+
+@pytest.mark.asyncio
+async def test_live_agent_allows_source_replacement_only_for_matching_diagnostic_digest(tmp_path: Path):
+    target = tmp_path / "module.py"
+    original = "def keep():\n    return 1\n"
+    target.write_text(original, encoding="utf-8")
+    server = MCPServer(workspace_root=str(tmp_path), session_id=42)
+
+    result = await server._write_file(
+        "module.py",
+        content="def replace():\n    return 2\n",
+        expected_sha256=hashlib.sha256(original.encode()).hexdigest(),
+    )
+
+    assert result.startswith("✅")
+    assert "def replace" in target.read_text(encoding="utf-8")

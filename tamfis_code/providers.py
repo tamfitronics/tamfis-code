@@ -686,9 +686,12 @@ class ProviderManager:
     # available fallback weights are normalized into the remaining 15%.
     AUTO_PROVIDER_WEIGHTS: dict[ProviderType, int] = {
         ProviderType.NVIDIA: 85,
-        ProviderType.OLLAMA_CLOUD: 3,
-        ProviderType.HF: 4,
-        ProviderType.OPENROUTER: 2,
+        # OpenRouter's :free pool is the preferred no-cost fallback after
+        # NIM. select_model() still chooses only free members under economy
+        # policy, so this does not turn automatic routing into paid traffic.
+        ProviderType.OPENROUTER: 10,
+        ProviderType.HF: 3,
+        ProviderType.OLLAMA_CLOUD: 2,
     }
 
     # Per-model context overrides. ProviderConfig.context_window is a
@@ -2292,6 +2295,7 @@ class ProviderManager:
         allow_fallback: bool = True,
         _nim_tried_key_indices: Optional[set[int]] = None,
         _nim_key_index_override: Optional[int] = None,
+        _openrouter_tried_models: Optional[set[str]] = None,
         _context_safety_margin: float = 0.75,
         _context_retry: bool = False,
         **kwargs: Any,
@@ -2346,6 +2350,9 @@ class ProviderManager:
             )
         )
         selected_model = self.normalize_model_for_endpoint(resolved, selected_model)
+        openrouter_tried_models = set(_openrouter_tried_models or ())
+        if resolved == ProviderType.OPENROUTER:
+            openrouter_tried_models.add(selected_model)
 
         request_kwargs: Dict[str, Any] = {
             "model": selected_model,
@@ -2534,6 +2541,7 @@ class ProviderManager:
                     allow_fallback=allow_fallback,
                     _nim_tried_key_indices=_nim_tried_key_indices,
                     _nim_key_index_override=_nim_key_index_override,
+                    _openrouter_tried_models=openrouter_tried_models,
                     _context_safety_margin=0.40,
                     _context_retry=True,
                     **kwargs,
@@ -2592,6 +2600,52 @@ class ProviderManager:
             # exhausted (or for failures that are not account quota/rate
             # limits).
             self.record_route_failure(resolved, selected_model, exc, stream=stream)
+
+            # OpenRouter's :free routes are independent upstream hosts. A
+            # busy host should rotate to the next healthy free model inside
+            # the same request before abandoning the entire OpenRouter pool.
+            # This is bounded to one pass through the configured pool and is
+            # used only for automatic selection; an explicit model pin keeps
+            # its existing fail-fast semantics.
+            if (
+                resolved == ProviderType.OPENROUTER
+                and str(model or "").lower() in {"", "auto", "default"}
+                and selected_model in set(config.free_models or ())
+                and self.is_quota_or_rate_limit_error(exc)
+            ):
+                candidates = [
+                    candidate for candidate in config.free_models
+                    if candidate not in openrouter_tried_models
+                    and self.route_is_healthy(ProviderType.OPENROUTER, candidate)
+                ]
+                if candidates:
+                    next_model = self.select_free_model(
+                        ProviderConfig(
+                            **{**config.__dict__, "free_models": candidates, "free_model": candidates[0]}
+                        )
+                    )
+                    if next_model:
+                        logger.warning(
+                            "[openrouter] Free route %s unavailable; rotating to %s",
+                            selected_model,
+                            next_model,
+                        )
+                        async for chunk in self.chat_completion(
+                            ProviderType.OPENROUTER,
+                            messages,
+                            model=None,
+                            stream=stream,
+                            temperature=temperature,
+                            max_tokens=max_tokens,
+                            reasoning_effort=reasoning_effort,
+                            task_profile=task_profile,
+                            allow_fallback=allow_fallback,
+                            _openrouter_tried_models=openrouter_tried_models,
+                            _context_safety_margin=_context_safety_margin,
+                            **kwargs,
+                        ):
+                            yield chunk
+                        return
 
             # FIX 2026-08-07: `provider != ProviderType.AUTO` used to block
             # fallback entirely whenever a specific provider was resolved

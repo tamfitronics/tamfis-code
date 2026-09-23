@@ -543,15 +543,16 @@ def test_unavailable_premium_ollama_is_removed_from_weighted_auto(monkeypatch):
 
 def test_auto_uses_next_low_cost_provider_when_nim_is_unavailable():
     # With NIM unavailable, the remaining AUTO_PROVIDER_WEIGHTS are drawn
-    # from directly (HF:4 vs OPENROUTER:2) rather than deterministically
-    # picking priority order -- HF should still win a clear majority.
+    # directly (OPENROUTER:10 vs HF:3) rather than deterministically picking
+    # priority order -- the configured free OpenRouter pool should win a clear
+    # majority without becoming the NIM primary.
     manager = _manager_with(ProviderType.OPENROUTER, ProviderType.HF)
     ProviderManager.reset_runtime_routing_state()
     profile = classify_task("fix and refactor the code")
     n = 2000
     selected = [manager._select_best_provider(profile) for _ in range(n)]
     hf_share = selected.count(ProviderType.HF) / n
-    assert 0.55 <= hf_share <= 0.78
+    assert 0.70 <= (1 - hf_share) <= 0.85
     assert ProviderType.OPENROUTER in selected
 
 

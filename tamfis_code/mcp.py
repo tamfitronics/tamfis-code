@@ -3,6 +3,7 @@
 from typing import Dict, Any, List, Optional, Callable
 from dataclasses import dataclass
 import contextlib
+import hashlib
 import html
 import json
 import os
@@ -643,6 +644,8 @@ class MCPServer:
                 "an append or partial update -- any existing content at `path` not included in "
                 "`content` is gone. To change only part of an existing file, use edit_file "
                 "instead so the rest of the file (and any concurrent, unrelated edits) survives. "
+                "For an existing source file, the live agent must first diagnose/read it and provide "
+                "expected_sha256; unverified full replacement is refused. "
                 "Use the extension the language and project actually use -- never '.txt' for code. "
                 "For a LARGE document, NEVER send it in one call: your arguments are bounded by "
                 "your own output token limit, and a call much over roughly 6,000 characters of "
@@ -664,6 +667,10 @@ class MCPServer:
                             "the end of the existing file -- use it to continue a large "
                             "document in a second call."
                         ),
+                    },
+                    "expected_sha256": {
+                        "type": "string",
+                        "description": "SHA-256 of the existing source file after diagnostic read; required for live full replacement",
                     },
                 },
                 "required": ["path", "content"]
@@ -710,8 +717,8 @@ class MCPServer:
                 "context in old_string to make the match unambiguous. Read the file (or the "
                 "relevant range) first and copy whitespace exactly; after editing, re-read the "
                 "changed region and run the project's checks to confirm the edit does what you "
-                "intended. Use write_file instead for creating a brand-new file or replacing "
-                "one's entire contents."
+                "intended. Use write_file instead for creating a brand-new file. Full replacement "
+                "of an existing source file is refused by the live agent unless expected_sha256 is verified."
             ),
             parameters={
                 "type": "object",
@@ -719,6 +726,8 @@ class MCPServer:
                     "path": {"type": "string", "description": "File path"},
                     "old_string": {"type": "string", "description": "Exact text to replace (must match exactly once)"},
                     "new_string": {"type": "string", "description": "Replacement text"},
+                    "content": {"type": "string", "description": "Full replacement content for a new file or verified source replacement"},
+                    "expected_sha256": {"type": "string", "description": "SHA-256 from the diagnostic read of the existing file"},
                 },
                 "required": ["path", "old_string", "new_string"],
             },
@@ -1851,6 +1860,44 @@ class MCPServer:
                 os.unlink(temp_name)
             raise
 
+    @staticmethod
+    def _is_source_file(path: Path) -> bool:
+        return path.suffix.lower() in {
+            ".py", ".pyi", ".js", ".jsx", ".ts", ".tsx", ".java", ".go",
+            ".rs", ".rb", ".php", ".c", ".cc", ".cpp", ".h", ".hpp", ".cs",
+            ".swift", ".kt", ".kts", ".scala", ".sql", ".sh", ".bash", ".zsh",
+            ".css", ".scss", ".html", ".vue", ".svelte", ".toml", ".yaml", ".yml",
+            ".json",
+        }
+
+    def _reject_unverified_source_replacement(
+        self, path: Path, original_content: Optional[str], expected_sha256: Optional[str], *, operation: str,
+    ) -> Optional[str]:
+        """Prevent an agent turn from blindly replacing an existing source file.
+
+        A full replacement is safe for a new file, but dangerous for an existing
+        source file because a truncated or stale model response can erase
+        unrelated code. The live agent must provide the digest obtained during
+        its diagnostic read; targeted ``edit_file`` remains the normal path.
+        Bare MCP callers/tests retain the low-level API for compatibility.
+        """
+        if self.session_id is None or original_content is None or not self._is_source_file(path):
+            return None
+        actual = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
+        supplied = str(expected_sha256 or "").strip().lower()
+        if not supplied:
+            return (
+                f"❌ Refused unverified {operation} of existing source file '{path}'. "
+                "Read/diagnose it first and provide expected_sha256, or use edit_file "
+                "with an exact unique old_string; no existing code was changed."
+            )
+        if supplied != actual:
+            return (
+                f"❌ Refused stale {operation} of '{path}': expected_sha256 does not match "
+                "the current file. Re-read and re-diagnose it; no existing code was changed."
+            )
+        return None
+
     async def _write_file(
         self, path: str, content: str | None = None, mode: str | None = None,
         **aliases: Any,
@@ -1871,6 +1918,12 @@ class MCPServer:
         append = str(mode or "write").strip().lower() == "append"
         p = self._resolve_in_workspace(path)
         original_content = p.read_text(encoding="utf-8", errors="ignore") if p.is_file() else None
+        if not append:
+            guard_error = self._reject_unverified_source_replacement(
+                p, original_content, aliases.pop("expected_sha256", None), operation="write"
+            )
+            if guard_error:
+                return guard_error
         if append and original_content is not None:
             content = original_content + content
         self._atomic_write_text(p, content)
@@ -1922,7 +1975,10 @@ class MCPServer:
         full_content = aliases.pop("content", None)
         full_content = full_content if full_content is not None else aliases.pop("new_content", None)
         if full_content is not None and old_string is None:
-            return await self._write_file(path, content=full_content)
+            return await self._write_file(
+                path, content=full_content,
+                expected_sha256=aliases.pop("expected_sha256", None),
+            )
         if old_string is None or new_string is None:
             return "❌ Error: edit_file requires old_string and new_string, or content for full replacement"
         p = self._resolve_in_workspace(path)
