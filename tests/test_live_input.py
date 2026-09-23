@@ -299,6 +299,13 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         buffer.suggestion = Suggestion("Continue the verified task")
         self.assertEqual(composer_placeholder(buffer), "")
 
+    def test_message_box_placeholder_yields_to_typed_text(self):
+        from prompt_toolkit.buffer import Buffer
+
+        buffer = Buffer()
+        buffer.text = "typed request"
+        self.assertEqual(composer_placeholder(buffer), "")
+
     def test_rules_span_the_terminal_width(self):
         from tamfis_code.live_input import composer_rule_html
 

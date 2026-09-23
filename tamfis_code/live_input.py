@@ -151,10 +151,16 @@ def composer_rule_html() -> str:
 
 
 def composer_placeholder(buffer: Any) -> Any:
-    """Show the faint composer hint only when no ghost suggestion is active."""
-    return "" if getattr(buffer, "suggestion", None) is not None else HTML(
-        f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"
-    )
+    """Show the faint hint only for a genuinely empty composer.
+
+    Prompt-toolkit can render the placeholder and a ghost suggestion in the
+    same frame. It can also keep the placeholder visible after the user has
+    started typing unless the callback checks the buffer explicitly. In both
+    cases the hint must yield to real input.
+    """
+    if getattr(buffer, "text", "") or getattr(buffer, "suggestion", None) is not None:
+        return ""
+    return HTML(f"<ansibrightblack>{MESSAGE_PLACEHOLDER}</ansibrightblack>")
 
 
 def _right_chip(session_id: Optional[int] = None, active_agents: int = 0) -> str:

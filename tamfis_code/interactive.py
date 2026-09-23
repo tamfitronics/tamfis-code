@@ -780,12 +780,12 @@ class _NextMessageAutoSuggest(AutoSuggest):
 
 
 def composer_placeholder(buffer: Any) -> Any:
-    """Show the faint composer hint only when no ghost suggestion is active."""
+    """Show the faint hint only while the composer is completely empty."""
     from .live_input import MESSAGE_PLACEHOLDER
 
-    return "" if getattr(buffer, "suggestion", None) is not None else HTML(
-        f"<ansigray>{MESSAGE_PLACEHOLDER}</ansigray>"
-    )
+    if getattr(buffer, "text", "") or getattr(buffer, "suggestion", None) is not None:
+        return ""
+    return HTML(f"<ansibrightblack>{MESSAGE_PLACEHOLDER}</ansibrightblack>")
 
 
 def _seed_next_message_suggestion(
