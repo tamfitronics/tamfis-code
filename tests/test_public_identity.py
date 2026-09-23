@@ -22,6 +22,8 @@ PRIVATE_MARKERS = ("ollama", "hugging", "openrouter", "nvidia", "kimi", "qwen")
 
 def test_public_aliases_parse_in_short_and_branded_forms():
     assert parse_public_model_alias("auto") == PUBLIC_MODEL_AUTO
+    assert parse_public_model_alias("finitron-auto") == PUBLIC_MODEL_AUTO
+    assert parse_public_model_alias("finitron-ultima") == PUBLIC_MODEL_ULTIMA
     assert parse_public_model_alias("TamfisGPT-fast") == PUBLIC_MODEL_SMART  # legacy alias
     assert parse_public_model_alias("PRO") == PUBLIC_MODEL_PRO
     assert parse_public_model_alias("ultra") == PUBLIC_MODEL_ULTRA

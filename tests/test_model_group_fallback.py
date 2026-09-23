@@ -90,8 +90,8 @@ def test_fallback_diagnostic_names_model_groups_not_generic_provider():
     )
 
     assert message == (
-        "TamfisGPT-Pro unavailable for this turn (HTTP 429); "
-        "falling back to TamfisGPT-Ultima."
+        "finitron-pro unavailable for this turn (HTTP 429); "
+        "falling back to finitron-ultima."
     )
     assert "Provider TamfisGPT" not in message
 

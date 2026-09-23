@@ -172,7 +172,7 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         rendered = "".join(text for _style, text in fragments)
 
         self.assertIn("ready", rendered)
-        self.assertIn("TamfisGPT-Ultra", rendered)
+        self.assertIn("finitron-ultra", rendered)
         self.assertNotIn("ollama", rendered.lower())
         self.assertIn("⏵⏵ manual", rendered)
         self.assertIn("shift+tab", rendered)
@@ -249,19 +249,19 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         # status is ABOVE the input, not packed into the footer under a box.
         renderer = StreamRenderer(_console())
         renderer._phase = "validate"
-        renderer._model = "TamfisGPT-Pro"
+        renderer._model = "finitron-pro"
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
         listener._status_tick = 2
         message = self._message_text(listener)
 
         self.assertIn("✶", message)  # star glyph for tick 2 (Claude Code's "✢ Mustering…")
         self.assertTrue(any(word in message for word in ("Evaluating", "Checking", "Verifying")))
-        self.assertIn("TamfisGPT-Pro", message)
+        self.assertIn("finitron-pro", message)
         self.assertRegex(message, r"\(\d.*\)")  # "(5m 45s · ...)" timing block
         # ...and none of it is in the footer any more.
         footer = self._toolbar_text(listener)
         self.assertNotIn("✶", footer)
-        self.assertNotIn("TamfisGPT-Pro", footer)
+        self.assertNotIn("finitron-pro", footer)
 
     def test_the_composer_is_split_status_and_tip_above_rules_around_the_input_mode_below(self):
         renderer = StreamRenderer(_console())

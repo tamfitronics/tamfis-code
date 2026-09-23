@@ -24,7 +24,7 @@ PLAN = [
 
 def _renderer():
     renderer = StreamRenderer(_console())
-    renderer._model = "TamfisGPT-Ultra"
+    renderer._model = "finitron-ultra"
     return renderer
 
 

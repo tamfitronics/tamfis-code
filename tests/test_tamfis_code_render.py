@@ -178,7 +178,7 @@ class StreamRendererTests(unittest.TestCase):
         renderer.handle_event(event)
         renderer.handle_event(event)
 
-        self.assertEqual(console.file.getvalue().count("Using TamfisGPT"), 1)
+        self.assertEqual(console.file.getvalue().count("Using finitron"), 1)
 
     def test_read_tools_show_only_a_compact_progress_line(self):
         console = _console()
@@ -661,7 +661,7 @@ class StreamRendererTests(unittest.TestCase):
         self.assertNotIn("Workspace rescanned", output)
         # The route is visible, but branded -- the raw backend/model id
         # ("nvidia · x") must never reach the user.
-        self.assertIn(f"Using {BRANDED_PROVIDER_LABEL}", output)
+        self.assertIn("Using finitron", output)
         self.assertNotIn("nvidia", output)
         self.assertEqual(renderer._selected_provider, "TamfisGPT")
 
@@ -676,7 +676,7 @@ class StreamRendererTests(unittest.TestCase):
         )
         output = console.file.getvalue()
         self.assertIn("Runtime: standalone", output)
-        self.assertIn("Model: TamfisGPT-Auto", output)
+        self.assertIn("Model: finitron-auto", output)
         self.assertNotIn("ollama", output.lower())
         self.assertNotIn("Host: local:auto", output)
 
@@ -690,7 +690,7 @@ class StreamRendererTests(unittest.TestCase):
         output = console.file.getvalue()
         self.assertIn("Focused workspace scope", output)
         self.assertIn("Reusing workspace context", output)
-        self.assertIn("Model: TamfisGPT-Ultra", output)
+        self.assertIn("Model: finitron-ultra", output)
 
     def test_model_selected_with_empty_model_shows_provider_default_not_unknown(self):
         # Tier IV/NIM routes leave the resolved model blank by design
@@ -703,7 +703,7 @@ class StreamRendererTests(unittest.TestCase):
         renderer.handle_event({"event_type": "model_selected", "payload": {"provider": "nvidia_nim", "model": "", "selection_reason": "r"}})
         output = console.file.getvalue()
         self.assertNotIn("unknown", output)
-        self.assertIn("TamfisGPT-Auto", output)
+        self.assertIn("finitron-auto", output)
 
     def test_approval_required_uses_top_level_command_text_not_nested_object(self):
         # Regression guard: the real backend payload for approval_required

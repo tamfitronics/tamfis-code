@@ -1143,7 +1143,7 @@ class StandaloneInfoCommandTests(_CliConfigIsolationMixin, unittest.TestCase):
             result = self.runner.invoke(cli, ["providers"])
         self.assertEqual(result.exit_code, 0, result.output)
         self.assertEqual(result.output.count("Status"), 1)
-        self.assertIn("TamfisGPT-Auto", result.output)
+        self.assertIn("finitron-auto", result.output)
 
     def test_doctor_reports_local_session_diagnostics_by_default(self):
         # `doctor` (no --remote) used to stop at the provider connectivity

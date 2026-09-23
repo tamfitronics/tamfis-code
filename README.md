@@ -204,12 +204,13 @@ Job status is one of `running`, `completed`, `failed`, or `stopped`. `--bg`
 is not available while creating a plan (the completed plan must first be
 saved locally), but a saved plan can be launched with `execute-plan --bg`.
 
-## TamfisGPT models
+## Finitron models
 
-Users select stable product aliases: **TamfisGPT Auto**, **TamfisGPT Fast**,
-**TamfisGPT Code**, **TamfisGPT Pro**, and **TamfisGPT Vision**. Use
-`/model list` in the interactive REPL, or pass `--model auto|fast|code|pro|vision`.
-TamfisGPT Auto is the default and chooses the appropriate model for the task.
+Users select stable product aliases: **finitron-auto**, **finitron-smart**,
+**finitron-pro**, **finitron-ultra**, and **finitron-ultima**. Use
+`/model list` in the interactive REPL, or pass `--model auto|smart|pro|ultra|ultima`.
+`finitron-auto` is the default and chooses the appropriate free-first model for
+the task.
 
 Reasoning effort is adaptive by default: complex debugging, architecture, and
 multi-component changes use deeper reasoning, while routine requests retain

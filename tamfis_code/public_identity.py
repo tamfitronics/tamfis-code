@@ -24,11 +24,11 @@ from .model_registry import MODELS as _MODEL_REGISTRY
 
 
 PUBLIC_PROVIDER_NAME = "TamfisGPT"
-PUBLIC_MODEL_AUTO = "TamfisGPT-Auto"
-PUBLIC_MODEL_SMART = "TamfisGPT-Smart"
-PUBLIC_MODEL_PRO = "TamfisGPT-Pro"
-PUBLIC_MODEL_ULTRA = "TamfisGPT-Ultra"
-PUBLIC_MODEL_ULTIMA = "TamfisGPT-Ultima"
+PUBLIC_MODEL_AUTO = "finitron-auto"
+PUBLIC_MODEL_SMART = "finitron-smart"
+PUBLIC_MODEL_PRO = "finitron-pro"
+PUBLIC_MODEL_ULTRA = "finitron-ultra"
+PUBLIC_MODEL_ULTIMA = "finitron-ultima"
 
 # FIX 2026-08-11: the TAMFIS provider's real per-tier catalog ids (see
 # providers.py's ProviderConfig.models for ProviderType.TAMFIS) -- added
@@ -76,6 +76,13 @@ _PUBLIC_MODEL_INPUTS = {
     "fast": PUBLIC_MODEL_SMART,
     "code": PUBLIC_MODEL_PRO,
     "vision": PUBLIC_MODEL_ULTRA,
+    # Canonical Finitron labels shown by the CLI. Keep the short names above
+    # and the historical TamfisGPT spellings accepted for compatibility.
+    "finitron auto": PUBLIC_MODEL_AUTO,
+    "finitron smart": PUBLIC_MODEL_SMART,
+    "finitron pro": PUBLIC_MODEL_PRO,
+    "finitron ultra": PUBLIC_MODEL_ULTRA,
+    "finitron ultima": PUBLIC_MODEL_ULTIMA,
 }
 
 _PROVIDER_RE = re.compile(
@@ -182,8 +189,10 @@ def model_is_within_public_group(
 def parse_public_model_alias(value: Any) -> str | None:
     """Return the canonical public alias when *value* names one."""
     normalized = re.sub(r"[ _-]+", " ", str(value or "").strip().lower())
-    if normalized.startswith("tamfisgpt "):
-        normalized = normalized.removeprefix("tamfisgpt ")
+    for prefix in ("tamfisgpt ", "finitron "):
+        if normalized.startswith(prefix):
+            normalized = normalized.removeprefix(prefix)
+            break
     return _PUBLIC_MODEL_INPUTS.get(normalized)
 
 

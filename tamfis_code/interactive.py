@@ -2405,10 +2405,10 @@ async def _run_interactive_impl(
                 table.add_column("STATUS")
                 uses = {
                     PUBLIC_MODEL_AUTO: "Automatic selection",
-                    "TamfisGPT-Smart": "Low-latency, low-cost tasks",
-                    "TamfisGPT-Pro": "Everyday coding and agent tasks",
-                    "TamfisGPT-Ultra": "Heavy multi-file / tool-heavy work",
-                    "TamfisGPT-Ultima": "Frontier reasoning -- top subscription tier only",
+                    "finitron-smart": "Low-latency, low-cost tasks",
+                    "finitron-pro": "Everyday coding and agent tasks",
+                    "finitron-ultra": "Heavy multi-file / tool-heavy work",
+                    "finitron-ultima": "Frontier reasoning -- top subscription tier only",
                 }
                 if standalone:
                     # No TamfisGPT subscription applies to a standalone (BYOK)
@@ -2448,7 +2448,7 @@ async def _run_interactive_impl(
                 if parts[0].lower() == "auto":
                     provider_type = ProviderType.AUTO
                     local_state.save_session_state(workspace.session_id, selected_model="auto", selected_provider=None)
-                    console.print("[green]Model set to TamfisGPT-Auto.[/green]")
+                    console.print("[green]Model set to finitron-auto.[/green]")
                     continue
                 try:
                     provider_type = _resolve_provider_type(parts[0])
@@ -2471,7 +2471,7 @@ async def _run_interactive_impl(
                 local_state.save_session_state(
                     workspace.session_id, selected_model="auto", selected_provider=None,
                 )
-                console.print("[green]Model set to TamfisGPT-Auto.[/green]")
+                console.print("[green]Model set to finitron-auto.[/green]")
                 continue
             route = parts[0].lower()
             if route not in ("hf", "openrouter", "ollama_cloud", "nvidia", "nvidia_nim", "gemini", "apiframe"):
