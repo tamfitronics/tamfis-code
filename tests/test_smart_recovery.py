@@ -10,7 +10,7 @@ from tamfis_code.orchestrator.validator import changed_paths_from_evidence
 from tamfis_code.return_recap import _first_sentences, _strip_context_chain, build_return_recap
 from tamfis_code.runner_local import (
     _checkpoint_resume_objective, _is_machine_generated_objective, _is_real_resume_objective, _is_resume_request,
-    _completed_saved_plan, _enum_wire_value, _normalize_provider_type, _resume_instruction_for_model,
+    _completed_saved_plan, _enum_wire_value, _is_git_delivery_command, _normalize_provider_type, _resume_instruction_for_model,
     _resume_step_contract, _resume_step_is_read_only,
 )
 
@@ -49,6 +49,12 @@ class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
         self.assertIsNone(_completed_saved_plan(SimpleNamespace(saved_plans=[{
             "steps": [{"step": "Run tests", "status": "pending"}],
         }])))
+
+    def test_resumed_git_delivery_uses_approval_path_but_chains_stay_blocked(self):
+        self.assertTrue(_is_git_delivery_command("git add wp-content/plugin.php"))
+        self.assertTrue(_is_git_delivery_command("git commit -m 'verified fix'"))
+        self.assertFalse(_is_git_delivery_command("git add . && git commit -m fix"))
+        self.assertFalse(_is_git_delivery_command("git status --short"))
 
 
     def test_a_submitted_suggestion_does_not_replace_or_snowball_the_real_task(self):

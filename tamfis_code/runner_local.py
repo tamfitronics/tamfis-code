@@ -2565,6 +2565,14 @@ def _is_resume_request(text: str) -> bool:
     return normalized.startswith(continuation_suffixes)
 
 
+def _is_git_delivery_command(command: str) -> bool:
+    """Recognise one unchained Git delivery command for resume escalation."""
+    value = (command or "").strip()
+    if any(operator in value for operator in ("&&", "||", ";", "|", ">", "<", "`", "$(")):
+        return False
+    return bool(re.match(r"^git\s+(?:add|commit|push|tag|mv|rm)\b", value, re.IGNORECASE))
+
+
 # Next-message suggestions the composer pre-fills (interactive.next_message_suggestion) and the recovery
 # machinery's own wording. Submitted once, they used to be treated as the user's OBJECTIVE and carried into
 # every later resume as "Additional user context: ...", snowballing until the real task (fix the TypeError in
@@ -11150,10 +11158,17 @@ async def _run_local_agent_turn_impl(
                             ),
                         })
                         continue
+            command_text = str(arguments.get("command") or "")
+            resume_delivery_mutation = (
+                resume_requested
+                and not user_requested_read_only
+                and _is_git_delivery_command(command_text)
+            )
             if (
                 turn_read_only
                 and tc.name == "execute_command"
-                and classify_command_risk(str(arguments.get("command") or "")) != RISK_READ_ONLY
+                and classify_command_risk(command_text) != RISK_READ_ONLY
+                and not resume_delivery_mutation
             ):
                 result = {
                     "success": False,
@@ -11196,7 +11211,7 @@ async def _run_local_agent_turn_impl(
                 if (
                     _read_only_reject_count < 2
                     and not user_requested_read_only
-                    and is_mutation_request(objective)
+                    and (is_mutation_request(objective) or resume_delivery_mutation)
                 ):
                     _read_only_reject_count += 1
                     turn_read_only = False
