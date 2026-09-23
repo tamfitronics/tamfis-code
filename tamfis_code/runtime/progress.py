@@ -82,7 +82,10 @@ class StallPolicy:
     """
 
     provider_warn: float = 45.0
-    provider_abort: float = 240.0
+    # A dead provider must not hold an interactive task for four minutes.
+    # Request-level timeouts and route fallback should normally resolve first;
+    # this watchdog is the last-resort bound when cancellation is ineffective.
+    provider_abort: float = 90.0
     # Nothing at all (no token, no tool start/finish, no event) for this long while NOT waiting on
     # the model, a tool or the user. Every legitimate operation in that gap (context compaction,
     # planning, hooks) is bounded by its own timeouts well under this; a run silent for longer than

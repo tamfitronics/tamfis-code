@@ -51,6 +51,9 @@ def _tracker(warn=45.0, abort=240.0):
 
 
 class ProgressStateMachineTests(unittest.TestCase):
+    def test_default_provider_abort_is_bounded_for_interactive_tasks(self):
+        self.assertEqual(StallPolicy().provider_abort, 90.0)
+
     def test_waiting_provider_becomes_stalled_then_abortable(self):
         tracker, clock = _tracker(warn=45, abort=240)
         tracker.observe("task_started")
