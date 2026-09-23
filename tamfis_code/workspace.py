@@ -1091,6 +1091,26 @@ def _discover_project_type_unchecked(workspace_root: Path) -> dict[str, Any]:
     except OSError:
         root_python = False
     if root_python:
+        # A launch directory can contain an unrelated helper script beside
+        # several real projects (for example /srv/wp-sites/site-a and
+        # /srv/wp-sites/site-b).  Treating that container as Python makes
+        # detect_validation_commands emit `compileall .` for every child
+        # scope, including PHP/WordPress sites.  A manifest-less directory
+        # with recognized project children is a container, not a Python app;
+        # real Python roots were already accepted above via their manifest.
+        try:
+            child_project = any(
+                child.is_dir()
+                and any(
+                    (child / marker).exists()
+                    for marker in (_PROJECT_MARKER_NAMES - {".git"})
+                )
+                for child in root.iterdir()
+            )
+        except OSError:
+            child_project = False
+        if child_project:
+            return result("unknown", package_manager=None)
         return result("Python", package_manager="pip")
 
     # Node.js / JavaScript / TypeScript.

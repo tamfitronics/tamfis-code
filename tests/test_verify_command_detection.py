@@ -82,6 +82,22 @@ class DetectVerifyCommandTests(unittest.TestCase):
                 commands = dict(detect_validation_commands(root))
             self.assertIn("python -m compileall -q .", commands.values())
 
+    def test_manifestless_project_container_does_not_inherit_python_compileall(self):
+        """A stray root script must not turn sibling WordPress sites into Python projects."""
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "operator_helper.py").write_text("print('not the project')\n")
+            for name in ("site-a", "site-b"):
+                site = root / name
+                site.mkdir()
+                (site / "wp-config.php").write_text("<?php\n")
+                (site / "index.php").write_text("<?php\n")
+
+            commands = dict(detect_validation_commands(root))
+
+        self.assertNotIn("python3 -m compileall -q .", commands.values())
+        self.assertNotIn("python -m compileall -q .", commands.values())
+
     def test_detects_cmake_build(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
