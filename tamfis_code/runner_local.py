@@ -7169,6 +7169,10 @@ async def _run_local_agent_turn_impl(
             partial_assistant=partial_assistant,
             status=status,
             last_error=last_error,
+            tool_records=[
+                item.to_dict()
+                for item in (orchestrator.run.tool_records if orchestrator.run else [])
+            ],
         )
 
     async def _fire_session_interrupted_hooks(reason: str) -> None:
@@ -7732,6 +7736,48 @@ async def _run_local_agent_turn_impl(
     port_conflict_seen = False
     stop_hook_blocks = 0
     max_stop_hook_blocks = 3
+
+    # A resumed turn may already contain real tool results from the prior
+    # process/route.  Rebuild the local validation flags from those records so
+    # the retry gate does not demand the same successful check again or claim
+    # that no mutation occurred.
+    _restored_records = [
+        item.to_dict() for item in (orchestrator.run.tool_records if orchestrator.run else [])
+    ]
+    _restored_successful_mutations = {
+        str(item.get("tool_name")) for item in _restored_records
+        if item.get("success") is True
+        and str(item.get("tool_name")) in {"write_file", "edit_file", "create_file", "patch_file", "extract_archive", "repackage_archive", "create_artifact"}
+    }
+    any_mutation = bool(_restored_successful_mutations)
+    any_code_mutation = any(
+        not _is_documentation_path((item.get("arguments") or {}).get("path"))
+        for item in _restored_records
+        if item.get("success") is True
+        and str(item.get("tool_name")) in _restored_successful_mutations
+    )
+    any_execute_command_since_mutation = any(
+        item.get("tool_name") == "execute_command"
+        and item.get("success") is True
+        and item.get("exit_code") in (None, 0)
+        for item in _restored_records
+    )
+    for _, expected_command in validation_commands:
+        for item in _restored_records:
+            if item.get("tool_name") != "execute_command" or item.get("success") is not True:
+                continue
+            if item.get("exit_code") not in (None, 0):
+                continue
+            actual_command = str((item.get("arguments") or {}).get("command") or "")
+            # `compileall -q` is deliberately silent on success.  Match its
+            # semantic command form rather than requiring output or brittle
+            # literal interpreter spelling (`python` vs `python3`).
+            if expected_command in actual_command or (
+                " -m compileall" in expected_command
+                and " -m compileall" in actual_command
+            ):
+                validation_confirmed.add(expected_command)
+                break
 
     async def _finalize_completed_answer(
         content: str, finish_reason: Optional[str], *, synthesized: bool = False,

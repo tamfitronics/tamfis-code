@@ -35,6 +35,7 @@ class ResumeSnapshot:
     static: dict[str, Any] = field(default_factory=dict)  # assumptions/components/validation_criteria/risks/phase_names
     task_state: dict[str, Any] = field(default_factory=dict)
     ledger_next_action: str = ""
+    tool_records: list[dict[str, Any]] = field(default_factory=list)
 
     @property
     def total(self) -> int:
@@ -120,6 +121,16 @@ def load_resume_snapshot(session_id: int) -> Optional[ResumeSnapshot]:
     ledger_next = str(getattr(ledger, "next_action", "") or "")
     if ledger_next.strip().casefold() in _UNINFORMATIVE_NEXT_ACTIONS:
         ledger_next = ""
+    checkpoint = state.turn_checkpoint if isinstance(state.turn_checkpoint, dict) else {}
+    checkpoint_records = checkpoint.get("tool_records") or []
+    if not checkpoint_records:
+        # Backward-compatible recovery for checkpoints written before tool
+        # records became first-class checkpoint data.  completed_actions is
+        # already durable and still contains the same ToolEnvelope fields.
+        checkpoint_records = [
+            item for item in (state.completed_actions or [])
+            if isinstance(item, dict) and item.get("type") == "tool"
+        ]
     return ResumeSnapshot(
         session_id=session_id,
         plan_id=str(plan.get("id") or ""),
@@ -128,6 +139,7 @@ def load_resume_snapshot(session_id: int) -> Optional[ResumeSnapshot]:
         static=static,
         task_state=dict(state.task_state or {}),
         ledger_next_action=ledger_next,
+        tool_records=[item for item in checkpoint_records if isinstance(item, dict)],
     )
 
 

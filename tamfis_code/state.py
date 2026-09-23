@@ -1201,6 +1201,7 @@ def save_turn_checkpoint(
     session_id: int, *, objective: str, mode: str,
     messages: list[dict[str, Any]], partial_assistant: str = "",
     status: str = "running", last_error: str = "",
+    tool_records: Optional[list[dict[str, Any]]] = None,
 ) -> None:
     """Atomically persist the resumable portion of a local agent turn.
 
@@ -1228,6 +1229,11 @@ def save_turn_checkpoint(
         "messages": _compact_memory_messages(messages),
         "partial_assistant": partial_assistant,
         "last_error": last_error,
+        # Tool results are part of the resumable execution contract.  The
+        # provider transcript alone is not sufficient: a failover may replace
+        # the in-memory orchestrator after a real mutation or a silent
+        # exit-zero validation command has already completed.
+        "tool_records": _sanitize((tool_records or [])[-250:]),
         "updated_at": _now(),
         "file_fingerprint": fingerprint,
     }

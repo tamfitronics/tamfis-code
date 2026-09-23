@@ -208,6 +208,41 @@ class SnapshotTests(_IsolatedState, unittest.TestCase):
         self.assertIn("3 done", banner)
         self.assertIn("instead of re-planning", banner)
 
+    def test_resume_restores_silent_exit_zero_validation_evidence(self):
+        """A provider reroute must not erase a completed quiet validation.
+
+        ``python3 -m compileall -q .`` emits no stdout when it succeeds, so
+        its exit code and tool record are the evidence.  This is the exact
+        failure mode where the next route saw the plan but not the command.
+        """
+        self._interrupt_after(515, done=1)
+        state_module.save_turn_checkpoint(
+            515,
+            objective=OBJECTIVE,
+            mode="execute",
+            messages=[],
+            status="interrupted",
+            tool_records=[{
+                "tool_call_id": "compileall-1",
+                "tool_name": "execute_command",
+                "arguments": {"command": "python3 -m compileall -q ."},
+                "purpose": "Python syntax check",
+                "success": True,
+                "exit_code": 0,
+                "stdout": "",
+                "stderr": "",
+            }],
+        )
+        snapshot = load_resume_snapshot(515)
+        self.assertEqual(len(snapshot.tool_records), 1)
+        resumed = AgentOrchestrator(session_id=515, workspace_root="/tmp", emit=lambda e: None)
+        resumed.begin(objective=OBJECTIVE, messages=[], read_only=False, restore=snapshot)
+        self.assertEqual(len(resumed.run.tool_records), 1)
+        record = resumed.run.tool_records[0]
+        self.assertTrue(record.success)
+        self.assertEqual(record.exit_code, 0)
+        self.assertEqual(record.stdout, "")
+
 
 class BareContinueTests(unittest.TestCase):
     def test_a_bare_continue_is_recognised(self):

@@ -179,6 +179,29 @@ class AgentOrchestrator:
         if restored:
             self.run.plan = self._plan_from_snapshot(canonical_objective, profile, restore)
             self.run.plan_restored = True
+            # Restore durable tool evidence before the next provider request.
+            # Without this, a failover/resume could retain the plan while
+            # losing the successful write/read/validation records that prove
+            # the plan's completed work.  In particular, `compileall -q` is
+            # intentionally silent; exit_code=0 is the evidence.
+            for raw in restore.tool_records:
+                try:
+                    fields = {
+                        key: raw.get(key)
+                        for key in ToolEnvelope.__dataclass_fields__
+                        if key in raw
+                    }
+                    fields.setdefault("tool_call_id", f"restored_{len(self.run.tool_records)}")
+                    fields.setdefault("tool_name", "unknown")
+                    fields.setdefault("arguments", {})
+                    fields.setdefault("purpose", "restored tool evidence")
+                    fields["arguments"] = fields["arguments"] if isinstance(fields["arguments"], dict) else {}
+                    self.run.tool_records.append(ToolEnvelope(**fields))
+                except (TypeError, ValueError):
+                    # A malformed legacy record must not crash resume or be
+                    # treated as evidence.  The next live tool result can
+                    # still rebuild the current checkpoint.
+                    continue
         else:
             self.run.plan = create_plan(objective, profile)
         self.run.runtime.start_planning()
