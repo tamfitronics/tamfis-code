@@ -689,7 +689,6 @@ class ProviderManager:
         ProviderType.OLLAMA_CLOUD: 3,
         ProviderType.HF: 4,
         ProviderType.OPENROUTER: 2,
-        ProviderType.GROK: 2,
     }
 
     # Per-model context overrides. ProviderConfig.context_window is a
@@ -1296,6 +1295,11 @@ class ProviderManager:
         # fallback is explicitly enabled. Local Ollama models are explicit-only
         # by default, while Ollama Cloud models retain their existing priority.
         if provider == ProviderType.OLLAMA_CLOUD and not self._ollama_allowed_automatically():
+            return False
+        # Meta Muse is paid-only. Keep explicit selection available for
+        # compatibility, but never spend on it during AUTO recovery merely
+        # because an API key or quality policy is configured.
+        if provider == ProviderType.META:
             return False
         if provider in self.AUTO_PROVIDER_WEIGHTS:
             return True
@@ -2622,6 +2626,10 @@ class ProviderManager:
                 # produce. Only bypass it for the specific failure mode it
                 # was never meant to cover.
                 allow_premium_primary=self.is_quota_or_rate_limit_error(exc),
+                # A credit/quota failure must not strand the task behind a
+                # stale cooldown on another configured free route. Each
+                # candidate still has its own timeout and health result.
+                include_cooling=self.is_quota_or_rate_limit_error(exc),
             ):
                 try:
                     self.record_fallback(resolved)
