@@ -457,7 +457,14 @@ class RemoteAPIClient:
         ) as resp:
             if resp.status_code == 401:
                 if await self._refresh():
-                    async for event in self.stream_session(session_id, last_event_id):
+                    # Preserve the caller's bounded idle-read policy across
+                    # token refresh.  Dropping it here could leave a
+                    # reconnected Tamfis-Code stream blocked forever after a
+                    # silent/stale server-side task, exactly when the caller
+                    # is relying on the timeout to recover.
+                    async for event in self.stream_session(
+                        session_id, last_event_id, idle_timeout=idle_timeout,
+                    ):
                         yield event
                     return
                 raise AuthRequiredError(401, "Not authenticated -- run `tamfis-code login`")
