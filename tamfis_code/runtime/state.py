@@ -49,11 +49,26 @@ class RuntimeSnapshot:
     action_counts: dict[str, int] = field(default_factory=dict)
     observation_counts: dict[str, int] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # Checkpoint/API payloads carry the wire value, while the controller
+        # uses RuntimePhase for transition rules and rendering. Normalize at
+        # construction so every later ``phase.value`` access is safe.
+        if not isinstance(self.phase, RuntimePhase):
+            self.phase = RuntimePhase(str(self.phase))
+
     @property
     def terminal(self) -> bool:
         return self.phase in _TERMINAL
 
     def transition(self, target: RuntimePhase) -> None:
+        # Checkpoints and API callers may provide the wire value instead of
+        # the enum. Normalize before consulting transition rules or rendering
+        # diagnostics; otherwise an invalid-transition error itself crashes
+        # with ``'str' object has no attribute 'value'``.
+        if isinstance(self.phase, str):
+            self.phase = RuntimePhase(self.phase)
+        if isinstance(target, str):
+            target = RuntimePhase(target)
         if target == self.phase:
             return
         if target not in _ALLOWED[self.phase]:

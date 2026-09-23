@@ -112,9 +112,20 @@ class _FakeRemoteMCPServer:
     def __init__(self):
         self.session_id = "sess-abc123"
         self.seen_session_ids: list[str | None] = []
+        self.seen_protocol_versions: list[str | None] = []
+        self.seen_context_headers: list[dict[str, str | None]] = []
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.seen_session_ids.append(request.headers.get("mcp-session-id"))
+        self.seen_protocol_versions.append(request.headers.get("mcp-protocol-version"))
+        self.seen_context_headers.append({
+            name: request.headers.get(name)
+            for name in (
+                "x-execution-id", "idempotency-key", "x-mission-id",
+                "x-conversation-id", "x-agent-id", "x-workspace-id",
+                "x-correlation-id", "x-tamfis-approval-token",
+            )
+        })
         body = json.loads(request.content)
         method = body.get("method")
         if method == "initialize":
@@ -159,7 +170,13 @@ async def test_discovers_and_calls_remote_http_mcp_tool(tmp_path: Path):
         assert [t["name"] for t in tools] == ["mcp__remote_server__remote_echo"]
 
         result = await asyncio.wait_for(
-            bridge.call_tool("mcp__remote_server__remote_echo", {"message": "hi"}), timeout=10,
+            bridge.call_tool(
+                "mcp__remote_server__remote_echo", {"message": "hi"},
+                request_id="execution-http-1", idempotency_key="mission-http-1:echo",
+                mission_id="mission-http-1", conversation_id="conversation-http-1",
+                agent_id="agent-http-1", workspace_id="workspace-http-1",
+                correlation_id="trace-http-1", approval_token="approval-http-1",
+            ), timeout=10,
         )
         assert result["success"] is True
         assert result["content"][0]["text"] == "hi"
@@ -171,6 +188,18 @@ async def test_discovers_and_calls_remote_http_mcp_tool(tmp_path: Path):
     # notifications/initialized, tools/call) -- not just remembered.
     assert fake_server.seen_session_ids[0] is None  # initialize itself carries none yet
     assert all(sid == fake_server.session_id for sid in fake_server.seen_session_ids[1:])
+    assert fake_server.seen_protocol_versions[0] is None
+    assert all(version == "2025-06-18" for version in fake_server.seen_protocol_versions[1:])
+    assert fake_server.seen_context_headers[-1] == {
+        "x-execution-id": "execution-http-1",
+        "idempotency-key": "mission-http-1:echo",
+        "x-mission-id": "mission-http-1",
+        "x-conversation-id": "conversation-http-1",
+        "x-agent-id": "agent-http-1",
+        "x-workspace-id": "workspace-http-1",
+        "x-correlation-id": "trace-http-1",
+        "x-tamfis-approval-token": "approval-http-1",
+    }
 
 
 @pytest.mark.asyncio

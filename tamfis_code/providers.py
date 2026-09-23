@@ -1871,6 +1871,16 @@ class ProviderManager:
             eligible.append(provider)
 
         if not eligible:
+            # An agentic turn must never silently fall back to a chat-only
+            # route.  That was the source of the live failure where the
+            # provider printed ``{"name":"list_tools"...}`` as prose and
+            # the harness later accepted a fabricated tool inventory.  A
+            # capability mismatch is a hard routing error; callers may then
+            # select an explicitly tool-capable route or report the block.
+            if requires_tools:
+                raise ValueError("No configured AI provider with native tool calling is available")
+            if requires_long_context:
+                raise ValueError("No configured AI provider with the required context capacity is available")
             eligible = candidates
 
         del quality_mode  # retained in the public signature for compatibility
@@ -2278,6 +2288,8 @@ class ProviderManager:
         allow_fallback: bool = True,
         _nim_tried_key_indices: Optional[set[int]] = None,
         _nim_key_index_override: Optional[int] = None,
+        _context_safety_margin: float = 0.75,
+        _context_retry: bool = False,
         **kwargs: Any,
     ) -> AsyncIterator[str]:
         """Yield text from one provider, with safe automatic fallback.
@@ -2353,6 +2365,18 @@ class ProviderManager:
             # request before Tamfis-Code's fallback chain can run.
             request_kwargs["parallel_tool_calls"] = False
 
+        # ProviderManager is also used by local chat and other lightweight
+        # callers that do not enter runner_local's request boundary.  Apply
+        # the same conservative compaction here so every direct provider
+        # submission is bounded before the SDK is called.
+        from .runner_local import _prepare_direct_provider_messages
+        bounded_messages, _trimmed, _before, _after = _prepare_direct_provider_messages(
+            request_kwargs["messages"], provider=resolved,
+            model=selected_model, tools=request_kwargs.get("tools") or [],
+            safety_margin=_context_safety_margin,
+        )
+        request_kwargs["messages"] = bounded_messages
+
         # Tier IV's OrchestrationContext reads `mode` (data.get("mode", "auto"))
         # to pick a category-vetted, weight-ordered model pool via
         # TamfisRuntime._resolve_category()/_category_candidates(). Leaving
@@ -2384,6 +2408,7 @@ class ProviderManager:
         # only a percentile can show it is slow.
         _latency_started = time.monotonic()
         from .runtime.telemetry import record_usage, span
+        provider_output_started = False
         try:
             with span(
                 "provider.invoke",
@@ -2435,6 +2460,10 @@ class ProviderManager:
                     # provider. ConnectionError is classified retryable BY TYPE
                     # (see is_retryable_provider_error), so this rides the
                     # existing fallback path rather than inventing a new one.
+                    # Once a stream has been handed to the caller, a retry
+                    # would duplicate visible output. Context rejection is
+                    # retryable only before this point.
+                    provider_output_started = True
                     yielded_content = False
                     async for chunk in response:
                         usage = getattr(chunk, "usage", None)
@@ -2479,6 +2508,34 @@ class ProviderManager:
                 return
 
         except Exception as exc:
+            detail = str(exc).lower()
+            context_rejected = (
+                "maximum context length" in detail
+                or ("context length" in detail and "token" in detail)
+                or "too many tokens" in detail
+            )
+            if context_rejected and not _context_retry and not provider_output_started:
+                # The provider rejected the request before generation. Retry
+                # exactly once from the original transcript with a smaller
+                # budget; no tool or side effect can have run at this point.
+                async for chunk in self.chat_completion(
+                    provider,
+                    messages,
+                    model=model,
+                    stream=stream,
+                    temperature=temperature,
+                    max_tokens=max_tokens,
+                    reasoning_effort=reasoning_effort,
+                    task_profile=task_profile,
+                    allow_fallback=allow_fallback,
+                    _nim_tried_key_indices=_nim_tried_key_indices,
+                    _nim_key_index_override=_nim_key_index_override,
+                    _context_safety_margin=0.40,
+                    _context_retry=True,
+                    **kwargs,
+                ):
+                    yield chunk
+                return
             record_provider_latency(resolved, time.monotonic() - _latency_started, ok=False)
             # Rotate to the next configured NVIDIA NIM key before ever
             # falling back to a different provider entirely -- one account

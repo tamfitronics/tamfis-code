@@ -45,6 +45,13 @@ class ExecutionRequest:
     isolation: str | None = None
     metadata: dict[str, Any] = field(default_factory=dict)
 
+    def __post_init__(self) -> None:
+        # REST/checkpoint recovery stores enum values as strings. Normalize
+        # them at the runtime boundary so lifecycle telemetry, task names,
+        # and cancellation paths never fail on ``mode.value`` during resume.
+        if not isinstance(self.mode, ExecutionMode):
+            self.mode = ExecutionMode(str(self.mode))
+
 
 @dataclass(slots=True)
 class ExecutionRecord:
@@ -55,6 +62,10 @@ class ExecutionRecord:
     error: str | None = None
     execution_id: str = ""
     duration_ms: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.mode, ExecutionMode):
+            self.mode = ExecutionMode(str(self.mode))
 
 
 class UnifiedAgentRuntime:

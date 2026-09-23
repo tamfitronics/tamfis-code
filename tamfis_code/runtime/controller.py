@@ -230,13 +230,17 @@ class ExecutionController:
                 f"Blocked repeated action: {tool_name} with identical arguments was already attempted "
                 f"{count - 1} times without sufficient progress."
             )
-            # Repeated action is refused first; terminal failure is reserved for
-            # continued no-progress pressure, so the model can choose a genuinely
-            # different strategy once.
-            terminal = self.snapshot.consecutive_empty_observations >= self.budgets.max_consecutive_empty_observations
-            if terminal:
-                self._fail(reason)
-            return GuardDecision(False, terminal, reason, fingerprint)
+            # Repeated action is refused, but it is deliberately never made a
+            # terminal controller failure here.  The runner owns the recovery
+            # decision: it can nudge the model, switch provider in AUTO mode,
+            # or synthesize an evidence-backed response.  Previously the
+            # consecutive-empty counter could make this branch call _fail()
+            # before that strategy-changing recovery ran; resuming then
+            # replayed the same checkpoint and immediately failed again.
+            # Genuine no-progress is still bounded by the runner's recovery
+            # budget, while tool-call and wall-clock budgets remain terminal
+            # boundaries of their own.
+            return GuardDecision(False, False, reason, fingerprint)
 
         self.snapshot.tool_calls += 1
         self._last_action = fingerprint

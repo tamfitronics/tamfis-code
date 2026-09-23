@@ -283,6 +283,33 @@ class OrchestratorTests(unittest.TestCase):
             self.assertFalse(report.passed)
             self.assertTrue(report.unresolved)
 
+    def test_warning_validation_cannot_be_reported_as_completed(self):
+        """An unresolved acceptance criterion must not become fake success.
+
+        Audit-plan incompleteness is represented as a warning so the caller
+        can show the concrete remaining step, but it is still a failed
+        completion decision.  Previously complete() checked severity instead
+        of report.passed and persisted this state as completed.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            engine = AgentOrchestrator(session_id=9014, workspace_root=root, emit=lambda event: None)
+            run = engine.begin(
+                objective="audit the repository",
+                messages=[{"role": "user", "content": "audit the repository"}],
+                read_only=True,
+            )
+            run.reasoning_plan = True
+            envelope = ToolEnvelope("c1", "read_file", {"path": "README.md"}, "inspect")
+            envelope.finish(result={"success": True, "result": "ok"}, success=True)
+            engine.record_tool(envelope)
+
+            report = engine.complete(final_text="The audit is complete.", any_mutation=False)
+
+            self.assertFalse(report.passed)
+            self.assertEqual(run.phase, AgentPhase.FAILED)
+            task_state = state_module.get_session_state(9014).task_state
+            self.assertEqual(task_state["status"], "failed")
+
     def test_plain_chat_has_no_tools(self):
         profile = classify_task("hello")
         self.assertEqual(allowed_tools(profile, read_only=False), [])

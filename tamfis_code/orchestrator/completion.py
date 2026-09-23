@@ -25,7 +25,7 @@ class CompletionSummary:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "status": self.status.value,
+            "status": self.status.value if isinstance(self.status, CompletionStatus) else str(self.status),
             "summary": self.summary,
             "changed_files": self.changed_files,
             "validations": self.validations,

@@ -60,7 +60,9 @@ BRANDED_PROVIDER_LABEL = PUBLIC_PROVIDER_NAME
 # depending on which one happened to be drawing it.
 # (marker, marker_style, step-text style)
 _PLAN_MARKER_BY_STATUS: dict[str, tuple[str, str, str]] = {
-    "completed": ("✓", "green", "dim strike"),
+    # Bright green has materially better contrast on the dark terminal themes
+    # used by the CLI; keep the semantic colour unchanged, only increase light.
+    "completed": ("✓", "bright_green", "dim strike"),
     "failed": ("✗", "bold red", "red"),
     "in_progress": ("◉", "bold yellow", "bold"),
     "pending": ("○", "dim", "dim"),
@@ -383,6 +385,13 @@ def _tool_action_label(name: str, arguments: Optional[dict[str, Any]] = None, *,
     return label
 
 
+def _trusted_activity_detail(value: Any, *, limit: int = 120) -> str:
+    """Keep a gateway-provided activity description useful but bounded."""
+    text = re.sub(r"[\x00-\x1f\x7f]", "", str(value or ""))
+    text = re.sub(r"\s+", " ", text).strip()
+    return text[: max(1, limit - 1)].rstrip() + "…" if len(text) > limit else text
+
+
 _READ_ONLY_TOOLS = {
     "read_file", "read_archive", "search_code", "find_references", "get_git_info", "read_background_job",
     "glob_files", "search_files", "grep_files", "list_directory",
@@ -501,6 +510,29 @@ def _read_target(arguments: Optional[dict[str, Any]]) -> str:
     ).strip()
 
 
+def _content_blocks_text(value: Any) -> str:
+    """Render MCP content blocks as text instead of Python list reprs."""
+    if isinstance(value, str):
+        return value.strip()
+    if not isinstance(value, list):
+        return str(value).strip() if value not in (None, "") else ""
+    parts: list[str] = []
+    for block in value:
+        if isinstance(block, dict):
+            block_type = str(block.get("type") or "")
+            if block_type in {"text", "input_text", "output_text"}:
+                text = block.get("text", block.get("content", ""))
+                if isinstance(text, (dict, list)):
+                    text = _content_blocks_text(text)
+                if text not in (None, ""):
+                    parts.append(str(text))
+            elif block.get("content") not in (None, ""):
+                parts.append(_content_blocks_text(block["content"]))
+        elif block not in (None, ""):
+            parts.append(str(block))
+    return "\n".join(part.strip() for part in parts if part and part.strip()).strip()
+
+
 def _tool_result_message(payload: dict[str, Any]) -> tuple[str, bool]:
     """Render structured tool results without asking the model to infer status.
 
@@ -513,7 +545,21 @@ def _tool_result_message(payload: dict[str, Any]) -> tuple[str, bool]:
     status = str(result.get("status") or "").strip().lower()
     error_code = str(result.get("error_code") or "").strip()
     message = str(result.get("message") or result.get("error") or "").strip()
-    content = str(result.get("content") or "").strip()
+    content = _content_blocks_text(result.get("content"))
+    # MCP servers sometimes put a JSON error envelope inside a text content
+    # block. Extract its message for the terminal, rather than showing raw
+    # nested JSON such as [{"type":"text","text":"{\"success\":false..."}].
+    if content.startswith(("{", "[")):
+        try:
+            embedded = json.loads(content)
+        except (TypeError, ValueError):
+            embedded = None
+        if isinstance(embedded, dict):
+            embedded_error = embedded.get("error") or embedded.get("message")
+            if embedded_error:
+                message = str(embedded_error).strip()
+            if embedded.get("success") is False or embedded.get("ok") is False:
+                success = False
     stdout = str(result.get("stdout") or "").strip()
     stderr = str(result.get("stderr") or "").strip()
     exit_code = result.get("exit_code")
@@ -1040,11 +1086,32 @@ class StreamRenderer:
         if ledger.plan_steps:
             done = sum(1 for s in ledger.plan_steps if s.status == "completed")
             lines.append(f"Plan: {done}/{len(ledger.plan_steps)} steps done")
-        edited = [e.file for e in ledger.edits if e.applied]
+        edited = [e for e in ledger.edits if e.applied and e.file]
         if edited:
-            shown = ", ".join(edited[:5])
-            more = f" (+{len(edited) - 5} more)" if len(edited) > 5 else ""
-            lines.append(f"Changed: {shown}{more}")
+            # Do not collapse all mutations into an unhelpful/stale
+            # ``Changed:`` line.  The operation is recorded by the real file
+            # mutation tool, and this recap is task-scoped by the orchestrator
+            # ledger, so users can see what was actually added, updated, or
+            # removed.  Keep a fallback for older ledgers without operation.
+            grouped: dict[str, list[str]] = {"Added": [], "Updated": [], "Removed": []}
+            for edit in edited:
+                operation = str(getattr(edit, "operation", "update") or "update").casefold()
+                label = "Added" if operation in {"create", "add", "added"} else (
+                    "Removed" if operation in {"delete", "remove", "removed"} else "Updated"
+                )
+                detail = edit.file
+                description = str(getattr(edit, "description", "") or "")
+                match = re.search(r"\(\+(\d+)/-(\d+)\)", description)
+                if match:
+                    detail += f" (+{match.group(1)}/-{match.group(2)})"
+                grouped[label].append(detail)
+            for label in ("Added", "Updated", "Removed"):
+                values = grouped[label]
+                if not values:
+                    continue
+                shown = ", ".join(values[:5])
+                more = f" (+{len(values) - 5} more)" if len(values) > 5 else ""
+                lines.append(f"{label}: {shown}{more}")
         tests_run = [t for t in ledger.tests if t.status != "not_run"]
         if tests_run:
             passed = sum(1 for t in tests_run if t.status == "passed")
@@ -1108,7 +1175,12 @@ class StreamRenderer:
         elif event_type == "tool_call_requested":
             name = str(payload.get("name") or payload.get("tool_name") or "tool")
             arguments = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {}
-            self._status_detail = _tool_action_label(name, arguments)
+            # Tier IV/gateway events already carry the real capability target;
+            # retain it instead of reducing remote work to a generic verb.
+            self._status_detail = (
+                _trusted_activity_detail(payload.get("sub_status"))
+                or _tool_action_label(name, arguments)
+            )
             normalized_name = _normalized_tool_name(name)
             if normalized_name in _TOOL_CATEGORY:
                 self._round_tool_counts[normalized_name] = self._round_tool_counts.get(normalized_name, 0) + 1
@@ -1122,7 +1194,15 @@ class StreamRenderer:
                 self._running_command = str(arguments.get("command") or "the requested command")
                 self._running_command_started = time.monotonic()
         elif event_type == "tool_output":
-            self._status_detail = "Reviewing the tool result"
+            gateway_detail = _trusted_activity_detail(payload.get("sub_status"))
+            result_name = payload.get("name") or payload.get("tool_name") or payload.get("tool")
+            self._status_detail = gateway_detail or (
+                _tool_action_label(
+                    str(result_name),
+                    payload.get("arguments") if isinstance(payload.get("arguments"), dict) else {},
+                    completed=True,
+                ) if result_name else "Reviewing the tool result"
+            )
             self._running_command = None
             self._running_command_started = None
         elif event_type == "file_mutation":
@@ -1494,25 +1574,9 @@ class StreamRenderer:
                 output = "\n".join(str(line) for line in lines)
             rows = _tool_display.ran_block(command, output, width=width, exit_code=code, failed=failed)
             if _tool_display.output_was_cut(output):
-                # Make the disclosure an actual visible bubble, not merely a
-                # dim text line that is easy to miss in a long transcript.
-                # Ctrl+O still opens the complete stored transcript.
-                head = [(role, text) for role, text in rows if role in {"head", "cmd"}]
-                self._print_rows(head, failed=failed)
-                preview = "\n".join(
-                    text for role, text in rows if role in {"out", "err"}
-                )
-                hidden = len(str(output).strip("\\n").split("\\n")) - _tool_display._PREVIEW_LINES_WHEN_CUT
-                self.console.print(Panel(
-                    Text(
-                        preview + f"\\n… +{hidden} lines hidden · Ctrl+O for full output",
-                        style="red" if failed else "dim",
-                    ),
-                    title="Tool output · collapsed",
-                    border_style="red" if failed else "cyan",
-                    expand=False,
-                    padding=(0, 1),
-                ))
+                # Keep the disclosure in the normal tool block so scrollback
+                # remains stable and Ctrl+O still opens the complete transcript.
+                self._print_rows(rows, failed=failed)
             else:
                 self._print_rows(rows, failed=failed)
             # Everything, not just the preview: what Ctrl+O shows.
@@ -1745,6 +1809,11 @@ class StreamRenderer:
         denials) reads as noise packed into a sentence at terminal width,
         not a message a user can act on at a glance."""
         error = str(payload.get("error") or "unknown error")
+        if payload.get("unverified_draft"):
+            self.console.print(
+                "[bold yellow]Rejected assistant draft:[/bold yellow] "
+                "the displayed completion claims were not backed by executed tool evidence."
+            )
         denied = [str(item) for item in payload.get("denied_targets") or []]
         allowed = [str(item) for item in payload.get("allowed_roots") or []]
         if not denied and not allowed:
@@ -2083,6 +2152,22 @@ class StreamRenderer:
             return
 
         if event_type == "tool_output":
+            # Provider protocol mismatches are sent back to the model as a
+            # structured tool result so it can self-correct, but they are not
+            # user tool executions and must not be rendered as if one ran.
+            # Showing the raw "unoffered MCP tool" envelope made normal
+            # provider recovery look like an MCP outage.
+            result = payload.get("result") if isinstance(payload.get("result"), dict) else {}
+            internal_tool_name = str(payload.get("tool") or payload.get("name") or "").strip().casefold()
+            internal_error = str(result.get("error") or payload.get("error") or "").casefold()
+            if (
+                payload.get("internal_protocol_error")
+                or internal_tool_name == "unavailable provider tool"
+                or "provider requested an unoffered mcp tool" in internal_error
+            ):
+                self._status_detail = "Recovering from a provider tool mismatch"
+                self._refresh_live()
+                return
             self._close_assistant()
             tool = str(payload.get("tool", "tool"))
             from .provider_protocols import normalize_tool_call

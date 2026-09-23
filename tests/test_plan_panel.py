@@ -13,7 +13,7 @@ from unittest.mock import patch
 from rich.console import Console
 
 from tamfis_code.live_input import LiveInputListener
-from tamfis_code.plan_panel import MAX_ROWS, plan_panel_html, rows_that_fit, visible_steps
+from tamfis_code.plan_panel import MAX_ROWS, plan_panel_html, plan_progress, plan_progress_label, rows_that_fit, visible_steps
 from tamfis_code.render import StreamRenderer
 
 from test_live_input import _config, _console
@@ -36,6 +36,16 @@ FOUR = _steps(
 
 
 class PanelLayoutTests(unittest.TestCase):
+    def test_progress_is_based_only_on_explicitly_completed_steps(self):
+        completed, total, percent = plan_progress(_steps(
+            ("done", "completed"),
+            ("active", "in_progress"),
+            ("blocked", "blocked"),
+            ("waiting", "pending"),
+        ))
+        self.assertEqual((completed, total, percent), (1, 4, 25))
+        self.assertEqual(plan_progress_label(_steps(("done", "completed"))), "100% (1/1 complete)")
+
     def test_the_panel_matches_the_requested_layout(self):
         lines = [_plain(line) for line in plan_panel_html(FOUR, width=100)]
         self.assertEqual(lines, [

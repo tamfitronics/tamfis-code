@@ -124,6 +124,18 @@ class BeginRestoresInsteadOfResettingTests(_IsolatedState, unittest.TestCase):
         next_action = load_ledger("502").next_action
         self.assertTrue(next_action.startswith("Resume at step 3/4:"), next_action)
 
+    def test_resume_keeps_saved_objective_when_wrapper_prompt_is_used(self):
+        """Recovery wording must not become a new task objective."""
+        self._interrupt_after(506, done=2)
+        snapshot = load_resume_snapshot(506)
+        wrapper = "Continue from the saved checkpoint and resolve: provider failure"
+        resumed = AgentOrchestrator(session_id=506, workspace_root="/tmp", emit=lambda e: None)
+        resumed.begin(objective=wrapper, messages=[], read_only=False, restore=snapshot)
+        state = state_module.get_session_state(506)
+        self.assertEqual(resumed.run.objective, OBJECTIVE)
+        self.assertEqual(state.active_task["objective"], OBJECTIVE)
+        self.assertEqual(load_ledger("506").objective, OBJECTIVE)
+
     def test_the_restored_plan_keeps_its_non_step_parts(self):
         first = self._interrupt_after(503, done=1)
         first.run.plan.risks.append("a risk the planner found")

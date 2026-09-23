@@ -42,6 +42,18 @@ class ScratchRootTests(unittest.TestCase):
         finally:
             root.rmdir()
 
+    def test_unwritable_canonical_directory_uses_isolated_fallback(self):
+        # Do not delete or chmod a directory owned by another process/user.
+        # The fallback keeps a resume alive when the canonical temp location
+        # is stale or inaccessible.
+        with patch.object(Path, "mkdir", side_effect=PermissionError("unwritable")):
+            root = scratch_root(90125)
+        try:
+            self.assertTrue(root.is_dir())
+            self.assertIn("tamfis-code-90125-", root.parent.name)
+        finally:
+            root.rmdir()
+
 
 class WordpressProjectMetadataTests(unittest.TestCase):
     """Confirmed live: a real WordPress site with no package.json/
@@ -311,6 +323,38 @@ class ResolveLocalWorkspaceTests(unittest.TestCase):
             first = resolve_local_workspace(cwd=Path(proj), discover=False)
             second = resolve_local_workspace(cwd=Path(proj), discover=False)
         self.assertEqual(first.session_id, second.session_id)
+
+    def test_fresh_session_reservation_is_atomic_and_unique(self):
+        # The id must be persisted before the allocator returns. This models
+        # two near-simultaneous terminals: the second allocation must see the
+        # first reservation instead of selecting the same max+1 id.
+        with tempfile.TemporaryDirectory() as proj:
+            first = state_module.mint_fresh_session_id(str(Path(proj).resolve()), objective="first task")
+            second = state_module.mint_fresh_session_id(str(Path(proj).resolve()), objective="second task")
+
+        self.assertNotEqual(first, second)
+        self.assertEqual(
+            state_module.get_session_state(first).workspace_root,
+            str(Path(proj).resolve()),
+        )
+        self.assertEqual(state_module.get_session_state(first).execution_status, "idle")
+
+    def test_new_objectives_do_not_reuse_a_live_reserved_session(self):
+        with tempfile.TemporaryDirectory() as proj:
+            first = resolve_local_workspace(
+                cwd=Path(proj), discover=False, objective="audit the payments service",
+            )
+            second = resolve_local_workspace(
+                cwd=Path(proj), discover=False, objective="repair the image renderer",
+            )
+        self.assertNotEqual(first.session_id, second.session_id)
+
+    def test_workspace_root_is_the_explicit_launch_directory(self):
+        with tempfile.TemporaryDirectory() as parent:
+            project = Path(parent) / "finitron"
+            project.mkdir()
+            context = resolve_local_workspace(cwd=project, discover=False, force_new=True)
+        self.assertEqual(context.workspace_root, str(project.resolve()))
 
     def test_different_workspace_roots_get_different_sessions(self):
         with tempfile.TemporaryDirectory() as proj_a, tempfile.TemporaryDirectory() as proj_b:

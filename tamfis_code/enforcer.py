@@ -55,7 +55,7 @@ class TestEnforcer:
             self._print(f"{prefix} {message}")
         sys.stdout.flush()
 
-    def _run_cmd(self, cmd: List[str], cwd: Optional[Path] = None, timeout: int = 120) -> Dict[str, Any]:
+    def _run_cmd(self, cmd: List[str], cwd: Optional[Path] = None, timeout: Optional[int] = None) -> Dict[str, Any]:
         cwd = cwd or self.workspace_root
         timeout = adaptive_command_timeout(" ".join(cmd), cwd, timeout)
         try:
@@ -140,8 +140,7 @@ class TestEnforcer:
                 self._print_progress(f"▶️ Running {test_file.name}...", "running")
                 result = self._run_cmd(
                     [sys.executable, "-m", "pytest", str(test_file), "-v", "--tb=short", "-q"],
-                    cwd=self.workspace_root,
-                    timeout=60
+                    cwd=self.workspace_root
                 )
                 if result["success"]:
                     passed += 1
@@ -161,7 +160,7 @@ class TestEnforcer:
         # (pyproject.toml/pytest.ini present), so run pytest at the root and
         # let it do its own discovery (covers src-layout/colocated tests).
         self._print_progress("No tests/test_*.py found; running `pytest -q` at the workspace root", "running")
-        result = self._run_cmd([sys.executable, "-m", "pytest", "-q"], cwd=self.workspace_root, timeout=300)
+        result = self._run_cmd([sys.executable, "-m", "pytest", "-q"], cwd=self.workspace_root)
         self.results["python"]["summary"]["total"] = 1
         self.results["python"]["summary"]["passed"] = 1 if result["success"] else 0
         if result["success"]:
@@ -208,7 +207,7 @@ class TestEnforcer:
         node_modules = self.workspace_root / "node_modules"
         if not node_modules.exists():
             self._print_progress("📦 Installing npm dependencies... (this may take a while)", "running")
-            result = self._run_cmd(["npm", "install"], cwd=self.workspace_root, timeout=300)
+            result = self._run_cmd(["npm", "install"], cwd=self.workspace_root)
             if result["success"]:
                 self._print_progress("✅ Dependencies installed", "success")
             else:
@@ -235,7 +234,7 @@ class TestEnforcer:
         results = []
         for script in available:
             self._print_progress(f"▶️ Running npm {script}...", "running")
-            result = self._run_cmd(["npm", "run", script], cwd=self.workspace_root, timeout=120)
+            result = self._run_cmd(["npm", "run", script], cwd=self.workspace_root)
             if result["success"]:
                 self._print_progress(f"✅ npm {script} PASSED ({result['elapsed']:.2f}s)", "success")
             else:
@@ -263,7 +262,7 @@ class TestEnforcer:
         self._print_progress("", "info")
         self._print_progress("🦀 Rust Tests", "info")
         self._print_progress("-" * 50, "info")
-        result = self._run_cmd(["cargo", "test"], cwd=self.workspace_root, timeout=300)
+        result = self._run_cmd(["cargo", "test"], cwd=self.workspace_root)
         self.results["rust"] = {"passed": result["success"], "elapsed": result.get("elapsed", 0)}
         if result["success"]:
             self._print_progress(f"✅ cargo test PASSED ({result['elapsed']:.2f}s)", "success")

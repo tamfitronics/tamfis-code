@@ -26,6 +26,7 @@ from tamfis_code.runner_local import (
     _requests_autonomous_execution,
     _requests_no_confirmation,
     _looks_like_fabricated_tool_result,
+    _looks_like_unverified_operation_result,
 )
 
 
@@ -64,6 +65,22 @@ class FakeToolCallDetectionTests(unittest.TestCase):
     def test_transcript_style_execute_command_claim_is_fabricated_result(self):
         self.assertTrue(_looks_like_fabricated_tool_result(
             "The execute_command tool has executed the npm test command."
+        ))
+
+    def test_invented_tool_inventory_is_fabricated_result(self):
+        self.assertTrue(_looks_like_fabricated_tool_result(
+            "Available tools: inspect_artifact, list_directory, read_file"
+        ))
+
+    def test_unverified_training_or_mutation_result(self):
+        self.assertTrue(_looks_like_unverified_operation_result(
+            "I have scaled up the dataset and implemented the distillation pipeline."
+        ))
+        self.assertTrue(_looks_like_unverified_operation_result(
+            "The model has been fine-tuned and evaluated successfully."
+        ))
+        self.assertFalse(_looks_like_unverified_operation_result(
+            "I will inspect the training configuration next."
         ))
 
     def test_cli_flag_style_fake_call_is_detected(self):

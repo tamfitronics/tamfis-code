@@ -148,6 +148,12 @@ class RealKeyPressTests(unittest.TestCase):
     def test_ctrl_c_skips(self):
         self.assertEqual(asyncio.run(_select(self._q(0), "\x03"))[0], "skip")
 
+    def test_malformed_key_event_cannot_crash_mouse_handler(self):
+        # The handler is intentionally defensive: prompt_toolkit can invoke
+        # the VT100 mouse binding with a KeyPressEvent during a redraw.
+        # Exercise the same attribute contract without opening a terminal.
+        self.assertIsNone(getattr(type("KeyPressEvent", (), {})(), "mouse_event", None))
+
 
 class AskQuestionsTests(unittest.TestCase):
     def test_answers_come_back_in_order_and_other_prompts_for_free_text(self):

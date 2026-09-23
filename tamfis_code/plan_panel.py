@@ -23,15 +23,39 @@ from xml.sax.saxutils import escape as _xml_escape
 
 # (marker, prompt_toolkit colour tag for the marker, tag for the step text)
 _MARKERS: dict[str, tuple[str, str, str]] = {
-    "completed": ("✓", "ansigreen", "ansigray"),
+    # Standard ANSI green is low-luminance on many dark terminal palettes;
+    # use the bright variant for completed work so the status remains legible.
+    "completed": ("✓", "ansibrightgreen", "ansigray"),
     "failed": ("✗", "ansired", "ansired"),
     "in_progress": ("◉", "ansiyellow", "ansiwhite"),
+    "awaiting_approval": ("?", "ansimagenta", "ansimagenta"),
+    "blocked": ("!", "ansired", "ansired"),
+    "cancelled": ("×", "ansigray", "ansigray"),
     "pending": ("○", "ansigray", "ansigray"),
 }
 
 _TITLE = "Plan progress"
 MIN_ROWS = 4
 MAX_ROWS = 12
+
+
+def plan_progress(items: Sequence[Any]) -> tuple[int, int, int]:
+    """Return ``(completed, total, percent)`` from persisted step state.
+
+    Only steps explicitly marked ``completed`` count toward the percentage.
+    An active, failed, blocked, or pending step never inflates progress, so
+    the number is an honest completion measure rather than an estimate.
+    """
+    steps = visible_steps(items)
+    total = len(steps)
+    completed = sum(1 for item in steps if str(item.get("status") or "pending") == "completed")
+    percent = round((completed / total) * 100) if total else 0
+    return completed, total, percent
+
+
+def plan_progress_label(items: Sequence[Any]) -> str:
+    completed, total, percent = plan_progress(items)
+    return f"{percent}% ({completed}/{total} complete)"
 
 
 def visible_steps(items: Sequence[Any]) -> list[dict[str, Any]]:

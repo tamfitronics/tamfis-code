@@ -15,7 +15,7 @@ from typing import Any
 # with a terminal that implements CPR can explicitly opt back in.
 os.environ.setdefault("PROMPT_TOOLKIT_NO_CPR", "1")
 
-__version__ = "1.7.16"
+__version__ = "1.7.45"
 MIN_COMPATIBLE_API_VERSION = "remote-ai-v2"
 
 _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
@@ -33,6 +33,12 @@ _LAZY_EXPORTS: dict[str, tuple[str, str]] = {
     "CodeIndexer": (".indexer", "CodeIndexer"),
     "CodeSymbol": (".indexer", "CodeSymbol"),
     "CodeFile": (".indexer", "CodeFile"),
+    "TamfisCodeCapabilityGateway": (".capability_gateway", "TamfisCodeCapabilityGateway"),
+    "RemoteCapabilityGateway": (".capability_gateway", "RemoteCapabilityGateway"),
+    "CompositeCapabilityGateway": (".capability_gateway", "CompositeCapabilityGateway"),
+    "FailoverCapabilityGateway": (".capability_gateway", "FailoverCapabilityGateway"),
+    "connect_remote_mcp_gateway": (".capability_gateway", "connect_remote_mcp_gateway"),
+    "connect_remote_mcp_gateway_with_local_fallback": (".capability_gateway", "connect_remote_mcp_gateway_with_local_fallback"),
 }
 
 __all__ = ["__version__", "MIN_COMPATIBLE_API_VERSION", *_LAZY_EXPORTS]

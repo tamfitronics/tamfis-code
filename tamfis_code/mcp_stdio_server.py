@@ -23,6 +23,7 @@ from mcp.server.lowlevel import Server
 from mcp.server.stdio import stdio_server
 
 from .mcp import MCPServer
+from .capability_gateway import TamfisCodeCapabilityGateway
 
 DEFAULT_EXPOSED_TOOLS = frozenset({
     "read_file", "list_directory", "search_code", "find_references", "get_git_info",
@@ -54,7 +55,7 @@ def build_server(workspace_root: str, *, expose_tools: Optional[frozenset[str]] 
     list_exposed_tools/call_exposed_tool can be tested directly without a
     real stdio transport."""
     exposed = expose_tools if expose_tools is not None else DEFAULT_EXPOSED_TOOLS
-    tool_server = MCPServer(workspace_root=workspace_root)
+    tool_server = TamfisCodeCapabilityGateway(MCPServer(workspace_root=workspace_root))
     server: Server = Server("tamfis-code")
 
     @server.list_tools()

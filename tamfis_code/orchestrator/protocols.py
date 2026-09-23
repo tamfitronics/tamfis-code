@@ -75,7 +75,11 @@ class CanonicalEvent:
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
-        data["event_type"] = self.event_type.value
+        data["event_type"] = (
+            self.event_type.value
+            if isinstance(self.event_type, EventType)
+            else str(self.event_type)
+        )
         return data
 
 

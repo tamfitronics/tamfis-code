@@ -71,9 +71,11 @@ _TERSE_NO_CHANGE_RE = re.compile(
 )
 
 _MUTATION_CLAIM_RE = re.compile(
-    r"\b(?:i\s+(?:have\s+)?(?:updated|changed|edited|rewritten|replaced|implemented|fixed)|"
-    r"changes?\s+(?:made|applied)|(?:updated|rewritten|modified)\s+(?:the\s+)?(?:file|code|worker|configuration)|"
-    r"(?:file|code|worker|configuration)\s+(?:was|has\s+been)\s+(?:updated|rewritten|modified))\b",
+    r"\b(?:i\s+(?:have\s+)?(?:updated|changed|edited|rewritten|replaced|implemented|fixed|created|added|wrote|generated|removed|deleted)|"
+    r"changes?\s+(?:made|applied)|(?:updated|rewritten|modified)\s+(?:the\s+)?(?:file|code|worker|configuration|registry|dataset|pipeline)|"
+    r"(?:file|code|worker|configuration|registry|script|module|report|document|artifact|dataset|pipeline)\s+(?:was|has\s+been)\s+(?:updated|rewritten|modified|created|added|generated|written|removed|deleted)|"
+    r"(?:created|added|generated|written|removed|deleted)\s+(?:the\s+|a\s+|an\s+)?(?:file|code|worker|configuration|registry|script|module|report|document|artifact|dataset|pipeline)\b|"
+    r"(?:created|added|generated|written|removed|deleted)\s+(?:[`/]))",
     re.IGNORECASE,
 )
 
@@ -146,6 +148,17 @@ _MUTATING_TOOLS = {
     "extract_archive", "repackage_archive",
     "create_artifact",
 }
+
+# These files have no executable surface for the generic command gate.  Keep
+# the exception deliberately narrow: JSON/YAML/TOML/configuration and scripts
+# can affect runtime behaviour and still require an explicit verification.
+_DOCUMENTATION_SUFFIXES = frozenset({
+    ".md", ".markdown", ".mdx", ".txt", ".rst", ".adoc", ".asciidoc",
+})
+_DOCUMENTATION_NAMES = frozenset({
+    "readme", "license", "licence", "changelog", "notes", "authors",
+    "contributing", "todo",
+})
 
 # The subset of tool_policy.py's RESEARCH_TOOLS that actually reaches outside
 # the repository/conversation for current information. read_file/search_code/
@@ -343,6 +356,39 @@ def _successful_changed_paths(tool_records: list[dict[str, Any]], workspace_root
             candidate = Path(str(raw_path)).expanduser()
             changed.add((candidate if candidate.is_absolute() else root / candidate).resolve())
     return changed
+
+
+def _successful_mutation_paths(tool_records: list[dict[str, Any]], workspace_root: str) -> set[Path]:
+    """Return paths written by successful mutation tools, excluding Git evidence.
+
+    Documentation-only edits are valid without a code execution command, but
+    that exception must be based on the actual mutation record rather than the
+    model's final prose or a broad ``git diff`` claim.
+    """
+    root = Path(workspace_root or ".").resolve()
+    changed: set[Path] = set()
+    for item in tool_records:
+        if item.get("success") is not True or item.get("tool_name") not in _MUTATING_TOOLS:
+            continue
+        candidates = list(item.get("files_changed") or [])
+        argument_path = (item.get("arguments") or {}).get("path")
+        if argument_path:
+            candidates.append(argument_path)
+        for raw_path in candidates:
+            candidate = Path(str(raw_path)).expanduser()
+            changed.add((candidate if candidate.is_absolute() else root / candidate).resolve())
+    return changed
+
+
+def _is_documentation_only_change(tool_records: list[dict[str, Any]], workspace_root: str) -> bool:
+    paths = _successful_mutation_paths(tool_records, workspace_root)
+    if not paths:
+        return False
+    return all(
+        path.suffix.lower() in _DOCUMENTATION_SUFFIXES
+        or (path.suffix == "" and path.name.lower() in _DOCUMENTATION_NAMES)
+        for path in paths
+    )
 
 
 def _successful_commands(tool_records: list[dict[str, Any]]) -> list[str]:
@@ -670,6 +716,18 @@ def validate_completion(
             item.get("tool_name") in evidence_tools and item.get("success")
             for item in tool_records
         )
+        documentation_only = effective_edit_task and _is_documentation_only_change(
+            tool_records, workspace_root,
+        )
+        if documentation_only:
+            # Prose-only files have no executable surface to test.  The
+            # successful write itself is the appropriate evidence, while
+            # code/config/script edits remain subject to execute_command.
+            validated = validated or any(
+                item.get("tool_name") in _MUTATING_TOOLS and item.get("success") is True
+                for item in tool_records
+            )
+        checks.append({"name": "documentation_only_change", "passed": True, "value": documentation_only})
 
         # Verification is ordered evidence.  A later failed check/build must
         # invalidate an earlier successful command; otherwise a model can run
@@ -684,7 +742,8 @@ def validate_completion(
         ]
         latest_command = commands[-1] if commands else None
         latest_command_failed = bool(
-            latest_command
+            (effective_edit_task or profile.task_type == TaskType.GIT)
+            and latest_command
             and (
                 latest_command.get("success") is not True
                 or latest_command.get("exit_code") not in (None, 0)

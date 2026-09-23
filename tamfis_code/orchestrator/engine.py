@@ -46,6 +46,13 @@ class OrchestrationRun:
     plan_restored: bool = False
     runtime: ExecutionController = field(default_factory=ExecutionController)
 
+    def __post_init__(self) -> None:
+        # Durable checkpoints and older callers serialize enum values as
+        # strings.  Keep the in-memory state typed so every later
+        # ``phase.value`` access is safe during resume and plan execution.
+        if isinstance(self.phase, str):
+            self.phase = AgentPhase(self.phase)
+
 
 class AgentOrchestrator:
     def __init__(
@@ -61,10 +68,26 @@ class AgentOrchestrator:
         self.emit = emit
         self.budgets = budgets or RuntimeBudgets()
         self.run: OrchestrationRun | None = None
+        # A session can execute several independent tasks.  The durable
+        # safety mutation history is intentionally broader than one task, but
+        # the user-facing task ledger/recap must not present an older task's
+        # files as changes from the current one.
+        self._ledger_is_new_task = False
+        self._ledger_initialized = False
+        try:
+            self._baseline_mutation_ids = {
+                str(item.get("mutation_id"))
+                for item in local_state.get_session_state(session_id).modified_files
+                if item.get("mutation_id")
+            }
+        except Exception:
+            self._baseline_mutation_ids = set()
 
     def transition(self, phase: AgentPhase, *, action: str = "") -> None:
         if self.run is None:
             raise RuntimeError("orchestration run has not started")
+        if isinstance(phase, str):
+            phase = AgentPhase(phase)
         self.run.phase = phase
         local_state.save_session_state(
             self.session_id, current_phase=phase.value,
@@ -96,12 +119,30 @@ class AgentOrchestrator:
         turn, resume included, so a task interrupted at 3 of 4 steps came back
         as 0 of 4 and had to be re-evaluated from scratch, again and again.
         """
-        profile = classify_task(objective, read_only=read_only)
-        self.run = OrchestrationRun(self.session_id, objective, profile, runtime=ExecutionController(self.budgets))
+        # A recovery prompt is transport/control data, not a replacement for
+        # the user's task.  Older resume paths passed strings such as
+        # "Continue from the saved checkpoint and resolve: ..." here and then
+        # persisted that wrapper as active_task.objective.  Subsequent resume
+        # selection consequently compared the wrapper against the saved plan,
+        # created a second plan, and displayed progress for the wrong task.
+        # The saved plan objective is authoritative whenever a valid snapshot
+        # is present; the current messages still carry any explicit follow-up
+        # requirements to the model.
+        canonical_objective = (
+            str(getattr(restore, "objective", "") or objective).strip()
+            if restore is not None and str(getattr(restore, "objective", "") or "").strip()
+            else objective
+        )
+        profile = classify_task(canonical_objective, read_only=read_only)
+        self.run = OrchestrationRun(self.session_id, canonical_objective, profile, runtime=ExecutionController(self.budgets))
         restored = restore is not None and restore.resume_index is not None
         local_state.save_session_state(
             self.session_id,
-            active_task={"objective": objective, "task_type": profile.task_type.value, "complexity": profile.complexity},
+            active_task={
+                "objective": canonical_objective,
+                "task_type": getattr(profile.task_type, "value", profile.task_type),
+                "complexity": getattr(profile.complexity, "value", profile.complexity),
+            },
             current_phase=AgentPhase.UNDERSTAND.value, execution_status="running",
             owner_pid=os.getpid(),
         )
@@ -115,7 +156,7 @@ class AgentOrchestrator:
                 if restore.session_id != self.session_id else {}
             )
             local_state.update_task_state(
-                self.session_id, task_id=str(self.session_id), objective=objective,
+                self.session_id, task_id=str(self.session_id), objective=canonical_objective,
                 status="running", phase=AgentPhase.UNDERSTAND.value,
                 **carried,
                 plan=names,
@@ -136,7 +177,7 @@ class AgentOrchestrator:
         if profile.requires_repository_context:
             self.transition(AgentPhase.INSPECT, action="Load or refresh repository context")
         if restored:
-            self.run.plan = self._plan_from_snapshot(objective, profile, restore)
+            self.run.plan = self._plan_from_snapshot(canonical_objective, profile, restore)
             self.run.plan_restored = True
         else:
             self.run.plan = create_plan(objective, profile)
@@ -472,10 +513,36 @@ class AgentOrchestrator:
         from ..runtime.ledger import LedgerEdit, PlanStep as _LedgerPlanStep, TaskLedger, load_ledger, save_ledger
 
         task_id = str(self.session_id)
-        ledger = load_ledger(task_id) or TaskLedger(
-            task_id=task_id, session_id=self.session_id, objective=self.run.objective,
-            repo_roots=[self.workspace_root], cwd=self.workspace_root,
-        )
+        existing_ledger = load_ledger(task_id)
+        if self._ledger_initialized:
+            ledger = existing_ledger or TaskLedger(
+                task_id=task_id, session_id=self.session_id, objective=self.run.objective,
+                repo_roots=[self.workspace_root], cwd=self.workspace_root,
+            )
+        elif existing_ledger is None:
+            ledger = TaskLedger(
+                task_id=task_id, session_id=self.session_id, objective=self.run.objective,
+                repo_roots=[self.workspace_root], cwd=self.workspace_root,
+            )
+            self._ledger_is_new_task = True
+            self._ledger_initialized = True
+        elif not local_state.task_objectives_compatible(
+            str(existing_ledger.objective or ""), self.run.objective,
+        ):
+            # Do not merge an unrelated task into the prior session ledger.
+            # This is the source of misleading recaps such as a Finitron task
+            # showing old registry/test files as if the current turn changed
+            # them.  Resume/continuation objectives remain compatible and keep
+            # their plan and evidence intact.
+            ledger = TaskLedger(
+                task_id=task_id, session_id=self.session_id, objective=self.run.objective,
+                repo_roots=[self.workspace_root], cwd=self.workspace_root,
+            )
+            self._ledger_is_new_task = True
+            self._ledger_initialized = True
+        else:
+            ledger = existing_ledger
+            self._ledger_initialized = True
         ledger.objective = self.run.objective
         ledger.status = status
         if self.run.plan is not None:
@@ -511,6 +578,7 @@ class AgentOrchestrator:
         ledger.edits = [
             LedgerEdit(
                 file=str(item.get("path") or ""),
+                operation=str(item.get("operation") or "update"),
                 description=(
                     f"{item.get('operation', 'edit')} "
                     f"(+{item.get('lines_added', 0)}/-{item.get('lines_removed', 0)})"
@@ -518,7 +586,11 @@ class AgentOrchestrator:
                 applied=True,
                 mutation_id=str(item.get("mutation_id") or ""),
             )
-            for item in modified if item.get("path")
+            for item in modified
+            if item.get("path") and not (
+                self._ledger_is_new_task
+                and item.get("mutation_id") in self._baseline_mutation_ids
+            )
         ]
         if self.run.route:
             ledger.current_provider = str(self.run.route.get("provider") or ledger.current_provider)
@@ -720,7 +792,7 @@ class AgentOrchestrator:
         )
         if (
             self.run.reasoning_plan
-            and self.run.profile.task_type.value == "audit"
+            and getattr(self.run.profile.task_type, "value", self.run.profile.task_type) == "audit"
             and self.run.plan is not None
         ):
             pending = [
@@ -763,21 +835,38 @@ class AgentOrchestrator:
                 )
             self._sync_plan_progress()
         self.transition(AgentPhase.REPORT, action="Report only evidence-supported outcomes")
-        if report.severity == "error":
+        # `passed` is the completion authority.  Severity describes how the
+        # caller should present the failure; a warning still contains an
+        # unresolved acceptance criterion (for example a pending plan step)
+        # and must never become a successful task merely because it is not an
+        # error-level finding.
+        if not report.passed:
             self.run.runtime.fail("Completion validation failed.")
         else:
             self.run.runtime.complete()
-        self.transition(AgentPhase.FAILED if report.severity == "error" else AgentPhase.COMPLETED)
-        local_state.checkpoint(self.session_id, reason="orchestrator_complete", summary=final_text[-1000:])
+        terminal_phase = AgentPhase.COMPLETED if report.passed else AgentPhase.FAILED
+        terminal_status = "completed" if report.passed else "failed"
+        self.transition(terminal_phase)
+        local_state.checkpoint(
+            self.session_id,
+            reason="orchestrator_complete" if report.passed else "orchestrator_validation_failed",
+            summary=final_text[-1000:],
+        )
         local_state.task_checkpoint(
-            self.session_id, reason="delivery_ready", next_action="none",
-            phase=AgentPhase.COMPLETED.value, status="completed",
-            completion_evidence=list((local_state.get_session_state(self.session_id).task_state or {}).get("completion_evidence") or []) + ["final delivery emitted"],
+            self.session_id,
+            reason="delivery_ready" if report.passed else "completion_validation_failed",
+            next_action="none" if report.passed else "resume and satisfy unresolved acceptance criteria",
+            phase=terminal_phase.value,
+            status=terminal_status,
+            completion_evidence=(
+                list((local_state.get_session_state(self.session_id).task_state or {}).get("completion_evidence") or [])
+                + (["final delivery emitted"] if report.passed else [])
+            ),
         )
         try:
             self.save_task_ledger(
-                status="failed" if report.severity == "error" else "completed",
-                next_action="none",
+                status=terminal_status,
+                next_action="none" if report.passed else "resume and satisfy unresolved acceptance criteria",
             )
         except Exception:
             pass

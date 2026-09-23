@@ -1560,7 +1560,8 @@ class LiveInputListener:
             f"Queued follow-ups: {queued_total}",
         ]
         if steps:
-            lines.insert(1, f"Plan: {done}/{len(steps)} steps done")
+            from .plan_panel import plan_progress_label
+            lines.insert(1, f"Plan: {done}/{len(steps)} steps done ({plan_progress_label(steps)})")
         return lines
 
     def _handle_status_command(self, text: str) -> bool:

@@ -16,7 +16,7 @@ from pathlib import Path
 _SKIP_DIRS = {".git", ".venv", "venv", "node_modules", "__pycache__", "build", "dist", "checkpoints"}
 _COMPILEALL = re.compile(r"(?:^|\s)(?:python(?:3)?)(?:\s+[^;&|]*?)?\s+-m\s+compileall\b", re.I)
 _IMPORT_CHECK = re.compile(r"(?:python(?:3)?).*\s-c\s+.*\b(?:import|from)\b", re.I)
-_TESTING = re.compile(r"(?:pytest|tox|nox|npm\s+(?:run\s+)?(?:test|check|typecheck|build)|cargo\s+test|go\s+test)", re.I)
+_TESTING = re.compile(r"(?:pytest|tox|nox|npm\s+(?:run\s+)?(?:install|test|check|typecheck|build)|cargo\s+test|go\s+test)", re.I)
 _TRAINING = re.compile(r"(?:train(?:ing)?|pretrain|fine[-_ ]?tune|frontier)", re.I)
 
 
@@ -50,13 +50,13 @@ def adaptive_command_timeout(command: str, cwd: str | Path, requested: int | flo
     mid-audit.
     """
     try:
-        requested_seconds = max(int(requested or 0), 1)
+        requested_seconds = max(int(requested or 0), 0)
     except (TypeError, ValueError):
-        requested_seconds = 60
+        requested_seconds = 0
 
     text = str(command or "")
     if not (_COMPILEALL.search(text) or _IMPORT_CHECK.search(text) or _TESTING.search(text) or _TRAINING.search(text)):
-        return requested_seconds
+        return requested_seconds or 60
 
     files, test_files, source_bytes = _package_workload(Path(cwd).expanduser().resolve())
     # A workload unit combines breadth and source volume.  This is deliberately
@@ -68,6 +68,8 @@ def adaptive_command_timeout(command: str, cwd: str | Path, requested: int | flo
     if _TRAINING.search(text):
         estimate = 300 + (workload * 15)
     elif _TESTING.search(text):
+        # Dependency installation and builds scale with package metadata and
+        # source breadth too; they share the same workload floor as tests.
         estimate = 180 + (workload * 8)
     elif _IMPORT_CHECK.search(text):
         estimate = 60 + (workload * 3)

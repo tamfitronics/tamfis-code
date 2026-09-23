@@ -123,15 +123,53 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
         parts.append(f"the last run {status}")
     if plan and plan.get("steps"):
         steps = plan["steps"]
+        from .plan_panel import plan_progress_label
         done = sum(1 for s in steps if str(s.get("status")) == "completed")
-        parts.append(f"plan {done}/{len(steps)} steps done")
-    files = [
-        str(m.get("path")) for m in (state.modified_files or [])
-        if m.get("path") and m.get("revert_status") != "reverted"
-    ]
+        parts.append(f"plan {done}/{len(steps)} steps done ({plan_progress_label(steps)})")
+    # Prefer the task-scoped ledger.  SessionState.modified_files is a safety
+    # history across the whole session and may contain edits from an earlier
+    # objective; using it here was the source of stale Finitron paths showing
+    # up in a later task's recap.
+    edits: list[dict[str, Any]] = []
+    try:
+        from .runtime.ledger import load_ledger
+
+        ledger = load_ledger(str(session_id))
+        if ledger is not None:
+            edits = [
+                {
+                    "path": edit.file,
+                    "operation": edit.operation,
+                    "revert_status": "none",
+                }
+                for edit in ledger.edits
+                if edit.applied and edit.file
+            ]
+    except Exception:
+        edits = []
+    if not edits:
+        edits = [
+            m for m in (state.modified_files or [])
+            if m.get("path") and m.get("revert_status") != "reverted"
+        ]
+    files = [str(m.get("path")) for m in edits if m.get("path")]
     unique_files = list(dict.fromkeys(reversed(files)))[:4]
     if unique_files:
-        parts.append("changed " + ", ".join(p.rsplit("/", 1)[-1] for p in unique_files))
+        grouped: dict[str, list[str]] = {"added": [], "updated": [], "removed": []}
+        for item in edits:
+            path = str(item.get("path") or "")
+            if not path:
+                continue
+            operation = str(item.get("operation") or "update").casefold()
+            category = "added" if operation in {"create", "add", "added"} else (
+                "removed" if operation in {"delete", "remove", "removed"} else "updated"
+            )
+            grouped[category].append(path.rsplit("/", 1)[-1])
+        labels = [
+            f"{name} {', '.join(list(dict.fromkeys(values))[:4])}"
+            for name, values in grouped.items() if values
+        ]
+        parts.append("; ".join(labels))
     outcome = _first_sentences(last_answer or state.conversation_summary, 260) if (last_answer or state.conversation_summary) else ""
     standing = "; ".join(filter(None, [outcome, ", ".join(parts)])) or "no progress was recorded"
     return ReturnRecap(

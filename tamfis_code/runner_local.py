@@ -23,6 +23,7 @@ changes to work with a local loop instead of remote SSE events.
 from __future__ import annotations
 
 import asyncio
+import copy
 import base64
 import contextlib
 import logging
@@ -119,6 +120,7 @@ from .runtime.workspace_authority import (
     resolve_workspace_targets,
 )
 from .orchestrator.repair import choose_repair, classify_failure
+from .intent_preflight import apply_preflight_answer, preflight_intent
 
 # A safety-valve ceiling, not a target -- local_chat.py's MAX_TOOL_ROUNDS=5
 # was appropriate for a read-only Q&A loop; a real coding-agent task
@@ -703,6 +705,102 @@ except (TypeError, ValueError):
 # leaves room for provider-side tokenization variance and the next response,
 # allowing the same task to continue instead of being cut off at the request.
 _CONTEXT_SAFETY_MARGIN = 0.75
+
+
+def _normalize_provider_type(value: Any, *, default: Optional[ProviderType] = None) -> Optional[ProviderType]:
+    """Normalize provider values restored from JSON/session state.
+
+    Provider enums serialize as their wire string. Resume and compatibility
+    callers can therefore hand a plain string to a path that historically
+    assumed ``ProviderType`` and accessed ``.value``. Normalize at direct-call
+    boundaries so stale checkpoint state cannot abort a task with
+    ``'str' object has no attribute 'value'``.
+    """
+    if value is None:
+        return default
+    if isinstance(value, ProviderType):
+        return value
+    raw = getattr(value, "value", value)
+    try:
+        return ProviderType(str(raw).strip().lower())
+    except (TypeError, ValueError):
+        return default
+
+
+def _enum_wire_value(value: Any) -> str:
+    """Return an enum's wire value while accepting checkpointed strings.
+
+    Task profiles are persisted as JSON, so ``TaskType`` values can be plain
+    strings after resume even though fresh classifier results use enums.
+    Rendering and event paths must treat both representations identically.
+    """
+    raw = getattr(value, "value", value)
+    return str(raw)
+
+# The round-loop guard below is useful for proactive compaction, but planning,
+# recovery and reconnect calls can enter the provider through a direct path.
+# Keep a second, request-boundary guard so no path can submit an oversized
+# payload.  This is deliberately conservative: provider tokenizers count JSON,
+# tool schemas and code more densely than the four-character estimate.
+_DIRECT_CONTEXT_FALLBACK_WINDOW = 131_072
+
+
+def _direct_provider_context_window(provider: Any, model: str) -> int:
+    """Resolve a context limit without constructing a ProviderManager.
+
+    Direct planning/recovery calls do not always receive a manager, and some
+    older callers omit ``provider`` while setting the telemetry context.  A
+    conservative endpoint limit is safer than trusting an alias or a stale
+    provider bucket.  Per-model overrides are retained for known long-context
+    NVIDIA routes.
+    """
+    try:
+        provider_type = provider if isinstance(provider, ProviderType) else ProviderType(str(provider))
+    except (TypeError, ValueError):
+        provider_type = None
+    if provider_type is not None:
+        config = ProviderManager.PROVIDERS.get(provider_type)
+        if config is not None:
+            window = int(getattr(config, "context_window", _DIRECT_CONTEXT_FALLBACK_WINDOW) or _DIRECT_CONTEXT_FALLBACK_WINDOW)
+            if provider_type == ProviderType.NVIDIA:
+                window = int(ProviderManager.MODEL_CONTEXT_WINDOWS.get(model, window))
+            return max(8_192, window)
+    return _DIRECT_CONTEXT_FALLBACK_WINDOW
+
+
+def _prepare_direct_provider_messages(
+    messages: list[dict[str, Any]], *, provider: Any, model: str, tools: list[dict[str, Any]],
+    safety_margin: float = _CONTEXT_SAFETY_MARGIN,
+) -> tuple[list[dict[str, Any]], bool, int, int]:
+    """Return a request-only, bounded copy for every direct provider call.
+
+    The durable working transcript is never mutated.  Tool schemas consume
+    context too, so they are reserved before trimming message history.  The
+    same compaction cascade used by the main loop is intentionally reused;
+    this closes the bypass without creating a second compaction implementation.
+    """
+    request_messages = copy.deepcopy(messages)
+    window = _direct_provider_context_window(provider, model)
+    tool_tokens = 0
+    if tools:
+        with contextlib.suppress(TypeError, ValueError):
+            tool_tokens = len(json.dumps(tools, ensure_ascii=False, separators=(",", ":"))) // _CHARS_PER_TOKEN_ESTIMATE
+    margin = min(0.95, max(0.20, float(safety_margin)))
+    target = max(
+        1_024,
+        int(window * margin) - MAX_TOKENS_PER_REQUEST - tool_tokens,
+    )
+    before = _estimate_tokens(request_messages)
+    changed = False
+    if before > target:
+        changed = _trim_tool_outputs(request_messages, target)
+        after = _estimate_tokens(request_messages)
+        # If protected messages plus protocol overhead still exceed the
+        # conservative target, make one emergency pass at the same boundary.
+        if after > target:
+            changed = _trim_tool_outputs(request_messages, max(1_024, int(target * 0.85))) or changed
+    after = _estimate_tokens(request_messages)
+    return request_messages, changed, before, after
 
 
 # Workspace scoping keeps broad requests such as "audit the full stack" from
@@ -1321,10 +1419,19 @@ def _apply_mcp_task_scope(
     been resolved, replace—not extend—the launch-workspace approval set with
     the exact authoritative project roots for this turn.
     """
-    mcp_server.allowed_workspace_roots = {
+    allowed = {
         Path(root).expanduser().resolve()
         for root in scope_roots
     }
+    mcp_server.allowed_workspace_roots = allowed
+    # The standalone runner may expose MCPServer through the capability
+    # gateway facade. Attribute assignment on the facade does not reach the
+    # wrapped server, so propagate the authoritative turn scope explicitly;
+    # otherwise writes to the always-granted scratch root are still rejected
+    # by the underlying handler.
+    wrapped = getattr(mcp_server, "server", None)
+    if wrapped is not None and hasattr(wrapped, "allowed_workspace_roots"):
+        wrapped.allowed_workspace_roots = set(allowed)
 
 
 def _scope_instruction(workspace_root: str, scope_roots: list[Path], *, scratch_root: Optional[Path] = None) -> str:
@@ -1358,7 +1465,9 @@ def _scope_instruction(workspace_root: str, scope_roots: list[Path], *, scratch_
 
 
 def _resolve_argument_path(value: Any, workspace_root: str) -> Optional[Path]:
-    raw = str(value or "").strip()
+    from .path_utils import clean_path_argument
+
+    raw = clean_path_argument(value)
     if not raw:
         return None
     path = Path(raw).expanduser()
@@ -1368,6 +1477,41 @@ def _resolve_argument_path(value: Any, workspace_root: str) -> Optional[Path]:
         return path.resolve()
     except OSError:
         return path.absolute()
+
+
+_REUSABLE_OBSERVATION_TOOLS = frozenset({
+    "read_file", "list_directory", "search_code", "find_references",
+    "get_git_info", "read_archive", "inspect_artifact",
+})
+
+
+def _read_only_observation_key(
+    tool_name: str, arguments: dict[str, Any], workspace_root: str,
+) -> Optional[str]:
+    """Stable key for safe observations that may be reused after failover.
+
+    Mutations and commands deliberately return ``None``.  A successful read
+    can be replayed to a replacement provider without touching the filesystem;
+    a command or mutation must always follow its normal execution/lease path.
+    """
+    name = str(tool_name or "").strip().casefold()
+    if name not in _REUSABLE_OBSERVATION_TOOLS:
+        return None
+    from .path_utils import clean_path_argument
+
+    canonical: dict[str, Any] = {}
+    for key, value in sorted((arguments or {}).items()):
+        if key in {"path", "file_path", "directory", "cwd", "source_dir"}:
+            text = clean_path_argument(value)
+            path = Path(text).expanduser()
+            if not path.is_absolute():
+                path = Path(workspace_root) / path
+            try:
+                value = str(path.resolve())
+            except OSError:
+                value = str(path.absolute())
+        canonical[key] = value
+    return json.dumps([name, canonical], sort_keys=True, default=str, separators=(",", ":"))
 
 
 def _is_within(path: Path, root: Path) -> bool:
@@ -1919,6 +2063,7 @@ async def _stream_completion_with_reconnect(
     progress_callback: Optional[Callable[[str], None]] = None,
     initial_partial: str = "",
     session_id: Optional[int] = None,
+    emit: bool = True,
 ) -> tuple[str, list["_StreamedToolCall"], Optional[str]]:
     """Stream a completion and reconnect without losing or duplicating text.
 
@@ -1938,6 +2083,7 @@ async def _stream_completion_with_reconnect(
     recurring failure instead. Visible only under TAMFIS_CODE_DEBUG, where
     seeing every retry attempt is exactly the point.
     """
+    provider = _normalize_provider_type(provider, default=ProviderType.AUTO) or ProviderType.AUTO
     durable_partial = initial_partial
     last_error: Optional[Exception] = None
 
@@ -1988,17 +2134,18 @@ async def _stream_completion_with_reconnect(
                     tools=tools,
                     renderer=renderer,
                     reasoning_effort=reasoning_effort,
-                    emit=not retrying_partial,
+                    emit=emit and not retrying_partial,
                     progress_callback=remember_attempt,
                 )
             record_round_trip(ok=True)
             if retrying_partial:
                 novel = _novel_continuation(durable_partial, content)
                 if novel:
-                    renderer.handle_event({
-                        "event_type": "assistant_delta",
-                        "payload": {"content": novel},
-                    })
+                    if emit:
+                        renderer.handle_event({
+                            "event_type": "assistant_delta",
+                            "payload": {"content": novel},
+                        })
                     if progress_callback is not None:
                         progress_callback(novel)
                 content = durable_partial + novel
@@ -2125,6 +2272,7 @@ async def _ask_provider_fallback_approval(
     failed_provider: ProviderType,
     interactive: bool,
     choices: list[tuple[ProviderType, str]] = (),
+    automatic: bool = False,
 ) -> str:
     """Ask before leaving an explicitly configured premium primary route.
 
@@ -2134,6 +2282,13 @@ async def _ask_provider_fallback_approval(
     inspect or resume later.
     """
     from .public_identity import public_model_name
+
+    # AUTO is an execution policy, not a request to ask the user after every
+    # provider hop.  A fallback remains inside the same task/checkpoint and
+    # must proceed automatically; consequential file/service actions still
+    # use their separate approval gate.
+    if automatic:
+        return "approve"
 
     choice_text = ""
     if choices:
@@ -2304,14 +2459,32 @@ def _fallback_candidates_for_turn(
         },
     )
     try:
-        return list(method(current, task_profile, **kwargs))
+        raw_candidates = list(method(current, task_profile, **kwargs))
     except TypeError:
         # Compatibility with lightweight provider doubles used by older
         # integrations and tests, which accept neither extra keyword. Passing
         # the subset the callable actually declares above means reaching here
         # is genuinely "this callable takes no keywords" -- rather than a
         # blanket retry that silently DROPS a real permission (see below).
-        return list(method(current, task_profile))
+        raw_candidates = list(method(current, task_profile))
+
+    # Persisted/API provider configuration may return wire names while the
+    # runner expects ProviderType values. Normalize once at this boundary so
+    # fallback recovery cannot fail with ``'str' object has no attribute
+    # 'value'`` after a provider outage.
+    candidates: list[ProviderType] = []
+    for candidate in raw_candidates:
+        raw = getattr(candidate, "value", candidate)
+        try:
+            normalized = raw if isinstance(raw, ProviderType) else ProviderType(str(raw))
+        except (TypeError, ValueError):
+            continue
+        # A fallback candidate may intentionally be the same provider with a
+        # different model (NIM's model-scoped circuit breaker). Do not discard
+        # it merely because its provider enum equals `current`.
+        if normalized not in candidates:
+            candidates.append(normalized)
+    return candidates
 
 
 def _supported_keyword_arguments(method: Any, wanted: dict[str, Any]) -> dict[str, Any]:
@@ -2351,6 +2524,26 @@ def _is_machine_generated_objective(text: str) -> bool:
     return bool(local_state.MACHINE_OBJECTIVE_RE.match(text or ""))
 
 
+def _resume_instruction_for_model(text: str) -> str:
+    """Return a safe continuation message for the provider.
+
+    Recovery suggestions are user-facing convenience text, not new work.
+    Feeding their full error payload back as a user objective makes a resumed
+    model debug the guard itself (for example by repeating ``list_agent_types``)
+    instead of continuing the original task.  The durable checkpoint still
+    retains the error for diagnostics; only the provider-facing message is
+    neutralised.
+    """
+    if _is_machine_generated_objective(text):
+        return (
+            "Continue the original task from the saved checkpoint. Treat the "
+            "previous failure as diagnostic context only; do not repeat the "
+            "same blocked action. Inspect the current checkpoint and choose "
+            "the next unfinished plan step."
+        )
+    return text
+
+
 def _is_real_resume_objective(text: str) -> bool:
     lowered = text.strip().lower()
     return bool(
@@ -2360,6 +2553,10 @@ def _is_real_resume_objective(text: str) -> bool:
         and not lowered.startswith(("active_plan=", "plan_"))
         and lowered not in {
             "understand", "inspect", "plan", "execute", "repair", "validate", "report", "completed",
+            # UI control words are not user objectives. Treating a plain
+            # `clear` follow-up as a new task overwrote the active objective
+            # and made the next resume inherit the wrong read-only mode.
+            "clear", "/clear",
         }
     )
 
@@ -2423,7 +2620,26 @@ def _checkpoint_resume_objective(checkpoint: dict[str, Any]) -> str:
         if key not in seen:
             unique.append(candidate)
             seen.add(key)
-    return "\n\nAdditional user context: ".join(unique) or stored
+    return "\n\nAdditional user context: ".join(unique) or (
+        stored if _is_real_resume_objective(stored) else ""
+    )
+
+
+def _objective_from_completed_actions(actions: Any) -> str:
+    """Recover a lost root objective from the session's durable action log.
+
+    Older sessions could overwrite both the checkpoint and active task with a
+    UI word such as ``clear``.  The first real plan/tool action still contains
+    the original ``for: ...`` objective and is safer than routing the literal
+    control word as a new task.  This is only a recovery fallback.
+    """
+    for action in actions or []:
+        purpose = str((action or {}).get("purpose") or "")
+        match = re.search(r"\bfor:\s*(.+)$", purpose, re.IGNORECASE | re.DOTALL)
+        candidate = match.group(1).strip() if match else ""
+        if _is_real_resume_objective(candidate):
+            return candidate
+    return ""
 
 
 def _close_interrupted_tool_calls(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -2434,6 +2650,16 @@ def _close_interrupted_tool_calls(messages: list[dict[str, Any]]) -> list[dict[s
     malformed assistant/tool transcript and a blind duplicate execution;
     the resumed agent must inspect actual workspace state before retrying.
     """
+    # Machine-generated resume/error suggestions are not conversation facts.
+    # They are safe to omit from the restored provider transcript; the real
+    # objective is recovered separately from the durable task/plan state.
+    messages = [
+        message for message in messages
+        if not (
+            message.get("role") == "user"
+            and _is_machine_generated_objective(str(message.get("content") or ""))
+        )
+    ]
     answered = {
         str(message.get("tool_call_id"))
         for message in messages
@@ -2581,7 +2807,9 @@ def _legacy_resume_messages(state, incoming_objective: str) -> tuple[list[dict[s
         if skip_internal_response and message.get("role") == "assistant":
             skip_internal_response = False
             continue
-        if message.get("role") == "user" and _is_resume_request(content):
+        if message.get("role") == "user" and (
+            _is_resume_request(content) or _is_machine_generated_objective(content)
+        ):
             skip_denial = True
             continue
         if skip_denial and message.get("role") == "assistant":
@@ -2688,7 +2916,10 @@ def _legacy_resume_messages(state, incoming_objective: str) -> tuple[list[dict[s
             ),
         })
     if recovered:
-        recovered.append({"role": "user", "content": incoming_objective})
+        recovered.append({
+            "role": "user",
+            "content": _resume_instruction_for_model(incoming_objective),
+        })
     return recovered, inferred_objective
 
 # Confirmed live: a reasoning-heavy provider (NVIDIA nemotron) can get stuck
@@ -3185,6 +3416,10 @@ async def _nonstream_one_completion_impl(
                 arguments=arguments,
             )
         )
+    json_content, json_calls = _extract_text_json_tool_calls(content)
+    if json_calls:
+        content = json_content
+        calls.extend(json_calls)
     return content, calls
 
 
@@ -3323,7 +3558,7 @@ async def _recover_empty_continuation(
     if requested_provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
         failed_provider = resolved_provider
         failed_model = model
-        for candidate in manager.fallback_candidates(failed_provider, task_profile):
+        for candidate in _fallback_candidates_for_turn(manager, failed_provider, task_profile):
             candidate_client = manager.get_client(candidate)
             candidate_config = manager.PROVIDERS.get(candidate)
             if candidate_client is None or candidate_config is None:
@@ -3759,6 +3994,7 @@ def _looks_like_service_restart(command: str) -> bool:
 _PORT_CONFLICT_RE = re.compile(r"\bEADDRINUSE\b|address already in use", re.IGNORECASE)
 _FORCED_LISTENER_RECLAMATION_RE = re.compile(
     r"(?:^|[;&|]\s*)(?:sudo\s+)?(?:kill(?:all)?|pkill)\b"
+    r"|\bkill\s+(?:-[A-Za-z]+\s+)?\d+(?:\s|$)"
     r"|\bfuser\b[^\n;&|]*(?:\s-k\b|--kill\b)"
     r"|\bxargs\b[^\n;&|]*\bkill(?:all)?\b"
     r"|\bsystemctl\s+(?:stop|restart)\b"
@@ -3858,6 +4094,12 @@ _FAKE_TOOL_CALL_JSON_RE = re.compile(
     r'"(?:tool|name)"\s*:\s*"(?:read_file|write_file|edit_file|extract_archive|repackage_archive|list_directory|'
     r'search_code|execute_command|get_git_info|browser|web_search)"'
 )
+_FAKE_TOOL_CALL_GENERIC_JSON_RE = re.compile(
+    r"(?:next\s+step|tool\s+call|function\s+call|calling)\s*:\s*\{\s*"
+    r"\"(?:name|tool)\"\s*:\s*\"[^\"]+\"\s*,\s*"
+    r"\"(?:parameters|arguments|args)\"\s*:",
+    re.IGNORECASE | re.DOTALL,
+)
 
 # Confirmed live, a third shape: instead of a paren-call or a JSON object, a
 # weak model can narrate a CLI-flag-style pseudo-invocation --
@@ -3873,7 +4115,8 @@ _FAKE_TOOL_CALL_FLAG_RE = re.compile(
     r"search_code|execute_command|get_git_info|browser|web_search)\s+--[A-Za-z_][\w-]*\s*="
 )
 _FAKE_TOOL_CALL_XML_RE = re.compile(
-    r"</tool_call\s*>|<tool_call[\s>]|<function(?:\s*=|\s+name\s*=)|<parameter(?:\s*=|\s+name\s*=)",
+    r"</tool_call\s*>|<tool_call[\s>]|<\|tool_call\s*>|"
+    r"<function(?:\s*=|\s+name\s*=)|<parameter(?:\s*=|\s+name\s*=)",
     re.IGNORECASE,
 )
 # Some models copy the host agent's internal channel syntax into their answer,
@@ -3897,6 +4140,7 @@ def _looks_like_fake_tool_call(text: str) -> bool:
     return bool(
         _FAKE_TOOL_CALL_RE.search(text)
         or _FAKE_TOOL_CALL_JSON_RE.search(text)
+        or _FAKE_TOOL_CALL_GENERIC_JSON_RE.search(text)
         or _FAKE_TOOL_CALL_FLAG_RE.search(text)
         or _FAKE_TOOL_CALL_XML_RE.search(text)
         or _looks_like_internal_tool_channel_leak(text)
@@ -3983,9 +4227,27 @@ def _looks_like_capitulation(text: str) -> bool:
 _FABRICATED_TOOL_RESULT_RE = re.compile(
     r"the\s+\w+\s+tool\s+(?:has\s+)?(?:found|returned|executed|ran|shows?|revealed|indicates?)|"
     r"(?:the\s+)?results?\s+(?:suggest|indicate)s?\b|"
+    r"(?:available|registered|offered)\s+tools?\s*:\s*\w+|"
     r"i\s+encountered\s+an?\s+(?:access|permission)\s+issue|"
     r"(?:here\s+are\s+the\s+)?allowed\s+directories\s+(?:are|include|where\s+i\s+can)|"
     r"i\s+(?:don'?t|do\s+not)\s+have\s+access\s+to\b",
+    re.IGNORECASE,
+)
+
+# A related failure is a model claiming that a consequential operation already
+# happened without issuing any command or mutation tool: "I have scaled the
+# dataset", "the model has been fine-tuned", or "I implemented the pipeline".
+# These are not harmless summaries when the task asked Tamfis-Code to do the
+# work.  Keep this separate from the ordinary mutation-claim validator: that
+# validator runs at finalisation, while this guard must stop the provider from
+# advancing to the next fictional step during an active tool turn.
+_UNVERIFIED_OPERATION_RESULT_RE = re.compile(
+    r"\bi\s+(?:have|ha(?:s|ve))\s+(?:successfully\s+)?(?:scaled|prepared|generated|created|designed|"
+    r"implemented|started|trained|fine[- ]?tuned|evaluated|validated|configured|updated|completed|"
+    r"finished|built|deployed)\b|"
+    r"\b(?:the|this)\s+(?:dataset|pipeline|model|architecture|training|fine[- ]?tuning|evaluation)\s+"
+    r"(?:is|was|has been)\s+(?:complete|completed|ready|finished|implemented|trained|evaluated|"
+    r"configured|updated|fine[- ]?tuned|successful)",
     re.IGNORECASE,
 )
 
@@ -3994,6 +4256,11 @@ def _looks_like_fabricated_tool_result(text: str) -> bool:
     """True when the model reports a past-tense tool result or tool-level
     refusal in prose without any real tool call backing it this round."""
     return bool(_FABRICATED_TOOL_RESULT_RE.search(text or ""))
+
+
+def _looks_like_unverified_operation_result(text: str) -> bool:
+    """True for a claimed write/training operation with no execution evidence."""
+    return bool(_UNVERIFIED_OPERATION_RESULT_RE.search(text or ""))
 
 
 @dataclass
@@ -4005,6 +4272,8 @@ class _StreamedToolCall:
 
 _TEXT_TOOL_START = "<tool_call"
 _TEXT_TOOL_END_RE = re.compile(r"</tool_call\s*>", re.IGNORECASE)
+_TEXT_CHANNEL_TOOL_START_RE = re.compile(r"<\|tool_call\s*>", re.IGNORECASE)
+_TEXT_CHANNEL_TOOL_END_RE = re.compile(r"<\|(?:end|end_tool_call)\|>", re.IGNORECASE)
 _TEXT_TOOL_FUNCTION_RE = re.compile(
     r"<function(?:\s*=\s*|\s+name\s*=\s*[\"']?)([A-Za-z_][\w.-]*)[\"']?\s*>",
     re.IGNORECASE,
@@ -4016,11 +4285,12 @@ _TEXT_TOOL_PARAMETER_RE = re.compile(
 
 
 def _partial_text_tool_prefix_length(text: str) -> int:
-    """Keep a possible split ``<tool_call`` prefix between stream chunks."""
+    """Keep possible split text/channel tool prefixes between chunks."""
     lowered = text.lower()
-    for size in range(min(len(lowered), len(_TEXT_TOOL_START) - 1), 0, -1):
-        if lowered.endswith(_TEXT_TOOL_START[:size]):
-            return size
+    for prefix in (_TEXT_TOOL_START, "<|tool_call"):
+        for size in range(min(len(lowered), len(prefix) - 1), 0, -1):
+            if lowered.endswith(prefix[:size]):
+                return size
     return 0
 
 
@@ -4036,8 +4306,12 @@ def _parse_text_tool_block(block: str, allowed_names: set[str]) -> Optional[_Str
     if function_match is None:
         return None
     name = function_match.group(1)
-    if name not in allowed_names:
-        return None
+    # Keep the block on the structured execution path even when the model
+    # names a tool that was not offered.  Returning ``None`` here makes the
+    # caller append the raw XML to assistant text, which leaks provider
+    # protocol garbage (and can make a malformed write_file look like a real
+    # edit).  The final offered-tool boundary still rejects unknown names
+    # before policy, approval, or execution, so this is quarantine—not trust.
 
     parameters: dict[str, Any] = {}
     matches = list(_TEXT_TOOL_PARAMETER_RE.finditer(block))
@@ -4066,6 +4340,74 @@ def _parse_text_tool_block(block: str, allowed_names: set[str]) -> Optional[_Str
     )
 
 
+def _extract_text_json_tool_calls(text: str) -> tuple[str, list[_StreamedToolCall]]:
+    """Quarantine tool-call JSON emitted in assistant prose.
+
+    A provider that lacks native function calling sometimes emits a request
+    such as ``{"name":"list_tools","parameters":{}}`` as ordinary text.
+    That text is neither an assistant answer nor evidence of an executed
+    operation.  Parse only objects with an explicit tool name and argument
+    field, return them to the normal offered-tool boundary, and remove the
+    JSON from the answer.  Unknown names intentionally remain structured so
+    the caller can return the same unoffered-tool error as a native call.
+    """
+    value = str(text or "")
+    decoder = json.JSONDecoder()
+    spans: list[tuple[int, int]] = []
+    calls: list[_StreamedToolCall] = []
+    cursor = 0
+    while cursor < len(value):
+        start = value.find("{", cursor)
+        if start < 0:
+            break
+        try:
+            parsed, end = decoder.raw_decode(value[start:])
+        except json.JSONDecodeError:
+            cursor = start + 1
+            continue
+        cursor = start + max(end, 1)
+        if not isinstance(parsed, dict):
+            continue
+        function = parsed.get("function")
+        if isinstance(function, dict):
+            name = function.get("name")
+            raw_args = function.get("arguments", function.get("parameters", {}))
+        else:
+            name = parsed.get("name", parsed.get("tool"))
+            raw_args = parsed.get("parameters", parsed.get("arguments", parsed.get("args", {})))
+        if not isinstance(name, str) or not name.strip():
+            continue
+        if not any(key in parsed for key in ("name", "tool", "function")):
+            continue
+        if not any(key in parsed or isinstance(function, dict) and key in function
+                   for key in ("parameters", "arguments", "args")):
+            continue
+        if isinstance(raw_args, str):
+            try:
+                raw_args = json.loads(raw_args)
+            except json.JSONDecodeError:
+                # Preserve malformed arguments for the ordinary argument
+                # validation path instead of silently executing {}.
+                raw_args = {"_malformed_arguments": raw_args}
+        if not isinstance(raw_args, dict):
+            raw_args = {"_malformed_arguments": raw_args}
+        calls.append(_StreamedToolCall(
+            call_id=f"text_json_call_{uuid.uuid4().hex[:12]}",
+            name=name.strip(),
+            arguments=json.dumps(raw_args, ensure_ascii=False),
+        ))
+        spans.append((start, start + end))
+    if not spans:
+        return value, []
+    cleaned: list[str] = []
+    previous = 0
+    for start, end in spans:
+        cleaned.append(value[previous:start])
+        previous = end
+    cleaned.append(value[previous:])
+    return "".join(cleaned), calls
+
+
 @dataclass
 class _TextToolStreamFilter:
     """Incrementally hide and collect XML-ish textual tool calls."""
@@ -4073,12 +4415,25 @@ class _TextToolStreamFilter:
     allowed_names: set[str]
     pending: str = ""
     in_tool: bool = False
+    in_channel_tool: bool = False
+    malformed_protocol: bool = False
     tool_blocks: list[str] = field(default_factory=list)
 
     def feed(self, content: str) -> str:
         self.pending += content
         visible: list[str] = []
         while self.pending:
+            if self.in_channel_tool:
+                end = _TEXT_CHANNEL_TOOL_END_RE.search(self.pending)
+                if end is None:
+                    # The provider may terminate without a channel end
+                    # marker. Keep the remainder quarantined until finish;
+                    # it is protocol markup, never assistant prose.
+                    break
+                self.pending = self.pending[end.end():]
+                self.in_channel_tool = False
+                self.malformed_protocol = True
+                continue
             if self.in_tool:
                 end = _TEXT_TOOL_END_RE.search(self.pending)
                 if end is None:
@@ -4089,6 +4444,14 @@ class _TextToolStreamFilter:
                 continue
 
             start = self.pending.lower().find(_TEXT_TOOL_START)
+            channel_match = _TEXT_CHANNEL_TOOL_START_RE.search(self.pending)
+            channel_start = channel_match.start() if channel_match else -1
+            if channel_start >= 0 and (start < 0 or channel_start < start):
+                visible.append(self.pending[:channel_start])
+                self.pending = self.pending[channel_start + channel_match.end() - channel_match.start():]
+                self.in_channel_tool = True
+                self.malformed_protocol = True
+                continue
             if start >= 0:
                 visible.append(self.pending[:start])
                 self.pending = self.pending[start:]
@@ -4106,18 +4469,28 @@ class _TextToolStreamFilter:
         return "".join(visible)
 
     def finish(self) -> tuple[str, list[_StreamedToolCall]]:
-        # Only suppress complete, valid, offered tool calls. If the model
-        # merely wrote an incomplete/invalid tag, preserve it as text so no
-        # content silently disappears.
+        # Suppress every complete tool-markup block.  Valid blocks become
+        # ordinary structured calls; malformed or unoffered blocks are also
+        # represented structurally so the normal malformed/unknown-tool
+        # refusal path handles them without exposing raw protocol markup.
         parsed: list[_StreamedToolCall] = []
-        rejected: list[str] = []
         for block in self.tool_blocks:
             call = _parse_text_tool_block(block, self.allowed_names)
             if call is None:
-                rejected.append(block)
+                # A complete block with no parseable function is still not
+                # assistant prose. Do not leak it into the terminal; the
+                # caller will receive a bounded diagnostic via the ordinary
+                # stream/recovery path.
+                self.malformed_protocol = True
+                continue
             else:
                 parsed.append(call)
-        trailing = "".join(rejected) + self.pending
+        # An incomplete block has no closing delimiter and remains pending.
+        # Preserve only that genuinely incomplete text; it is not executable
+        # and cannot silently mutate the workspace.
+        if self.in_channel_tool:
+            self.malformed_protocol = True
+        trailing = "" if self.malformed_protocol else self.pending
         self.pending = ""
         return trailing, parsed
 
@@ -4693,6 +5066,30 @@ async def _stream_one_completion_impl(
             })
 
     trailing_content, textual_calls = text_tool_filter.finish()
+    # Some routes ignore the native tool schema and print a JSON request in
+    # ordinary assistant text (for example ``{"name":"list_tools",...}``).
+    # Recover it before the no-tool finalisation branch.  The extracted call
+    # goes through the exact same offered-name, policy, approval and execution
+    # boundary as a native call; the JSON itself is never returned as an
+    # assistant answer or treated as a successful action.
+    json_content, json_calls = _extract_text_json_tool_calls(
+        "".join(content_parts) + trailing_content,
+    )
+    if json_calls:
+        # The stream may already have emitted the provisional text to a TTY.
+        # Replace the returned content and do not emit it again; subsequent
+        # turns therefore cannot present the unexecuted JSON as evidence.
+        content_parts[:] = [json_content]
+        trailing_content = ""
+        textual_calls.extend(json_calls)
+    # A provider can emit a proprietary channel wrapper such as
+    # ``<|tool_call>call:write_todos{...}`` instead of either native
+    # tool_calls or the supported XML-ish form.  The filter quarantines it;
+    # classify the completion as corrupted so the normal bounded provider
+    # recovery/fallback path runs.  Crucially, do this before flushing the
+    # quarantined tail to the renderer.
+    if text_tool_filter.malformed_protocol and not quality_failure_reason:
+        quality_failure_reason = finish_reason = "corrupted_output"
     if not quality_failure_reason:
         pending_content += trailing_content
         combined_tail = (tail_buffer + trailing_content)[-_DEGENERATE_REPETITION_TAIL_WINDOW:]
@@ -4764,9 +5161,26 @@ async def _stream_one_completion(
     """Trace a compatible streaming provider request without its payload."""
     from .runtime.telemetry import current_provider, span
 
+    effective_provider = provider or current_provider()
+    bounded_messages, context_trimmed, context_before, context_after = (
+        _prepare_direct_provider_messages(
+            messages, provider=effective_provider, model=model, tools=tools,
+        )
+    )
+    if context_trimmed and context_before != context_after:
+        with contextlib.suppress(Exception):
+            renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {
+                    "content": (
+                        f"Provider context protected: compacted ~{context_before} to "
+                        f"~{context_after} estimated input tokens before sending {model}."
+                    ),
+                },
+            })
     provider_name = (
-        provider.value if isinstance(provider, ProviderType)
-        else str(provider or current_provider() or "unknown")
+        effective_provider.value if isinstance(effective_provider, ProviderType)
+        else str(effective_provider or "unknown")
     )
     if provider_name == "ollama_cloud":
         from . import ollama_pacing
@@ -4777,7 +5191,7 @@ async def _stream_one_completion(
             return await _stream_one_completion_impl(
                 client,
                 model=model,
-                messages=messages,
+                messages=bounded_messages,
                 tools=tools,
                 renderer=renderer,
                 reasoning_effort=reasoning_effort,
@@ -4785,6 +5199,53 @@ async def _stream_one_completion(
                 progress_callback=progress_callback,
             )
         except Exception as exc:
+            # OpenAI-compatible gateways may tokenize code/JSON/tool history
+            # much more densely than the inexpensive local estimate.  A
+            # context rejection is safe to retry once because the rejected
+            # request never executed a tool or other side effect.  Rebuild
+            # from the durable transcript so neither request mutates it.
+            detail = str(exc).lower()
+            context_rejected = (
+                "maximum context length" in detail
+                or ("context length" in detail and "token" in detail)
+                or "too many tokens" in detail
+            )
+            if context_rejected:
+                emergency_messages, emergency_trimmed, emergency_before, emergency_after = (
+                    _prepare_direct_provider_messages(
+                        messages,
+                        provider=effective_provider,
+                        model=model,
+                        tools=tools,
+                        safety_margin=0.40,
+                    )
+                )
+                with contextlib.suppress(Exception):
+                    renderer.handle_event({
+                        "event_type": "diagnostics",
+                        "payload": {
+                            "content": (
+                                "Provider rejected the estimated context; compacted again "
+                                f"(~{emergency_before} to ~{emergency_after} estimated tokens) "
+                                "and retrying the same request safely."
+                            ),
+                        },
+                    })
+                try:
+                    return await _stream_one_completion_impl(
+                        client,
+                        model=model,
+                        messages=emergency_messages,
+                        tools=tools,
+                        renderer=renderer,
+                        reasoning_effort=reasoning_effort,
+                        emit=emit,
+                        progress_callback=progress_callback,
+                    )
+                except Exception:
+                    # Keep the original error for the existing fallback
+                    # classifier if the emergency budget is insufficient.
+                    pass
             _progress = getattr(renderer, "progress", None)
             if _progress is not None and not isinstance(exc, asyncio.CancelledError):
                 # RETRYING / RATE_LIMITED / QUOTA_EXHAUSTED until output resumes,
@@ -5139,7 +5600,9 @@ _READ_ONLY_RESUME_STEP_RE = re.compile(
 )
 _MUTATING_RESUME_STEP_RE = re.compile(
     r"\b(?:add|build|change|create|delete|edit|fix|implement|install|migrate|"
-    r"modify|remove|replace|rewrite|update|write|commit|push|deploy|restart)\b",
+    r"modify|remove|replace|rewrite|update|write|commit|push|deploy|restart|"
+    r"train(?:ing|ed|s)?|pretrain(?:ing|ed)?|fine[- ]?tun(?:e|ing|ed)|"
+    r"benchmark(?:ing|ed)?)\b",
     re.IGNORECASE,
 )
 
@@ -5268,10 +5731,12 @@ def _resume_plan_message_content(plan: Any) -> str:
         lines.append(f"{marker} {step.index}. {step.name}")
         if step.status == "completed" and step.evidence:
             lines.append(f"     evidence: {'; '.join(str(e) for e in step.evidence[:2])[:200]}")
-    if plan.assumptions:
-        lines.append("Assumptions: " + "; ".join(plan.assumptions))
-    if plan.risks:
-        lines.append("Risks: " + "; ".join(plan.risks))
+    assumptions = list(getattr(plan, "assumptions", []) or [])
+    risks = list(getattr(plan, "risks", []) or [])
+    if assumptions:
+        lines.append("Assumptions: " + "; ".join(assumptions))
+    if risks:
+        lines.append("Risks: " + "; ".join(risks))
     return "\n".join(lines)
 
 
@@ -5281,10 +5746,12 @@ def _plan_message_content(plan: Any, *, heading: str) -> str:
         lines.append("No executable plan was produced; inspect the current state before proceeding.")
         return "\n".join(lines)
     lines += [f"{step.index}. {step.name}" for step in plan.steps]
-    if plan.assumptions:
-        lines.append("Assumptions: " + "; ".join(plan.assumptions))
-    if plan.risks:
-        lines.append("Risks: " + "; ".join(plan.risks))
+    assumptions = list(getattr(plan, "assumptions", []) or [])
+    risks = list(getattr(plan, "risks", []) or [])
+    if assumptions:
+        lines.append("Assumptions: " + "; ".join(assumptions))
+    if risks:
+        lines.append("Risks: " + "; ".join(risks))
     return "\n".join(lines)
 
 
@@ -5742,6 +6209,7 @@ async def _attempt_reasoning_plan(
     exactly, so existing callers that don't have a ProviderManager handy
     are unaffected.
     """
+    provider = _normalize_provider_type(provider)
     repository_context = local_state.get_session_state(session_id).repository_context or {}
     prompt_messages = build_reasoning_plan_prompt(
         objective, task_profile, repository_context,
@@ -5803,8 +6271,8 @@ async def _attempt_reasoning_plan(
                 manager is not None and provider is not None
                 and manager.is_retryable_provider_error(exc)
             ):
-                for candidate in manager.fallback_candidates(
-                    provider, task_profile,
+                for candidate in _fallback_candidates_for_turn(
+                    manager, provider, task_profile,
                     allow_premium_primary=manager.is_quota_or_rate_limit_error(exc),
                 ):
                     if candidate in tried_providers:
@@ -6253,6 +6721,11 @@ async def _run_local_agent_turn_impl(
     remain visible only via the plain-text attachment note already added to
     `messages` (path only, no pixel content) for those routes.
     """
+    # Public/ACP/resume callers can carry the provider as its persisted wire
+    # value. Normalize once before routing, telemetry, and fallback code use
+    # ``provider.value`` repeatedly.
+    provider = _normalize_provider_type(provider, default=ProviderType.AUTO) or ProviderType.AUTO
+
     messages, oversized_evidence_id = archive_oversized_objective(
         messages, session_id=session_id,
     )
@@ -6283,7 +6756,10 @@ async def _run_local_agent_turn_impl(
         # Keep the user's new continuation directive explicit.  It may name
         # selected steps ("proceed with 1, 2, and 3"), so it must not be
         # replaced by a generic resume instruction.
-        messages = [*resumed_messages, {"role": "user", "content": incoming_objective}]
+        messages = [
+            *resumed_messages,
+            {"role": "user", "content": _resume_instruction_for_model(incoming_objective)},
+        ]
     elif resume_requested:
         legacy_messages, legacy_objective = _legacy_resume_messages(prior_state, incoming_objective)
         if legacy_messages:
@@ -6335,6 +6811,12 @@ async def _run_local_agent_turn_impl(
         ),
         external_mcp_servers=external_mcp_servers,
     )
+    # The local runner keeps MCPServer's public surface, but all tool calls
+    # now pass through the standalone canonical capability facade. The facade
+    # delegates policy/transport attributes to the same server, so no second
+    # registry or tool-name surface is introduced.
+    from .capability_gateway import TamfisCodeCapabilityGateway
+    mcp_server = TamfisCodeCapabilityGateway(mcp_server)
     # Read fresh once per turn (not cached across turns/process lifetime) so
     # editing hooks.toml takes effect on the next turn without a restart.
     configured_hooks = load_hooks(workspace_root)
@@ -6342,6 +6824,8 @@ async def _run_local_agent_turn_impl(
         _checkpoint_resume_objective(prior_checkpoint)
         if resumed_from_checkpoint else (legacy_objective if resumed_from_legacy and legacy_objective else "")
     )
+    if not recovered_objective and resumed_from_checkpoint:
+        recovered_objective = _objective_from_completed_actions(prior_state.completed_actions)
     # Confirmed live: a legacy (pre-v0.4.28) resume's inferred_objective is a
     # best-guess reconstruction from old completed_actions/history and can be
     # something totally unrelated to what the user just typed this turn (a
@@ -6390,6 +6874,50 @@ async def _run_local_agent_turn_impl(
         added_context = "\n".join(r.message for r in prompt_hook_results if r.message)
         if added_context:
             objective = f"{objective}\n\nAdditional context from hook: {added_context}"
+    # Deterministic intent preflight comes before provider/network work. The
+    # model can handle nuanced trade-offs later, but it must not be asked to
+    # guess the scope of "fix it" or execute an obviously unsafe objective.
+    # Non-TTY callers cannot receive an interactive decision, so they fail
+    # closed only for explicitly recognized unsafe text and otherwise retain
+    # the existing scripted/CI behavior.
+    preflight = preflight_intent(objective, workspace_root=workspace_root)
+    if not preflight.proceed:
+        if preflight.question is None:
+            message = preflight.reason or "The request needs a concrete, authorized scope before execution."
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            return TaskOutcome(status="blocked", error=message)
+        if not interactive or not getattr(console, "is_terminal", False):
+            message = (
+                f"Before proceeding: {preflight.reason} "
+                "Run this task from an interactive terminal and choose a safe scope, or provide the "
+                "specific component and authorized objective explicitly."
+            )
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            return TaskOutcome(status="blocked", error=message)
+        from . import ask_user
+        questions = ask_user.normalize_questions([{
+            "header": preflight.question.header,
+            "question": preflight.question.question,
+            "options": preflight.question.options,
+        }])
+        await suspend_live_async_if_active(renderer)
+        try:
+            answers = await ask_user.ask_questions(console, questions)
+        finally:
+            resume_live_if_active(renderer)
+        answer = answers[0] if answers else None
+        selected = answer.values[0] if answer and answer.values else ""
+        if not selected or answer.skipped or "stop" in selected.casefold():
+            message = "The request was not executed; the required scope/safety decision was not approved."
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            return TaskOutcome(status="blocked", error=message)
+        if "fix the named" in selected.casefold():
+            message = "Please name the component, files, failing behavior, and authorized acceptance criteria before requesting changes."
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": message}})
+            return TaskOutcome(status="blocked", error=message)
+        objective = apply_preflight_answer(preflight, selected)
+        renderer.handle_event({"event_type": "diagnostics", "payload": {"content": f"Preflight decision recorded: {selected}"}})
+
     # Name the session NOW, in the background, from what the user just asked --
     # not after the turn completes (a long or stuck first task would otherwise
     # sit as "Session N" for as long as it runs). Never blocks the turn.
@@ -6438,8 +6966,13 @@ async def _run_local_agent_turn_impl(
     # an interrupted "start/resume/implement" step retains its execute/write
     # tools and can actually finish instead of merely printing a command.
     resume_plan_mutating = bool(resume_requested and not resume_plan_read_only)
+    # Interactive resume routing may have classified the recovery sentence as
+    # plan/audit and passed ``read_only=True`` even though the saved step is
+    # an implementation/training step. The durable step is stronger evidence
+    # than that wrapper classification; lift only this inferred restriction.
+    inferred_read_only = bool(read_only) and not resume_plan_mutating
     turn_read_only = (
-        bool(read_only)
+        inferred_read_only
         or resume_plan_read_only
         or (
             getattr(task_profile.task_type, "value", "") in {"inspect", "audit", "plan"}
@@ -6452,7 +6985,7 @@ async def _run_local_agent_turn_impl(
     # corrected by the escalation path below when the objective itself
     # turns out to request action.
     user_requested_read_only = (
-        bool(read_only)
+        inferred_read_only
         or (resume_plan_read_only and not resume_plan_mutating)
         or is_explicit_read_only_request(objective)
     )
@@ -6467,6 +7000,12 @@ async def _run_local_agent_turn_impl(
     tools: list[dict[str, Any]] = (
         mcp_server.tool_schemas_openai(names=selected_tool_names) if selected_tool_names else []
     )
+    # Tool-required turns must not stream a model's unverified completion
+    # prose.  Tool calls/results and diagnostics remain live, while the final
+    # assistant answer is emitted only after the evidence gate passes.  This
+    # prevents a rejected draft such as "Phase 0 is complete" from appearing
+    # as a real result and prevents each evidence retry from duplicating it.
+    buffer_assistant_answer = bool(task_profile.requires_tools)
     # Extension tools are not implicitly safe merely because they expose an
     # OpenAI/MCP schema. Until Tamfis Code has a verified per-tool read-only
     # annotation contract, keep every plugin and external MCP tool out of an
@@ -6711,7 +7250,7 @@ async def _run_local_agent_turn_impl(
     # see providers.py's _check_tier_iv_available -- rather than a separate
     # pre-flight routing-advisor call, since the real service only exposes
     # an execution endpoint, not a routing-decision one.
-    renderer.handle_event({"event_type": "routing_started", "payload": {"requested_provider": provider.value, "task_type": task_profile.task_type.value}})
+    renderer.handle_event({"event_type": "routing_started", "payload": {"requested_provider": provider.value, "task_type": _enum_wire_value(task_profile.task_type)}})
     if provider == ProviderType.AUTO and hasattr(manager, "resolve_route"):
         try:
             resolved_provider, config = manager.resolve_route(provider, task_profile, quality_mode="quality")
@@ -6757,6 +7296,7 @@ async def _run_local_agent_turn_impl(
                 failed_provider=resolved_provider,
                 interactive=interactive,
                 choices=choices,
+                automatic=provider == ProviderType.AUTO or approval_policy == "auto",
             )
             if decision != "deny":
                 selected = _requested_fallback_choice(decision, choices)
@@ -7034,7 +7574,24 @@ async def _run_local_agent_turn_impl(
 
         if selected_plan is not None and orchestrator.run is not None:
             orchestrator.replace_plan(selected_plan)
-            orchestrator.run.reasoning_plan = reasoning_plan is not None
+            # A deterministic, evidence-grounded fallback plan is still an
+            # executable plan.  Previously this was set only when the model
+            # successfully returned a reasoning plan.  If planning timed out
+            # or the route failed, the fallback plan was displayed to the
+            # user but marked non-authoritative internally; the pending-step
+            # continuation guard then skipped it and completion validation
+            # stopped the turn with 0/N steps done.  Plan authority depends on
+            # the plan being selected and persisted, not on which planner
+            # produced it.
+            orchestrator.run.reasoning_plan = bool(
+                reasoning_plan is not None
+                # Short provider-routing/audit probes use a deterministic
+                # fallback plan for context, but should be allowed to finish
+                # after the route itself recovers. Long objectives (the real
+                # multi-phase case, including Finitron) must keep the plan
+                # authoritative even when the planning call failed.
+                or len(objective.strip()) >= 320
+            )
             plan_message = {
                 "role": "system",
                 "content": _plan_message_content(
@@ -7054,9 +7611,18 @@ async def _run_local_agent_turn_impl(
     previous_tool_calls_signature: Optional[tuple[tuple[str, str], ...]] = None
     consecutive_identical_rounds = 0
     recent_tool_signatures: list[tuple[tuple[str, str], ...]] = []
+    # Successful read-only observations survive provider failover and stream
+    # reconnects within this task.  The replacement route receives a normal
+    # role=tool message, but the filesystem is not re-read and the renderer
+    # does not print another Explored entry.
+    reusable_observations: dict[str, dict[str, Any]] = {}
     any_mutation = False
     any_code_mutation = False  # a change to something a command could verify (not prose-only)
-    prechange_review_required = _requires_prechange_review(task_profile, objective)
+    # A pre-change review is an interactive safety checkpoint. Non-interactive
+    # callers cannot answer it; their explicit approval policy and sandbox
+    # remain authoritative rather than silently converting a valid autonomous
+    # run into an unexplained cancellation.
+    prechange_review_required = interactive and _requires_prechange_review(task_profile, objective)
     prechange_review_granted = False
     prechange_review_blocked_round = -1
     rollover_count = 0
@@ -7072,6 +7638,7 @@ async def _run_local_agent_turn_impl(
     fabricated_result_failed_providers: set[ProviderType] = set()
     fake_tool_call_retries: dict[ProviderType, int] = {}
     fake_tool_call_failed_providers: set[ProviderType] = set()
+    unoffered_tool_failed_providers: set[ProviderType] = set()
     single_tool_call_retries: dict[ProviderType, int] = {}
     completion_evidence_retries = 0
     consecutive_scope_errors = 0
@@ -7171,7 +7738,7 @@ async def _run_local_agent_turn_impl(
                     and hasattr(manager, "fallback_candidates")
                 ):
                     failed_provider = resolved_provider
-                    for candidate in manager.fallback_candidates(failed_provider, task_profile):
+                    for candidate in _fallback_candidates_for_turn(manager, failed_provider, task_profile):
                         candidate_client = manager.get_client(candidate)
                         candidate_config = manager.PROVIDERS.get(candidate)
                         if candidate_client is None or candidate_config is None:
@@ -7299,20 +7866,35 @@ async def _run_local_agent_turn_impl(
             # recoverable, and the user needs the first concrete blocker to
             # continue the same checkpoint rather than wait blindly.
             blockers = "; ".join(str(item) for item in validation.unresolved[:2]).strip()
-            message = (
-                "Completion needs more verified work before it can be reported"
-                + (f": {blockers}" if blockers else "")
-                + ". The response is retained; use `/retry` to continue from this checkpoint."
+            no_tool_evidence = any(
+                "no successful tool call" in str(item).lower()
+                or "tool evidence" in str(item).lower()
+                for item in validation.unresolved
             )
+            if no_tool_evidence:
+                message = (
+                    "Task not completed: no tool executed successfully, so the provider's "
+                    "prose cannot be treated as evidence of a change. The checkpoint is "
+                    "retained, but this route will not be retried automatically; select a "
+                    "tool-capable provider/model and then retry."
+                )
+            else:
+                message = (
+                    "Completion needs more verified work before it can be reported"
+                    + (f": {blockers}" if blockers else "")
+                    + ". The response is retained; use `/retry` to continue from this checkpoint."
+                )
             renderer.handle_event({
                 "event_type": "ai_task_failed",
                 "payload": {
                     "error": message,
                     "internal_error": "; ".join(validation.unresolved),
                     "validation": validation.to_dict(),
+                    "unverified_draft": True,
                 },
             })
-            _persist_turn_checkpoint(partial_assistant=content, status="interrupted", last_error=message)
+            checkpoint_status = "failed" if no_tool_evidence else "interrupted"
+            _persist_turn_checkpoint(partial_assistant=content, status=checkpoint_status, last_error=message)
             await _fire_session_interrupted_hooks(message)
             return TaskOutcome(status="failed", error=message, summary=content)
         if not validation.passed:
@@ -7323,6 +7905,16 @@ async def _run_local_agent_turn_impl(
             note = "\n\nℹ " + " ".join(dict.fromkeys(soft_validation_notes))
             renderer.handle_event({"event_type": "assistant_delta", "payload": {"content": note}})
             content += note
+
+        if buffer_assistant_answer and content.strip():
+            # Tool-required assistant prose was held back while the model
+            # worked.  Release it only after the independent preflight gate
+            # above accepted the evidence, so rejected drafts never appear
+            # as completed work and retries cannot print duplicate bubbles.
+            renderer.handle_event({
+                "event_type": "assistant_delta",
+                "payload": {"content": content},
+            })
 
         stop_results = await _fire_session_completed_hooks(content)
         stop_block = next((result for result in stop_results if result.blocked), None)
@@ -7362,6 +7954,23 @@ async def _run_local_agent_turn_impl(
             return TaskOutcome(status="continue", summary="")
 
         validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
+        if not validation.passed:
+            blockers = "; ".join(str(item) for item in validation.unresolved[:3]).strip()
+            message = (
+                "Task not completed: completion validation still has unresolved evidence"
+                + (f": {blockers}" if blockers else ".")
+            )
+            renderer.handle_event({
+                "event_type": "ai_task_failed",
+                "payload": {"error": message, "validation": validation.to_dict()},
+            })
+            _persist_turn_checkpoint(
+                partial_assistant=content,
+                status="failed",
+                last_error=message,
+            )
+            await _fire_session_interrupted_hooks(message)
+            return TaskOutcome(status="failed", error=message, summary=content)
         renderer.handle_event({"event_type": "ai_task_completed", "payload": {"status": "completed", "validation": validation.to_dict()}})
         local_state.remember_conversation_turn(
             session_id, objective=objective, answer=content, clear_checkpoint=True,
@@ -7594,8 +8203,8 @@ async def _run_local_agent_turn_impl(
             except Exception as exc:
                 fallback_client = fallback_model = None
                 if manager.is_retryable_provider_error(exc):
-                    for candidate in manager.fallback_candidates(
-                        recovery_provider, task_profile,
+                    for candidate in _fallback_candidates_for_turn(
+                        manager, recovery_provider, task_profile,
                         allow_premium_primary=manager.is_quota_or_rate_limit_error(exc),
                     ):
                         if candidate in tried_recovery_providers:
@@ -7897,7 +8506,7 @@ async def _run_local_agent_turn_impl(
                 })
 
             if input_tokens > token_budget and provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
-                for candidate in manager.fallback_candidates(resolved_provider, task_profile):
+                for candidate in _fallback_candidates_for_turn(manager, resolved_provider, task_profile):
                     candidate_config = manager.PROVIDERS.get(candidate)
                     if candidate_config is None or candidate_config.context_window <= config.context_window:
                         continue
@@ -7978,6 +8587,7 @@ async def _run_local_agent_turn_impl(
                 reasoning_effort=_reasoning_effort(resolved_provider, resolved_model, task_profile),
                 progress_callback=_remember_stream_delta,
                 session_id=session_id,
+                emit=not buffer_assistant_answer,
             )
             if content.strip() or tool_calls:
                 local_state.record_route_served(session_id)   # a working route just answered: heals "route down"
@@ -8092,6 +8702,7 @@ async def _run_local_agent_turn_impl(
                     failed_provider=failed_provider,
                     interactive=interactive,
                     choices=premium_choices,
+                    automatic=provider == ProviderType.AUTO or approval_policy == "auto",
                 )
                 selected_choice = _requested_fallback_choice(decision, premium_choices)
                 allow_premium_primary = decision != "deny"
@@ -8235,6 +8846,7 @@ async def _run_local_agent_turn_impl(
                                 progress_callback=_remember_stream_delta,
                                 initial_partial=interrupted_partial,
                                 session_id=session_id,
+                                emit=not buffer_assistant_answer,
                             )
                             _persist_turn_checkpoint(
                                 partial_assistant=content,
@@ -8459,7 +9071,7 @@ async def _run_local_agent_turn_impl(
             checkpoint_partial_parts.clear()
             switched = False
             if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
-                for candidate in manager.fallback_candidates(failed_quality_provider, task_profile):
+                for candidate in _fallback_candidates_for_turn(manager, failed_quality_provider, task_profile):
                     if candidate in quality_failed_providers:
                         continue
                     candidate_client = manager.get_client(candidate)
@@ -8684,7 +9296,7 @@ async def _run_local_agent_turn_impl(
                 narrated_failed_providers.add(resolved_provider)
                 switched = False
                 if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
-                    for candidate in manager.fallback_candidates(resolved_provider, task_profile):
+                    for candidate in _fallback_candidates_for_turn(manager, resolved_provider, task_profile):
                         if candidate in narrated_failed_providers:
                             continue
                         candidate_client = manager.get_client(candidate)
@@ -8762,7 +9374,7 @@ async def _run_local_agent_turn_impl(
                 fake_tool_call_failed_providers.add(resolved_provider)
                 switched = False
                 if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
-                    for candidate in manager.fallback_candidates(resolved_provider, task_profile):
+                    for candidate in _fallback_candidates_for_turn(manager, resolved_provider, task_profile):
                         if candidate in fake_tool_call_failed_providers:
                             continue
                         candidate_client = manager.get_client(candidate)
@@ -8816,7 +9428,10 @@ async def _run_local_agent_turn_impl(
                 renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
                 return TaskOutcome(status="failed", error=error)
 
-            if tools and _looks_like_fabricated_tool_result(content):
+            if tools and (
+                _looks_like_fabricated_tool_result(content)
+                or (not any_mutation and _looks_like_unverified_operation_result(content))
+            ):
                 working_messages.append({"role": "assistant", "content": content})
                 working_messages.append({"role": "system", "content": FABRICATED_RESULT_CORRECTION})
                 attempts = fabricated_result_retries.get(resolved_provider, 0)
@@ -8840,7 +9455,7 @@ async def _run_local_agent_turn_impl(
                 fabricated_result_failed_providers.add(resolved_provider)
                 switched = False
                 if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
-                    for candidate in manager.fallback_candidates(resolved_provider, task_profile):
+                    for candidate in _fallback_candidates_for_turn(manager, resolved_provider, task_profile):
                         if candidate in fabricated_result_failed_providers:
                             continue
                         candidate_client = manager.get_client(candidate)
@@ -8926,7 +9541,7 @@ async def _run_local_agent_turn_impl(
                 capitulation_failed_providers.add(resolved_provider)
                 switched = False
                 if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
-                    for candidate in manager.fallback_candidates(resolved_provider, task_profile):
+                    for candidate in _fallback_candidates_for_turn(manager, resolved_provider, task_profile):
                         if candidate in capitulation_failed_providers:
                             continue
                         candidate_client = manager.get_client(candidate)
@@ -8989,16 +9604,20 @@ async def _run_local_agent_turn_impl(
                 ]
             if (
                 tools and task_profile.requires_tools
-                and getattr(task_profile.task_type, "value", "") == "audit"
+                and getattr(orchestrator.run, "reasoning_plan", False)
                 and pending_plan_steps
-                and plan_completion_retries < 2
+                and plan_completion_retries < 3
+                and (
+                    getattr(task_profile.task_type, "value", "") == "audit"
+                    or not any_mutation
+                )
             ):
                 plan_completion_retries += 1
                 working_messages.append({"role": "assistant", "content": content})
                 working_messages.append({
                     "role": "system",
                     "content": (
-                        "The audit is not complete. The execution plan still has pending steps: "
+                        "The active plan is not complete. The execution plan still has pending steps: "
                         + "; ".join(pending_plan_steps)
                         + ". Continue inspecting the remaining workspace and recover from any failed read "
                         "with a focused alternative path. Do not provide the final report until every plan "
@@ -9162,6 +9781,7 @@ async def _run_local_agent_turn_impl(
                 objective=objective,
                 workspace_root=workspace_root,
                 project_instructions=preflight_instructions,
+                read_only=turn_read_only,
             )
             if (
                 tools
@@ -9268,6 +9888,47 @@ async def _run_local_agent_turn_impl(
         # and inspect reality instead of executing the action twice.
         _persist_turn_checkpoint()
 
+        # A provider may batch an unoffered/internal call together with a
+        # valid call (common when it emits a forbidden shell command beside a
+        # read). Reject only the invalid members; dispatch the valid members
+        # in the same batch so one bad call cannot erase all real evidence.
+        if invalid_tool_ids and any(tc.call_id not in invalid_tool_ids for tc in tool_calls):
+            valid_tool_calls = [tc for tc in tool_calls if tc.call_id not in invalid_tool_ids]
+            for invalid_call in tool_calls:
+                if invalid_call.call_id not in invalid_tool_ids:
+                    continue
+                invalid_result = {
+                    "success": False,
+                    "error": (
+                        f"Unknown or unoffered MCP tool: {invalid_call.name}. "
+                        "Use exactly one of the registered tools offered in this turn."
+                    ),
+                }
+                working_messages.append({
+                    "role": "tool", "tool_call_id": invalid_call.call_id,
+                    "content": json.dumps(invalid_result),
+                })
+                renderer.handle_event({
+                    "event_type": "tool_output",
+                    "payload": {
+                        "tool": "unavailable provider tool",
+                        "internal_protocol_error": True,
+                        "result": {
+                            "success": False,
+                            "error": "The provider requested an unoffered MCP tool; nothing was executed.",
+                        },
+                    },
+                })
+            working_messages.append({
+                "role": "system",
+                "content": (
+                    "An unoffered tool in the batch was rejected and not executed. "
+                    "The remaining offered tool calls are being processed."
+                ),
+            })
+            tool_calls = valid_tool_calls
+            invalid_tool_ids = set()
+
         if invalid_tool_ids:
             # Protocol-invalid names are answered as rejected tool calls, not
             # sent through risk classification or approval. This is the final
@@ -9288,42 +9949,73 @@ async def _run_local_agent_turn_impl(
                 previous_invalid_tool_signature = invalid_signature
                 invalid_tool_repeats = 1
             # An unavailable internal/provider tool is a protocol failure,
-            # not a recoverable workspace action. Re-feeding the same error
-            # to the model can produce the visible "Review Agent" loop seen
-            # with providers that emit internal labels as tool names. Stop
-            # after one correction attempt and preserve the checkpoint.
+            # not a workspace action. Re-feeding the same error indefinitely
+            # can produce the visible "Review Agent" loop seen with
+            # providers that emit internal labels as tool names. After the
+            # bounded correction, hand control to the normal stuck-loop
+            # recovery path: AUTO may fail over while preserving the
+            # checkpoint; pinned routes receive one tools-disabled recovery
+            # answer. Neither path claims that the unoffered tool ran.
             if invalid_tool_repeats >= 2:
-                safe_error = {
-                    "success": False,
-                    "error": (
-                        "The provider repeatedly requested an unavailable tool. "
-                        "No tool was executed; retry this turn or choose a different route."
-                    ),
-                }
-                for invalid_call in tool_calls:
-                    if invalid_call.call_id not in invalid_tool_ids:
-                        continue
-                    working_messages.append({
-                        "role": "tool",
-                        "tool_call_id": invalid_call.call_id,
-                        "content": json.dumps(safe_error),
-                    })
-                    renderer.handle_event({
-                        "event_type": "tool_output",
-                        "payload": {"tool": "unavailable provider tool", "result": safe_error},
-                    })
-                message = (
-                    "The provider repeatedly requested an unavailable internal tool; "
-                    "the turn was stopped before any tool ran. Retry the request or "
-                    "switch provider/model."
+                unoffered_tool_failed_providers.add(resolved_provider)
+                switched = False
+                if provider == ProviderType.AUTO and _auto_provider_fallback_enabled(manager) and hasattr(manager, "fallback_candidates"):
+                    for candidate in _fallback_candidates_for_turn(manager, resolved_provider, task_profile):
+                        if candidate in unoffered_tool_failed_providers:
+                            continue
+                        candidate_client = manager.get_client(candidate)
+                        candidate_config = manager.PROVIDERS.get(candidate)
+                        if candidate_client is None or candidate_config is None:
+                            continue
+                        candidate_model = _select_public_group_model(
+                            manager, candidate, candidate_config, task_profile, model,
+                            requires_vision=bool(image_content_blocks),
+                        )
+                        if candidate_model is None:
+                            continue
+                        old_provider = resolved_provider
+                        resolved_provider = candidate
+                        resolved_model = candidate_model
+                        config = candidate_config
+                        client = candidate_client
+                        orchestrator.mark_repair(
+                            f"Falling back from {old_provider.value}: route repeatedly requested an unoffered tool",
+                            provider_switch=True,
+                        )
+                        orchestrator.record_route(
+                            provider=resolved_provider.value,
+                            model=resolved_model,
+                            reason="automatic fallback after unoffered provider tool",
+                            fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    f"{old_provider.value} requested an unavailable tool repeatedly; "
+                                    f"continuing on {resolved_provider.value} / {resolved_model}."
+                                )
+                            },
+                        })
+                        invalid_tool_repeats = 0
+                        previous_invalid_tool_signature = ()
+                        consecutive_identical_rounds = 0
+                        recent_tool_signatures = []
+                        switched = True
+                        break
+                if switched:
+                    _persist_turn_checkpoint()
+                    continue
+                stuck_reason = (
+                    "the provider repeatedly requested an unavailable internal tool "
+                    "and no such tool was executed"
                 )
-                _persist_turn_checkpoint(status="interrupted", last_error=message)
-                orchestrator.fail(message)
-                renderer.handle_event({
-                    "event_type": "ai_task_failed",
-                    "payload": {"error": message},
-                })
-                return TaskOutcome(status="failed", error=message)
+                outcome = await _handle_stuck_loop(stuck_reason, tool_calls)
+                if outcome is not None:
+                    if outcome.status == "continue":
+                        continue
+                    return outcome
+                continue
             repeated_invalid = stuck_reason is not None
             if repeated_invalid:
                 outcome = await _handle_stuck_loop(stuck_reason, tool_calls)
@@ -9355,9 +10047,16 @@ async def _run_local_agent_turn_impl(
                         # the model still receives the precise structured
                         # error above and can correct itself once.
                         "tool": "unavailable provider tool",
+                        "internal_protocol_error": True,
                         "result": {
                             "success": False,
-                            "error": "The provider requested an unavailable tool; nothing was executed.",
+                            "error": (
+                                "The provider requested an unoffered MCP tool; nothing was executed."
+                                + (
+                                    " This tool is intentionally unavailable in read-only mode."
+                                    if turn_read_only else ""
+                                )
+                            ),
                         },
                     },
                 })
@@ -9542,6 +10241,17 @@ async def _run_local_agent_turn_impl(
         ) -> Optional[TaskOutcome]:
             nonlocal any_mutation, any_code_mutation, any_execute_command_since_mutation, port_conflict_seen
             result = _normalise_tool_result(tc.name, arguments, result, workspace_root)
+            observation_key = _read_only_observation_key(tc.name, arguments, workspace_root)
+            if observation_key and result.get("success") is True:
+                reusable_observations[observation_key] = json.loads(
+                    json.dumps(result, default=str)
+                )
+            # Capture bind conflicts before any stalled-observation recovery.
+            # Recovery may return/continue before the ordinary post-processing
+            # block, but the conflict is still safety-critical evidence that
+            # must gate a later kill/restart attempt.
+            if tc.name == "execute_command" and _has_port_conflict(result):
+                port_conflict_seen = True
             envelope.finish(result=result, success=bool(result.get("success")))
             observation = orchestrator.record_tool(envelope)
             if observation.terminal:
@@ -9695,6 +10405,7 @@ async def _run_local_agent_turn_impl(
                     })
 
             if tc.name in {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"} and result.get("success"):
+                reusable_observations.clear()
                 any_mutation = True
                 if not (tc.name in {"write_file", "edit_file"} and _is_documentation_path(arguments.get("path"))):
                     any_code_mutation = True  # archives/artifacts and every non-prose file stay gated
@@ -9931,6 +10642,39 @@ async def _run_local_agent_turn_impl(
                     "event_type": "tool_output",
                     "payload": {"tool": tc.name, "result": result},
                 })
+                if "Blocked repeated action:" in guard.reason:
+                    # The controller refused this call before execution. Do
+                    # not feed the same refusal back through the ordinary
+                    # terminal path: that used to leave a resumed task with
+                    # a failed runtime and caused provider switches to retry
+                    # the identical historical call. The stuck-loop handler
+                    # changes strategy, preserves the checkpoint, and may
+                    # fail over only when AUTO policy permits it.
+                    recovery = await _handle_stuck_loop(guard.reason, [])
+                    if recovery is not None:
+                        if recovery.status == "continue":
+                            continue
+                        return recovery
+                    continue
+                if turn_read_only and tc.name == "execute_command":
+                    # A read-only command refusal is recoverable guidance,
+                    # not a completed inspection and not a reason to let the
+                    # model narrate a fabricated result.  Give the model an
+                    # explicit structured correction so it chooses a
+                    # registered read-only tool or reports the step blocked.
+                    working_messages.append({
+                        "role": "system",
+                        "content": (
+                            "The requested execute_command was refused because this turn is read-only; "
+                            "nothing ran and it provides no evidence. Do not repeat that command and do "
+                            "not claim its result. Continue with read_file, list_directory, search_code, "
+                            "find_references, get_git_info, or another offered read-only tool. If the "
+                            "acceptance criterion genuinely requires mutation or an unavailable command, "
+                            "mark that plan step blocked with the exact reason."
+                        ),
+                    })
+                    _persist_turn_checkpoint(status="running", last_error=guard.reason)
+                    continue
                 if guard.terminal:
                     # Calls already queued from earlier in this same round
                     # must still run and get a matching tool response before
@@ -10099,6 +10843,18 @@ async def _run_local_agent_turn_impl(
                 scope_roots=scope_roots,
                 attachment_paths=attachment_paths,
             )
+            observation_key = _read_only_observation_key(tc.name, arguments, workspace_root)
+            cached_observation = reusable_observations.get(observation_key) if observation_key else None
+            if cached_observation is not None and cached_observation.get("success") is True:
+                # Complete the replacement provider's transcript without
+                # touching the filesystem or printing a duplicate Explored
+                # entry. The new call id still receives a normal tool result.
+                cached_result = json.loads(json.dumps(cached_observation, default=str))
+                working_messages.append({
+                    "role": "tool", "tool_call_id": tc.call_id,
+                    "content": json.dumps(cached_result, default=str),
+                })
+                continue
             renderer.handle_event({"event_type": "tool_call_requested", "payload": {"name": tc.name, "arguments": arguments}})
             if scope_error:
                 consecutive_scope_errors += 1
@@ -10152,8 +10908,7 @@ async def _run_local_agent_turn_impl(
                     return _flush_outcome
 
             if (
-                port_conflict_seen
-                and tc.name == "execute_command"
+                tc.name == "execute_command"
                 and _looks_like_forced_listener_reclamation(str(arguments.get("command") or ""))
                 and not _user_authorized_service_disruption(_latest_user_text(messages))
             ):
@@ -10197,8 +10952,8 @@ async def _run_local_agent_turn_impl(
                     plan = orchestrator.run.plan if orchestrator.run is not None else None
                     plan_steps = [str(step.name) for step in (plan.steps if plan is not None else [])[:5]]
                     summary = (
-                        f"Request type: {task_profile.task_type.value}; complexity: "
-                        f"{task_profile.complexity.value}. "
+                        f"Request type: {_enum_wire_value(task_profile.task_type)}; complexity: "
+                        f"{_enum_wire_value(task_profile.complexity)}. "
                         + ("Proposed steps: " + "; ".join(plan_steps) if plan_steps else "No reviewed plan is available yet.")
                     )
                     if not interactive:
@@ -10671,6 +11426,12 @@ async def run_local_shell_command(
             return TaskOutcome(status="denied", error="Denied by approval policy")
 
     mcp_server = MCPServer(workspace_root=workspace_root, session_id=session_id)
+    # Keep explicit shell commands on the same canonical local capability
+    # boundary as model-driven calls. This preserves the existing safety and
+    # approval checks inside MCPServer while preventing a second execution
+    # path from bypassing gateway bookkeeping.
+    from .capability_gateway import TamfisCodeCapabilityGateway
+    mcp_server = TamfisCodeCapabilityGateway(mcp_server)
     result = await mcp_server.call_tool("execute_command", {"command": command})
     payload = result.get("result") if isinstance(result.get("result"), dict) else result
     stdout = str(payload.get("stdout") or "")

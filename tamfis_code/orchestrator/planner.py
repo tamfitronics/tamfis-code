@@ -219,10 +219,14 @@ def merge_phase_plans(objective: str, phase_plans: list[tuple[str, ExecutionPlan
         phase_names.append(phase_name)
         for step in plan.steps:
             steps.append(PlanStep(0, step.name, status=step.status, evidence=list(step.evidence), phase=phase_index))
-        assumptions.extend(plan.assumptions)
-        risks.extend(plan.risks)
-        validation_criteria.extend(plan.validation_criteria)
-        components.extend(plan.components)
+        # Legacy checkpoints and provider-produced plans can contain null
+        # optional arrays.  Treat those as empty; a resumed task must not die
+        # with ``'NoneType' object has no attribute 'assumptions'`` while
+        # rendering or merging an otherwise usable phase.
+        assumptions.extend(list(getattr(plan, "assumptions", []) or []))
+        risks.extend(list(getattr(plan, "risks", []) or []))
+        validation_criteria.extend(list(getattr(plan, "validation_criteria", []) or []))
+        components.extend(list(getattr(plan, "components", []) or []))
 
     if not steps:
         raise ValueError("merge_phase_plans: no phase produced any usable steps")

@@ -27,10 +27,20 @@ from tamfis_code.providers import ProviderType
 from tamfis_code.routing import TaskProfile, TaskType
 from tamfis_code.runner_local import (
     _attempt_reasoning_plan,
+    _fallback_candidates_for_turn,
     _plan_message_content,
     _resume_plan_message_content,
     run_local_agent_turn,
 )
+
+
+def test_fallback_candidates_normalize_persisted_wire_names():
+    class Manager:
+        def fallback_candidates(self, current, task_profile, **kwargs):
+            return ["openrouter", ProviderType.HF, "not-a-provider", "openrouter"]
+
+    candidates = _fallback_candidates_for_turn(Manager(), ProviderType.NVIDIA, None)
+    assert candidates == [ProviderType.OPENROUTER, ProviderType.HF]
 
 
 class ParseReasoningPlanTests(unittest.TestCase):

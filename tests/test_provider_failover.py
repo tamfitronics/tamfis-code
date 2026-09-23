@@ -42,6 +42,7 @@ from tamfis_code import state as state_module
 from tamfis_code.providers import ProviderManager, ProviderType
 from tamfis_code.runner_local import (
     _fallback_candidates_for_turn,
+    _StreamedToolCall,
     run_local_agent_turn,
 )
 
@@ -175,6 +176,7 @@ class _ExhaustionChainManager(ProviderManager):
             ProviderType.GROK: _Config("grok-3-mini", name="Grok"),
         }
         self.attempts: list[str] = []
+        self._evidence_routes: set[ProviderType] = set()
         self._primary_error = Exception(LIVE_OLLAMA_429)
 
     def _stream_error_for(self, provider: ProviderType) -> Exception | None:
@@ -211,6 +213,18 @@ def _wire_stream(manager: _ExhaustionChainManager):
             # not 50s of same-route backoff.
             error.same_route_reconnectable = False
             raise error
+        # Successful audit turns must contain real tool evidence.  Returning
+        # prose only here used to bypass the intended provider-failover
+        # protocol and made the fixture incompatible with the completion gate.
+        if kwargs.get("tools") and provider not in manager._evidence_routes:
+            manager._evidence_routes.add(provider)
+            return "", [
+                _StreamedToolCall(
+                    call_id=f"evidence_{len(manager.attempts)}",
+                    name="list_directory",
+                    arguments=json.dumps({"path": "/tmp"}),
+                )
+            ], "tool_calls"
         return "the audit continues", [], "stop"
 
     return patch("tamfis_code.runner_local._stream_one_completion", side_effect=fake_stream)
@@ -485,7 +499,7 @@ class NimAnchoredFailoverTests(_NimPolicyHarness):
                                     ProviderType.OLLAMA_CLOUD)
         outcome, renderer = self._run(manager, 61)
         self.assertEqual(self._failures(renderer), [])
-        self.assertEqual(manager.attempts, ["nvidia"] * 4)  # 3 x 503, then the 200
+        self.assertEqual(manager.attempts, ["nvidia"] * 5)  # 3 x 503, read evidence, then final answer
 
     def test_out_of_credit_providers_are_never_tried_even_when_nim_is_failing(self):
         manager = _NimFlakyManager(nim_failures=2)
@@ -547,7 +561,7 @@ class NimAnchoredFailoverTests(_NimPolicyHarness):
                                     ProviderType.OLLAMA_CLOUD)
         outcome, renderer = self._run(manager, 68, model="pro")
         self.assertEqual(self._failures(renderer), [])
-        self.assertEqual(manager.attempts, ["nvidia"] * 4)
+        self.assertEqual(manager.attempts, ["nvidia"] * 5)
 
     def test_the_retry_loop_can_be_switched_off(self):
         manager = _NimFlakyManager(nim_failures=-1)

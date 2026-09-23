@@ -59,6 +59,36 @@ class RealActivityTests(unittest.TestCase):
         # The composer shows the command on its own line, so its headline does not repeat it.
         self.assertEqual(renderer.current_activity(include_command=False), "Running command")
 
+    def test_gateway_activity_detail_survives_remote_event_normalization(self):
+        renderer = _renderer()
+        renderer.handle_event({
+            "event_type": "tool_call_requested",
+            "payload": {
+                "name": "extract_document",
+                "sub_status": "Extracting text from: quarterly-report.pdf",
+            },
+        })
+        self.assertEqual(renderer.current_activity(), "Extracting text from: quarterly-report.pdf")
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "extract_document",
+                "sub_status": "Extracted text from: quarterly-report.pdf",
+                "content": "ok",
+            },
+        })
+        self.assertEqual(renderer.current_activity(), "Extracted text from: quarterly-report.pdf")
+
+    def test_gateway_activity_detail_is_bounded_and_strips_controls(self):
+        renderer = _renderer()
+        renderer.handle_event({
+            "event_type": "tool_call_requested",
+            "payload": {"name": "read_file", "sub_status": "Reading\n" + "x" * 200},
+        })
+        activity = renderer.current_activity()
+        self.assertNotIn("\n", activity)
+        self.assertLessEqual(len(activity), 120)
+
     def test_the_headline_fits_a_narrow_terminal_without_cutting_the_timing(self):
         renderer = _renderer()
         _tool(renderer, "read_file", path="/home/user/projects/very/deep/nested/structure/of/folders/package.json")

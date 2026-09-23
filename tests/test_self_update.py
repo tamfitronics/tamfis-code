@@ -2,7 +2,13 @@
 from pathlib import Path
 import pytest
 
-from tamfis_code.self_update import _parse_version, _pip_install_command, check_update_available
+from tamfis_code.self_update import (
+    _REQUIRED_WHEEL_MODULES,
+    _parse_version,
+    _pip_install_command,
+    _wheel_has_required_runtime,
+    check_update_available,
+)
 
 
 def test_parse_version_numeric_not_lexical():
@@ -65,3 +71,27 @@ def test_checksum_failure_never_runs_installer(monkeypatch, tmp_path):
     monkeypatch.setattr(self_update, "urlopen", lambda *a, **k: io.BytesIO(b"tampered"))
     monkeypatch.setattr(self_update.subprocess, "run", lambda *a, **k: pytest.fail("installer must not run"))
     assert self_update.apply_update()[0] is False
+
+
+def test_update_rejects_wheel_missing_critical_runtime_module(tmp_path):
+    import zipfile
+
+    wheel = tmp_path / "broken.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for member in _REQUIRED_WHEEL_MODULES[:-1]:
+            archive.writestr(member, "")
+
+    valid, reason = _wheel_has_required_runtime(wheel)
+    assert valid is False
+    assert "openhands/tools.py" in reason
+
+
+def test_update_accepts_wheel_with_critical_runtime_modules(tmp_path):
+    import zipfile
+
+    wheel = tmp_path / "complete.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        for member in _REQUIRED_WHEEL_MODULES:
+            archive.writestr(member, "")
+
+    assert _wheel_has_required_runtime(wheel) == (True, "")

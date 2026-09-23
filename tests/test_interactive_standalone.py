@@ -226,6 +226,23 @@ class NextMessageSuggestionTests(unittest.TestCase):
         )
         self.assertEqual(next_message_suggestion(None, state=state), "/retry")
 
+    def test_no_tool_evidence_requires_route_change_before_retry(self):
+        state = SimpleNamespace(
+            turn_checkpoint={
+                "status": "failed",
+                "last_error": (
+                    "Task not completed: no tool executed successfully, so the provider's prose "
+                    "cannot be treated as evidence of a change."
+                ),
+            },
+            saved_plans=[], active_plan_id=None, unresolved_issues=[],
+            validation_results=[], modified_files=[],
+        )
+        self.assertEqual(
+            next_message_suggestion(None, state=state),
+            "Select a tool-capable provider/model with /model, then /retry",
+        )
+
     def test_interrupted_checkpoint_error_never_leaks_the_real_backend_name(self):
         """FIX: turn_checkpoint's last_error is a raw internal message
         persisted straight from runner_local.py (e.g. "Provider streaming

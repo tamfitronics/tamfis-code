@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -61,6 +61,28 @@ class RemoteAgentExecutionTests(unittest.IsolatedAsyncioTestCase):
             })
             self.assertIn("error", result)
             self.assertFalse((Path(tmp).parent / "outside.txt").exists())
+
+    async def test_write_binds_gateway_idempotency_to_rpc_request(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            bridge = object.__new__(remote_agent.RemoteAgentBridge)
+            bridge.workspace_root = tmp
+            gateway = SimpleNamespace(
+                execute=AsyncMock(return_value=SimpleNamespace(
+                    output="✅ Successfully wrote 4 bytes to 'note.txt'",
+                    error=None,
+                ))
+            )
+            with patch.object(remote_agent, "MCPServer", return_value=object()), patch.object(
+                remote_agent, "TamfisCodeCapabilityGateway", return_value=gateway,
+            ):
+                result = await bridge._write_text_file(
+                    {"path": "note.txt", "content": "note"}, request_id="rpc-42",
+                )
+
+            self.assertEqual(result["exit_code"], 0)
+            request = gateway.execute.await_args.args[0]
+            self.assertEqual(request.request_id, "rpc-42")
+            self.assertEqual(request.idempotency_key, "remote-agent:rpc-42")
 
 
 class RemoteAgentReconnectTests(unittest.IsolatedAsyncioTestCase):

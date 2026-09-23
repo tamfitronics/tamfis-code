@@ -27,6 +27,13 @@ class AdaptiveTimeoutTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as raw:
             self.assertEqual(adaptive_command_timeout("printf ok", raw, 120), 120)
 
+    def test_omitted_timeout_is_calculated_for_a_test_workload(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            for index in range(220):
+                (root / f"test_{index}.py").write_text("def test_ok(): pass\n")
+            self.assertGreater(adaptive_command_timeout("pytest -q", root, None), 120)
+
     def test_package_import_check_is_not_capped_at_short_probe_timeout(self):
         with tempfile.TemporaryDirectory() as raw:
             root = Path(raw)

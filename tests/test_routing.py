@@ -1,5 +1,7 @@
 from dataclasses import replace
 
+import pytest
+
 from tamfis_code.providers import ProviderManager, ProviderType, cost_policy
 from tamfis_code.model_registry import get_model
 from tamfis_code.routing import (
@@ -72,6 +74,28 @@ def test_genuine_debug_request_is_unaffected():
     profile = classify_task("please fix the bug in calc.py")
     assert profile.task_type == TaskType.DEBUG
     assert profile.requires_tools
+
+
+def test_training_requests_receive_execution_tools_and_are_not_inspection():
+    objective = "Train the Finitron model from the approved acquisition manifest and save the checkpoint."
+    profile = classify_task(objective)
+    assert is_mutation_request(objective)
+    assert profile.task_type == TaskType.EXECUTE
+    assert profile.requires_tools
+    assert "execute_command" in allowed_tools(profile, read_only=False)
+
+
+def test_named_model_training_request_is_execution_work():
+    profile = classify_task("Train Finitron Models from the approved acquisition manifest")
+    assert profile.task_type == TaskType.EXECUTE
+    assert profile.requires_tools is True
+    assert "execute_command" in allowed_tools(profile, read_only=False)
+
+
+def test_training_data_research_remains_read_only():
+    profile = classify_task("Research current training data sources for Finitron models")
+    assert profile.task_type in {TaskType.RESEARCH, TaskType.INSPECT}
+    assert "execute_command" not in allowed_tools(profile, read_only=False)
 
 
 def test_git_only_delivery_does_not_require_a_file_mutation():
@@ -234,6 +258,20 @@ def test_research_request_requires_tools_but_not_repository_context():
     assert profile.task_type == TaskType.RESEARCH
     assert profile.requires_tools
     assert not profile.requires_repository_context
+
+
+def test_auto_refuses_chat_only_route_for_agentic_turn(monkeypatch):
+    manager = _manager_with(ProviderType.TIER_IV)
+    manager.runtime_mode = "remote"
+    manager.PRIORITY_ORDER = (ProviderType.TIER_IV,)
+    manager.AUTO_PROVIDER_WEIGHTS = {ProviderType.TIER_IV: 1}
+    manager.PROVIDERS = dict(manager.PROVIDERS)
+    manager.PROVIDERS[ProviderType.TIER_IV] = replace(
+        manager.PROVIDERS[ProviderType.TIER_IV], tool_calling=False,
+    )
+
+    with pytest.raises(ValueError, match="native tool calling"):
+        manager._select_best_provider(classify_task("inspect the repository and fix the bug"))
 
 
 def test_ordinary_in_repo_search_stays_inspect_not_research():

@@ -32,6 +32,15 @@ from .config import CONFIG_DIR
 _HTTP_REQUEST_TIMEOUT_SECONDS = 30.0
 
 
+class MCPTransportError(RuntimeError):
+    """The MCP peer could not be reached or the transport was lost.
+
+    This is deliberately distinct from an MCP JSON-RPC/application error:
+    callers may use it to select an availability fallback, but must not
+    replay a request for an error returned by a reachable server.
+    """
+
+
 @dataclass(frozen=True)
 class MCPServerConfig:
     name: str
@@ -131,6 +140,7 @@ class _HTTPConnection:
     client: httpx.AsyncClient
     url: str
     session_id: str | None = None
+    protocol_version: str | None = None
 
 
 def _parse_streamable_http_body(body: str, content_type: str) -> list[dict[str, Any]]:
@@ -248,10 +258,13 @@ class StandaloneMCPBridge:
         self._request_id += 1
         request_id = self._request_id
         assert process.stdin is not None and process.stdout is not None
-        process.stdin.write((json.dumps({
-            "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
-        }) + "\n").encode())
-        await process.stdin.drain()
+        try:
+            process.stdin.write((json.dumps({
+                "jsonrpc": "2.0", "id": request_id, "method": method, "params": params,
+            }) + "\n").encode())
+            await process.stdin.drain()
+        except (BrokenPipeError, ConnectionError, OSError) as exc:
+            raise MCPTransportError(f"MCP stdio transport unavailable during {method}: {exc}") from exc
         while True:
             raw = await asyncio.wait_for(process.stdout.readline(), timeout=15)
             if not raw:
@@ -259,7 +272,7 @@ class StandaloneMCPBridge:
                 if process.stderr is not None:
                     with contextlib.suppress(asyncio.TimeoutError):
                         stderr = (await asyncio.wait_for(process.stderr.read(), timeout=.2)).decode(errors="replace")
-                raise RuntimeError(f"MCP server exited during {method}: {stderr.strip()}")
+                raise MCPTransportError(f"MCP server exited during {method}: {stderr.strip()}")
             message = json.loads(raw)
             if message.get("id") != request_id:
                 continue
@@ -282,23 +295,43 @@ class StandaloneMCPBridge:
         }
         if conn.session_id:
             headers["Mcp-Session-Id"] = conn.session_id
+        if conn.protocol_version:
+            headers["MCP-Protocol-Version"] = conn.protocol_version
         return headers
 
-    async def _request_http(self, name: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _request_http(
+        self,
+        name: str,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         conn = self._http[name]
         self._request_id += 1
         request_id = self._request_id
         payload = {"jsonrpc": "2.0", "id": request_id, "method": method, "params": params}
-        response = await conn.client.post(
-            conn.url, json=payload, headers=self._http_request_headers(conn),
-            timeout=_HTTP_REQUEST_TIMEOUT_SECONDS,
-        )
+        try:
+            response = await conn.client.post(
+                conn.url,
+                json=payload,
+                headers={**self._http_request_headers(conn), **(request_headers or {})},
+                timeout=_HTTP_REQUEST_TIMEOUT_SECONDS,
+            )
+        except (httpx.RequestError, TimeoutError, OSError) as exc:
+            raise MCPTransportError(
+                f"MCP server '{name}' transport unavailable during {method}: {exc}"
+            ) from exc
         # Per spec, a server MAY assign a session id on its response to
         # `initialize` -- every later request/notification on this
         # connection must then carry it back.
         session_id = response.headers.get("Mcp-Session-Id")
         if session_id:
             conn.session_id = session_id
+        if response.status_code in {502, 503, 504}:
+            raise MCPTransportError(
+                f"MCP server '{name}' unavailable (HTTP {response.status_code}) during {method}"
+            )
         if response.status_code >= 400:
             raise RuntimeError(f"MCP server '{name}' returned HTTP {response.status_code} during {method}")
         messages = _parse_streamable_http_body(response.text, response.headers.get("content-type", ""))
@@ -308,7 +341,7 @@ class StandaloneMCPBridge:
             if "error" in message:
                 raise RuntimeError(str(message["error"]))
             return message.get("result") or {}
-        raise RuntimeError(f"MCP server '{name}' sent no response to {method}")
+        raise MCPTransportError(f"MCP server '{name}' sent no response to {method}")
 
     async def _notify_http(self, name: str, method: str, params: dict[str, Any] | None = None) -> None:
         conn = self._http[name]
@@ -326,10 +359,17 @@ class StandaloneMCPBridge:
             raise RuntimeError(f"MCP server '{name}' returned HTTP {response.status_code} during {method}")
 
     # ── transport-agnostic surface ───────────────────────────────────
-    async def _request(self, name: str, method: str, params: dict[str, Any]) -> dict[str, Any]:
+    async def _request(
+        self,
+        name: str,
+        method: str,
+        params: dict[str, Any],
+        *,
+        request_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         if name in self._processes:
             return await self._request_stdio(self._processes[name], method, params)
-        return await self._request_http(name, method, params)
+        return await self._request_http(name, method, params, request_headers=request_headers)
 
     async def _notify(self, name: str, method: str, params: dict[str, Any] | None = None) -> None:
         if name in self._processes:
@@ -388,10 +428,13 @@ class StandaloneMCPBridge:
         conn = _HTTPConnection(client=client, url=config.url)
         self._http[name] = conn
         try:
-            await self._request_http(name, "initialize", {
+            negotiated = await self._request_http(name, "initialize", {
                 "protocolVersion": "2025-06-18", "capabilities": {},
                 "clientInfo": {"name": "tamfis-code", "version": __version__},
             })
+            protocol_version = negotiated.get("protocolVersion")
+            if isinstance(protocol_version, str) and protocol_version:
+                conn.protocol_version = protocol_version
             await self._notify_http(name, "notifications/initialized")
             await self._register_tools(name)
         except Exception:
@@ -401,13 +444,41 @@ class StandaloneMCPBridge:
     async def list_tools(self) -> list[dict[str, Any]]:
         return list(self._tools)
 
-    async def call_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    async def call_tool(
+        self,
+        name: str,
+        arguments: dict[str, Any],
+        *,
+        idempotency_key: str | None = None,
+        request_id: str | None = None,
+        correlation_id: str | None = None,
+        mission_id: str | None = None,
+        conversation_id: str | None = None,
+        agent_id: str | None = None,
+        workspace_id: str | None = None,
+        approval_token: str | None = None,
+    ) -> dict[str, Any]:
         if name not in self._tool_map:
             return {"success": False, "is_error": True, "error": f"Unknown MCP tool: {name}"}
         server, original = self._tool_map[name]
-        result = await self._request(server, "tools/call", {
-            "name": original, "arguments": arguments,
-        })
+        request_headers = {
+            header: value for header, value in {
+                "Idempotency-Key": idempotency_key,
+                "X-Execution-ID": request_id,
+                "X-Correlation-ID": correlation_id,
+                "X-Mission-ID": mission_id,
+                "X-Conversation-ID": conversation_id,
+                "X-Agent-ID": agent_id,
+                "X-Workspace-ID": workspace_id,
+                "X-Tamfis-Approval-Token": approval_token,
+            }.items() if value
+        }
+        result = await self._request(
+            server,
+            "tools/call",
+            {"name": original, "arguments": arguments},
+            request_headers=request_headers or None,
+        )
         is_error = bool(result.get("isError"))
         return {"success": not is_error, "is_error": is_error, "content": result.get("content") or []}
 

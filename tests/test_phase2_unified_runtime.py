@@ -11,6 +11,11 @@ from tamfis_code.providers import ProviderType
 from tamfis_code.runtime.unified import ExecutionMode, ExecutionRequest, UnifiedAgentRuntime
 
 
+def test_execution_request_normalizes_checkpoint_string_mode():
+    request = ExecutionRequest("local_agent", session_id=99, objective="resume checkpoint")
+    assert request.mode is ExecutionMode.LOCAL_AGENT
+
+
 @pytest.fixture
 def isolated_state(tmp_path, monkeypatch):
     """Redirect state.json/.memory to a throwaway dir so these tests never

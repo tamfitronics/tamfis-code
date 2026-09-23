@@ -29,6 +29,16 @@ async def test_agent_inventory_is_registered_and_read_only(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_agent_inventory_ignores_recovered_historical_arguments(tmp_path):
+    server = MCPServer(workspace_root=str(tmp_path))
+    result = await server.call_tool(
+        "list_agent_types",
+        {"_tamfis_code_recovered": "malformed historical tool arguments omitted"},
+    )
+    assert result["success"] is True
+
+
+@pytest.mark.asyncio
 async def test_channel_marked_unknown_tool_is_rejected_before_external_dispatch(tmp_path):
     server = MCPServer(workspace_root=str(tmp_path))
     result = await server.call_tool(

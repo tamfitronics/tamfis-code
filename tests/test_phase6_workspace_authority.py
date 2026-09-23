@@ -6,6 +6,7 @@ from tamfis_code.runtime.workspace_authority import (
     WorkspaceAuthorityError,
     auto_grant_explicit_targets,
     explicit_absolute_targets,
+    infer_named_local_project,
     resolve_workspace_targets,
 )
 
@@ -36,6 +37,32 @@ def test_named_project_context_does_not_change_workspace_target(tmp_path: Path):
         allowed_roots=[current],
     )
     assert result.roots == (current.resolve(),)
+
+
+def test_action_target_named_child_project_narrows_shared_parent(tmp_path: Path):
+    parent = tmp_path / "home"
+    parent.mkdir()
+    finitron = _project(parent / "finitron")
+    _project(parent / "tamfiscode")
+    result = resolve_workspace_targets(
+        launch_root=parent,
+        objective="do this for Finitron: prepare the training pipeline",
+        allowed_roots=[parent],
+    )
+    assert result.roots == (finitron.resolve(),)
+
+
+def test_named_child_in_background_context_does_not_narrow_shared_parent(tmp_path: Path):
+    parent = tmp_path / "home"
+    parent.mkdir()
+    _project(parent / "finitron")
+    _project(parent / "tamfiscode")
+    result = resolve_workspace_targets(
+        launch_root=parent,
+        objective="TamfisGPT uses Finitron as a downstream model and port 9500 is configured.",
+        allowed_roots=[parent],
+    )
+    assert result.roots == (parent.resolve(),)
 
 
 def test_explicit_external_path_requires_prior_grant(tmp_path: Path):

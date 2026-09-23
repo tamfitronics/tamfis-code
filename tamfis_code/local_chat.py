@@ -63,6 +63,12 @@ async def _run_local_turn_impl(
     tools_client = LocalReadOnlyTools() if use_tools else None
     working_messages = list(messages)
 
+    # This path intentionally remains a lightweight offline/local-chat
+    # implementation, but it still shares the provider boundary with the
+    # full agent loop.  Without this guard a large resumed transcript could
+    # bypass runner_local's compaction and submit an oversized request.
+    from .runner_local import _prepare_direct_provider_messages
+
     for _ in range(MAX_TOOL_ROUNDS):
         client = manager.get_client(provider)
         if not client:
@@ -84,10 +90,35 @@ async def _run_local_turn_impl(
             kwargs["tools"] = READ_ONLY_TOOL_SCHEMAS
             kwargs["tool_choice"] = "auto"
 
-        response = await client.chat.completions.create(
-            model=resolved_model, messages=system_messages_first(working_messages), stream=False,
-            temperature=0.2, max_tokens=4096, **kwargs,
+        wire_messages = system_messages_first(working_messages)
+        bounded_messages, _trimmed, _before, _after = _prepare_direct_provider_messages(
+            wire_messages, provider=provider, model=resolved_model,
+            tools=kwargs.get("tools") or [],
         )
+        try:
+            response = await client.chat.completions.create(
+                model=resolved_model, messages=bounded_messages, stream=False,
+                temperature=0.2, max_tokens=4096, **kwargs,
+            )
+        except Exception as exc:
+            detail = str(exc).lower()
+            if not (
+                "maximum context length" in detail
+                or ("context length" in detail and "token" in detail)
+                or "too many tokens" in detail
+            ):
+                raise
+            # A provider's tokenizer can be denser than the local estimate.
+            # Retry once from the durable working transcript at a smaller
+            # request budget; this request has not executed a tool yet.
+            emergency_messages, _trimmed, _before, _after = _prepare_direct_provider_messages(
+                wire_messages, provider=provider, model=resolved_model,
+                tools=kwargs.get("tools") or [], safety_margin=0.40,
+            )
+            response = await client.chat.completions.create(
+                model=resolved_model, messages=emergency_messages, stream=False,
+                temperature=0.2, max_tokens=4096, **kwargs,
+            )
         if not response.choices:
             return ""
         choice = response.choices[0]

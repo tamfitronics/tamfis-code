@@ -19,6 +19,7 @@ import websockets
 from .api_client import AuthRequiredError
 from .config import CONFIG_DIR
 from .mcp import MCPServer
+from .capability_gateway import ExecutionRequest, TamfisCodeCapabilityGateway
 
 DEVICE_PATH = CONFIG_DIR / "device.json"
 OUTBOX_PATH = CONFIG_DIR / "agent-outbox.json"
@@ -209,9 +210,9 @@ class RemoteAgentBridge:
         started = time.monotonic()
         try:
             if method == "execute":
-                result = await self._execute(params)
+                result = await self._execute(params, request_id=request_id)
             elif method == "write_text_file":
-                result = await self._write_text_file(params)
+                result = await self._write_text_file(params, request_id=request_id)
             else:
                 result = {"error": f"Unsupported local-agent method: {method}"}
         except Exception as exc:
@@ -243,35 +244,47 @@ class RemoteAgentBridge:
         async with self._send_lock:
             await websocket.send(json.dumps(message))
 
-    async def _execute(self, params: dict[str, Any]) -> dict[str, Any]:
-        server = MCPServer(workspace_root=self.workspace_root)
-        result = await server.call_tool("execute_command", {
+    async def _execute(self, params: dict[str, Any], *, request_id: str = "") -> dict[str, Any]:
+        server = TamfisCodeCapabilityGateway(MCPServer(workspace_root=self.workspace_root))
+        arguments = {
             "command": str(params.get("command") or ""),
             "timeout": int(params.get("timeout_seconds") or 120),
-        })
-        payload = result.get("result") if isinstance(result.get("result"), dict) else result
+        }
+        result = await server.execute(ExecutionRequest(
+            "native.execute_command", arguments,
+            request_id=request_id or str(uuid.uuid4()),
+            idempotency_key=f"remote-agent:{request_id}" if request_id else None,
+        ))
+        if result.error:
+            return {"stdout": "", "stderr": result.error, "exit_code": 1, "truncated": False}
+        payload = result.output if isinstance(result.output, dict) else {}
         return {
             "stdout": str(payload.get("stdout") or ""),
             "stderr": str(payload.get("stderr") or payload.get("error") or ""),
-            "exit_code": int(payload.get("return_code", 0 if result.get("success") else 1)),
+            "exit_code": int(payload.get("return_code", 0)),
             "truncated": False,
         }
 
-    async def _write_text_file(self, params: dict[str, Any]) -> dict[str, Any]:
-        server = MCPServer(workspace_root=self.workspace_root)
-        result = await server.call_tool("write_file", {
-            "path": str(params.get("path") or ""),
-            "content": str(params.get("content") or ""),
-        })
-        output = str(result.get("result") or result.get("error") or "")
-        if not result.get("success") or output.startswith("❌"):
+    async def _write_text_file(self, params: dict[str, Any], *, request_id: str = "") -> dict[str, Any]:
+        server = TamfisCodeCapabilityGateway(MCPServer(workspace_root=self.workspace_root))
+        result = await server.execute(ExecutionRequest(
+            "native.write_file",
+            {
+                "path": str(params.get("path") or ""),
+                "content": str(params.get("content") or ""),
+            },
+            request_id=request_id or str(uuid.uuid4()),
+            idempotency_key=f"remote-agent:{request_id}" if request_id else None,
+        ))
+        output = str(result.output or result.error or "")
+        if result.error or output.startswith("❌"):
             return {"error": output or "File write failed"}
         return {"stdout": str(params.get("path") or ""), "exit_code": 0}
 
     async def _send_workspace_sync(self, websocket) -> None:
         if self.session_id is None:
             return
-        server = MCPServer(workspace_root=self.workspace_root)
+        server = TamfisCodeCapabilityGateway(MCPServer(workspace_root=self.workspace_root))
         result = await server.call_tool("execute_command", {
             "command": "git rev-parse HEAD 2>/dev/null; git status --porcelain=v1 2>/dev/null",
             "timeout": 10,

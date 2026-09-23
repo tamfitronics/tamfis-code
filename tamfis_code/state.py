@@ -748,7 +748,7 @@ def is_session_actively_running(state: SessionState) -> bool:
     live as one terminal's status flipping in sync with unrelated work
     happening in a second terminal opened in the same directory.
     """
-    if state.execution_status != "running":
+    if state.execution_status not in {"running", "reserved"}:
         return False
     # A live owner process is stronger evidence than the wall-clock lease.
     # Provider calls, approval prompts, and long tool commands can all be
@@ -3150,6 +3150,55 @@ def task_objectives_compatible(incoming: str, stored: str) -> bool:
     return bool(incoming_tokens & stored_tokens)
 
 
+def _reserve_session_id_locked(
+    workspace_root: str, *, objective: Optional[str] = None,
+) -> int:
+    """Reserve a fresh local session id while ``state_lock`` is held.
+
+    The reservation is written before the caller releases the lock.  This is
+    important for two terminals launched at nearly the same time: calculating
+    ``max(ids) + 1`` and persisting the row as separate operations allowed
+    both processes to select the same id and then overwrite each other's
+    workspace/checkpoint state.
+    """
+    data = _load_raw()
+    known: list[int] = []
+    for key in data:
+        try:
+            known.append(int(key))
+        except (TypeError, ValueError):
+            continue
+    session_id = max(known) + 1 if known else 1
+    now = _now()
+    state = SessionState(
+        session_id=session_id,
+        workspace_root=workspace_root,
+        primary_workspace=workspace_root,
+        allowed_workspaces=[workspace_root],
+        active_task={"objective": objective} if objective else None,
+        # The row is reserved for ID allocation, not marked as an executing
+        # task. The actual runner claims ownership with execution_status=
+        # "running" when the turn begins; leaving a reservation "running"
+        # would make ordinary same-workspace reuse look permanently busy.
+        execution_status="idle",
+        owner_pid=None,
+        created_at=now,
+        updated_at=now,
+    )
+    data[str(session_id)] = _compact_row(asdict(state), cold=False)
+    _save_raw(data)
+    _VOLATILE_STATE[_volatile_key(session_id)] = state
+    return session_id
+
+
+def mint_fresh_session_id(
+    workspace_root: str, *, objective: Optional[str] = None,
+) -> int:
+    """Atomically allocate and reserve a new local session row."""
+    with state_lock():
+        return _reserve_session_id_locked(workspace_root, objective=objective)
+
+
 def mint_or_reuse_session_id(
     workspace_root: str, *, exclude_actively_running: bool = True,
     objective: Optional[str] = None,
@@ -3216,8 +3265,10 @@ def mint_or_reuse_session_id(
             if compatible:
                 compatible.sort(key=lambda pair: pair[1].updated_at or "", reverse=True)
                 return compatible[0][0], True
-        known = [sid for sid, _ in candidates]
-        return ((max(known) + 1) if known else 1), False
+        # Reserve the row before releasing the lock.  Returning an
+        # unpersisted max+1 here is racy when two one-shot commands start
+        # concurrently and both have a new/different objective.
+        return _reserve_session_id_locked(workspace_root, objective=objective), False
 
 
 def reset_session_task_state(session_id: int) -> bool:

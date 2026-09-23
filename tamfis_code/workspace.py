@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -24,6 +25,7 @@ from . import state as local_state
 from .config import CONFIG_DIR, load_config
 
 REUSABLE_STATUSES = {"idle", "active"}
+_SCRATCH_FALLBACKS: dict[int, Path] = {}
 
 
 def scratch_root(session_id: int) -> Path:
@@ -37,8 +39,19 @@ def scratch_root(session_id: int) -> Path:
     Session-scoped (not a single shared directory) so two sessions running
     concurrently never collide on the same filenames.
     """
-    root = Path(tempfile.gettempdir()) / "tamfis-code" / str(session_id)
-    root.mkdir(parents=True, exist_ok=True)
+    # Do not reuse the historical shared ``/tmp/tamfis-code/<id>`` location:
+    # it can be owned by a prior service user, contain stale files, or be
+    # inaccessible under a sandbox.  A private OS-created parent gives this
+    # process an unambiguous, writable session root without deleting or
+    # changing anybody else's directory.  Cache it for idempotence during a
+    # turn and across repeated tool-scope construction.
+    existing = _SCRATCH_FALLBACKS.get(session_id)
+    if existing is not None and existing.is_dir():
+        return existing
+    parent = Path(tempfile.mkdtemp(prefix=f"tamfis-code-{session_id}-"))
+    root = parent / str(session_id)
+    os.mkdir(root)
+    _SCRATCH_FALLBACKS[session_id] = root
     return root
 INSTRUCTION_NAMES = {
     "AGENTS.override.md", "AGENTS.md", "CLAUDE.md", "CODEX.md", "TAMFIS.md", ".tamfis",
@@ -488,16 +501,18 @@ def resolve_local_workspace(
             workspace_root, objective=objective,
         )
     elif session_id is None:
-        with local_state.state_lock():
-            known = local_state.all_known_session_ids()
-            session_id = (max(known) + 1) if known else 1
+        # Reserve the id and row atomically.  The old max+1 calculation was
+        # performed under a lock but the row was written only afterwards, so
+        # two concurrent ``--new-session`` launches could both choose the
+        # same id and then overwrite each other's state.
+        session_id = local_state.mint_fresh_session_id(workspace_root)
 
     # Reopening a crashed session used to refresh updated_at while preserving
     # execution_status="running", making a dead task look newly live forever.
     # Reconcile the stale lifecycle before workspace bookkeeping touches it.
     existing = local_state.get_session_state(session_id)
     if (
-        existing.execution_status in {"running", "backgrounded"}
+        existing.execution_status in {"running", "backgrounded", "reserved"}
         and not local_state.is_session_actively_running(existing)
     ):
         local_state.save_session_state(
@@ -706,7 +721,9 @@ def resolve_swarm_subtask_workspace(
     minted with no real parent (confirmed via agent-cmd delegate).
     """
     resolved_root = str(Path(workspace_root).resolve())
-    session_id = _next_local_session_id()
+    # Reserve before creating the child metadata so concurrent swarm
+    # workers cannot select the same max+1 id.
+    session_id = local_state.mint_fresh_session_id(resolved_root, objective=label or None)
     worktree_path: Optional[str] = None
     worktree_branch: Optional[str] = None
     if isolate:

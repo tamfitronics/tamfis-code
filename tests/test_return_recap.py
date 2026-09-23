@@ -65,7 +65,7 @@ class RecapTests(unittest.TestCase):
         self._history(5, "Edit stuff", "Done.", modified_files=[
             {"path": "/w/a.py", "revert_status": "reverted"}, {"path": "/w/b.py"}])
         recap = build_return_recap(5)
-        self.assertIn("changed b.py", recap.standing)
+        self.assertIn("updated b.py", recap.standing)
         self.assertNotIn("a.py", recap.standing)
 
     def test_render_prints_the_titled_block(self):

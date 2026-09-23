@@ -10,7 +10,7 @@ from tamfis_code.orchestrator.validator import changed_paths_from_evidence
 from tamfis_code.return_recap import _first_sentences, _strip_context_chain, build_return_recap
 from tamfis_code.runner_local import (
     _checkpoint_resume_objective, _is_machine_generated_objective, _is_real_resume_objective, _is_resume_request,
-    _resume_step_contract, _resume_step_is_read_only,
+    _enum_wire_value, _normalize_provider_type, _resume_instruction_for_model, _resume_step_contract, _resume_step_is_read_only,
 )
 
 
@@ -29,6 +29,9 @@ class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
             self.assertFalse(_is_real_resume_objective(text), text)
         self.assertFalse(_is_machine_generated_objective("Fix the TypeError in serve2.py streaming"))
         self.assertTrue(_is_real_resume_objective("Fix the TypeError in serve2.py streaming"))
+        self.assertFalse(_is_real_resume_objective("clear"))
+        self.assertFalse(_is_real_resume_objective("/clear"))
+
 
     def test_a_submitted_suggestion_does_not_replace_or_snowball_the_real_task(self):
         checkpoint = {
@@ -42,6 +45,15 @@ class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
         recovered = _checkpoint_resume_objective(checkpoint)
         self.assertEqual(recovered, "Fix the TypeError in serve2.py SSE streaming")
         self.assertNotIn("Additional user context", recovered)
+
+    def test_control_word_checkpoint_can_recover_the_original_action_objective(self):
+        from tamfis_code.runner_local import _objective_from_completed_actions
+
+        recovered = _objective_from_completed_actions([
+            {"purpose": "Execute write_todos for: keep training Finitron models in /home/finitron"},
+            {"purpose": "Execute ask_user_question for: clear"},
+        ])
+        self.assertIn("Finitron", recovered)
 
     def test_read_only_saved_step_cannot_escalate_repair_wording(self):
         from types import SimpleNamespace
@@ -57,6 +69,44 @@ class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
 
         snapshot = SimpleNamespace(resume_step_name="Implement the fix in serve2.py")
         self.assertFalse(_resume_step_is_read_only(self.MACHINE[1], snapshot))
+
+    def test_persisted_provider_wire_name_is_normalized_before_value_access(self):
+        from tamfis_code.providers import ProviderType
+
+        self.assertIs(_normalize_provider_type("nvidia"), ProviderType.NVIDIA)
+        self.assertIs(_normalize_provider_type(ProviderType.HF.value), ProviderType.HF)
+        self.assertIs(_normalize_provider_type("stale-provider", default=ProviderType.AUTO), ProviderType.AUTO)
+
+    def test_machine_repeated_action_error_is_not_replayed_as_the_objective(self):
+        prompt = (
+            "Continue from the saved checkpoint and resolve: Blocked repeated action: "
+            "list_agent_types with identical arguments was already attempted 2 times "
+            "without sufficient progress."
+        )
+        safe = _resume_instruction_for_model(prompt)
+        self.assertIn("Continue the original task", safe)
+        self.assertNotIn("list_agent_types", safe)
+
+    def test_legacy_resume_does_not_append_guard_error_to_provider_transcript(self):
+        from types import SimpleNamespace
+        from tamfis_code.runner_local import _legacy_resume_messages
+
+        error_prompt = (
+            "Continue from the saved checkpoint and resolve: Blocked repeated action: "
+            "list_agent_types with identical arguments was already attempted 2 times"
+        )
+        state = SimpleNamespace(
+            conversation_history=[
+                {"role": "user", "content": "Train Finitron Models"},
+                {"role": "user", "content": error_prompt},
+            ],
+            completed_actions=[], active_task={"objective": "Train Finitron Models"},
+            modified_files=[], validation_results=[], context_checkpoints=[],
+            conversation_summary="",
+        )
+        messages, objective = _legacy_resume_messages(state, error_prompt)
+        assert objective == "Train Finitron Models"
+        assert all("list_agent_types" not in str(item.get("content")) for item in messages)
 
 
 class UserStopIsNotAFailureTests(unittest.TestCase):
@@ -200,3 +250,8 @@ class CleanerKeepsWhatAPersonWroteTests(unittest.TestCase):
                 "/background\n\nAdditional user context: continue from the saved checkpoint and resolve: blocked"),
             "/background",
         )
+
+
+class CheckpointEnumCompatibilityTests(unittest.TestCase):
+    def test_checkpointed_task_profile_strings_render_without_value_error(self):
+        self.assertEqual(_enum_wire_value("very_complex"), "very_complex")

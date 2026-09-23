@@ -91,7 +91,7 @@ class PrintRecapTests(unittest.TestCase):
         console = _console()
         renderer = StreamRenderer(console)
         renderer.print_recap(7)
-        self.assertIn("Changed: tamfis_code/foo.py", console.file.getvalue())
+        self.assertIn("Updated: tamfis_code/foo.py", console.file.getvalue())
 
     def test_completed_ledger_omits_next_action_line(self):
         # A finished task's stale next_action ("run the test suite") would
@@ -799,7 +799,12 @@ class StreamRendererTests(unittest.TestCase):
             },
         })
         rendered = console.file.getvalue()
-        self.assertIn("Tool output · collapsed", rendered)
+        # Tool output uses the shared compact transcript renderer. It keeps
+        # the first lines visible and advertises Ctrl+O for the complete
+        # transcript instead of wrapping the result in the older collapsed
+        # panel label.
+        self.assertIn("• Ran find . -type f", rendered)
+        self.assertIn("└ result-0", rendered)
         self.assertIn("Ctrl+O for full output", rendered)
 
     def test_internal_prompt_leak_suppresses_following_stream_chunks(self):
@@ -876,6 +881,48 @@ class StreamRendererTests(unittest.TestCase):
         self.assertTrue(failed)
         self.assertIn("read_file", message)
         self.assertNotIn("Tool completed", message)
+
+    def test_mcp_content_blocks_render_the_embedded_error_not_raw_json(self):
+        message, failed = _tool_result_message({
+            "tool": "write_file",
+            "success": False,
+            "content": [{
+                "type": "text",
+                "text": '{"success": false, "error": "write_file was not executed"}',
+            }],
+        })
+        self.assertTrue(failed)
+        self.assertEqual(message, "write_file was not executed")
+        self.assertNotIn('"type": "text"', message)
+
+    def test_internal_provider_tool_mismatch_is_not_rendered_as_mcp_failure(self):
+        console = _console()
+        renderer = StreamRenderer(console)
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "unavailable provider tool",
+                "internal_protocol_error": True,
+                "result": {
+                    "success": False,
+                    "error": "The provider requested an unoffered MCP tool; nothing was executed.",
+                },
+            },
+        })
+        rendered = console.file.getvalue()
+        self.assertNotIn("unoffered MCP tool", rendered)
+        self.assertNotIn("unavailable provider tool", rendered)
+
+        # Checkpoint replay from an older release has no internal flag.  The
+        # stable tool/error identity must still be quarantined.
+        renderer.handle_event({
+            "event_type": "tool_output",
+            "payload": {
+                "tool": "unavailable provider tool",
+                "result": {"success": False, "error": "The provider requested an unoffered MCP tool; nothing was executed."},
+            },
+        })
+        self.assertNotIn("unoffered MCP tool", console.file.getvalue())
 
     def test_short_contextual_replies_are_expanded(self):
         self.assertIn("step 1", contextualize_short_reply("1", has_context=True))

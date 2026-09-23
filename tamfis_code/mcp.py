@@ -1361,7 +1361,11 @@ class MCPServer:
             "brief": external_agents.continuation_brief(record),
         }
 
-    async def _list_agent_types(self) -> Dict[str, Any]:
+    async def _list_agent_types(self, **_ignored: Any) -> Dict[str, Any]:
+        # Older checkpoints may contain a malformed assistant tool call with
+        # synthetic recovery arguments.  This is a no-argument discovery
+        # operation, so safely ignore those historical arguments instead of
+        # turning recovery into a second failure or provider-switch loop.
         from .agent_definitions import load_agent_definitions
         from .agents import AgentManager
 
@@ -1690,8 +1694,10 @@ class MCPServer:
         raising if it escapes the workspace boundary. Only enforced when
         `self.workspace_root` is set -- see __init__'s docstring on why
         legacy no-arg callers get today's unrestricted behaviour instead."""
+        from .path_utils import clean_path_argument
+
         base = Path(self.workspace_root) if self.workspace_root else Path.cwd()
-        p = Path(path)
+        p = Path(clean_path_argument(path))
         if not p.is_absolute():
             p = base / p
         resolved = p.resolve()
@@ -1998,13 +2004,20 @@ class MCPServer:
         excluded_count = 0
         omitted_count = 0
 
-        def visit(directory: Path, remaining: int) -> None:
+        async def visit(directory: Path, remaining: int) -> None:
             nonlocal excluded_count, omitted_count
+            # Recursive filesystem calls through the generic worker-thread
+            # wrapper can deadlock on Python 3.13 after the first nested
+            # directory operation. Keep this bounded walk cooperative on the
+            # event loop instead: yield between entries so prompt input,
+            # cancellation, and status events remain responsive.
+            await asyncio.sleep(0)
             try:
                 children = sorted(directory.iterdir(), key=lambda item: item.name)
             except OSError:
                 return
             for item in children:
+                await asyncio.sleep(0)
                 try:
                     is_dir = item.is_dir()
                     if is_dir and item.name in EXCLUDED_DIR_NAMES:
@@ -2025,14 +2038,14 @@ class MCPServer:
                         entry["depth"] = requested_depth - remaining + 1
                     results.append(entry)
                     if is_dir and remaining > 1:
-                        visit(item, remaining - 1)
+                        await visit(item, remaining - 1)
                 except OSError:
                     # A disappearing or unreadable child should not invalidate
                     # the rest of a useful directory listing.
                     continue
 
         try:
-            await run_blocking_bounded(lambda: visit(p, requested_depth), timeout=30.0)
+            await asyncio.wait_for(visit(p, requested_depth), timeout=30.0)
         except asyncio.TimeoutError:
             return [{"error": (
                 f"Listing '{path}' took longer than 30s and was stopped. "
@@ -2960,4 +2973,5 @@ class MCPServer:
 async def call_tool(name: str, **kwargs):
     """Call a tool with given parameters"""
     server = MCPServer()
-    return await server.call_tool(name, kwargs)
+    from .capability_gateway import TamfisCodeCapabilityGateway
+    return await TamfisCodeCapabilityGateway(server).call_tool(name, kwargs)

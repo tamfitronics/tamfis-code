@@ -13,6 +13,7 @@ from pathlib import Path
 
 from tamfis_code import state as state_module
 from tamfis_code.orchestrator.engine import AgentOrchestrator
+from tamfis_code.orchestrator.protocols import ToolEnvelope
 from tamfis_code.runtime import RuntimeBudgets
 from tamfis_code.runtime import ledger as ledger_module
 
@@ -74,6 +75,17 @@ class TaskLedgerLifecycleTests(_IsolatedStorage):
         orchestrator = _orchestrator(3)
         orchestrator.begin(objective="add tests", messages=[], read_only=False)
         orchestrator.start_execution()
+        # Completion validation is intentionally evidence-driven: the direct
+        # lifecycle test must provide the same successful inspection evidence
+        # a real tool turn would record before asserting a completed ledger.
+        orchestrator.record_tool(ToolEnvelope(
+            "c1", "read_file", {"path": "tests/test_example.py"}, "inspect",
+            success=True, stdout="assert True\n",
+        ))
+        orchestrator.record_tool(ToolEnvelope(
+            "c2", "execute_command", {"command": "pytest -q tests/test_example.py"}, "validate",
+            success=True, exit_code=0, stdout="1 passed\n",
+        ))
 
         orchestrator.complete(final_text="Done: tests added.", any_mutation=True)
 

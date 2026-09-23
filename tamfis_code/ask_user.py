@@ -26,6 +26,9 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Sequence
 
+from prompt_toolkit.keys import Keys
+from prompt_toolkit.mouse_events import MouseEventType
+
 MAX_QUESTIONS = 4
 MAX_OPTIONS = 6
 _MAX_LABEL_CHARS = 60
@@ -310,10 +313,44 @@ async def _run_selector(state: SelectorState, *, input: Any = None, output: Any 
     def _skip(event) -> None:
         event.app.exit(result=("skip", []))
 
+    @bindings.add(Keys.Vt100MouseEvent)
+    def _mouse(event) -> None:
+        # prompt_toolkit reports coordinates relative to the selector window.
+        # The first rendered row starts after the question/header lines; use
+        # the nearest option row rather than requiring arrow-key navigation.
+        # Some prompt_toolkit/input backends deliver a normal KeyPressEvent
+        # to this handler when a VT100 mouse sequence is incomplete or the
+        # terminal switches modes during redraw. Treat that as a no-op; an
+        # approval/question screen must never crash the event loop merely
+        # because keyboard and mouse input crossed at the same tick.
+        mouse = getattr(event, "mouse_event", None)
+        if mouse is None:
+            return
+        if mouse.event_type != MouseEventType.MOUSE_UP:
+            return
+        clicked_y = int(mouse.position.y)
+        row = None
+        render_y = 2  # leading blank line + question line
+        options = [*state.question.options, Option(OTHER_LABEL, "Type your own answer")]
+        for index, option in enumerate(options):
+            if clicked_y == render_y:
+                row = index
+                break
+            render_y += 1
+            if option.description:
+                render_y += 1
+        if row is not None:
+            state.cursor = row
+            if not state.question.multi_select:
+                event.app.exit(result=state.confirm())
+            else:
+                state.toggle()
+                event.app.invalidate()
+
     control = FormattedTextControl(lambda: FormattedText(state.render()), focusable=True, show_cursor=False)
     application = Application(
         layout=Layout(Window(control, wrap_lines=True, dont_extend_height=True)),
-        key_bindings=bindings, full_screen=False, mouse_support=False,
+        key_bindings=bindings, full_screen=False, mouse_support=True,
         input=input, output=output,
     )
     result = await application.run_async()

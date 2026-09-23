@@ -1,4 +1,7 @@
 from tamfis_code.runtime import ExecutionController, RuntimeBudgets, RuntimePhase
+from tamfis_code.orchestrator.completion import CompletionStatus, CompletionSummary
+from tamfis_code.orchestrator.protocols import CanonicalEvent, EventType
+from tamfis_code.runtime.state import RuntimeSnapshot
 
 
 def _result(stdout="", *, success=True, items=None):
@@ -6,6 +9,21 @@ def _result(stdout="", *, success=True, items=None):
     if items is not None:
         payload["items"] = items
     return {"success": success, "result": payload}
+
+
+def test_string_wire_phases_are_normalized_before_value_access():
+    snapshot = RuntimeSnapshot(phase="execute")
+    assert snapshot.phase is RuntimePhase.EXECUTE
+    assert snapshot.to_dict()["phase"] == "execute"
+    snapshot.transition("observe")
+    assert snapshot.phase is RuntimePhase.OBSERVE
+    assert snapshot.to_dict()["phase"] == "observe"
+
+    event = CanonicalEvent(event_type="done")
+    assert event.to_dict()["event_type"] == "done"
+
+    summary = CompletionSummary(status="completed", summary="ok")
+    assert summary.to_dict()["status"] == CompletionStatus.COMPLETED.value
 
 
 def test_useful_observation_resets_empty_streak():
@@ -61,7 +79,20 @@ def test_identical_action_is_blocked_after_two_attempts():
         controller.observe("search_code", args, _result("(empty)"))
     third = controller.guard_action("search_code", args)
     assert not third.allowed
+    assert not third.terminal
     assert "repeated action" in third.reason.casefold()
+
+
+def test_repeated_action_does_not_poison_runtime_for_strategy_recovery():
+    controller = ExecutionController(RuntimeBudgets(max_identical_actions=1, max_runtime_seconds=60))
+    args = {"path": "/tmp/app.py"}
+    assert controller.guard_action("read_file", args).allowed
+    blocked = controller.guard_action("read_file", args)
+    assert not blocked.allowed
+    assert not blocked.terminal
+    assert controller.snapshot.phase != RuntimePhase.FAILED
+    # A genuinely different action remains available to the recovery path.
+    assert controller.guard_action("search_code", {"query": "class App"}).allowed
 
 
 def test_different_actions_returning_duplicate_evidence_trigger_stall():

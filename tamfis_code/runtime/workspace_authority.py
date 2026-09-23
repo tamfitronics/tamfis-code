@@ -240,6 +240,67 @@ def infer_named_external_project(launch_root: Path, objective: str) -> tuple[Pat
     return tuple(matches)
 
 
+_LOCAL_PROJECT_MARKERS = frozenset({
+    ".git", "pyproject.toml", "requirements.txt", "package.json", "setup.py",
+    "setup.cfg", "Cargo.toml", "go.mod", "composer.json", "wp-config.php",
+    "Dockerfile",
+})
+_LOCAL_PROJECT_ACTION_RE = re.compile(
+    r"\b(?:audit|inspect|review|read|edit|fix|update|modify|change|search|"
+    r"check|test|build|deploy|run|open|scan|train|pretrain|fine[- ]?tune|"
+    r"upgrade|improve|implement|create|do|work)\b",
+    re.IGNORECASE,
+)
+
+
+def infer_named_local_project(launch_root: Path, objective: str) -> tuple[Path, ...]:
+    """Select an immediate child project named as the task target.
+
+    Launching from a shared parent such as ``/home`` is common.  In that
+    case phrases like ``do this for finitron`` are an explicit *local*
+    project target even though they do not contain an absolute path.  The
+    old fail-closed rule treated the name as mere context and left the whole
+    parent as the planning scope, which caused unrelated sibling projects to
+    appear in plans.  This helper is deliberately narrower than external
+    project inference: it only considers immediate children of the launch
+    directory, requires a project marker, and requires an action near the
+    child name.  It never grants a path outside the launch directory.
+    """
+    launch = Path(launch_root).expanduser().resolve()
+    try:
+        children = [child.resolve() for child in launch.iterdir() if child.is_dir()]
+    except OSError:
+        return ()
+    objective_text = objective or ""
+    compact = lambda value: re.sub(r"[^a-z0-9]+", "", value.casefold())
+    selected: list[Path] = []
+    for child in children:
+        try:
+            if not any((child / marker).exists() for marker in _LOCAL_PROJECT_MARKERS):
+                continue
+        except OSError:
+            continue
+        name = child.name
+        if not name or not re.search(rf"(?<![A-Za-z0-9]){re.escape(name)}(?![A-Za-z0-9])", objective_text, re.IGNORECASE):
+            # Also support harmless punctuation/spacing differences such as
+            # ``finitron-models`` versus ``Finitron models``.
+            if compact(name) not in compact(objective_text):
+                continue
+        for match in re.finditer(re.escape(name), objective_text, re.IGNORECASE):
+            before = objective_text[max(0, match.start() - 96):match.start()]
+            after = objective_text[match.end():match.end() + 48]
+            if re.search(r"\b(?:for|in|inside|within|on|under|target(?:ing)?)\s*$", before, re.IGNORECASE) or _LOCAL_PROJECT_ACTION_RE.search(before):
+                selected.append(child)
+                break
+    deduped: list[Path] = []
+    seen: set[Path] = set()
+    for path in selected:
+        if path not in seen:
+            seen.add(path)
+            deduped.append(path)
+    return tuple(deduped)
+
+
 def resolve_workspace_targets(
     *, launch_root: str | Path, objective: str, allowed_roots: Iterable[str | Path] = ()
 ) -> WorkspaceResolution:
@@ -270,6 +331,17 @@ def resolve_workspace_targets(
     for path in directory_targets:
         if grant.contains(path) and path not in selected:
             selected.append(path)
+
+    if not selected:
+        # A shared launch parent is not itself a project scope.  A direct
+        # action-target phrase such as "do this for Finitron" identifies one
+        # of its immediate child projects without requiring the user to type
+        # an absolute path or grant an unrelated external workspace.
+        named_local = infer_named_local_project(grant.launch_root, objective)
+        selected.extend(path for path in named_local if grant.contains(path))
+
+    if selected:
+        return WorkspaceResolution(roots=tuple(selected), explicit_paths=explicit)
 
     if not selected:
         # A sibling's product/repository name is context, not a filesystem

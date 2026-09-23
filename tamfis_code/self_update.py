@@ -22,6 +22,7 @@ import hashlib
 import json
 import tempfile
 import time
+import zipfile
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 from pathlib import Path
@@ -220,6 +221,53 @@ def _pip_install_command(*arguments: str) -> list[str]:
     return [*command, *arguments]
 
 
+_REQUIRED_WHEEL_MODULES = (
+    "tamfis_code/__init__.py",
+    "tamfis_code/runner_local.py",
+    "tamfis_code/provider_protocols.py",
+    "tamfis_code/openhands/__init__.py",
+    "tamfis_code/openhands/conversation.py",
+    "tamfis_code/openhands/tools.py",
+)
+
+
+def _wheel_has_required_runtime(wheel: Path) -> tuple[bool, str]:
+    """Reject a truncated/incomplete wheel before replacing the installation."""
+    try:
+        with zipfile.ZipFile(wheel) as archive:
+            members = set(archive.namelist())
+    except (OSError, zipfile.BadZipFile) as exc:
+        return False, f"wheel is unreadable: {exc}"
+    missing = [member for member in _REQUIRED_WHEEL_MODULES if member not in members]
+    if missing:
+        return False, "wheel is missing required runtime modules: " + ", ".join(missing)
+    return True, ""
+
+
+def _verify_installed_runtime() -> tuple[bool, str]:
+    """Verify imports in a fresh interpreter before the caller re-execs."""
+    probe = (
+        "import tamfis_code; "
+        "import tamfis_code.runner_local; "
+        "import tamfis_code.provider_protocols; "
+        "import tamfis_code.openhands.conversation; "
+        "import tamfis_code.openhands.tools"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c", probe],
+            capture_output=True,
+            text=True,
+            timeout=30,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"post-install import verification failed: {exc}"
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "import failed").strip()[-1200:]
+        return False, f"post-install import verification failed: {detail}"
+    return True, ""
+
+
 def check_update_available(repo_path: Optional[Path] = None) -> Optional[str]:
     """Return the newest available release; explicit paths only check locally."""
     repo_version = _repo_version(repo_path or DEFAULT_REPO_PATH)
@@ -247,9 +295,15 @@ def apply_update(repo_path: Optional[Path] = None) -> Tuple[bool, str]:
                 if len(data) > 64 * 1024 * 1024 or hashlib.sha256(data).hexdigest() != remote["sha256"]:
                     return False, "Update failed: release checksum mismatch or oversized download"
                 wheel.write_bytes(data)
-                result = subprocess.run(_pip_install_command("--upgrade", str(wheel)), capture_output=True, text=True, timeout=180)
+                valid, reason = _wheel_has_required_runtime(wheel)
+                if not valid:
+                    return False, "Update failed: " + reason
+                result = subprocess.run(_pip_install_command("--upgrade", "--force-reinstall", str(wheel)), capture_output=True, text=True, timeout=180)
                 if result.returncode:
                     return False, "Update failed: " + (result.stderr or result.stdout)[-2000:]
+                valid, reason = _verify_installed_runtime()
+                if not valid:
+                    return False, "Update failed: " + reason
                 return True, f"Updated to {remote['version']}."
         except (OSError, subprocess.TimeoutExpired) as exc:
             return False, f"Update failed: {exc}"

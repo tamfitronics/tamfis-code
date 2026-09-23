@@ -572,6 +572,11 @@ _COMPLETION_GATE_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NO_TOOL_EVIDENCE_ERROR_RE = re.compile(
+    r"no tool executed successfully|no successful tool call|no registered tool execution",
+    re.IGNORECASE,
+)
+
 
 def next_message_suggestion(
     answer: Optional[str], previous_objective: Optional[str] = None,
@@ -662,6 +667,12 @@ def next_message_suggestion(
             # otherwise enforces everywhere else.
             from .public_identity import redact_routing_text
             error = redact_routing_text(checkpoint.get("last_error") or "").strip()
+            if error and _NO_TOOL_EVIDENCE_ERROR_RE.search(error):
+                # Retrying the same route cannot recover a turn that never
+                # executed a tool. Require an explicit provider/model choice
+                # first; this prevents a prose-only completion checkpoint from
+                # replaying indefinitely.
+                return "Select a tool-capable provider/model with /model, then /retry"
             if error and _COMPLETION_GATE_ERROR_RE.search(error):
                 # The completion check's own message ("Completion needs more verified work ... use /retry")
                 # is a verdict about the run, not a task. Pasting it into the user's message box made the
@@ -1298,7 +1309,8 @@ async def _run_interactive_impl(
 
     def _click_available_update(mouse_event):
         if mouse_event.event_type == MouseEventType.MOUSE_UP:
-            get_app().exit(result=_UPDATE_ACTION)
+            if _available_update:
+                get_app().exit(result=_UPDATE_ACTION)
         return None
 
     @bindings.add("c-b")
@@ -1476,18 +1488,9 @@ async def _run_interactive_impl(
         # change failed to provide; the status/mode toolbar remains directly
         # below the frame, matching Codex/Claude Code's visual hierarchy.
         show_frame=False,
-        # Mouse mode is enabled only while there is an actionable update
-        # chip. This keeps normal terminal selection behavior unchanged for
-        # the overwhelmingly common up-to-date case. Fixed at construction
-        # time, unlike update_version/update_handler just above (both
-        # re-evaluated on every toolbar render): a release _poll_for_live_
-        # updates discovers mid-session, after this PromptSession already
-        # exists, still lights up the chip text and stays installable via
-        # Ctrl+U, but is not clickable in that one session -- toggling
-        # terminal mouse-tracking mode on an already-running prompt is not
-        # something prompt_toolkit exposes, and unconditionally enabling it
-        # from the start would cost every ordinary, already-up-to-date
-        # session its normal mouse text selection for no benefit.
+        # Keep normal terminal text selection behavior. Keyboard shortcuts
+        # remain available for update actions; mouse support is enabled only
+        # by dedicated decision prompts that need it.
         mouse_support=False,
     )
     force_bottom_toolbar_visible(session)
@@ -1518,6 +1521,24 @@ async def _run_interactive_impl(
 
         state = local_state.get_session_state(workspace.session_id)
         active_objective = str((state.active_task or {}).get("objective") or "").strip()
+        if followup:
+            # This is an acknowledgement, not a second model task.  Sending
+            # every in-flight follow-up through another provider created the
+            # misleading "rate-limited; will be applied while the task
+            # continues" branch even when the main task was paused or had
+            # already failed.  The follow-up is already durably queued by the
+            # live-input path; report that fact from local state and let the
+            # main orchestrator classify/apply it at a safe boundary.
+            execution_status = str(getattr(state, "execution_status", "") or "running").casefold()
+            if execution_status in {"failed", "interrupted", "cancelled"}:
+                return (
+                    f"Follow-up queued and acknowledged. The current task is {execution_status}; "
+                    "it is not progressing and the follow-up will be considered only if the task is resumed."
+                )
+            return (
+                "Follow-up queued and acknowledged. It has not been applied yet; the active task will "
+                "consider it at the next safe checkpoint."
+            )
         context_line = (
             f"The user's main task is currently: {active_objective[:1000]}"
             if active_objective else
@@ -1528,7 +1549,9 @@ async def _run_interactive_impl(
                 "The user just sent a follow-up message while their coding task is still running. Reply "
                 "in at most 4 short sentences, in the user's language: (1) say what you understood they "
                 "want; (2) say whether it extends, changes or contradicts the running task; (3) say it "
-                "will be applied at the running task's next safe step while the task continues. If it is "
+                "has been queued and acknowledged, but do not promise when or whether it will be applied. "
+                "Say it will be considered only at a safe checkpoint; if the task is paused, rate-limited, "
+                "failed, or cancelled, say that plainly and do not claim it is still progressing. If it is "
                 "ambiguous, risky or destructive, ask ONE clear question instead and say they can answer "
                 "by typing, or press Esc to stop the task. Never claim to have done anything yourself: "
                 "you cannot edit files or run tools here. " + context_line
@@ -2107,9 +2130,10 @@ async def _run_interactive_impl(
                 if ledger is not None:
                     plan_total = len(ledger.plan_steps)
                     plan_done = sum(1 for s in ledger.plan_steps if s.status == "completed")
+                    plan_percent = round((plan_done / plan_total) * 100) if plan_total else 0
                     ledger_line = (
                         f"\ntask={ledger.task_id}  ledger_status={ledger.status}  "
-                        f"plan={plan_done}/{plan_total}  checkpoint={ledger.checkpoint_version}\n"
+                        f"plan={plan_percent}% ({plan_done}/{plan_total} complete)  checkpoint={ledger.checkpoint_version}\n"
                         f"current_action={ledger.current_action or '-'}\n"
                         f"next_action={ledger.next_action or '-'}"
                     )
@@ -2993,7 +3017,7 @@ async def _run_interactive_impl(
                 continue
             console.print(f"[green]Reverted[/green] {result.get('path')}")
             continue
-        if _ci_equals(text, "/clear"):
+        if _ci_equals(text, "/clear") or _ci_equals(text, "clear"):
             console.clear()
             continue
         if _ci_equals(text, "/resume") or _ci_startswith(text, "/resume "):
@@ -3010,9 +3034,17 @@ async def _run_interactive_impl(
                         print_error(console, f"No known local session {target_id}. Use /agents to list known sessions.")
                         continue
                 else:
-                    candidates = [sid for sid in reversed(known) if sid != workspace.session_id]
+                    current_root = Path(workspace.workspace_root).resolve()
+                    candidates = [
+                        sid for sid in reversed(known)
+                        if sid != workspace.session_id
+                        and Path(
+                            local_state.get_session_state(sid).workspace_root
+                            or local_state.get_session_state(sid).primary_workspace
+                        ).resolve() == current_root
+                    ]
                     if not candidates:
-                        console.print("[dim]No other sessions to resume.[/dim]")
+                        console.print("[dim]No other sessions to resume in the current workspace.[/dim]")
                         continue
                     target_id = candidates[0]
                 target_state = local_state.get_session_state(target_id)

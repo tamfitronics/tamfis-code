@@ -1882,7 +1882,10 @@ async def _run_local_ai_command(
     # Preserve the prior objective until run_local_agent_turn has had a
     # chance to recover it. Overwriting active_task with the literal word
     # "continue" destroys the last useful legacy resume pointer.
-    if not _is_resume_request(objective):
+    # A bare UI command such as `clear` must never replace the durable task
+    # objective. Otherwise a later resume loses the original mode/plan and
+    # can incorrectly re-enter a cancelled coding task as read-only.
+    if not _is_resume_request(objective) and objective.strip().casefold() not in {"clear", "/clear"}:
         local_state.save_session_state(workspace.session_id, active_task={"objective": objective, "mode": mode})
         # Title the session as soon as the turn starts, not only after it
         # completes: a session interrupted mid-first-turn (Ctrl+C, crash,
@@ -2271,12 +2274,13 @@ async def bridge(ctx: click.Context):
 @click.option("--provider", default="auto", hidden=True)
 @click.option("--model", default=None, help="TamfisGPT model tier: Auto, Smart, Pro, Ultra, or Ultima (Ultima requires an entitled subscription).")
 @click.option("--remote", is_flag=True, default=False, help="Resume a session on the legacy TamfisGPT Remote Workspace backend instead of a local one.")
+@click.option("--all-workspaces", is_flag=True, default=False, help="Allow selecting a session rooted outside the current directory.")
 @click.pass_context
 @async_command
-async def resume(ctx: click.Context, session_id: Optional[int], provider: str, model: Optional[str], remote: bool):
+async def resume(ctx: click.Context, session_id: Optional[int], provider: str, model: Optional[str], remote: bool, all_workspaces: bool):
     """Resume a previous session -- a full-screen picker of named local
-    sessions when no id is given (search, Cwd/All and Active/Archived
-    filters, sort by updated/created), most-recently-updated first."""
+    sessions rooted in the current directory when no id is given. Use
+    ``--all-workspaces`` to intentionally select a session elsewhere."""
     from .interactive import run_interactive
 
     config: Config = ctx.obj["config"]
@@ -2290,10 +2294,22 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
                 print_error(console, f"No known local session {session_id}. Use `tamfis-code sessions` to list known sessions.")
                 raise SystemExit(EXIT_TASK_FAILED)
             target_id = session_id
+            target_state = local_state.get_session_state(target_id)
+            target_root = Path(target_state.workspace_root or target_state.primary_workspace).resolve()
+            if not all_workspaces and target_root != workspace_root.resolve():
+                print_error(
+                    console,
+                    f"Session {target_id} belongs to {target_root}, outside the current workspace {workspace_root.resolve()}. "
+                    "Run `tamfis-code resume --all-workspaces` or start from that directory explicitly.",
+                )
+                raise SystemExit(EXIT_TASK_FAILED)
         elif _is_interactive_tty():
             candidates = list_resumable_local_sessions(workspace_root)
+            if not all_workspaces:
+                candidates = [candidate for candidate in candidates if candidate.in_current_workspace]
             if not candidates:
-                print_error(console, "No sessions to resume. Run `tamfis-code` to start one.")
+                detail = " in the current workspace" if not all_workspaces else ""
+                print_error(console, f"No sessions to resume{detail}. Run `tamfis-code` to start one.")
                 raise SystemExit(EXIT_TASK_FAILED)
             from .resume_picker import run_resume_picker
 
@@ -2310,8 +2326,11 @@ async def resume(ctx: click.Context, session_id: Optional[int], provider: str, m
             target_id = picked_id
         else:
             fallback = list_resumable_local_sessions(workspace_root, limit=1)
+            if not all_workspaces:
+                fallback = [candidate for candidate in fallback if candidate.in_current_workspace]
             if not fallback:
-                print_error(console, "No sessions to resume. Run `tamfis-code` to start one.")
+                detail = " in the current workspace" if not all_workspaces else ""
+                print_error(console, f"No sessions to resume{detail}. Run `tamfis-code` to start one.")
                 raise SystemExit(EXIT_TASK_FAILED)
             target_id = fallback[0].session_id
         target_state = local_state.get_session_state(target_id)
@@ -3096,7 +3115,8 @@ def tools_cmd(action: str, name: str, params: str):
             return
         
         params_dict = json.loads(params) if params else {}
-        result = asyncio.run(server.call_tool(name, params_dict))
+        from .capability_gateway import TamfisCodeCapabilityGateway
+        result = asyncio.run(TamfisCodeCapabilityGateway(server).call_tool(name, params_dict))
         if result.get('success'):
             click.echo(json.dumps(result.get('result', {}), indent=2))
         else:

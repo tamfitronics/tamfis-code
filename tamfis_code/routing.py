@@ -119,6 +119,13 @@ _EXPLICIT_MUTATION_RE = re.compile(
     # write_file, so the model could only heredoc the script through the shell.
     r"\bwrite\b.{0,40}\b(?:scripts?|programs?|modules?|snippets?)\b|"
     r"\bcommit\b|\bpush\b|\brestart\b|\binstall\b|"
+    # Training/benchmark requests are execution work even when they do not
+    # say "edit" or "run". They can write checkpoints, metrics and model
+    # artifacts, so classifying "train the model" as inspection silently
+    # removed execute_command from the offered tool set.
+    r"\btrain(?:ing)?\b(?!\s+data\b).{0,60}\b(?:models?|weights?|checkpoints?|pipelines?|jobs?|scripts?)\b|"
+    r"\bpretrain(?:ing|ed)?\b|"
+    r"\bfine[- ]?tun(?:e|ing|ed)\b|\bbenchmark(?:ing|ed)?\b|"
     # "execute the instructions" / "retry automatically" are EXECUTION
     # directives (run, act, redo on failure), not requests to merely read
     # and report -- live-confirmed 2026-09: "read and executed the
@@ -324,6 +331,18 @@ def classify_task(text: str, *, read_only: bool = False) -> TaskProfile:
     )
     if has(git_words) and not has(code_change_words) and not read_only:
         return profile(TaskType.GIT, True, True, False, True, "high")
+    training_request = bool(re.search(
+        r"\btrain(?:ing)?\b(?!\s+data\b).{0,60}\b(?:models?|weights?|checkpoints?|pipelines?|jobs?|scripts?)\b|"
+        r"\bpretrain(?:ing|ed)?\b|\bfine[- ]?tun(?:e|ing|ed)\b|\bbenchmark(?:ing|ed)?\b",
+        text,
+        re.IGNORECASE,
+    ))
+    if training_request and not read_only:
+        # Model training/benchmarking is an execution workload: its primary
+        # effect is a long-running process and checkpoint/artifact output,
+        # not a source-file edit. Keep it out of the generic EDIT branch so
+        # resumed training steps retain execute_command.
+        return profile(TaskType.EXECUTE, True, True, False, True, "high")
     if is_mutation_request(text) and not read_only:
         return profile(TaskType.EDIT, True, True, True, True, "frontier")
     if has(("pytest", "test suite", "run tests", "fix tests", "lint", "typecheck", "type check")):

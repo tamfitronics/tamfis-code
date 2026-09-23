@@ -79,6 +79,7 @@ class LedgerEdit:
     """A semantic record of one applied file mutation (diff-aware)."""
     file: str
     description: str
+    operation: str = "update"
     symbols_changed: list[str] = field(default_factory=list)
     diff_summary: str = ""
     applied: bool = False
@@ -94,6 +95,7 @@ class LedgerEdit:
         return cls(
             file=str(payload.get("file") or ""),
             description=str(payload.get("description") or ""),
+            operation=str(payload.get("operation") or "update"),
             symbols_changed=[str(s) for s in (payload.get("symbols_changed") or [])],
             diff_summary=str(payload.get("diff_summary") or ""),
             applied=bool(payload.get("applied")),
