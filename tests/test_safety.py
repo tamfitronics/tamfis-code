@@ -114,6 +114,31 @@ class ClassifyCommandRiskTests(unittest.TestCase):
             RISK_READ_ONLY,
         )
 
+    def test_find_exec_php_lint_and_wp_queries_are_read_only(self):
+        self.assertEqual(
+            classify_command_risk(
+                "find /home/tistalents/www/wp-content/plugins/tamfis-auto-blog "
+                "-name '*.php' -exec php -l {} \\;"
+            ),
+            RISK_READ_ONLY,
+        )
+        self.assertEqual(
+            classify_command_risk(
+                "wp option get tab_settings --path=/home/finima/www --format=json"
+            ),
+            RISK_READ_ONLY,
+        )
+
+    def test_find_exec_and_wp_mutations_remain_blocked(self):
+        for command in (
+            "find . -exec sh -c 'touch owned' {} \\;",
+            "wp option update tab_settings value --path=/home/finima/www",
+            "wp eval 'file_put_contents(\"owned\", \"x\")'",
+            "wp option get tab_settings && rm -rf /tmp/x",
+        ):
+            with self.subTest(command=command):
+                self.assertNotEqual(classify_command_risk(command), RISK_READ_ONLY)
+
     def test_rm_rf_is_dangerous(self):
         self.assertEqual(classify_command_risk("rm -rf /tmp/scratch"), RISK_DANGEROUS)
         self.assertEqual(classify_command_risk("rm -fr build/"), RISK_DANGEROUS)

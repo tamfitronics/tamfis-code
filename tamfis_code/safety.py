@@ -136,7 +136,7 @@ _READ_ONLY_COMMANDS = {
     # which can invoke an interpreter's own syntax checker. Both are gated
     # below to that single safe flag, exactly like sed's `-n '<N>p'`/awk's
     # side-effect-free-program restriction already gate those two entries.
-    "php", "bash", "sh",
+    "php", "bash", "sh", "wp",
 }
 _READ_ONLY_GIT_SUBCOMMANDS = {"status", "diff", "log", "show", "rev-parse", "ls-files", "grep"}
 _BLOCKED_TEST_OPTIONS = (
@@ -150,6 +150,53 @@ def _is_safe_test_arguments(arguments: list[str]) -> bool:
         arg in _BLOCKED_TEST_OPTIONS
         or arg.startswith(tuple(f"{item}=" for item in _BLOCKED_TEST_OPTIONS[1:]))
         for arg in arguments
+    )
+
+
+def _is_safe_find_exec(command: str) -> bool:
+    """Allow only syntax-check commands under ``find -exec``.
+
+    ``find -exec`` is normally arbitrary command execution.  The only safe
+    exception here is a complete command whose target is PHP or shell syntax
+    validation, with ``{}`` as the sole input placeholder and a terminating
+    ``;``.  This supports repository-wide linting without opening a general
+    execution escape hatch.
+    """
+    if not re.match(r"^\s*find\s+", command):
+        return False
+    try:
+        lexer = shlex.shlex(command, posix=True, punctuation_chars="|;&<>")
+        lexer.whitespace_split = True
+        argv = list(lexer)
+    except ValueError:
+        return False
+    try:
+        marker = next(index for index, item in enumerate(argv) if item in {"-exec", "-execdir"})
+    except StopIteration:
+        return False
+    if marker == 0 or any(item in {"-delete", "-ok", "-okdir"} for item in argv[1:marker]):
+        return False
+    tail = argv[marker + 1:]
+    if len(tail) != 4 or tail[-1] != ";" or tail[-2] != "{}":
+        return False
+    return tail[:2] in (["php", "-l"], ["bash", "-n"], ["sh", "-n"])
+
+
+def _is_safe_wp_query(arguments: list[str]) -> bool:
+    """Allow bounded, read-only WP-CLI queries; reject code-loading flags."""
+    if not arguments or any(
+        item == flag or item.startswith(flag + "=")
+        for item in arguments
+        for flag in ("--require", "--exec", "--prompt", "--ssh", "--http")
+    ):
+        return False
+    # Global WP-CLI flags such as --path and --format may occur before or
+    # after the subcommand. The subcommand itself must be an observation.
+    positional = [item for item in arguments if not item.startswith("-")]
+    return (
+        positional[:2] in (["option", "get"], ["option", "list"], ["post", "list"],
+                           ["plugin", "list"], ["theme", "list"], ["user", "list"],
+                           ["core", "version"], ["db", "size"])
     )
 
 
@@ -197,6 +244,8 @@ def _is_read_only_command(command: str) -> bool:
         return False
     if not argv:
         return False
+    if ";" in argv and _is_safe_find_exec(normalized):
+        return True
     if any(token in {"||", ";", "&", "&&", "<", ">", "<<", ">>"} for token in argv):
         return False
     segments: list[list[str]] = [[]]
@@ -237,6 +286,8 @@ def _is_read_only_command_segment(argv: list[str]) -> bool:
         )
     if executable == "pytest":
         return _is_safe_test_arguments(argv[1:])
+    if executable == "wp":
+        return _is_safe_wp_query(argv[1:])
     if executable not in _READ_ONLY_COMMANDS:
         return False
     if executable == "find" and any(
