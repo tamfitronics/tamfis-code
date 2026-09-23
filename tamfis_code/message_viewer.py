@@ -140,7 +140,7 @@ class MessageViewer:
             hints.append("PgUp/PgDn page")
         if len(self._entries) > 1:
             hints.append(f"←/→ other {noun}s")
-        hints.append(f"{self._key} or Esc to show less")
+        hints.append(f"{self._key} or Esc to show less (or click 'Show less lines' to close)")
         foot = f"{_DIM}  {' · '.join(hints)}{_RESET}"
         return ["", head, *[f"{line}{_RESET}" for line in body], foot, ""]
 

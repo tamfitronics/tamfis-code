@@ -94,8 +94,8 @@ class ConcurrentWriteFileMutationEventTests(_StatePatchMixin, unittest.TestCase)
         # black-box behavioral proof, not an implementation-detail assertion.
         with tempfile.TemporaryDirectory() as workspace:
             root = Path(workspace)
-            write_a = json.dumps({"path": "a.py", "content": "print('first')\n"})
-            write_b = json.dumps({"path": "a.py", "content": "print('second')\n"})
+            write_a = json.dumps({"path": "a.txt", "content": "first\n"})
+            write_b = json.dumps({"path": "a.txt", "content": "second\n"})
             verify_args = json.dumps({"command": "true"})
             rounds = [
                 [_chunk(_delta(tool_calls=[
@@ -105,7 +105,7 @@ class ConcurrentWriteFileMutationEventTests(_StatePatchMixin, unittest.TestCase)
                 [_chunk(_delta(tool_calls=[
                     _tool_call_delta(0, call_id="verify", name="execute_command", arguments=verify_args),
                 ]))],
-                [_chunk(_delta(content="Wrote a.py twice."), finish_reason="stop")],
+                [_chunk(_delta(content="Wrote a.txt twice."), finish_reason="stop")],
             ]
             client = _FakeClient(rounds)
             manager = _FakeManager(client)
@@ -125,7 +125,7 @@ class ConcurrentWriteFileMutationEventTests(_StatePatchMixin, unittest.TestCase)
                     manager,
                     ProviderType.NVIDIA,
                     None,
-                    [{"role": "user", "content": "edit a.py twice"}],
+                    [{"role": "user", "content": "edit a.txt twice"}],
                     Console(file=StringIO(), no_color=True, width=200),
                     renderer,
                     workspace_root=str(root),
@@ -133,14 +133,14 @@ class ConcurrentWriteFileMutationEventTests(_StatePatchMixin, unittest.TestCase)
                     approval_policy="auto",
                     interactive=False,
                 ))
-            final_content = root.joinpath("a.py").read_text()
+            final_content = root.joinpath("a.txt").read_text()
 
         self.assertEqual(outcome.status, "completed")
         # The two same-path writes must never appear together in a single
         # gather call (group size >= 2) -- every group touching them is
         # exactly 1.
         self.assertTrue(all(size <= 1 for size in group_sizes), group_sizes)
-        self.assertEqual(final_content, "print('second')\n")
+        self.assertEqual(final_content, "second\n")
 
 
 if __name__ == "__main__":
