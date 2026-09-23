@@ -1879,9 +1879,10 @@ class MCPServer:
         source file because a truncated or stale model response can erase
         unrelated code. The live agent must provide the digest obtained during
         its diagnostic read; targeted ``edit_file`` remains the normal path.
-        Bare MCP callers/tests retain the low-level API for compatibility.
+        This applies to every caller; there is no unguarded full-replacement
+        escape hatch for an existing source file.
         """
-        if self.session_id is None or original_content is None or not self._is_source_file(path):
+        if original_content is None or not self._is_source_file(path):
             return None
         actual = hashlib.sha256(original_content.encode("utf-8")).hexdigest()
         supplied = str(expected_sha256 or "").strip().lower()

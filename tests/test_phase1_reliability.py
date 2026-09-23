@@ -61,7 +61,11 @@ async def test_edit_file_content_alias_performs_full_atomic_replacement(tmp_path
     server = MCPServer(workspace_root=str(tmp_path))
 
     content = "<?php\n$wpdb->get_var(\"SELECT COUNT(*)\");\n"
-    result = await server._edit_file("functions.php", content=content)
+    result = await server._edit_file(
+        "functions.php",
+        content=content,
+        expected_sha256=hashlib.sha256("<?php\necho 'old';\n".encode()).hexdigest(),
+    )
 
     assert result.startswith("✅")
     assert target.read_text(encoding="utf-8") == content
