@@ -11,7 +11,7 @@ from tamfis_code.orchestrator.validator import changed_paths_from_evidence
 from tamfis_code.return_recap import _first_sentences, _strip_context_chain, build_return_recap
 from tamfis_code.runner_local import (
     _checkpoint_resume_objective, _is_machine_generated_objective, _is_real_resume_objective, _is_resume_request,
-    _completed_saved_plan, _enum_wire_value, _is_git_delivery_command, _normalize_provider_type, _resume_instruction_for_model,
+    _completed_saved_plan, _has_unverified_interruption, _enum_wire_value, _is_git_delivery_command, _normalize_provider_type, _resume_instruction_for_model,
     _resume_step_contract, _resume_step_is_read_only,
     _next_audit_plan_target,
 )
@@ -51,6 +51,14 @@ class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
         self.assertIsNone(_completed_saved_plan(SimpleNamespace(saved_plans=[{
             "steps": [{"step": "Run tests", "status": "pending"}],
         }])))
+
+    def test_cancelled_final_turn_is_not_treated_as_delivered_completion(self):
+        state = SimpleNamespace(
+            saved_plans=[{"steps": [{"step": "Run tests", "status": "completed"}]}],
+            turn_checkpoint={"status": "interrupted", "last_error": "Execution cancelled by user."},
+        )
+        self.assertTrue(_completed_saved_plan(state))
+        self.assertTrue(_has_unverified_interruption(state))
 
     def test_resumed_git_delivery_uses_approval_path_but_chains_stay_blocked(self):
         self.assertTrue(_is_git_delivery_command("git add wp-content/plugin.php"))

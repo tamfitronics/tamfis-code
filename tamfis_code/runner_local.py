@@ -6032,6 +6032,31 @@ def _completed_saved_plan(state: Any) -> Optional[dict[str, Any]]:
     return None
 
 
+def _has_unverified_interruption(state: Any) -> bool:
+    """Whether a completed-looking plan still needs post-interruption proof.
+
+    A cancelled turn can race the final plan write: the plan steps may all be
+    marked completed while the acceptance result, final tool evidence, or
+    delivery event never reached the client. Such a plan is resumable, not a
+    delivered result.
+    """
+    checkpoint = getattr(state, "turn_checkpoint", None)
+    if not isinstance(checkpoint, dict):
+        return False
+    status = str(checkpoint.get("status") or "").strip().casefold()
+    if status in {"interrupted", "failed", "cancelled", "canceled"}:
+        return True
+    error = str(checkpoint.get("last_error") or "").casefold()
+    return any(
+        marker in error
+        for marker in (
+            "execution cancelled", "execution canceled", "cancelled by user",
+            "canceled by user", "stream cancelled", "stream canceled",
+            "provider failure", "internal capacity error",
+        )
+    )
+
+
 # A recovery suggestion may contain words such as "repair" or "resolve" even
 # when the actual saved step is explicitly read-only (for example, "Read
 # pyproject.toml and requirements.txt").  Classification must follow the
@@ -7394,6 +7419,7 @@ async def _run_local_agent_turn_impl(
         and _is_machine_generated_objective(incoming_objective)
         and resume_snapshot is None
         and _completed_saved_plan(prior_state) is not None
+        and not _has_unverified_interruption(prior_state)
     ):
         # A provider can finish the final step and fail while reporting it.
         # Do not replay the recovery wrapper as a fresh coding request or
