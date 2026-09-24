@@ -18,10 +18,23 @@ if [ -n "$(git status --porcelain -- tamfis_code pyproject.toml setup.py setup.c
 fi
 export PYTHONPATH="$repo"
 version=$(python3 -c 'import tamfis_code; print(tamfis_code.__version__)')
-if [ -n "$notes" ]; then python3 ops/publish_release.py "$public" --notes "$notes"; else python3 ops/publish_release.py "$public"; fi
+if [ -z "$notes" ] && [ -f "$repo/RELEASE_NOTES_${version}.md" ]; then
+  notes="$repo/RELEASE_NOTES_${version}.md"
+fi
+if [ -n "$notes" ]; then
+  python3 ops/publish_release.py "$public" --notes "$notes"
+else
+  python3 ops/publish_release.py "$public"
+fi
 mkdir -p "$live"
-cp -p "$public/latest.json" "$public/release-notes.md" "$public/install.sh" "$live/" 2>/dev/null || true
-cp -p "$public"/tamfis_code-"$version"-py3-none-any.whl "$live/"
+for metadata in latest.json release-notes.md install.sh; do
+  test -f "$public/$metadata"
+  cp -p "$public/$metadata" "$live/$metadata"
+done
+wheel="$public/tamfis_code-${version}-py3-none-any.whl"
+test -f "$wheel"
+cp -p "$wheel" "$live/"
+test "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["version"])' "$public/latest.json")" = "$version"
 served=$(curl -fsS -m 15 "$url" | python3 -c 'import sys, json; print(json.load(sys.stdin)["version"])')
 if [ "$served" != "$version" ]; then
   echo "MISMATCH: built $version but $url serves $served" >&2
