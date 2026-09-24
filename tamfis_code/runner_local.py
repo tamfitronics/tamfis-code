@@ -4664,6 +4664,50 @@ def _parse_text_tool_block(block: str, allowed_names: set[str]) -> Optional[_Str
     )
 
 
+# Confirmed live 2026-09-24 (auto-blog plugin task): a weak model emitted its
+# tool call as prose JSON -- {"name": "write_todos", "parameters": {"todos":
+# "[{"task": ..."}]"}} -- but wrote the nested "todos" value with UNESCAPED
+# inner quotes, so the outer object is not valid JSON and raw_decode rejects
+# the whole thing. The JSON then rendered verbatim in the Assistant panel
+# while the model waited on a call that never executed. A brace that opens a
+# tool-call-shaped object ("{" + a "name"/"tool"/"function" key) is protocol,
+# not prose: quarantine it from the answer even when malformed, and surface a
+# malformed-call refusal so the model retries with a real, parseable call.
+_TOOL_CALL_CANDIDATE_RE = re.compile(
+    r"\{\s*\"(?:name|tool|function)\"\s*:",
+)
+_TOOL_CALL_CANDIDATE_MAX_CHARS = 1200
+
+
+def _object_span_from(value: str, start: int) -> tuple[int, int]:
+    """The (start, end) span of the brace-balanced object opening at `start`,
+    string-aware, capped at _TOOL_CALL_CANDIDATE_MAX_CHARS. When the object is
+    truncated (stream cut mid-object) the span runs to the cap."""
+    cap = min(len(value), start + _TOOL_CALL_CANDIDATE_MAX_CHARS)
+    depth = 0
+    in_string = False
+    escaped = False
+    for index in range(start, cap):
+        char = value[index]
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return start, index + 1
+    return start, cap
+
+
 def _extract_text_json_tool_calls(text: str) -> tuple[str, list[_StreamedToolCall]]:
     """Quarantine tool-call JSON emitted in assistant prose.
 
@@ -4674,6 +4718,12 @@ def _extract_text_json_tool_calls(text: str) -> tuple[str, list[_StreamedToolCal
     field, return them to the normal offered-tool boundary, and remove the
     JSON from the answer.  Unknown names intentionally remain structured so
     the caller can return the same unoffered-tool error as a native call.
+
+    A MALFORMED tool-call-shaped object (e.g. nested quotes the model never
+    escaped) is also quarantined from the answer and yields one synthetic
+    ``malformed_text_tool_call`` so the dispatch loop produces its ordinary
+    invalid-arguments refusal and the model retries with a real call -- the
+    JSON never renders as assistant prose and nothing is executed on a guess.
     """
     value = str(text or "")
     decoder = json.JSONDecoder()
@@ -4721,11 +4771,29 @@ def _extract_text_json_tool_calls(text: str) -> tuple[str, list[_StreamedToolCal
             arguments=json.dumps(raw_args, ensure_ascii=False),
         ))
         spans.append((start, start + end))
+    # Malformed tool-call-shaped objects that raw_decode rejected: quarantine
+    # any candidate not already inside a successfully-parsed span.
+    for match in _TOOL_CALL_CANDIDATE_RE.finditer(value):
+        start = match.start()
+        if any(lo <= start < hi for lo, hi in spans):
+            continue
+        lo, hi = _object_span_from(value, start)
+        if hi <= lo:
+            continue
+        spans.append((lo, hi))
+        calls.append(_StreamedToolCall(
+            call_id=f"text_json_malformed_{uuid.uuid4().hex[:12]}",
+            name="malformed_text_tool_call",
+            arguments=json.dumps({"_malformed_arguments": value[lo:hi][:400]}),
+        ))
     if not spans:
         return value, []
+    spans.sort()
     cleaned: list[str] = []
     previous = 0
     for start, end in spans:
+        if start < previous:
+            continue  # overlap guard: the larger enclosing span already consumed this region
         cleaned.append(value[previous:start])
         previous = end
     cleaned.append(value[previous:])
@@ -8088,6 +8156,11 @@ async def _run_local_agent_turn_impl(
     unoffered_tool_failed_providers: set[ProviderType] = set()
     single_tool_call_retries: dict[ProviderType, int] = {}
     completion_evidence_retries = 0
+    # A model-quality failure (the draft claims work but executed no tool)
+    # needs a route change, not merely another request to the same model.
+    # Keep this separate from evidence-correction retries so a provider can
+    # be replaced once without creating an unbounded validation loop.
+    tool_evidence_route_retries = 0
     consecutive_scope_errors = 0
     # Distinct from consecutive_identical_rounds/_is_cycling above: those
     # catch the model retrying the SAME (or a short repeating cycle of)
@@ -8200,6 +8273,7 @@ async def _run_local_agent_turn_impl(
         run against them -- otherwise a summary of genuinely completed
         work gets a false "nothing happened" caveat slapped on it."""
         nonlocal resolved_provider, config, client, resolved_model, stop_hook_blocks
+        nonlocal tool_evidence_route_retries
         truncation_rounds = 0
         while finish_reason == "length" and truncation_rounds < MAX_TRUNCATION_CONTINUATIONS:
             truncation_rounds += 1
@@ -8361,6 +8435,60 @@ async def _run_local_agent_turn_impl(
                 for item in validation.unresolved
             )
             if no_tool_evidence:
+                if (
+                    provider == ProviderType.AUTO
+                    and _auto_provider_fallback_enabled(manager)
+                    and tool_evidence_route_retries < 1
+                ):
+                    recovered_route = _fresh_fallback_route(
+                        manager,
+                        resolved_provider,
+                        task_profile,
+                        model,
+                        requires_vision=bool(image_content_blocks),
+                        allow_premium_primary=True,
+                    )
+                    if recovered_route is not None:
+                        (
+                            resolved_provider,
+                            config,
+                            client,
+                            resolved_model,
+                        ) = recovered_route
+                        tool_evidence_route_retries += 1
+                        orchestrator.mark_repair(
+                            "Rejected unsupported completion claim; retrying on a fresh tool-capable route.",
+                            provider_switch=True,
+                        )
+                        orchestrator.record_route(
+                            provider=resolved_provider.value,
+                            model=resolved_model,
+                            reason="automatic fallback after missing tool evidence",
+                            fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    "The previous route returned an unverified completion; "
+                                    "retrying automatically on another tool-capable route."
+                                )
+                            },
+                        })
+                        # Do not append the rejected assistant draft. It was
+                        # never emitted for tool-required turns, and putting
+                        # it into context would make the replacement route
+                        # repeat the same unverified claim.
+                        working_messages.append({
+                            "role": "system",
+                            "content": (
+                                "The previous model response was rejected because it claimed a "
+                                "change without executing a registered tool. Continue the task "
+                                "with real tool calls and verify their results before reporting completion."
+                            ),
+                        })
+                        _persist_turn_checkpoint(status="running", last_error="")
+                        return TaskOutcome(status="continue", summary="")
                 message = (
                     "Task not completed: no tool executed successfully, so the provider's "
                     "prose cannot be treated as evidence of a change. The checkpoint is "
@@ -10437,6 +10565,41 @@ async def _run_local_agent_turn_impl(
             tool_calls = valid_tool_calls
             invalid_tool_ids = set()
 
+        # Synthetic calls from _extract_text_json_tool_calls: the model wrote
+        # its tool call as prose JSON but the object was malformed (e.g.
+        # unescaped nested quotes). Quarantined from the answer; answer here
+        # with the ordinary malformed-arguments correction -- the same refusal
+        # a natively-emitted unparseable call receives -- rather than the
+        # misleading "unknown tool" message (the tool may well be registered;
+        # the REQUEST was unparseable).
+        synthetic_malformed = [
+            tc for tc in tool_calls if tc.name == "malformed_text_tool_call"
+        ]
+        if synthetic_malformed:
+            for tc in synthetic_malformed:
+                correction = malformed_tool_arguments_result(
+                    "the tool call written as text",
+                    "the JSON object was not parseable (nested quotes were not escaped)",
+                    truncated=finish_reason == "length",
+                )
+                working_messages.append({
+                    "role": "tool", "tool_call_id": tc.call_id,
+                    "content": json.dumps(correction),
+                })
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {"content": (
+                        "✗ A tool call written as text in the answer was not valid JSON -- "
+                        "not running it; asked the model to issue the real tool call."
+                    )},
+                })
+            tool_calls = [
+                tc for tc in tool_calls if tc.name != "malformed_text_tool_call"
+            ]
+            if not tool_calls:
+                _persist_turn_checkpoint()
+                continue
+
         if invalid_tool_ids:
             # Protocol-invalid names are answered as rejected tool calls, not
             # sent through risk classification or approval. This is the final
@@ -12025,63 +12188,3 @@ async def run_local_agent_turn(
         attachment_paths=attachment_paths, image_content_blocks=image_content_blocks,
         external_mcp_servers=external_mcp_servers,
     )
-    # A model-quality failure (the draft claims work but executed no tool)
-    # needs a route change, not merely another request to the same model.
-    # Keep this separate from evidence-correction retries so a provider can
-    # be replaced once without creating an unbounded validation loop.
-    tool_evidence_route_retries = 0
-        nonlocal tool_evidence_route_retries
-                if (
-                    provider == ProviderType.AUTO
-                    and _auto_provider_fallback_enabled(manager)
-                    and tool_evidence_route_retries < 1
-                ):
-                    recovered_route = _fresh_fallback_route(
-                        manager,
-                        resolved_provider,
-                        task_profile,
-                        model,
-                        requires_vision=bool(image_content_blocks),
-                        allow_premium_primary=True,
-                    )
-                    if recovered_route is not None:
-                        (
-                            resolved_provider,
-                            config,
-                            client,
-                            resolved_model,
-                        ) = recovered_route
-                        tool_evidence_route_retries += 1
-                        orchestrator.mark_repair(
-                            "Rejected unsupported completion claim; retrying on a fresh tool-capable route.",
-                            provider_switch=True,
-                        )
-                        orchestrator.record_route(
-                            provider=resolved_provider.value,
-                            model=resolved_model,
-                            reason="automatic fallback after missing tool evidence",
-                            fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
-                        )
-                        renderer.handle_event({
-                            "event_type": "diagnostics",
-                            "payload": {
-                                "content": (
-                                    "The previous route returned an unverified completion; "
-                                    "retrying automatically on another tool-capable route."
-                                )
-                            },
-                        })
-                        # Do not append the rejected assistant draft. It was
-                        # never emitted for tool-required turns, and putting
-                        # it into context would make the replacement route
-                        # repeat the same unverified claim.
-                        working_messages.append({
-                            "role": "system",
-                            "content": (
-                                "The previous model response was rejected because it claimed a "
-                                "change without executing a registered tool. Continue the task "
-                                "with real tool calls and verify their results before reporting completion."
-                            ),
-                        })
-                        _persist_turn_checkpoint(status="running", last_error="")
-                        return TaskOutcome(status="continue", summary="")

@@ -2136,6 +2136,19 @@ class MCPServer:
                 return guard_error
         if append and original_content is not None:
             content = original_content + content
+        # No-op guard (confirmed live 2026-09-24: a model "edited" a file it
+        # had already put into its requested state, the tool rewrote identical
+        # bytes, recorded a +0/-0 "mutation", and printed "✅ Edited" -- the
+        # validator then counted that fabricated mutation as progress
+        # evidence). Identical content is a truthful result, never a mutation.
+        if original_content is not None and content == original_content:
+            if append:
+                return f"ℹ Nothing appended to '{path}': the new content is byte-identical to the file."
+            return (
+                f"ℹ No changes written to '{path}': the provided content is byte-identical "
+                "to the current file. Do not re-issue this write; the requested state "
+                "already exists -- verify it and continue."
+            )
         self._atomic_write_text(p, content)
         if p.read_text(encoding="utf-8", errors="strict") != content:
             return f"❌ Failed to verify write to '{path}'"
@@ -2223,6 +2236,18 @@ class MCPServer:
                 "Include more surrounding context to disambiguate."
             )
         new_content = original_content.replace(old_string, new_string, 1)
+        # No-op guard: identical bytes (old_string == new_string, or the
+        # replacement round-trips to the same content) must not rewrite the
+        # file or record a +0/-0 mutation as if work had happened -- the
+        # live auto-blog session showed exactly that being counted as edit
+        # evidence. Report the truth and point the model at the next action.
+        if new_content == original_content:
+            return (
+                f"ℹ No changes made to '{path}': the replacement produces content identical "
+                "to the current file (old_string == new_string, or the section is already "
+                "in the requested state). Do not repeat this edit; verify the current "
+                "content and move to the next step."
+            )
         self._atomic_write_text(p, new_content)
         if p.read_text(encoding="utf-8", errors="strict") != new_content:
             return f"❌ Failed to verify edit to '{path}'"

@@ -294,10 +294,10 @@ class ShiftTabCyclesModeTests(unittest.TestCase):
         self.assertTrue(ghost.italic)
 
     def _message_text(self, listener) -> str:
-        return "".join(text for _style, text in listener._composer_message().__pt_formatted_text__())
+        return "".join(f[1] for f in listener._composer_message().__pt_formatted_text__() if len(f) >= 2 and isinstance(f[1], str))
 
     def _toolbar_text(self, listener) -> str:
-        return "".join(text for _style, text in listener._bottom_toolbar().__pt_formatted_text__())
+        return "".join(f[1] for f in listener._bottom_toolbar().__pt_formatted_text__() if len(f) >= 2 and isinstance(f[1], str))
 
     def test_running_status_sits_above_the_input_with_animation_and_phase_activity(self):
         # Claude Code / Codex layout (owner request 2026-09-19): the running
@@ -505,7 +505,8 @@ class SessionTitleFooterPrefixTests(_StatePatchMixin, unittest.TestCase):
         renderer = StreamRenderer(_console())
         listener = LiveInputListener(session_id=9, renderer=renderer, cli_config=_config("ask"))
         rendered = "".join(
-            text for _style, text in listener._bottom_toolbar().__pt_formatted_text__()
+            f[1] for f in listener._bottom_toolbar().__pt_formatted_text__()
+            if len(f) >= 2 and isinstance(f[1], str)
         )
         self.assertIn("Refactor the auth middleware", rendered)
 
@@ -1039,7 +1040,7 @@ class IdleFooterTipFitTests(_StatePatchMixin, unittest.TestCase):
         state_module.save_session_state(1, workspace_root="/a")
         with patch("shutil.get_terminal_size", return_value=os.terminal_size((columns, 24))):
             rendered = idle_bottom_toolbar(Config(), 1, model="auto", **kwargs)
-        return "".join(text for _style, text in rendered.__pt_formatted_text__()).split("\n")
+        return "".join(f[1] for f in rendered.__pt_formatted_text__() if len(f) >= 2 and isinstance(f[1], str)).split("\n")
 
     def test_the_idle_toolbar_is_a_full_width_rule_then_one_footer_line(self):
         lines = self._footer(120)
@@ -1069,10 +1070,10 @@ class RunningComposerStateTests(_StatePatchMixin, unittest.TestCase):
     leaked route events into unrelated tests)."""
 
     def _message_text(self, listener) -> str:
-        return "".join(text for _style, text in listener._composer_message().__pt_formatted_text__())
+        return "".join(f[1] for f in listener._composer_message().__pt_formatted_text__() if len(f) >= 2 and isinstance(f[1], str))
 
     def _toolbar_text(self, listener) -> str:
-        return "".join(text for _style, text in listener._bottom_toolbar().__pt_formatted_text__())
+        return "".join(f[1] for f in listener._bottom_toolbar().__pt_formatted_text__() if len(f) >= 2 and isinstance(f[1], str))
 
     def test_a_route_exception_rides_on_the_status_line_and_names_no_provider(self):
         state_module.save_session_state(1, workspace_root="/home")
@@ -1118,7 +1119,7 @@ class RunningCommandActivityTests(_StatePatchMixin, unittest.TestCase):
         renderer._running_command_started = __import__("time").monotonic() - 12
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
         with patch("shutil.get_terminal_size", return_value=os.terminal_size((width, 24))):
-            return "".join(text for _s, text in listener._composer_message().__pt_formatted_text__()).split("\n")
+            return "".join(f[1] for f in listener._composer_message().__pt_formatted_text__() if len(f) >= 2 and isinstance(f[1], str)).split("\n")
 
     def test_the_title_and_the_running_command_are_separate_lines(self):
         lines = self._message()
@@ -1144,6 +1145,6 @@ class TipLineFitsTheTerminalTests(_StatePatchMixin, unittest.TestCase):
         for _label, tip in live_input_module._ROTATING_TIPS:
             with patch.object(live_input_module, "_tip_text", return_value=tip), \
                     patch("shutil.get_terminal_size", return_value=os.terminal_size((60, 24))):
-                text = "".join(t for _s, t in listener._composer_message().__pt_formatted_text__())
+                text = "".join(f[1] for f in listener._composer_message().__pt_formatted_text__() if len(f) >= 2 and isinstance(f[1], str))
             for line in text.split("\n"):
                 self.assertLessEqual(len(line), 60, line)
