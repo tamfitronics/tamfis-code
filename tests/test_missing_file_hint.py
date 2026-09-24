@@ -67,6 +67,33 @@ class MissingFileHintTests(unittest.TestCase):
         self.assertIn("Resolved requested path", message)
         self.assertIn("def handle", message)
 
+    def test_complete_tree_search_reaches_deep_file_before_typo_hint(self):
+        # Reproduce the reported failure: a shallow tamgpt_init.py must not
+        # hide the canonical tamgpt_api.py several levels down.
+        (self.ws / "tamgpt_init.py").write_text("WRONG = True\n")
+        target = self.ws
+        for index in range(16):
+            target /= f"layer_{index}"
+        target.mkdir(parents=True)
+        (target / "tamgpt_api.py").write_text("CANONICAL = True\n")
+
+        message = self._read(self._server(8), "tamgpt_api.py")
+        self.assertIn("Resolved requested path", message)
+        self.assertIn("CANONICAL = True", message)
+        self.assertNotIn("Did you mean", message)
+
+    def test_live_source_wins_over_archival_duplicate(self):
+        live = self.ws / "tier_iv_orchestration" / "tamgpt_api.py"
+        backup = self.ws / "backups" / "old" / "tier_iv_orchestration" / "tamgpt_api.py"
+        live.parent.mkdir(parents=True)
+        backup.parent.mkdir(parents=True)
+        live.write_text("LIVE_SOURCE = True\n")
+        backup.write_text("ARCHIVAL_COPY = True\n")
+
+        message = self._read(self._server(8), "tamgpt_api.py")
+        self.assertIn("LIVE_SOURCE = True", message)
+        self.assertNotIn("ARCHIVAL_COPY = True", message)
+
     def test_missing_prefixed_status_name_recovers_canonical_status_sibling(self):
         target = self.ws / "training_queue_state" / "status"
         target.parent.mkdir(parents=True)

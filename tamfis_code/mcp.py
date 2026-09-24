@@ -300,12 +300,10 @@ def _page_search_matches(
 MAX_SEARCH_FILE_SIZE_BYTES = 2_000_000
 MAX_SEARCH_MATCH_CHARS = 500
 
-# A missing read path gets one bounded discovery pass before it is reported as
-# absent.  These limits are deliberately independent from search_code: a
-# typo/missing-prefix recovery must stay cheap even in a large monorepo and
-# must never turn read_file into an unbounded filesystem crawl.
-MAX_READ_RECOVERY_DEPTH = 12
-MAX_READ_RECOVERY_FILES = 30_000
+# Missing-file recovery must inspect the complete authorised source tree. The
+# walk still skips dependency/build output directories, but it has no depth or
+# file-count ceiling: a valid source file must not be hidden by an arbitrary
+# traversal limit.
 MAX_READ_RECOVERY_CANDIDATES = 8
 
 # How much of a still-running (or already-finished) background job's own
@@ -1680,19 +1678,12 @@ class MCPServer:
         p = self._resolve_readable_input(path)
         resolved_note = ""
         if not p.exists():
-            # Preserve the established, high-confidence typo diagnostic. It
-            # is more useful than silently selecting a same-basename file and
-            # keeps callers that already know how to repair this response
-            # compatible with the deeper discovery pass below.
-            corrected = self._correct_path_typos(path)
-            if corrected and self._is_allowed_read_path(Path(corrected)):
-                return f"Error: File '{path}' not found. Did you mean '{corrected}'?"
             recovered, candidates = self._recover_missing_read_path(path)
             if recovered is not None:
                 p = recovered
                 resolved_note = (
                     f"[Resolved requested path '{path}' to workspace file "
-                    f"'{self._display_workspace_path(p)}' after bounded tree discovery.]\n"
+                    f"'{self._display_workspace_path(p)}' after complete tree discovery.]\n"
                 )
             elif candidates:
                 rendered = ", ".join(f"'{item}'" for item in candidates)
@@ -1702,6 +1693,12 @@ class MCPServer:
                     "read_file with one of these exact paths."
                 )
             else:
+                # Only offer a typo suggestion after the complete tree search
+                # has failed. Otherwise a shallow sibling such as
+                # tamgpt_init.py can mask the real nested tamgpt_api.py.
+                corrected = self._correct_path_typos(path)
+                if corrected and self._is_allowed_read_path(Path(corrected)):
+                    return f"Error: File '{path}' not found. Did you mean '{corrected}'?"
                 return f"Error: File '{path}' not found.{self._not_found_hint(path)}"
         if not p.is_file():
             return f"Error: '{path}' is not a file"
@@ -1823,26 +1820,17 @@ class MCPServer:
         suffix_matches: list[Path] = []
         basename_matches: list[Path] = []
         seen: set[Path] = set()
-        visited_files = 0
         for root in roots:
             try:
-                root_depth = len(root.parts)
                 for current, dirnames, filenames in os.walk(root, topdown=True, followlinks=False):
                     current_path = Path(current)
-                    depth = len(current_path.parts) - root_depth
-                    if depth >= MAX_READ_RECOVERY_DEPTH:
-                        dirnames[:] = []
-                    else:
-                        dirnames[:] = [
-                            name for name in dirnames
-                            if name not in self._PATH_SUGGESTION_SKIP_DIRS
-                            and name not in EXCLUDED_DIR_NAMES
-                            and not name.endswith(".egg-info")
-                        ]
+                    dirnames[:] = [
+                        name for name in dirnames
+                        if name not in self._PATH_SUGGESTION_SKIP_DIRS
+                        and name not in EXCLUDED_DIR_NAMES
+                        and not name.endswith(".egg-info")
+                    ]
                     for filename in filenames:
-                        visited_files += 1
-                        if visited_files > MAX_READ_RECOVERY_FILES:
-                            break
                         candidate = (current_path / filename).resolve()
                         if candidate in seen or not candidate.is_file():
                             continue
@@ -1855,8 +1843,6 @@ class MCPServer:
                             if relative_parts and len(relative_parts) >= len(requested_parts):
                                 if relative_parts[-len(requested_parts):] == requested_parts:
                                     suffix_matches.append(candidate)
-                    if visited_files > MAX_READ_RECOVERY_FILES:
-                        break
             except OSError:
                 continue
 
@@ -1868,10 +1854,20 @@ class MCPServer:
         if len(suffix_matches) == 1:
             return suffix_matches[0], []
         candidates = suffix_matches if suffix_matches else basename_matches
+        if len(candidates) > 1:
+            active = [item for item in candidates if not self._is_archival_recovery_path(item)]
+            if len(active) == 1:
+                return active[0], []
         if len(candidates) == 1:
             return candidates[0], []
         rendered = [self._display_workspace_path(item) for item in candidates[:MAX_READ_RECOVERY_CANDIDATES]]
         return None, rendered
+
+    @staticmethod
+    def _is_archival_recovery_path(path: Path) -> bool:
+        """Identify duplicate copies that should not outrank live source."""
+        archival_names = {"backup", "backups", ".backup", "dist", "build", "__pycache__"}
+        return any(part.lower() in archival_names for part in path.parts)
 
     def _resolve_readable_input(self, path: str) -> Path:
         """Resolve a workspace file or one exact, user-supplied attachment.
@@ -1961,7 +1957,7 @@ class MCPServer:
     }
 
     def _suggest_similar_paths(self, missing_name: str, *, limit: int = 5) -> list[str]:
-        """Bounded, workspace-relative search for files sharing `missing_name`'s
+        """Complete workspace-relative search for files sharing `missing_name`'s
         basename.
 
         A bare "File 'X' not found" invites the same wrong guess again --
@@ -1971,25 +1967,20 @@ class MCPServer:
         not-found error something concrete to point at instead of leaving
         "resolve the canonical path" (orchestrator/repair.py's own repair
         strategy for this failure class) as an instruction with no tool
-        support behind it. Walk is capped (dirs and total files visited) so
-        a miss on a huge monorepo fails fast instead of stalling the turn.
+        support behind it. Dependency and generated directories are skipped,
+        but there is no depth or file-count cutoff.
         """
         base = Path(self.workspace_root) if self.workspace_root else Path.cwd()
         target_name = Path(missing_name).name
         if not target_name or not base.is_dir():
             return []
         matches: list[str] = []
-        visited = 0
-        max_visited = 20000
         for root, dirnames, filenames in os.walk(base):
             dirnames[:] = [
                 d for d in dirnames
                 if d not in self._PATH_SUGGESTION_SKIP_DIRS and not d.endswith(".egg-info")
             ]
             for name in filenames:
-                visited += 1
-                if visited > max_visited:
-                    return matches
                 if name == target_name:
                     try:
                         rel = str(Path(root, name).relative_to(base))
