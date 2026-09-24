@@ -21,6 +21,7 @@ from tamfis_code.live_input import (
     _ROTATING_TIPS,
     _SHIFT_TAB,
     _active_agent_count,
+    classify_active_follow_up,
     _mode_and_agents_html,
     _right_align,
     _right_chip,
@@ -99,6 +100,59 @@ class InFlightCommandTests(_StatePatchMixin, unittest.TestCase):
             command_completer=completer,
         )
         self.assertIs(listener._command_completer, completer)
+
+    def test_follow_up_classifier_merges_additions_and_defers_new_tasks(self):
+        self.assertEqual(
+            classify_active_follow_up("also add regression tests", active=True),
+            "append",
+        )
+        self.assertEqual(
+            classify_active_follow_up(
+                "change the login flow instead", active=True,
+                objective="repair the authentication flow",
+            ),
+            "replace",
+        )
+        self.assertEqual(
+            classify_active_follow_up("start a separate task for billing", active=True),
+            "deferred",
+        )
+        self.assertEqual(
+            classify_active_follow_up("also add tests", active=False),
+            "follow_up",
+        )
+
+    def test_active_addition_is_marked_for_live_delivery_not_presented_as_queued(self):
+        state = state_module.get_session_state(2)
+        state.execution_status = "running"
+        state.active_task = {"objective": "repair the authentication flow"}
+        state_module.put_session_state(state)
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=2, renderer=renderer, cli_config=_config())
+
+        listener._enqueue("also add regression tests")
+
+        item = state_module.get_session_state(2).queued_user_instructions[0]
+        self.assertEqual(item["classification"], "append")
+        output = renderer.console.file.getvalue()
+        self.assertIn("Added to the active task", output)
+        self.assertNotIn("Follow-up queued", output)
+
+    def test_explicit_new_task_stays_deferred(self):
+        state = state_module.get_session_state(3)
+        state.execution_status = "running"
+        state.active_task = {"objective": "repair the authentication flow"}
+        state_module.put_session_state(state)
+        renderer = StreamRenderer(_console())
+        listener = LiveInputListener(session_id=3, renderer=renderer, cli_config=_config())
+
+        listener._enqueue("start a separate task for billing")
+
+        item = state_module.get_session_state(3).queued_user_instructions[0]
+        self.assertEqual(item["classification"], "deferred")
+        from tamfis_code.runner_local import _claim_live_queued_instructions
+        self.assertEqual(_claim_live_queued_instructions(3), [])
+        self.assertIn("Follow-up queued", renderer.console.file.getvalue())
 
     def test_exit_and_quit_are_immediate_interrupt_commands(self):
         renderer = StreamRenderer(_console())

@@ -133,6 +133,59 @@ def _truncate(text: str, limit: int) -> str:
     return text if len(text) <= limit else text[: max(1, limit - 1)].rstrip() + "…"
 
 
+# These are deliberately conservative.  A live follow-up must be folded into
+# the current task when it is clearly additive, but an explicitly new task
+# must remain a normal queued turn.  The model is not used for this routing
+# decision: the input path has to remain deterministic even when the provider
+# is unavailable or failing over.
+_NEW_TASK_FOLLOWUP_RE = re.compile(
+    r"\b(?:new|another|separate|unrelated)\s+(?:task|request|issue|thing)\b"
+    r"|\b(?:forget|drop|abandon)\s+(?:this|that|the current)\b",
+    re.IGNORECASE,
+)
+_REPLACE_TASK_FOLLOWUP_RE = re.compile(
+    r"\b(?:instead|actually|scratch that|change direction|replace|ignore my last)\b",
+    re.IGNORECASE,
+)
+_ADD_TO_TASK_FOLLOWUP_RE = re.compile(
+    r"\b(?:also|add|include|incorporate|append|update|change|fix|make sure|ensure|"
+    r"continue|proceed|finish|verify|test|check|use|prefer|rename|remove|keep)\b",
+    re.IGNORECASE,
+)
+
+
+def classify_active_follow_up(text: str, *, active: bool, objective: str = "") -> str:
+    """Classify a message submitted while a task is running.
+
+    ``append`` means the message is an amendment to the active objective and
+    should be delivered at the next safe orchestration boundary.  ``replace``
+    is still live steering, but tells the model to revise its direction.
+    ``deferred`` is used for explicitly separate work and is handled by the
+    ordinary queued-turn path. ``follow_up`` is retained for legacy callers
+    that submit outside a running task. This is intentionally a
+    small lexical gate, not an LLM call: queue routing must never depend on a
+    second provider request.
+    """
+    if not active:
+        return "follow_up"
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized or _NEW_TASK_FOLLOWUP_RE.search(normalized):
+        return "deferred"
+    if _REPLACE_TASK_FOLLOWUP_RE.search(normalized):
+        return "replace"
+    if _ADD_TO_TASK_FOLLOWUP_RE.search(normalized):
+        return "append"
+
+    # A short message sharing real words with the active objective is usually
+    # an amendment ("the login tests" / "the README example"), not a new
+    # turn.  Ignore stop words so common conversational filler cannot cause a
+    # false merge.
+    stop = {"a", "an", "and", "for", "in", "of", "on", "or", "the", "to", "with", "this", "that"}
+    incoming = {word.casefold() for word in re.findall(r"[A-Za-z0-9_./-]{3,}", normalized) if word.casefold() not in stop}
+    prior = {word.casefold() for word in re.findall(r"[A-Za-z0-9_./-]{3,}", str(objective or "")) if word.casefold() not in stop}
+    return "append" if incoming and len(incoming & prior) >= 1 else "deferred"
+
+
 def composer_rule_html() -> str:
     """A bounded horizontal rule for the top/bottom edge of the composer.
 
@@ -1601,8 +1654,19 @@ class LiveInputListener:
             if self._active and not self._paused:
                 self._schedule_prompt()
             return
+        session_state = local_state.get_session_state(self.session_id)
+        task = session_state.active_task or {}
+        active_task = bool(
+            self._active
+            or session_state.execution_status in {"running", "reserved", "backgrounded"}
+        )
+        classification = classify_active_follow_up(
+            text,
+            active=active_task,
+            objective=str(task.get("objective") or ""),
+        )
         item = local_state.enqueue_instruction(
-            self.session_id, text, classification="follow_up",
+            self.session_id, text, classification=classification,
         )
         request_steering = getattr(self.renderer, "request_steering", None)
         if callable(request_steering):
@@ -1611,14 +1675,21 @@ class LiveInputListener:
             "event_type": "user_message",
             "payload": {"content": text},
         })
-        _log.info("follow-up queued id=%s session=%s chars=%d", item.id, self.session_id, len(text))
+        _log.info(
+            "live follow-up accepted id=%s session=%s classification=%s chars=%d",
+            item.id, self.session_id, classification, len(text),
+        )
+        if classification in {"append", "replace", "clarification"}:
+            delivery = f"Added to the active task ({item.id}): {_truncate(text, 120)}"
+        else:
+            delivery = (
+                f"Follow-up queued ({item.id}): {_truncate(text, 120)} "
+                "-- separate task; it will run after the active task."
+            )
         self.renderer.handle_event({
             "event_type": "diagnostics",
             "payload": {
-                "content": (
-                    f"↳ Follow-up queued ({item.id}): {_truncate(text, 120)} "
-                    "-- the running task picks it up at the next safe step."
-                ),
+                "content": f"↳ {delivery}",
             },
         })
         self._start_followup_ack(text)
