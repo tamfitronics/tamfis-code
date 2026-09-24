@@ -368,6 +368,10 @@ class ToolDefinition:
 
 _TOOL_PARAMETER_ALIASES: Dict[str, tuple[str, ...]] = {
     "path": ("file_path", "filepath", "target_path", "filename", "file"),
+    # Providers sometimes reuse the generic `path` field when they mean the
+    # command working directory. Keep execute_command compatible without
+    # passing an unknown keyword into its handler.
+    "cwd": ("working_directory", "directory", "path"),
     "content": ("text", "new_content", "file_content"),
     "old_string": ("old_text", "old_content"),
     "new_string": ("new_text", "replacement"),

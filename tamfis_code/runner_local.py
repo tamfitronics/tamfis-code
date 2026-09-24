@@ -11279,6 +11279,13 @@ async def _run_local_agent_turn_impl(
                         })
                         continue
             command_text = str(arguments.get("command") or "")
+            external_scope_requested = bool(arguments.get(_EXTERNAL_SCOPE_PATHS_KEY))
+            external_scope_gate_candidate = external_scope_requested and (
+                tc.name in {
+                    "read_file", "list_directory", "search_code", "find_references",
+                    "get_git_info", "read_archive", "inspect_artifact", "execute_command",
+                }
+            )
             resume_delivery_mutation = (
                 resume_requested
                 and not user_requested_read_only
@@ -11289,6 +11296,7 @@ async def _run_local_agent_turn_impl(
                 and tc.name == "execute_command"
                 and classify_command_risk(command_text) != RISK_READ_ONLY
                 and not resume_delivery_mutation
+                and not external_scope_gate_candidate
             ):
                 result = {
                     "success": False,
@@ -11315,7 +11323,7 @@ async def _run_local_agent_turn_impl(
                 continue
             permission_decision = _turn_permission_decisions.get(tc.call_id)
 
-            if turn_read_only and risk != "read_only":
+            if turn_read_only and risk != "read_only" and not external_scope_gate_candidate:
                 # ESCALATION SAFETY NET (live-confirmed 2026-09: a "read and
                 # execute these instructions end to end, retry if you fail"
                 # objective classified read-only, and the model then spent
@@ -11361,7 +11369,8 @@ async def _run_local_agent_turn_impl(
                         hint = (
                             " Use read_file with offset/limit, search_code, or a recognized read-only "
                             "pipeline (for example grep/rg piped to head, sed -n, or bounded awk) "
-                            "instead of retrying Python or another general-purpose command. `php -l "
+                            "instead of retrying Python or another general-purpose command. `crontab -l` "
+                            "is also allowed for inspecting the current user's schedule. `php -l "
                             "<one file>` and `bash -n <one file>` (or `sh -n <one file>`) are also "
                             "read-only syntax checks -- run them per file (find the files first, "
                             "already read-only, then lint each one individually); a find|xargs fan-out "

@@ -293,6 +293,10 @@ class ClassifyToolCallRiskTests(unittest.TestCase):
                 RISK_DANGEROUS,
             )
 
+    def test_crontab_listing_is_read_only_but_mutation_is_not(self):
+        self.assertEqual(classify_command_risk("crontab -l"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("crontab -r"), RISK_READ_ONLY)
+
     def test_read_only_tools_are_always_read_only(self):
         with tempfile.TemporaryDirectory() as root:
             for name in ("read_file", "list_directory", "search_code", "get_git_info", "ask_user_question"):

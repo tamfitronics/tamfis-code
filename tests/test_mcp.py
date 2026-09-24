@@ -572,6 +572,19 @@ class TestMCPServerWorkspaceScoped:
         assert 'marker.txt' in result['result']['stdout']
 
     @pytest.mark.asyncio
+    async def test_execute_command_accepts_path_alias_for_cwd(self):
+        subdir = Path(self.temp_dir) / "path-alias"
+        subdir.mkdir()
+        (subdir / "marker.txt").write_text("here")
+
+        result = await self.server.call_tool('execute_command', {
+            'command': 'ls', 'path': 'path-alias',
+        })
+
+        assert result['result']['success'] is True
+        assert 'marker.txt' in result['result']['stdout']
+
+    @pytest.mark.asyncio
     async def test_execute_command_cwd_outside_workspace_is_blocked(self):
         result = await self.server.call_tool('execute_command', {'command': 'ls', 'cwd': '/etc'})
 
