@@ -68,6 +68,17 @@ class NormalizeTests(unittest.TestCase):
         self.assertEqual(parsed[0].question, "Continue?")
         self.assertEqual([o.label for o in parsed[0].options], ["Yes", "No"])
 
+    def test_python_repr_question_arrays_are_parsed(self):
+        parsed = au.normalize_questions(
+            questions="[{'question': 'Do you want to proceed with the revised plan?', "
+                      "'header': 'Revised Plan', 'options': "
+                      "[{'label': 'Yes', 'description': 'Proceed with the revised plan.'}, "
+                      "{'label': 'No', 'description': 'Do not proceed.'}]}]",
+        )
+        self.assertEqual(parsed[0].header, "Revised Plan")
+        self.assertEqual(parsed[0].question, "Do you want to proceed with the revised plan?")
+        self.assertEqual([o.label for o in parsed[0].options], ["Yes", "No"])
+
     def test_plain_string_option_stays_one_option(self):
         parsed = au.normalize_questions(question="Environment?", options="staging")
         self.assertEqual([o.label for o in parsed[0].options], ["staging"])

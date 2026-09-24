@@ -21,6 +21,7 @@ pure so they are unit-testable; only `ask_questions` touches the terminal.
 """
 from __future__ import annotations
 
+import ast
 import json
 import re
 from dataclasses import dataclass, field
@@ -105,7 +106,10 @@ def _option_items(raw: Any) -> list[Any]:
             try:
                 decoded = json.loads(text)
             except (TypeError, ValueError, json.JSONDecodeError):
-                decoded = None
+                try:
+                    decoded = ast.literal_eval(text)
+                except (SyntaxError, ValueError):
+                    decoded = None
             if isinstance(decoded, list):
                 return decoded
         return [raw]
@@ -130,7 +134,10 @@ def normalize_questions(
             try:
                 decoded = json.loads(text)
             except (TypeError, ValueError, json.JSONDecodeError):
-                decoded = None
+                try:
+                    decoded = ast.literal_eval(text)
+                except (SyntaxError, ValueError):
+                    decoded = None
             if isinstance(decoded, list):
                 questions = decoded
     if isinstance(questions, list) and questions:

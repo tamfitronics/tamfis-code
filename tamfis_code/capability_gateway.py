@@ -7,6 +7,7 @@ MCPServer tools without changing the existing runner or tool policy.
 """
 from __future__ import annotations
 
+import ast
 import asyncio
 import hashlib
 import inspect
@@ -48,7 +49,10 @@ def _normalise_ask_user_arguments(name: str, arguments: Mapping[str, Any]) -> di
         try:
             decoded = json.loads(text)
         except (TypeError, ValueError, json.JSONDecodeError):
-            return value
+            try:
+                decoded = ast.literal_eval(text)
+            except (SyntaxError, ValueError):
+                return value
         return decoded
 
     for key in ("questions", "options"):
