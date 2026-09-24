@@ -29,6 +29,7 @@ from rich.panel import Panel
 from .render import resume_live_if_active, suspend_live_if_active
 from .sandbox import SandboxPolicy, build_sandbox_command
 from .timeouts import adaptive_command_timeout
+from .safety import _is_read_only_command
 # MCP commands can be invoked without constructing a ProviderManager (for
 # example, `tamfis-code tools list`). Reuse the canonical project `.env`
 # loader here so TAMGPT_MCP_CONFIG and TAMFIS_MONOREPO_ROOT are available in
@@ -64,6 +65,34 @@ _DDG_RESULT_RE = re.compile(
 )
 _DDG_SNIPPET_RE = re.compile(r'<a class="result__snippet"[^>]*>(.*?)</a>', re.DOTALL)
 _HTML_TAG_RE = re.compile(r"<[^>]+>")
+
+_WP_CLI_ROOT_GUARD_RE = re.compile(
+    r"(?:running this as root|meant to run this as the user|use the --allow-root flag)",
+    re.IGNORECASE,
+)
+
+
+def _wp_cli_root_retry_command(command: str, output: str) -> Optional[str]:
+    """Return a safe WP-CLI retry after its root guard rejects a read.
+
+    WP-CLI refuses to run as root even for harmless reads such as
+    ``wp option get``.  That refusal is environmental, not evidence that the
+    option is absent.  Retry only a single, already-classified read-only
+    command and never add ``--allow-root`` to a write, pipeline, or shell
+    expression.  The caller has already passed the normal command approval
+    gate; this is an execution recovery for the same approved observation.
+    """
+    if not output or not _WP_CLI_ROOT_GUARD_RE.search(output):
+        return None
+    if not _is_read_only_command(command):
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return None
+    if not argv or Path(argv[0]).name != "wp" or "--allow-root" in argv:
+        return None
+    return shlex.join([argv[0], "--allow-root", *argv[1:]])
 
 
 def _sandbox_result(command: Any) -> Dict[str, Any]:
@@ -2804,6 +2833,7 @@ class MCPServer:
         sandbox_permissions: str = "use_default",
         approval_metadata: Optional[Dict[str, Any]] = None,
         background_signal: Optional[asyncio.Event] = None,
+        _wp_root_retry: bool = False,
     ) -> Dict[str, Any]:
         # `background_signal` is never part of this tool's schema and the
         # model never sets it -- runner_local.py injects it into arguments
@@ -2827,12 +2857,21 @@ class MCPServer:
         if timeout <= 0:
             timeout = 60
         try:
-            # Commands always execute inside the approved workspace. Omitting
-            # cwd means workspace_root, never the caller process's accidental
-            # current directory (which may contain unrelated manifests).
+            # Commands default to the approved workspace. An explicit
+            # require_escalated arrives only after the runner's user approval
+            # gate for an external scope, so it is the narrow capability that
+            # permits diagnostics such as `wp option get` in /srv/site or
+            # `cat /etc/cron.d/...`. Do not make the whole MCP server
+            # unrestricted: without this flag the existing workspace boundary
+            # remains fail-closed.
             run_dir = self._resolve_in_workspace(cwd or ".")
         except PermissionError as e:
-            return {"error": str(e), "success": False}
+            if sandbox_permissions != "require_escalated":
+                return {"error": str(e), "success": False}
+            external_cwd = Path(cwd or ".").expanduser()
+            if not external_cwd.is_absolute():
+                return {"error": str(e), "success": False}
+            run_dir = external_cwd.resolve()
         if not run_dir.is_dir():
             return {"error": f"cwd '{cwd}' is not a directory", "success": False}
 
@@ -2857,7 +2896,12 @@ class MCPServer:
             chunks: list[bytes] = []
             try:
                 for operand in cat_argv[1:]:
-                    path = self._resolve_in_workspace(operand)
+                    try:
+                        path = self._resolve_in_workspace(operand)
+                    except PermissionError:
+                        if sandbox_permissions != "require_escalated" or not Path(operand).expanduser().is_absolute():
+                            raise
+                        path = Path(operand).expanduser().resolve()
                     if not path.is_file():
                         return {"error": f"cat: {operand}: not a regular file", "success": False}
                     chunks.append(path.read_bytes())
@@ -2866,7 +2910,10 @@ class MCPServer:
             return {
                 "stdout": b"".join(chunks).decode("utf-8", errors="replace"),
                 "stderr": "", "return_code": 0, "success": True,
-                "sandbox": {"active": False, "backend": "direct-read"},
+                "sandbox": {
+                    "active": False, "backend": "direct-read",
+                    **({"external_scope_approved": True} if sandbox_permissions == "require_escalated" else {}),
+                },
             }
 
         # Training and frontier jobs are durable, stateful workloads. Killing
@@ -2994,13 +3041,37 @@ class MCPServer:
             if background_signal is None:
                 try:
                     stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-                    return {
+                    result = {
                         "stdout": stdout.decode('utf-8', errors='ignore'),
                         "stderr": stderr.decode('utf-8', errors='ignore'),
                         "return_code": proc.returncode,
                         "success": proc.returncode == 0,
                         "sandbox": _sandbox_result(sandbox_command),
                     }
+                    retry_command = (
+                        None if _wp_root_retry else
+                        _wp_cli_root_retry_command(command, result["stderr"] or result["stdout"])
+                    )
+                    if retry_command:
+                        recovered = await self._execute_command(
+                            retry_command, cwd=cwd, timeout=timeout,
+                            environment=environment, shell=shell,
+                            sandbox_permissions=sandbox_permissions,
+                            approval_metadata=approval_metadata,
+                            background_signal=background_signal,
+                            _wp_root_retry=True,
+                        )
+                        recovered["recovery"] = {
+                            "kind": "wp_cli_root_guard",
+                            "original_command": command,
+                            "retry_command": retry_command,
+                            "message": (
+                                "WP-CLI rejected the approved read because the process was "
+                                "running as root; the same read was retried with --allow-root."
+                            ),
+                        }
+                        return recovered
+                    return result
                 except asyncio.TimeoutError:
                     # asyncio.wait_for only cancels the communicate() task on
                     # timeout, it never touches the subprocess -- without an
@@ -3024,13 +3095,37 @@ class MCPServer:
                     background_wait.cancel()
             if communicate_task in done:
                 stdout, stderr = communicate_task.result()
-                return {
+                result = {
                     "stdout": stdout.decode('utf-8', errors='ignore'),
                     "stderr": stderr.decode('utf-8', errors='ignore'),
                     "return_code": proc.returncode,
                     "success": proc.returncode == 0,
                     "sandbox": _sandbox_result(sandbox_command),
                 }
+                retry_command = (
+                    None if _wp_root_retry else
+                    _wp_cli_root_retry_command(command, result["stderr"] or result["stdout"])
+                )
+                if retry_command:
+                    recovered = await self._execute_command(
+                        retry_command, cwd=cwd, timeout=timeout,
+                        environment=environment, shell=shell,
+                        sandbox_permissions=sandbox_permissions,
+                        approval_metadata=approval_metadata,
+                        background_signal=background_signal,
+                        _wp_root_retry=True,
+                    )
+                    recovered["recovery"] = {
+                        "kind": "wp_cli_root_guard",
+                        "original_command": command,
+                        "retry_command": retry_command,
+                        "message": (
+                            "WP-CLI rejected the approved read because the process was "
+                            "running as root; the same read was retried with --allow-root."
+                        ),
+                    }
+                    return recovered
+                return result
             if background_wait in done:
                 job_id = uuid.uuid4().hex[:12]
                 job = BackgroundJob(

@@ -643,6 +643,57 @@ async def test_execute_command_reads_plain_cat_without_shell_timeout(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_wp_cli_root_guard_retries_approved_read_with_allow_root(tmp_path):
+    """A root-only WP-CLI refusal must not become a false diagnostic dead end."""
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir()
+    wp = fake_bin / "wp"
+    wp.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = \"--allow-root\" ]; then\n"
+        "  shift\n"
+        "  printf '%s\\n' '{\"enabled\":true}'\n"
+        "  exit 0\n"
+        "fi\n"
+        "printf '%s\\n' \"YIKES! It looks like you're running this as root.\" >&2\n"
+        "printf '%s\\n' \"You probably meant to run this as the user that your WordPress installation exists under.\" >&2\n"
+        "exit 1\n"
+    )
+    wp.chmod(0o755)
+    server = MCPServer(workspace_root=str(tmp_path), session_id=9920)
+    result = await server.call_tool("execute_command", {
+        "command": f"{wp} option get tab_settings",
+        "environment": {"PATH": f"{fake_bin}:{os.environ['PATH']}"},
+    })
+    assert result["result"]["success"] is True
+    assert result["result"]["stdout"].strip() == '{"enabled":true}'
+    assert result["result"]["recovery"]["kind"] == "wp_cli_root_guard"
+    assert result["result"]["recovery"]["retry_command"].endswith(
+        "wp --allow-root option get tab_settings"
+    )
+
+
+@pytest.mark.asyncio
+async def test_approved_external_read_is_not_blocked_by_workspace_boundary(tmp_path):
+    external_dir = tmp_path.parent / "tamfis-approved-external-root"
+    external_dir.mkdir()
+    external_file = external_dir / "cron.conf"
+    external_file.write_text("25 4 * * 0 tamfitronics audit\n")
+    try:
+        server = MCPServer(workspace_root=str(tmp_path), session_id=9921)
+        result = await server.call_tool("execute_command", {
+            "command": f"cat {external_file}",
+            "sandbox_permissions": "require_escalated",
+        })
+        assert result["result"]["success"] is True
+        assert result["result"]["stdout"] == external_file.read_text()
+        assert result["result"]["sandbox"]["external_scope_approved"] is True
+    finally:
+        external_file.unlink(missing_ok=True)
+        external_dir.rmdir()
+
+
+@pytest.mark.asyncio
 async def test_execute_command_falls_back_to_default_on_unparseable_timeout(tmp_path):
     server = MCPServer(workspace_root=str(tmp_path), session_id=9915)
     result = await server.call_tool('execute_command', {'command': 'echo hi', 'timeout': 'not-a-number'})
