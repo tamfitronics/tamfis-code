@@ -17,6 +17,7 @@ import difflib
 import ast
 import re
 import shlex
+import textwrap
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
@@ -215,11 +216,17 @@ def _is_safe_python_heredoc(command: str) -> bool:
     """
     match = re.fullmatch(
         r"\s*python3?\s+-\s+<<-?([\"']?)([A-Za-z_][A-Za-z0-9_-]*)\1\s*\n"
-        r"(?P<source>.*?)\n\2\s*\Z",
+        r"(?P<source>.*?)\n\s*\2\s*\Z",
         command or "",
         re.DOTALL,
     )
-    return bool(match and _is_safe_python_inline(match.group("source")))
+    if not match:
+        return False
+    # Tool-call renderers often indent every line of a multiline argument for
+    # display. Shell heredocs preserve that indentation, but it is formatting
+    # rather than Python structure for a top-level inspection snippet.
+    source = textwrap.dedent(match.group("source"))
+    return _is_safe_python_inline(source)
 
 
 def _is_safe_find_exec(command: str) -> bool:
