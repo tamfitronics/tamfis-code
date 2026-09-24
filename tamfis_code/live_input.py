@@ -154,6 +154,69 @@ _ADD_TO_TASK_FOLLOWUP_RE = re.compile(
 )
 
 
+# Disengagement (observed 2026-09-24): "Since you are being cocky, I have
+# delegated the task to Codex to fix it for me. Bye." -- the user has ended
+# the interaction. This is NOT a follow-up, NOT a new task, and NOT an offer
+# to delegate: the previous build treated it as one, asked "Are you sure you
+# want to delegate the task to Codex?" and waited on a user who had already
+# left. Farewell/handoff detection is deliberately context-shaped (farewell
+# close + past-tense handoff statement) rather than a keyword tripwire:
+# the words "bye", "stop" or "Codex" inside quoted text, source or tool
+# output must never cancel anything.
+_FAREWELL_TOKEN_RE = re.compile(
+    r"(?:^|\s)(?:bye|goodbye|byee|good\s*bye|farewell|cya|see\s+ya|i'?m\s+out|"
+    r"that'?s\s+all|i'?m\s+done(?:\s+here)?|im\s+done)(?:[.,!?]|$|\s)",
+    re.IGNORECASE,
+)
+_HANDOFF_STATEMENT_RE = re.compile(
+    r"\b(?:i(?:'ve|\s+have|'m|\s+am)|we(?:'ve|\s+have)|task\s+(?:is|was)|going\s+to)\s+"
+    r"[^.!?\n]{0,80}\b(?:delegat(?:e|ed|ing)|hand(?:ed|ing)\s+(?:it|this|over)|"
+    r"giv(?:e|ing)\s+(?:it|this)\s+to|switch(?:ed|ing)\s+to|mov(?:e|ing)\s+to|"
+    r"us(?:e|ing)\s+another\s+(?:tool|agent|assistant))\b[^.!?\n]{0,120}"
+    r"(?:(?:codex|claude|cursor|gemini|copilot|another\s+(?:agent|tool|assistant))|"
+    r"\binstead\b|\.\s*$|!\s*$)",
+    re.IGNORECASE,
+)
+
+
+def classify_disengagement(text: str) -> bool:
+    """True when a message is the user ending the interaction.
+
+    Requires BOTH a farewell close and a past-tense handoff statement in the
+    same message (the observed disengagement shape), or a bare farewell. A
+    question ("...?"), a request to actually delegate NOW ("delegate this to
+    codex"), or those words appearing in quoted/code content does not match.
+    Deliberately mechanical: the decision must hold even when no provider is
+    reachable to classify anything.
+    """
+    normalized = " ".join(str(text or "").split()).strip()
+    if not normalized or normalized.endswith("?"):
+        return False
+    if len(normalized) > 600:
+        return False
+    farewell = bool(_FAREWELL_TOKEN_RE.search(normalized))
+    if not farewell:
+        return False
+    # A bare farewell ("bye", "goodbye") with nothing else is a stop, and a
+    # farewell plus a PAST handoff statement ("I have delegated ... to Codex")
+    # is a disengagement. A farewell plus an IMPERATIVE delegation request
+    # ("delegate this to Codex, bye") is still real work -- not a goodbye.
+    if _HANDOFF_STATEMENT_RE.search(normalized):
+        return True
+    words = normalized.split()
+    if len(words) <= 3:
+        # Source/quoted content can contain "bye" as a whole token
+        # ('print("bye")', '```python # bye ```'). Only a plain-text short
+        # message is a bare farewell.
+        if any(marker in normalized for marker in ("(", ")", "{", "}", "=", "```", '"', "'", ";", "#")):
+            return False
+        return True
+    # A farewell inside anything longer with no past-tense handoff statement
+    # is ambiguous at best (a sign-off buried in logs/quotes/comments) and
+    # must not cancel running work. Only the two explicit shapes above count.
+    return False
+
+
 def classify_active_follow_up(text: str, *, active: bool, objective: str = "") -> str:
     """Classify a message submitted while a task is running.
 
@@ -399,7 +462,13 @@ def idle_bottom_toolbar(
     # Same route-exception note as the live in-task footer (see
     # LiveInputListener._bottom_toolbar), so the information survives the
     # moment the turn ends instead of disappearing with the in-task bar.
+    # The route note ends with its own text ("... 2 failovers"), so a bare
+    # adjacency with the next fragment collapsed to "failoversready" once
+    # the markup is stripped (plain pipes, screen readers, and the width
+    # math that ignores tags). Emit the separator as part of the SAME
+    # styled fragment so stripping tags still leaves "failovers · ready".
     route_html = _route_note_html(session_id)
+    route_html = f"{route_html}<ansigray> · </ansigray>" if route_html else ""
     left = (
         f" {_session_title_prefix(session_id)}{route_html}"
         f"<ansigray>ready · {public_model_name(model)} ·</ansigray> "
@@ -1676,6 +1745,26 @@ class LiveInputListener:
             self._active
             or session_state.execution_status in {"running", "reserved", "backgrounded"}
         )
+        # Disengagement check BEFORE any steering/queue handling (observed
+        # 2026-09-24): a farewell + past-tense handoff ("I have delegated the
+        # task to Codex to fix it for me. Bye.") means the interaction is
+        # over. Stop scheduling work, cancel cancellable work through the
+        # normal interrupt path (which checkpoints), acknowledge briefly,
+        # and never ask a confirmation question or contact another agent.
+        if active_task and classify_disengagement(text):
+            local_state.enqueue_instruction(self.session_id, text, classification="cancelled")
+            self._request_interrupt("cancel")
+            self.renderer.handle_event({
+                "event_type": "diagnostics",
+                "payload": {"content": (
+                    "◆ Task stopped and checkpointed. Goodbye -- pick the work back up "
+                    "any time with `continue`."
+                )},
+            })
+            _log.info("live disengagement accepted session=%s chars=%d", self.session_id, len(text))
+            if self._active and not self._paused:
+                self._schedule_prompt()
+            return
         classification = classify_active_follow_up(
             text,
             active=active_task,

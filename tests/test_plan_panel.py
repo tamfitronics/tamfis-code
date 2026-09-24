@@ -178,7 +178,10 @@ class ComposerTests(unittest.TestCase):
         renderer._plan_steps = plan
         listener = LiveInputListener(session_id=1, renderer=renderer, cli_config=_config("ask"))
         with patch("shutil.get_terminal_size", return_value=os.terminal_size((width, 40))):
-            text = "".join(t for _s, t in listener._composer_message().__pt_formatted_text__())
+            text = "".join(
+                fragment[1] for fragment in listener._composer_message().__pt_formatted_text__()
+                if len(fragment) >= 2 and isinstance(fragment[1], str)
+            )
         return text.split("\n")
 
     def test_the_composer_draws_the_plan_above_the_status_with_breathing_room(self):

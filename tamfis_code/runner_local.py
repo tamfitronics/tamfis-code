@@ -1620,6 +1620,49 @@ def _mark_external_scope(scoped: dict[str, Any], paths: list[Path]) -> None:
         scoped[_EXTERNAL_SCOPE_PATHS_KEY] = unique
 
 
+# One boolean flag repeated N>1 times is model degeneration, not intent:
+# confirmed live 2026-09-24 with `wp --no-plugins` x15. Collapse repeats of
+# the same flag token to one occurrence (keeping the first) while leaving
+# values, quoted strings, and repeated *value* options (--exclude a
+# --exclude b) untouched. Applied to execute_command arguments before
+# approval/dispatch so the panel, the record and the executed command agree.
+_FLAG_COLLAPSE_MIN_REPEATS = 3
+
+
+def _collapse_repeated_flags(command: str) -> str:
+    """Collapse a flag repeated >= 3 times in one command to a single use.
+
+    Conservative on purpose: only tokens starting with `--`/`-` that appear
+    >= _FLAG_COLLAPSE_MIN_REPEATS times as standalone whitespace-delimited
+    tokens are collapsed, and quoted segments are never rewritten. A command
+    without repetition is returned unchanged (the common case pays nothing).
+    """
+    value = str(command or "")
+    if not value:
+        return value
+    try:
+        tokens = shlex.split(value)
+    except ValueError:
+        return value
+    counts: dict[str, int] = {}
+    for token in tokens:
+        if token.startswith("-") and len(token) > 1:
+            counts[token] = counts.get(token, 0) + 1
+    repeated = {flag for flag, count in counts.items() if count >= _FLAG_COLLAPSE_MIN_REPEATS}
+    if not repeated:
+        return value
+    rebuilt: list[str] = []
+    for token in tokens:
+        if token in repeated:
+            if token in rebuilt:
+                continue
+        rebuilt.append(token)
+    try:
+        return shlex.join(rebuilt)
+    except ValueError:
+        return value
+
+
 def _scope_tool_arguments(
     tool_name: str,
     arguments: dict[str, Any],
@@ -1721,6 +1764,21 @@ def _scope_tool_arguments(
             command,
             flags=re.VERBOSE | re.DOTALL,
         )
+
+        # Degenerate repetition collapse. Confirmed live 2026-09-24: a weak
+        # model can emit the same flag dozens of times in one argument
+        # ("--no-plugins" repeated 15+ times), wrapping the terminal in
+        # garbage and making both the approval panel and the "Ran ..."
+        # record unreadable. The repeats carry no meaning -- the flag is
+        # idempotent -- so collapse each repeated boolean flag to one before
+        # scope/approval/dispatch see it. Only whole flags preceded by
+        # whitespace are collapsed, so legitimate uses of the same token
+        # inside quoted strings or as values survive untouched.
+        if command and not heredoc_header:
+            collapsed_command = _collapse_repeated_flags(command)
+            if collapsed_command != command:
+                command = collapsed_command
+                scoped["command"] = command
 
         if leading_cd is not None:
             raw_target = leading_cd.group("target")
@@ -2742,6 +2800,40 @@ def _checkpoint_resume_objective(checkpoint: dict[str, Any]) -> str:
     messages = list(checkpoint.get("messages") or [])
     # A checkpoint written before machine wording was filtered may hold a snowballed chain.
     stored = local_state.clean_objective_chain(str(checkpoint.get("objective") or "")).strip()
+
+    # Authoritative-user-only recovery (observed 2026-09-24, session
+    # "Fix Workspace Canvas Streaming"): the stored "objective" can be an
+    # ASSISTANT progress statement ("The existing code confirms the
+    # architecture is split across three intent systems...") that overwrote
+    # the real task on resume. Assistant prose is never an authoritative
+    # user objective, so when the stored text is not found verbatim among
+    # the checkpoint's USER messages, ignore it as the anchor and rebuild
+    # from the transcript's real user messages instead (bounded tail).
+    stored_is_user_authored = any(
+        message.get("role") == "user"
+        and " ".join(str(message.get("content") or "").split()).casefold()
+        == " ".join(stored.split()).casefold()
+        for message in messages
+    ) if stored else False
+    if stored and not stored_is_user_authored:
+        user_candidates = [
+            str(message.get("content") or "").strip()
+            for message in messages
+            if message.get("role") == "user" and _is_real_resume_objective(str(message.get("content") or ""))
+        ]
+        user_candidates = [text for text in user_candidates if text][-4:]
+        if user_candidates:
+            unique: list[str] = []
+            seen: set[str] = set()
+            for candidate in user_candidates:
+                key = candidate.casefold()
+                if key not in seen:
+                    unique.append(candidate)
+                    seen.add(key)
+            return "\n\nAdditional user context: ".join(unique)
+        # Nothing authoritative to recover from: hand back empty rather
+        # than silently promoting assistant prose into the task objective.
+        return ""
 
     # Anchor at the user message that created this checkpoint, then cross
     # backwards only over unfinished assistant work (tool calls, narrated
@@ -4366,6 +4458,25 @@ _NARRATED_TOOL_INTENT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Confirmed live 2026-09-24 ("Fix Workspace Canvas Streaming" session): the
+# model listed a directory, dumped the filenames, and ended its answer with
+# "The next step would be to inspect the context..." -- a promise of future
+# work phrased as a roadmap, then STOPPED despite an active unfinished plan.
+# Neither _NARRATED_TOOL_INTENT_RE (first-person "I will ...") nor
+# _CAPITULATION_RE ("no clear next step") matches a third-person roadmap, so
+# the text passed every premature-completion guard and the turn ended as if
+# the repair were done. A sentence that itself says the work has a next step
+# is an admission that this turn is not finished.
+_FUTURE_STEP_ROADMAP_RE = re.compile(
+    r"(?:^|[.!?]\s+|\n)\s*(?:the\s+)?next\s+(?:step|action|move)s?\s+"
+    r"(?:would|will|should|is|are)\s+(?:be\s+)?to\s+"
+    r"(?:check|examine|inspect|read|look|search|run|open|review|verify|explore|"
+    r"scan|list|install|write|create|add|implement|fix|update|modify|delete|"
+    r"remove|download|build|configure|debug|edit|investigate|trace|analyze|"
+    r"analyse|test|compare|locate|identify)\b",
+    re.IGNORECASE,
+)
+
 _NARRATED_TOOL_DISPATCH_RE = re.compile(
     r"\b(?:i(?:'ll|\s+will|\s+am\s+going\s+to))\s+"
     r"(?:call|invoke|use)\b[^.!?\n]{0,180}\b(?:registered\s+)?tool(?:s)?\b",
@@ -4376,7 +4487,11 @@ _NARRATED_TOOL_DISPATCH_RE = re.compile(
 def _looks_like_narrated_tool_intent(text: str) -> bool:
     """True only for promises to perform future tool work, not past reports."""
     value = text or ""
-    return bool(_NARRATED_TOOL_INTENT_RE.search(value) or _NARRATED_TOOL_DISPATCH_RE.search(value))
+    return bool(
+        _NARRATED_TOOL_INTENT_RE.search(value)
+        or _NARRATED_TOOL_DISPATCH_RE.search(value)
+        or _FUTURE_STEP_ROADMAP_RE.search(value)
+    )
 
 
 # Confirmed live: given an open-ended instruction ("continue until you fix
@@ -9996,10 +10111,14 @@ async def _run_local_agent_turn_impl(
                 and getattr(orchestrator.run, "reasoning_plan", False)
                 and pending_plan_steps
                 and plan_completion_retries < 3
-                and (
-                    getattr(task_profile.task_type, "value", "") == "audit"
-                    or not any_mutation
-                )
+                # 2026-09-24: this used to fire only for audits (or turns with
+                # no mutation yet), which let a MUTATION task stop the moment
+                # the model produced prose between tool rounds -- the
+                # observed "listed a directory, said 'the next step would be
+                # to inspect…', stopped" failure. An unfinished plan is
+                # unfinished work regardless of task type; the mutation
+                # safeguards below (verification-command requirement,
+                # evidence preflight) still gate the actual final delivery.
             ):
                 plan_completion_retries += 1
                 working_messages.append({"role": "assistant", "content": content})
