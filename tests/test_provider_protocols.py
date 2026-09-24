@@ -178,6 +178,13 @@ def test_reasoning_and_content_in_separate_deltas_stay_separate():
     assert [e.event_type.value for e in content_events] == ["assistant_delta"]
 
 
+def test_empty_openai_choice_list_is_a_valid_non_content_chunk():
+    # Some finitron-compatible gateways emit a usage/heartbeat envelope with
+    # choices=[]. It must be ignored by normalization and never surface as an
+    # IndexError that aborts the fallback chain.
+    assert normalize_stream_chunk({"choices": []}) == []
+
+
 def test_embedded_resource_exhausted_stream_error_is_raised_as_retryable():
     chunk = {"error": {"message": "ResourceExhausted: Worker local total request limit reached (32/32)", "type": "internal_server_error", "code": 500}}
     with pytest.raises(ProviderStreamError) as raised:

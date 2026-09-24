@@ -2506,9 +2506,17 @@ class ProviderManager:
                                          output_tokens=getattr(usage, "completion_tokens", None),
                                          reasoning_tokens=getattr(getattr(usage, "completion_tokens_details", None), "reasoning_tokens", None),
                                          cached_input_tokens=getattr(getattr(usage, "prompt_tokens_details", None), "cached_tokens", None))
-                        if not chunk.choices:
+                        choices = getattr(chunk, "choices", None) or []
+                        try:
+                            choice = choices[0]
+                        except (IndexError, KeyError, TypeError):
+                            # OpenAI-compatible providers are allowed to emit
+                            # usage/heartbeat/final chunks with no choices.
+                            # Never turn one of those valid envelopes into a
+                            # fatal ``list index out of range`` stream error.
                             continue
-                        content = chunk.choices[0].delta.content
+                        delta = getattr(choice, "delta", None)
+                        content = getattr(delta, "content", None) if delta is not None else None
                         if content:
                             yielded_content = True
                             yield content
@@ -2527,8 +2535,14 @@ class ProviderManager:
                     record_provider_latency(resolved, time.monotonic() - _latency_started)
                     return
 
-                if response.choices:
-                    content = response.choices[0].message.content
+                choices = getattr(response, "choices", None) or []
+                try:
+                    choice = choices[0]
+                except (IndexError, KeyError, TypeError):
+                    choice = None
+                if choice is not None:
+                    message = getattr(choice, "message", None)
+                    content = getattr(message, "content", None) if message is not None else None
                     if content:
                         yield content
                 usage = getattr(response, "usage", None)

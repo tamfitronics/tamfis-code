@@ -198,7 +198,11 @@ EXCLUDED_DIR_NAMES = {
     ".turbo", ".cache", "site-packages",
 }
 MAX_LIST_DIRECTORY_ENTRIES = 500
-MAX_LIST_DIRECTORY_DEPTH = 3
+# ``0`` means recurse until there are no more reachable directories. There is
+# deliberately no hard maximum: discovery must reach the deepest file in a
+# deeply nested project tree. The result-size cap is independent and protects
+# the model context from an accidental broad listing.
+MAX_LIST_DIRECTORY_DEPTH = None
 MAX_SEARCH_RESULTS = 200
 # How many matches may be RETURNED in one tool result before the remainder is
 # handed over as a continuation offset. Small enough to keep a broad query from
@@ -781,7 +785,8 @@ class MCPServer:
             name="list_directory",
             description=(
                 "List one directory tree. By default depth=1 lists immediate children; "
-                "an optional bounded depth can include nested contents. Common noise directories "
+                "set depth=0 to recurse to the deepest reachable directory, or provide any "
+                "positive depth for a finite prefix. Common noise directories "
                 "(.git, node_modules, __pycache__, and "
                 "similar) are always excluded. For a broad, unfocused request, list the top "
                 "level once and then act on what it actually returns -- read_file a specific "
@@ -795,11 +800,11 @@ class MCPServer:
                 "properties": {
                     "path": {"type": "string", "description": "Directory path"},
                     "depth": {
-                        "type": "integer", "minimum": 1, "maximum": MAX_LIST_DIRECTORY_DEPTH,
+                        "type": "integer", "minimum": 0,
                         "default": 1,
                         "description": (
-                            "Optional bounded recursion depth. 1 lists immediate children; "
-                            f"the maximum is {MAX_LIST_DIRECTORY_DEPTH}."
+                            "Optional recursion depth. 1 lists immediate children; "
+                            "0 walks to the deepest reachable directory with no depth limit."
                         ),
                     },
                 },
@@ -2292,13 +2297,14 @@ class MCPServer:
     async def _list_directory(
         self, path: str = ".", depth: int = 1,
     ) -> List[Dict[str, Any]]:
-        """List a bounded directory tree.
+        """List a directory tree.
 
         Older callers omit ``depth`` and retain the original immediate-child
         behavior. Newer models sometimes include it automatically in a tool
         call, so accepting it here prevents a schema/handler mismatch from
-        terminating the task. The depth is clamped to a small hard maximum
-        and the total result remains bounded independently.
+        terminating the task. ``depth=0`` means unlimited recursion. The
+        result count remains bounded independently so a broad listing does not
+        flood the model context in one response.
         """
         try:
             p = self._resolve_in_workspace(path)
@@ -2314,18 +2320,19 @@ class MCPServer:
             requested_depth = int(depth)
         except (TypeError, ValueError):
             return [{"error": "depth must be an integer"}]
-        if requested_depth < 1 or requested_depth > MAX_LIST_DIRECTORY_DEPTH:
+        if requested_depth < 0:
             return [{
-                "error": (
-                    f"depth must be between 1 and {MAX_LIST_DIRECTORY_DEPTH}"
-                )
+                "error": "depth must be a non-negative integer"
             }]
+
+        unlimited = requested_depth == 0
+        walk_depth = None if unlimited else requested_depth
 
         results: list[Dict[str, Any]] = []
         excluded_count = 0
         omitted_count = 0
 
-        async def visit(directory: Path, remaining: int) -> None:
+        async def visit(directory: Path, remaining: int | None) -> None:
             nonlocal excluded_count, omitted_count
             # Recursive filesystem calls through the generic worker-thread
             # wrapper can deadlock on Python 3.13 after the first nested
@@ -2355,18 +2362,18 @@ class MCPServer:
                         "size": item.stat().st_size if item.exists() else 0,
                         "modified": item.stat().st_mtime if item.exists() else 0,
                     }
-                    if remaining < requested_depth:
+                    if not unlimited and remaining < requested_depth:
                         entry["depth"] = requested_depth - remaining + 1
                     results.append(entry)
-                    if is_dir and remaining > 1:
-                        await visit(item, remaining - 1)
+                    if is_dir and (unlimited or remaining > 1):
+                        await visit(item, None if unlimited else remaining - 1)
                 except OSError:
                     # A disappearing or unreadable child should not invalidate
                     # the rest of a useful directory listing.
                     continue
 
         try:
-            await asyncio.wait_for(visit(p, requested_depth), timeout=30.0)
+            await asyncio.wait_for(visit(p, walk_depth), timeout=30.0)
         except asyncio.TimeoutError:
             return [{"error": (
                 f"Listing '{path}' took longer than 30s and was stopped. "

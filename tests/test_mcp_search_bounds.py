@@ -67,10 +67,22 @@ class ListDirectoryBoundsTests(unittest.TestCase):
             self.assertIn(str(nested), paths)
             self.assertIn(str(nested / "module.py"), paths)
 
-    def test_depth_is_rejected_above_the_hard_bound(self):
+    def test_depth_can_reach_arbitrarily_deep_nested_children(self):
         with tempfile.TemporaryDirectory() as ws:
-            result = _run(MCPServer()._list_directory(ws, depth=MAX_LIST_DIRECTORY_DEPTH + 1))
-            self.assertIn("depth must be between", result[0]["error"])
+            root = Path(ws)
+            deepest = root
+            for index in range(8):
+                deepest /= f"level_{index}"
+                deepest.mkdir()
+            (deepest / "last.py").write_text("needle = True\n")
+            results = _run(MCPServer()._list_directory(ws, depth=0))
+            paths = {item["path"] for item in results if "path" in item}
+            self.assertIn(str(deepest / "last.py"), paths)
+
+    def test_negative_depth_is_rejected(self):
+        with tempfile.TemporaryDirectory() as ws:
+            result = _run(MCPServer()._list_directory(ws, depth=-1))
+            self.assertIn("non-negative", result[0]["error"])
 
     def test_caps_entry_count_with_truncation_marker(self):
         with tempfile.TemporaryDirectory() as ws:

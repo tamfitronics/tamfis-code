@@ -1913,17 +1913,14 @@ def _scope_tool_arguments(
             if not any(_is_within(candidate, root) for root in scope_roots):
                 external_paths.append(candidate)
 
-        # External recursive discovery must remain bounded even after the
-        # user approves the directory gate. On some hosts `/etc` contains
-        # mounts or service-managed paths that make an unrestricted `find`
-        # hang until the command timeout. Preserve the requested search while
-        # adding a conservative depth/filesystem boundary; users can narrow
-        # the root or request a different depth explicitly with -maxdepth.
+        # External recursive discovery must remain on one filesystem after the
+        # user approves the directory gate, but must not impose an artificial
+        # depth cap: approved discovery may need to reach the deepest file.
         if external_paths and command and re.match(r"^\s*find\b", command) and "-maxdepth" not in command:
             try:
                 tokens = shlex.split(command)
                 if tokens and tokens[0] == "find":
-                    command = shlex.join(["find", "-xdev", "-maxdepth", "20", *tokens[1:]])
+                    command = shlex.join(["find", "-xdev", *tokens[1:]])
                     scoped["command"] = command
             except ValueError:
                 pass
