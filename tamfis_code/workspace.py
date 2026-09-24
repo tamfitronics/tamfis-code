@@ -1409,7 +1409,19 @@ def detect_validation_commands(workspace_root: Path) -> list[tuple[str, str]]:
         add("CMake build", "cmake -S . -B build && cmake --build build")
     elif (root / "Makefile").is_file() or (root / "makefile").is_file():
         add("Make build", "make")
-    if any(root.glob("*.sh")):
+    # Scripts commonly live under scripts/ rather than at repository root.
+    # Keep discovery bounded to the workspace's meaningful source tree and
+    # skip dependency/build directories so a parent workspace does not inherit
+    # validators from node_modules or generated artifacts.
+    has_shell_scripts = False
+    try:
+        for candidate in root.rglob("*.sh"):
+            if candidate.is_file() and not any(part in IGNORED_PARTS for part in candidate.relative_to(root).parts):
+                has_shell_scripts = True
+                break
+    except OSError:
+        has_shell_scripts = False
+    if has_shell_scripts:
         # Use the safety-approved find -exec form. The previous xargs fan-out
         # was intentionally rejected by the read-only command classifier
         # because xargs options can hide arbitrary interpreter execution. That
