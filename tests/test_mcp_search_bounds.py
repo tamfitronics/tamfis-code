@@ -196,6 +196,15 @@ class SearchCodePagingTests(unittest.TestCase):
         self.assertEqual(capped[-1]["pagination"]["total"], 30)
         self.assertLessEqual(len([m for m in capped if "file" in m]), MAX_SEARCH_RESULTS)
 
+    def test_search_code_accepts_limit_alias(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            (root / "heartbeat.py").write_text("heartbeat = True\n")
+
+            results = _run(MCPServer()._search_code("heartbeat", path=str(root), limit=1))
+
+            self.assertTrue(any("file" in item for item in results))
+
 
 class SearchCodeBoundsTests(unittest.TestCase):
     def test_excludes_matches_inside_generated_or_dependency_directories(self):

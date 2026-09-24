@@ -844,6 +844,13 @@ class MCPServer:
                         "maximum": MAX_SEARCH_RESULTS,
                         "description": "Optional matches per page (default 80, maximum 200)",
                     },
+                    "limit": {
+                        "type": "integer", "minimum": 1,
+                        "maximum": MAX_SEARCH_RESULTS,
+                        "description": (
+                            "Alias for max_results accepted by common search tool callers"
+                        ),
+                    },
                 },
                 "required": ["query"]
             },
@@ -2392,6 +2399,7 @@ class MCPServer:
     async def _search_code(
         self, query: str, path: str = ".", file_pattern: str = None,
         offset: Optional[int] = None, max_results: Optional[int] = None,
+        limit: Optional[int] = None,
     ) -> List[Dict[str, Any]]:
         """Search for `query`, returning ONE PAGE of matches.
 
@@ -2402,6 +2410,8 @@ class MCPServer:
         to continue from -- rather than only telling the model to narrow the
         query, which throws away the fact that the answer is ON match 120.
         """
+        if max_results is None:
+            max_results = limit
         matches = await self._search_code_matches(query, path, file_pattern)
         if matches and isinstance(matches[0], dict) and matches[0].get("error"):
             return matches
