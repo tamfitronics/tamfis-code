@@ -668,6 +668,15 @@ def help_text() -> str:
         for command in rows:
             names = command.name + (f" ({', '.join(command.aliases)})" if command.aliases else "")
             lines.append(f"{names:<24}{command.description}")
+    # Rewrite aliases are not attached to a SlashCommand because they target
+    # legacy interactive handlers. Keep the important session aliases visible
+    # in /help nevertheless; otherwise /history appears to be accepted only
+    # by completion, which is exactly how its broken resume behavior went
+    # unnoticed.
+    lines.append("\nSession aliases:")
+    for alias in ("/history", "/sessions", "/chats", "/continue"):
+        target, description = ALIAS_REWRITES[alias]
+        lines.append(f"{alias:<24}{description} (alias for {target})")
     return "\n".join(lines)
 
 

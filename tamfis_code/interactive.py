@@ -83,7 +83,7 @@ from .safety import revert_transaction as local_revert_transaction
 from .tasks import find_recent_task
 from .workspace import (
     WorkspaceContext, blocking_dirty_files, context_from_session, discover_local_repository,
-    find_resumable_session,
+    find_resumable_session, list_resumable_local_sessions,
 )
 from .routing import is_mutation_request
 
@@ -3092,19 +3092,22 @@ async def _run_interactive_impl(
                         print_error(console, f"No known local session {target_id}. Use /agents to list known sessions.")
                         continue
                 else:
-                    current_root = Path(workspace.workspace_root).resolve()
-                    candidates = [
-                        sid for sid in reversed(known)
-                        if sid != workspace.session_id
-                        and Path(
-                            local_state.get_session_state(sid).workspace_root
-                            or local_state.get_session_state(sid).primary_workspace
-                        ).resolve() == current_root
-                    ]
-                    if not candidates:
-                        console.print("[dim]No other sessions to resume in the current workspace.[/dim]")
+                    # `/resume` and its `/history`/`/sessions` aliases are
+                    # browse commands when used inside the REPL. The old
+                    # implementation silently picked the newest other row,
+                    # which made `/history` appear to create or resume a
+                    # fresh session instead of showing the user's sessions.
+                    rows = list_resumable_local_sessions(Path(workspace.workspace_root))
+                    if not rows:
+                        console.print("[dim]No existing sessions in the current workspace.[/dim]")
                         continue
-                    target_id = candidates[0]
+                    from .resume_picker import run_resume_picker
+
+                    action, picked_id = await run_resume_picker(rows)
+                    if action != "resume" or picked_id is None:
+                        console.print("[dim]No session selected.[/dim]")
+                        continue
+                    target_id = picked_id
                 target_state = local_state.get_session_state(target_id)
                 workspace = WorkspaceContext(
                     session_id=target_id,

@@ -613,9 +613,26 @@ class StandaloneAgentsAndResumeTests(_StatePatchMixin, unittest.TestCase):
         output_all = _run(["/agents --all", EOFError()])
         self.assertIn("no known parent", output_all)
 
-    def test_resume_with_no_other_sessions(self):
+    def test_resume_with_no_existing_sessions(self):
         output = _run(["/resume", EOFError()])
-        self.assertIn("No other sessions to resume", output)
+        self.assertIn("No existing sessions", output)
+
+    def test_history_alias_opens_the_existing_session_picker(self):
+        state_module.save_session_state(
+            1, workspace_root="/tmp/fake-workspace",
+            conversation_history=[{"role": "user", "content": "first task"}],
+        )
+        state_module.save_session_state(
+            2, workspace_root="/tmp/fake-workspace",
+            conversation_history=[{"role": "user", "content": "older task"}],
+        )
+        with patch(
+            "tamfis_code.resume_picker.run_resume_picker",
+            new=AsyncMock(return_value=("resume", 2)),
+        ):
+            output = _run(["/history", EOFError()])
+        self.assertIn("Resumed session 2", output)
+        self.assertNotIn("No existing sessions", output)
 
     def test_resume_unknown_session_id_shows_error(self):
         output = _run(["/resume 999", EOFError()])

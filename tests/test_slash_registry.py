@@ -92,6 +92,11 @@ class DispatchTests(_Isolated, unittest.TestCase):
         result, _ = self.run_cmd("/history 12")
         self.assertEqual(result, sr.Rewrite("/resume 12"))
 
+    def test_resume_aliases_are_documented_in_help(self):
+        text = sr.help_text()
+        for alias in ("/history", "/sessions", "/chats", "/continue"):
+            self.assertIn(alias, text)
+
     def test_a_users_own_custom_command_wins_over_a_builtin(self):
         result, _ = self.run_cmd("/review please", self.ctx(custom_commands={"review": object()}))
         self.assertIsNone(result)
