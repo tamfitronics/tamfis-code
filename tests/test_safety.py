@@ -94,6 +94,21 @@ class ClassifyCommandRiskTests(unittest.TestCase):
         )
         self.assertEqual(classify_command_risk(command), RISK_READ_ONLY)
 
+    def test_read_only_python_heredoc_report_is_allowed(self):
+        command = """python3 - <<'PY'
+from tamgpt6.tamgpt_api import TamgptAPI
+api = TamgptAPI()
+print(api.chat('Hello'))
+PY"""
+        self.assertEqual(classify_command_risk(command), RISK_READ_ONLY)
+
+    def test_python_heredoc_mutation_primitives_are_not_read_only(self):
+        command = """python3 - <<'PY'
+from pathlib import Path
+Path('x').write_text('bad')
+PY"""
+        self.assertNotEqual(classify_command_risk(command), RISK_READ_ONLY)
+
     def test_python_inline_mutation_primitives_are_not_read_only(self):
         self.assertNotEqual(
             classify_command_risk("python3 -c \"from pathlib import Path; Path('x').write_text('bad')\""),

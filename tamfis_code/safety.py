@@ -205,6 +205,23 @@ def _is_safe_python_inline(source: str) -> bool:
     return True
 
 
+def _is_safe_python_heredoc(command: str) -> bool:
+    """Recognise the heredoc form of the bounded Python inspection profile.
+
+    Models commonly emit a multiline script as ``python - <<'PY'`` when a
+    one-line ``python -c`` command would be unreadable. This is still only
+    read-only when the same AST restrictions used for inline Python pass and
+    when the complete command contains no shell suffix/control operators.
+    """
+    match = re.fullmatch(
+        r"\s*python3?\s+-\s+<<-?([\"']?)([A-Za-z_][A-Za-z0-9_-]*)\1\s*\n"
+        r"(?P<source>.*?)\n\2\s*\Z",
+        command or "",
+        re.DOTALL,
+    )
+    return bool(match and _is_safe_python_inline(match.group("source")))
+
+
 def _is_safe_find_exec(command: str) -> bool:
     """Allow only syntax-check commands under ``find -exec``.
 
@@ -276,6 +293,8 @@ def is_process_inspection_command(command: str) -> bool:
 
 def _is_read_only_command(command: str) -> bool:
     """Conservatively recognize shell commands that only inspect state."""
+    if _is_safe_python_heredoc(command):
+        return True
     # Discard only the common stderr-to-/dev/null suffix used by discovery
     # commands. Every other redirection/control/substitution construct is
     # treated as mutating/unknown and therefore not allowed in read-only mode.
