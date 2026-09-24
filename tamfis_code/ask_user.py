@@ -124,6 +124,15 @@ def normalize_questions(
     ValueError with a message the model can act on when nothing usable was asked.
     """
     raw_list: list[Any]
+    if isinstance(questions, str):
+        text = questions.strip()
+        if text.startswith("[") and text.endswith("]"):
+            try:
+                decoded = json.loads(text)
+            except (TypeError, ValueError, json.JSONDecodeError):
+                decoded = None
+            if isinstance(decoded, list):
+                questions = decoded
     if isinstance(questions, list) and questions:
         raw_list = questions
     elif question:

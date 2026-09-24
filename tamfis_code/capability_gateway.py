@@ -25,6 +25,47 @@ _SIDE_EFFECT_NAMES = {
 }
 
 
+def _normalise_ask_user_arguments(name: str, arguments: Mapping[str, Any]) -> dict[str, Any]:
+    """Repair JSON-encoded arrays emitted by weaker provider tool adapters.
+
+    The canonical schema is intentionally strict, but several providers send
+    an array as a JSON string (and sometimes encode the nested ``options`` a
+    second time).  Decode only this well-known interactive capability; all
+    other tools retain their exact arguments and malformed values still fail
+    normal schema validation.
+    """
+    result = dict(arguments)
+    if name != "ask_user_question":
+        return result
+
+    def decode(value: Any) -> Any:
+        if not isinstance(value, str):
+            return value
+        text = value.strip()
+        if not text.startswith(("[", "{")):
+            return value
+        try:
+            decoded = json.loads(text)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return value
+        return decoded
+
+    for key in ("questions", "options"):
+        if key in result:
+            result[key] = decode(result[key])
+    questions = result.get("questions")
+    if isinstance(questions, list):
+        repaired: list[Any] = []
+        for item in questions:
+            if isinstance(item, Mapping):
+                item = dict(item)
+                if "options" in item:
+                    item["options"] = decode(item["options"])
+            repaired.append(item)
+        result["questions"] = repaired
+    return result
+
+
 def _validate_input_schema(schema: Mapping[str, Any], arguments: Mapping[str, Any]) -> None:
     """Validate the common JSON-schema contract before native dispatch."""
     if not schema:
@@ -149,10 +190,11 @@ class RemoteCapabilityGateway:
         match = next((tool for tool in tools or [] if _safe_namespace(str(tool.get("name", ""))) == name), None)
         if match is None:
             return ExecutionResult(request.request_id, error=f"remote capability not found: {name}")
+        arguments = _normalise_ask_user_arguments(name, request.arguments)
         try:
             _validate_input_schema(
                 match.get("parameters", match.get("inputSchema", {})) or {},
-                request.arguments,
+                arguments,
             )
         except ValueError as exc:
             # Reject malformed input locally so a remote connector cannot
@@ -203,7 +245,7 @@ class RemoteCapabilityGateway:
             # rather than receiving speculative keywords.
             supported_kwargs = {}
         result = await call_tool(
-            str(match["name"]), dict(request.arguments), **supported_kwargs,
+            str(match["name"]), arguments, **supported_kwargs,
         )
         if not result.get("success", True):
             return ExecutionResult(request.request_id, error=str(result.get("error", "remote tool failed")))
@@ -394,14 +436,15 @@ class TamfisCodeCapabilityGateway:
         descriptor = next((item for item in self.discover() if item.id == request.capability_id), None)
         if descriptor is None:
             return ExecutionResult(request.request_id, error=f"unknown native capability: {name}")
+        arguments = _normalise_ask_user_arguments(name, request.arguments)
         try:
-            _validate_input_schema(descriptor.input_schema, request.arguments)
+            _validate_input_schema(descriptor.input_schema, arguments)
         except ValueError as exc:
             return ExecutionResult(request.request_id, error=f"invalid arguments: {exc}")
         key = request.idempotency_key
         fingerprint = hashlib.sha256(json.dumps({
             "capability_id": request.capability_id,
-            "arguments": dict(request.arguments),
+            "arguments": arguments,
             "extra_kwargs": extra_kwargs or {},
         }, sort_keys=True, separators=(",", ":"), default=str).encode()).hexdigest()
         owner = False
@@ -427,7 +470,7 @@ class TamfisCodeCapabilityGateway:
             return await wait_for
         try:
             result = await self.server.call_tool(
-                name, dict(request.arguments), extra_kwargs=extra_kwargs,
+                name, arguments, extra_kwargs=extra_kwargs,
             )
             if not result.get("success"):
                 outcome = ExecutionResult(request.request_id, error=str(result.get("error", "tool failed")))

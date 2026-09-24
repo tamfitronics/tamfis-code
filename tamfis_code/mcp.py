@@ -752,7 +752,9 @@ class MCPServer:
                 "similar) are always excluded. For a broad, unfocused request, list the top "
                 "level once and then act on what it actually returns -- read_file a specific "
                 "file it named, list_directory a specific subdirectory, or use search_code for "
-                "a concrete pattern -- rather than repeatedly listing while deciding what to do."
+                "a concrete pattern -- rather than repeatedly listing while deciding what to do. "
+                "This is the mandatory repository-orientation operation: use it before the "
+                "first read of an unresolved repository path instead of guessing a filename."
             ),
             parameters={
                 "type": "object",

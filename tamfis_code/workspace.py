@@ -1583,7 +1583,14 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "works. If any link is missing or fails, report the precise blocker and never "
         "use words such as fixed, live, verified, working, or successful for that "
         "outcome.",
-        "\n- Investigate with intent. Never call list_directory (or any other read-only "
+        "\n- Repository orientation is mandatory before file reads. For every new "
+        "repository or unresolved repository path, first call list_directory on the "
+        "authoritative target root (the bounded tree operation; equivalent to a safe "
+        "`tree` inspection). Use its returned paths to choose exact read_file/search_code "
+        "targets. Never invent a path from a filename, and never call read_file first "
+        "when the tree has not yet established that path. If a prior verified checkpoint "
+        "already contains the same tree for this repository, reuse that evidence instead "
+        "of repeating the call.\n- Investigate with intent. Never call list_directory (or any other read-only "
         "tool) again with the exact same arguments you already used earlier in this same "
         "task -- you already have that result; re-issuing it is not progress and will "
         "end the task early as a stuck loop. For a broad request (e.g. \"audit the "
@@ -1595,7 +1602,6 @@ def build_system_prompt(session_id: int, workspace_root: Path, *, force_discover
         "too broad to make that concrete next choice at all, say so and ask the user to "
         "narrow it (a specific component, directory, or concern) instead of stalling on "
         "repeated top-level listings.",
-        "\n- Do not guess what you can verify. If you're unsure which file actually "
         "\n- Do not guess what you can verify. If you're unsure which file actually "
         "defines something, use read_file or search_code to find it first; do not guess "
         "a file's contents from its name. If read_file reports an exact path miss, "

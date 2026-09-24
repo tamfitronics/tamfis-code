@@ -1,4 +1,5 @@
 import asyncio
+import json
 
 import pytest
 
@@ -105,6 +106,73 @@ async def test_native_gateway_rejects_invalid_contract_before_dispatch():
     result = await gateway.execute(ExecutionRequest("native.write_status", {}))
     assert result.error == "invalid arguments: missing required argument(s): value"
     assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_native_gateway_repairs_json_encoded_ask_question_arrays():
+    calls = []
+
+    class Server:
+        def list_tools(self):
+            return [{
+                "name": "ask_user_question",
+                "description": "Ask the user a structured question",
+                "parameters": {
+                    "type": "object",
+                    "required": ["questions"],
+                    "additionalProperties": False,
+                    "properties": {"questions": {"type": "array"}},
+                },
+            }]
+
+        async def call_tool(self, name, arguments, **_kwargs):
+            calls.append((name, arguments))
+            return {"success": True, "result": "answered"}
+
+    encoded_questions = json.dumps([{
+        "question": "Modify the cron jobs?",
+        "options": json.dumps([{"label": "Yes"}, {"label": "No"}]),
+    }])
+    gateway = TamfisCodeCapabilityGateway(Server())
+    result = await gateway.execute(ExecutionRequest(
+        "native.ask_user_question", {"questions": encoded_questions},
+    ))
+
+    assert result.error is None
+    assert calls[0][0] == "ask_user_question"
+    assert isinstance(calls[0][1]["questions"], list)
+    assert isinstance(calls[0][1]["questions"][0]["options"], list)
+
+
+@pytest.mark.asyncio
+async def test_remote_gateway_repairs_json_encoded_ask_question_arrays():
+    calls = []
+
+    class Connector:
+        async def list_tools(self):
+            return [{
+                "name": "ask_user_question",
+                "operation": "READ",
+                "parameters": {
+                    "type": "object",
+                    "required": ["questions"],
+                    "properties": {"questions": {"type": "array"}},
+                },
+            }]
+
+        async def call_tool(self, name, arguments, **_kwargs):
+            calls.append(arguments)
+            return {"success": True, "result": "answered"}
+
+    gateway = RemoteCapabilityGateway(Connector(), connector_name="remote")
+    result = await gateway.execute(ExecutionRequest(
+        "remote.remote.ask_user_question",
+        {"questions": json.dumps([{"question": "Continue?", "options": "[]"}])},
+    ))
+
+    assert result.error is None
+    assert isinstance(calls[0]["questions"], list)
+    assert calls[0]["questions"][0]["options"] == []
 
 
 class _RemoteConnector:

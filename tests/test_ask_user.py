@@ -61,6 +61,13 @@ class NormalizeTests(unittest.TestCase):
         parsed = au.normalize_questions(question="Continue?", options='["Yes", "No"]')
         self.assertEqual([o.label for o in parsed[0].options], ["Yes", "No"])
 
+    def test_json_encoded_question_arrays_are_parsed(self):
+        parsed = au.normalize_questions(
+            questions='[{"question":"Continue?","options":["Yes","No"]}]',
+        )
+        self.assertEqual(parsed[0].question, "Continue?")
+        self.assertEqual([o.label for o in parsed[0].options], ["Yes", "No"])
+
     def test_plain_string_option_stays_one_option(self):
         parsed = au.normalize_questions(question="Environment?", options="staging")
         self.assertEqual([o.label for o in parsed[0].options], ["staging"])
