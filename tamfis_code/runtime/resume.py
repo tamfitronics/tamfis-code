@@ -196,9 +196,32 @@ def load_resume_snapshot(session_id: int) -> Optional[ResumeSnapshot]:
             for item in (state.unresolved_issues or [])
             if isinstance(item, dict)
         )
+    checkpoint_status = str(checkpoint.get("status") or "").strip().casefold()
+    checkpoint_error = last_error.casefold()
+    interrupted_recovery = checkpoint_status in {"interrupted", "failed", "cancelled", "canceled"} or any(
+        marker in checkpoint_error
+        for marker in (
+            "execution cancelled", "execution canceled", "cancelled by user",
+            "canceled by user", "stream cancelled", "stream canceled",
+            "provider failure", "internal capacity error",
+        )
+    )
     # A completed plan can still have failed terminal validation. Preserve it
     # as a validation-only resume so `continue` runs the missing check instead
-    # of returning "already complete" or creating a second edit plan.
+    # of returning "already complete" or creating a second edit plan. A plan
+    # that was marked complete immediately before an interrupted/cancelled
+    # turn is also not safe to report as delivered: the final evidence event
+    # may never have reached the client. Add one synthetic, read-only
+    # verification step so resume executes the saved task's acceptance check
+    # instead of silently declaring success.
+    if all(step["status"] == "completed" for step in steps) and interrupted_recovery and not validation_recovery:
+        steps.append({
+            "name": "Verify the completed work and acceptance evidence after the interrupted execution",
+            "status": "pending",
+            "evidence": [],
+            "phase": max((step.get("phase", 0) for step in steps), default=0),
+        })
+        validation_recovery = True
     if not steps or (all(step["status"] == "completed" for step in steps) and not validation_recovery):
         return None
     try:

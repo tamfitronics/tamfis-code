@@ -995,10 +995,22 @@ def _compact_row(row: dict[str, Any], *, cold: bool) -> dict[str, Any]:
             row["saved_plans"] = [p for p in plans[:-COLD_PLANS_KEPT] if isinstance(p, dict) and p.get("id") == active] + plans[-COLD_PLANS_KEPT:]
         if isinstance(row.get("context_checkpoints"), list):
             row["context_checkpoints"] = [_clip_strings(c, CLIPPED_STRING_CHARS) for c in row["context_checkpoints"][-COLD_CHECKPOINTS_KEPT:]]
-        if row.get("execution_status") in ("completed", "idle", "done") and row.get("turn_checkpoint"):
+        checkpoint = row.get("turn_checkpoint")
+        checkpoint_status = str(checkpoint.get("status") or "").casefold() if isinstance(checkpoint, dict) else ""
+        # An interrupted/failed turn is resumable evidence even when the
+        # process has already released its execution lease and therefore the
+        # session status is ``idle``.  Clearing it here made a cancelled
+        # final step look like a successfully completed plan on the next
+        # ``continue``.  Only discard checkpoints that explicitly represent
+        # a delivered terminal turn.
+        if (
+            row.get("execution_status") in ("completed", "idle", "done")
+            and checkpoint
+            and checkpoint_status not in {"interrupted", "failed", "cancelled", "canceled"}
+        ):
             row["turn_checkpoint"] = None
-        elif isinstance(row.get("turn_checkpoint"), dict):
-            checkpoint = dict(row["turn_checkpoint"])
+        elif isinstance(checkpoint, dict):
+            checkpoint = dict(checkpoint)
             if isinstance(checkpoint.get("messages"), list):
                 checkpoint["messages"] = checkpoint["messages"][-COLD_TURN_MESSAGES_KEPT:]
             row["turn_checkpoint"] = _clip_strings(checkpoint, CLIPPED_STRING_CHARS)

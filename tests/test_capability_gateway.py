@@ -162,6 +162,35 @@ async def test_native_gateway_repairs_json_encoded_ask_question_arrays():
 
 
 @pytest.mark.asyncio
+async def test_native_gateway_repairs_single_ask_question_shapes():
+    class Server:
+        def list_tools(self):
+            return [{
+                "name": "ask_user_question",
+                "parameters": {
+                    "type": "object",
+                    "required": ["questions"],
+                    "properties": {
+                        "questions": {"type": "array"},
+                        "options": {"type": "array"},
+                    },
+                },
+            }]
+
+        async def call_tool(self, name, arguments, **_kwargs):
+            return {"success": True, "result": arguments}
+
+    gateway = TamfisCodeCapabilityGateway(Server())
+    result = await gateway.execute(ExecutionRequest(
+        "native.ask_user_question",
+        {"questions": {"question": "Which route?", "options": "Continue"}},
+    ))
+    assert result.error is None
+    assert result.output["questions"][0]["question"] == "Which route?"
+    assert result.output["questions"][0]["options"] == ["Continue"]
+
+
+@pytest.mark.asyncio
 async def test_native_gateway_coerces_numeric_search_arguments():
     calls = []
 

@@ -55,13 +55,34 @@ def _normalise_ask_user_arguments(name: str, arguments: Mapping[str, Any]) -> di
         if key in result:
             result[key] = decode(result[key])
     questions = result.get("questions")
+    # Weaker tool adapters sometimes emit one question object (or one plain
+    # string) instead of the declared array.  Normalize that narrow
+    # interactive capability before schema validation; otherwise a harmless
+    # provider-format variation becomes a failover loop of
+    # "questions must be an array" errors.
+    if isinstance(questions, Mapping):
+        result["questions"] = [dict(questions)]
+    elif isinstance(questions, str):
+        result["questions"] = [{"question": questions}]
+        questions = result["questions"]
+    options = result.get("options")
+    if isinstance(options, str):
+        decoded_options = decode(options)
+        result["options"] = decoded_options if isinstance(decoded_options, list) else [options]
+    elif options is not None and not isinstance(options, list):
+        result["options"] = [options]
+    questions = result.get("questions")
     if isinstance(questions, list):
         repaired: list[Any] = []
         for item in questions:
             if isinstance(item, Mapping):
                 item = dict(item)
                 if "options" in item:
-                    item["options"] = decode(item["options"])
+                    nested_options = decode(item["options"])
+                    item["options"] = (
+                        nested_options if isinstance(nested_options, list)
+                        else [item["options"]]
+                    )
             repaired.append(item)
         result["questions"] = repaired
     return result
@@ -81,6 +102,17 @@ def _normalise_schema_arguments(
     properties = schema.get("properties") if isinstance(schema, Mapping) else None
     if not isinstance(properties, Mapping):
         return result
+    # Schema-first repair for adapters that expose a custom alias for the
+    # interactive question capability.  Do not rely solely on the wire tool
+    # name: the gateway may receive ``ask_user_question`` through a provider
+    # alias while its descriptor still unambiguously declares an array.
+    for key, rule in properties.items():
+        if (
+            isinstance(rule, Mapping) and rule.get("type") == "array"
+            and key in {"questions", "options"}
+            and isinstance(result.get(key), Mapping)
+        ):
+            result[key] = [dict(result[key])]
     for key, rule in properties.items():
         value = result.get(key)
         if not isinstance(value, str) or not isinstance(rule, Mapping):

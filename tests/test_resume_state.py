@@ -189,6 +189,29 @@ class SnapshotTests(_IsolatedState, unittest.TestCase):
         self.assertIsNone(load_resume_snapshot(511))
         self.assertIsNone(describe_resume_point(511))
 
+    def test_interrupted_turn_with_completed_plan_resumes_validation(self):
+        self._interrupt_after(517, done=4)
+        # Install the terminal checkpoint directly so this regression test
+        # isolates resume selection from the state writer's lease/compaction
+        # bookkeeping. The production writer is covered by the persisted
+        # checkpoint contract; this test is specifically about not treating
+        # an interrupted final plan as delivered.
+        state = state_module.get_session_state(517)
+        state.turn_checkpoint = {
+            "objective": OBJECTIVE,
+            "mode": "coding",
+            "status": "interrupted",
+            "messages": [{"role": "user", "content": OBJECTIVE}],
+            "last_error": "Execution cancelled by user.",
+        }
+        state.execution_status = "running"
+        state_module.put_session_state(state)
+        snapshot = load_resume_snapshot(517)
+        self.assertIsNotNone(snapshot)
+        assert snapshot is not None
+        self.assertEqual(snapshot.resume_step_name, "Verify the completed work and acceptance evidence after the interrupted execution")
+        self.assertEqual(snapshot.done, 4)
+
     def test_the_resume_point_is_the_first_step_not_completed(self):
         self._interrupt_after(512, done=2)
         point = describe_resume_point(512)
