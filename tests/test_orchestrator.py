@@ -321,7 +321,7 @@ class OrchestratorTests(unittest.TestCase):
         profile = classify_task("audit the entire repository", read_only=True)
         tools = allowed_tools(profile, read_only=True)
         self.assertIn("read_file", tools)
-        self.assertNotIn("execute_command", tools)
+        self.assertIn("execute_command", tools)
         self.assertNotIn("write_file", tools)
 
     def test_ask_user_question_is_offered_even_in_read_only_mode(self):
@@ -355,7 +355,7 @@ class OrchestratorTests(unittest.TestCase):
     def test_question_is_still_read_only_when_explicitly_in_read_only_mode(self):
         profile = classify_task("what does this function do", read_only=True)
         tools = allowed_tools(profile, read_only=True)
-        self.assertNotIn("execute_command", tools)
+        self.assertIn("execute_command", tools)
         self.assertNotIn("write_file", tools)
         self.assertNotIn("edit_file", tools)
 

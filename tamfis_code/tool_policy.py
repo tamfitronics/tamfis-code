@@ -36,11 +36,16 @@ READ_TOOLS = [
     "list_external_agent_sessions", "read_external_agent_session", "list_agent_types",
     "write_todos",
 ]
-# Keep ordinary read-only turns strictly read-only. A resumed machine-generated
-# checkpoint gets the separately gated process-inspection surface in
-# runner_local.py; exposing shell execution to every audit/question made the
-# public tool contract unsafe and broke callers that rely on this boundary.
-READ_ONLY_INSPECTION_TOOLS = [*READ_TOOLS]
+# Safe shell inspection is part of the read-only contract.  The tool is still
+# constrained twice at runtime: safety.classify_command_risk() admits only
+# proven non-mutating commands, and runner_local.py rejects everything else.
+# Keeping it in the schema matters for repository audits: compile checks,
+# pytest discovery, bounded Python reports, and checkpoint inspection cannot
+# be completed reliably through read_file/search_code alone.  A prior build
+# hid the tool from ordinary audits, causing Finitron recovery to stop after
+# useful inspection with "no successful tool call" even though the requested
+# verification was non-mutating.
+READ_ONLY_INSPECTION_TOOLS = [*READ_TOOLS, "execute_command"]
 EDIT_TOOLS = [
     *READ_TOOLS,
     "execute_command",

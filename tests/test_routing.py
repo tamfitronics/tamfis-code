@@ -150,7 +150,7 @@ def test_explicit_no_edit_status_review_is_inspection_even_when_filename_contain
     assert profile.requires_tools
     assert not profile.requires_validation
     assert not should_plan(profile)
-    assert "execute_command" not in allowed_tools(profile, read_only=False)
+    assert "execute_command" in allowed_tools(profile, read_only=False)
     assert "edit_file" not in allowed_tools(profile, read_only=False)
 
 
@@ -233,7 +233,7 @@ def test_explicit_read_only_mode_still_restricts_audit_then_fix_request():
     )
 
     assert profile.task_type == TaskType.AUDIT
-    assert "execute_command" not in allowed_tools(profile, read_only=True)
+    assert "execute_command" in allowed_tools(profile, read_only=True)
     assert "edit_file" not in allowed_tools(profile, read_only=True)
 
 

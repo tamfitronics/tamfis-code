@@ -113,9 +113,9 @@ class WriteTodosToolPolicyTests(unittest.TestCase):
 
     def test_read_only_turns_still_get_write_todos(self):
         tools = allowed_tools(_profile(TaskType.INSPECT), read_only=True)
+        self.assertIn("execute_command", tools)
         self.assertIn("write_todos", tools)
         self.assertNotIn("write_file", tools)
-        self.assertNotIn("execute_command", tools)
 
     def test_edit_turns_get_write_todos(self):
         self.assertIn("write_todos", allowed_tools(_profile(TaskType.EDIT), read_only=False))
