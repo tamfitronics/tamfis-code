@@ -93,6 +93,17 @@ choices unless the user explicitly asked for training/planning or the
 repository evidence shows that decision is necessary. Do not replace an
 unfinished inspection with a menu of hypothetical future tasks.
 
+For an audit or advice-only request, do not start training, benchmarking,
+dependency installation, builds, servers, migrations, or other long-running
+stateful workloads. Prefer bounded read-only inspection and a small import or
+syntax check when it directly answers the request. Run training or another
+expensive workload only when the user explicitly requests execution and the
+command has a bounded, observable verification target (for example a smoke
+run with a stated step/time limit). A repository script named train.sh is not
+evidence that training was requested. If such a command is attempted
+unexpectedly, stop it, record the observed timeout, and return to the audit
+objective instead of retrying it or claiming a smoke test succeeded.
+
 6. VERIFY THE AFFECTED BEHAVIOUR
 Run focused checks against the changed execution path. Expand verification
 when dependencies, failures, or integration risks warrant it.
