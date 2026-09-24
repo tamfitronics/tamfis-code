@@ -584,6 +584,18 @@ class StandaloneDiffsAndRevertTests(_StatePatchMixin, unittest.TestCase):
 
 
 class StandaloneAgentsAndResumeTests(_StatePatchMixin, unittest.TestCase):
+    def test_notifications_lists_pending_background_completion(self):
+        with patch(
+            "tamfis_code.background.list_jobs",
+            return_value=[{
+                "id": "bg-1", "session_id": 1, "status": "completed",
+                "objective_preview": "audit pipeline",
+            }],
+        ):
+            output = _run(["/notifications", EOFError()])
+        self.assertIn("Notifications (1)", output)
+        self.assertIn("bg-1", output)
+
     def test_agents_lists_local_sessions_not_remote_call(self):
         state_module.save_session_state(1, workspace_root="/tmp/fake-workspace")
         state_module.save_session_state(2, workspace_root="/tmp/other-project")

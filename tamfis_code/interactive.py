@@ -234,6 +234,7 @@ $ <command>            explicit shell command
 /reports             show the repository report index
 /queue               show queued instructions
 /queue <instruction> append a follow-up instruction
+/notifications       show pending background-task completion notifications
 /cwd                 show the current workspace root
 /cd <path>           change the working directory for this session (auto-approves the
                       containing project root); every following turn's tools and
@@ -310,6 +311,7 @@ SLASH_COMMANDS: tuple[tuple[str, str], ...] = (
     ("/context", "show cached repository/task context"),
     ("/reports", "show the repository report index"),
     ("/queue", "show or append queued instructions"),
+    ("/notifications", "show pending background-task completion notifications"),
     ("/cwd", "show the current workspace root"),
     ("/cd", "change the working directory for this session"),
     ("/copy", "copy the last assistant response to the clipboard"),
@@ -2439,6 +2441,29 @@ async def _run_interactive_impl(
                 console.print(escape(
                     f"  {item.get('id')}  {item.get('status')}  {item.get('classification')}  {item.get('text')}"
                 ))
+            continue
+        if _ci_equals(text, "/notifications"):
+            pending = [
+                item for item in local_state.get_session_state(workspace.session_id).queued_user_instructions
+                if item.get("status") == "queued" and item.get("classification") == "follow_up"
+            ]
+            from .background import list_jobs
+            finished_jobs = [
+                job for job in list_jobs()
+                if job.get("session_id") == workspace.session_id
+                and job.get("status") in {"completed", "failed", "stopped"}
+            ]
+            if pending or finished_jobs:
+                console.print(f"[bold]Notifications ({len(pending) + len(finished_jobs)})[/bold]")
+                for item in pending:
+                    console.print(escape(f"  {item.get('id')}  {item.get('text')}"))
+                for job in finished_jobs:
+                    console.print(escape(
+                        f"  {job.get('id')}  background {job.get('status')}  "
+                        f"{job.get('objective_preview') or ''}"
+                    ))
+            else:
+                console.print("[dim]No pending notifications for this session.[/dim]")
             continue
         if _ci_equals(text, "/model") or _ci_startswith(text, "/model "):
             arg = text[len("/model"):].strip()
