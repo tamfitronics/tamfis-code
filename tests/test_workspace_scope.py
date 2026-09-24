@@ -231,7 +231,7 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             )
             self.assertIsNone(error)
             self.assertIn("-xdev", scoped["command"])
-            self.assertIn("-maxdepth 8", scoped["command"])
+            self.assertIn("-maxdepth 20", scoped["command"])
             self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
 
     def test_read_only_postgresql_socket_inspection_is_allowed_after_symlink_resolution(self):

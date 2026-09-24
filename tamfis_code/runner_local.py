@@ -1806,7 +1806,7 @@ def _scope_tool_arguments(
             try:
                 tokens = shlex.split(command)
                 if tokens and tokens[0] == "find":
-                    command = shlex.join(["find", "-xdev", "-maxdepth", "8", *tokens[1:]])
+                    command = shlex.join(["find", "-xdev", "-maxdepth", "20", *tokens[1:]])
                     scoped["command"] = command
             except ValueError:
                 pass
