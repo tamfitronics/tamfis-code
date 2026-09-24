@@ -187,7 +187,19 @@ def load_resume_snapshot(session_id: int) -> Optional[ResumeSnapshot]:
         plans[-1],
     ) or {}
     steps = _normalise_steps(plan.get("steps") or [])
-    if not steps or all(step["status"] == "completed" for step in steps):
+    checkpoint = state.turn_checkpoint if isinstance(state.turn_checkpoint, dict) else {}
+    last_error = str(checkpoint.get("last_error") or "")
+    validation_recovery = "validation incomplete" in last_error.casefold()
+    if not validation_recovery:
+        validation_recovery = any(
+            "validation incomplete" in str(item.get("issue") or item.get("error") or "").casefold()
+            for item in (state.unresolved_issues or [])
+            if isinstance(item, dict)
+        )
+    # A completed plan can still have failed terminal validation. Preserve it
+    # as a validation-only resume so `continue` runs the missing check instead
+    # of returning "already complete" or creating a second edit plan.
+    if not steps or (all(step["status"] == "completed" for step in steps) and not validation_recovery):
         return None
     try:
         ledger = load_ledger(str(session_id))
@@ -197,7 +209,6 @@ def load_resume_snapshot(session_id: int) -> Optional[ResumeSnapshot]:
     ledger_next = str(getattr(ledger, "next_action", "") or "")
     if ledger_next.strip().casefold() in _UNINFORMATIVE_NEXT_ACTIONS:
         ledger_next = ""
-    checkpoint = state.turn_checkpoint if isinstance(state.turn_checkpoint, dict) else {}
     checkpoint_records = checkpoint.get("tool_records") or []
     # A later failover checkpoint may contain only its own failed/partial
     # records.  Merge the durable, objective-matched ledger so validation can

@@ -1410,7 +1410,13 @@ def detect_validation_commands(workspace_root: Path) -> list[tuple[str, str]]:
     elif (root / "Makefile").is_file() or (root / "makefile").is_file():
         add("Make build", "make")
     if any(root.glob("*.sh")):
-        add("shell syntax check", "find . -type f -name '*.sh' -not -path './node_modules/*' -not -path './vendor/*' -print0 | xargs -0 -r -n1 bash -n")
+        # Use the safety-approved find -exec form. The previous xargs fan-out
+        # was intentionally rejected by the read-only command classifier
+        # because xargs options can hide arbitrary interpreter execution. That
+        # made a harmless shell syntax check impossible to confirm, causing a
+        # completed config-only task to fail validation and be replayed on
+        # resume.
+        add("shell syntax check", "find . -type f -name '*.sh' -not -path './node_modules/*' -not -path './vendor/*' -exec bash -n {} \\;")
 
     return commands
 

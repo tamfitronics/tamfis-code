@@ -141,6 +141,15 @@ class ClassifyCommandRiskTests(unittest.TestCase):
             ),
             RISK_READ_ONLY,
         )
+
+    def test_find_exec_shell_syntax_check_is_read_only(self):
+        self.assertEqual(
+            classify_command_risk(
+                "find . -type f -name '*.sh' -not -path './node_modules/*' "
+                "-not -path './vendor/*' -exec bash -n {} \\;"
+            ),
+            RISK_READ_ONLY,
+        )
         self.assertEqual(
             classify_command_risk(
                 "wp option get tab_settings --path=/home/finima/www --format=json"

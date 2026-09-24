@@ -5694,7 +5694,19 @@ def _has_active_prior_plan(session_id: int, objective: str = "") -> bool:
     latest = plans[-1] or {}
     steps = latest.get("steps") or []
     if not any(isinstance(s, dict) and s.get("status") != "completed" for s in steps):
-        return False
+        state = local_state.get_session_state(session_id)
+        checkpoint = state.turn_checkpoint if isinstance(state.turn_checkpoint, dict) else {}
+        validation_failure = "validation incomplete" in str(checkpoint.get("last_error") or "").casefold()
+        validation_failure = validation_failure or any(
+            "validation incomplete" in str(item.get("issue") or item.get("error") or "").casefold()
+            for item in (state.unresolved_issues or [])
+            if isinstance(item, dict)
+        )
+        # A fully executed plan with unresolved validation is still active,
+        # but only for a validation-only resume. This prevents a bare
+        # `continue` from replaying the edit or silently declaring success.
+        if not validation_failure:
+            return False
     if not objective:
         # Legacy callers (no objective available): previous behaviour.
         return True
