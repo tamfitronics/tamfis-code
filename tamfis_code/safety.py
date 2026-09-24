@@ -340,6 +340,10 @@ def _is_read_only_command_segment(argv: list[str]) -> bool:
         return _is_safe_test_arguments(argv[1:])
     if executable == "wp":
         return _is_safe_wp_query(argv[1:])
+    if executable == "crontab":
+        # Listing the current user's schedule is read-only. Do not allow
+        # -u/installation/removal forms through the audit-mode allowlist.
+        return argv[1:] == ["-l"]
     if executable not in _READ_ONLY_COMMANDS:
         return False
     if executable == "find" and any(

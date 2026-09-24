@@ -10899,6 +10899,17 @@ async def _run_local_agent_turn_impl(
                         "model to resend complete JSON."
                     )},
                 })
+                working_messages.append({
+                    "role": "system",
+                    "content": (
+                        f"Do not repeat the malformed {tc.name} call verbatim. "
+                        "Resend it with a complete JSON object in the arguments field. "
+                        "If the intended action is read-only inspection, use an exact "
+                        "registered read tool or a command already allowed by the "
+                        "read-only policy; do not retry a command that was explicitly "
+                        "rejected."
+                    ),
+                })
                 continue
 
             guard = orchestrator.guard_tool_call(tc.name, arguments)

@@ -31,6 +31,8 @@ class ClassifyCommandRiskTests(unittest.TestCase):
         )
         self.assertEqual(classify_command_risk("git status"), RISK_READ_ONLY)
         self.assertEqual(classify_command_risk("git diff --check"), RISK_READ_ONLY)
+        self.assertEqual(classify_command_risk("crontab -l"), RISK_READ_ONLY)
+        self.assertNotEqual(classify_command_risk("crontab -r"), RISK_READ_ONLY)
         self.assertEqual(
             classify_command_risk("find . -name '*.py' -type f | xargs grep -l 'tokenize|Encoding' | head -10"),
             RISK_READ_ONLY,
