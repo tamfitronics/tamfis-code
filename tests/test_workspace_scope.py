@@ -219,6 +219,21 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
             )
             self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
 
+    def test_external_find_is_bounded_after_scope_resolution(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            project = _make_project(root, "backend")
+            scoped, error = _scope_tool_arguments(
+                "execute_command",
+                {"command": "find /etc -name '*cron*' -type f | head -20", "cwd": str(project)},
+                workspace_root=str(root),
+                scope_roots=[project.resolve()],
+            )
+            self.assertIsNone(error)
+            self.assertIn("-xdev", scoped["command"])
+            self.assertIn("-maxdepth 8", scoped["command"])
+            self.assertEqual(scoped["sandbox_permissions"], "require_escalated")
+
     def test_read_only_postgresql_socket_inspection_is_allowed_after_symlink_resolution(self):
         with tempfile.TemporaryDirectory() as ws:
             root = Path(ws)
