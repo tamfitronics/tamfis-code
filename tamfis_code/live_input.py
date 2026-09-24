@@ -963,6 +963,22 @@ class LiveInputListener:
             lines.append("")
             lines.extend(plan_lines)
             lines.append("")
+        # The live think card: the model's reasoning as it streams, drawn by
+        # the composer (redrawn in place by prompt_toolkit) so the user sees
+        # what the model is deciding while it decides it. Sits under the
+        # plan, above the activity line; yields to the viewer like the plan.
+        if not VIEWER.is_open:
+            try:
+                import shutil
+
+                think_lines = self.renderer._think_card_lines(
+                    shutil.get_terminal_size(fallback=(80, 24)).columns,
+                )
+            except Exception:
+                think_lines = []
+            if think_lines:
+                lines.append("")
+                lines.extend(think_lines)
         activity = self.renderer.live_input_activity_line()
         if activity:
             # "Reading 3 files…  ⎿  $ pytest -q (12s)" is two facts: what the round is

@@ -824,6 +824,12 @@ class StreamRenderer:
         self._reasoning_start: Optional[float] = None
         self._reasoning_last: Optional[float] = None
         self._thought_seconds: Optional[float] = None
+        # Live "think card" buffer (see think_card.py): the latest reasoning
+        # text shown above the composer while the model streams it. Bounded;
+        # cleared when the answer starts and on task_started so each turn's
+        # card holds only that turn's thinking.
+        self._reasoning_buffer = ""
+        self._thought_line_printed = False
         self._terminal_status: Optional[str] = None
         self._spinner = Spinner("dots", style="cyan")
         self._is_tty = bool(getattr(console, "is_terminal", False))
@@ -1129,6 +1135,11 @@ class StreamRenderer:
         self._round_tool_counts = {}
         self._running_command = None
         self._running_command_started = None
+        # A turn cancelled while the model was mid-thought: close the live
+        # card (the stale buffer must not leak into the next turn's view).
+        # When thinking already produced a frozen _thought_seconds, this is
+        # the "Esc mid-thinking" path that still earns its summary line.
+        self._close_think_card()
         self._terminal_status = (
             "Completed" if status == "completed"
             else "Stopped" if status in {"cancelled", "exited"}
@@ -1153,6 +1164,12 @@ class StreamRenderer:
             self._round_tool_counts = {}
             self._announced_route = None
             self._terminal_status = None
+            # New turn: fresh think-card episode and fresh reasoning clocks.
+            self._reasoning_buffer = ""
+            self._reasoning_start = None
+            self._reasoning_last = None
+            self._thought_seconds = None
+            self._thought_line_printed = False
             # New turn: fresh recovery-narration budget and fresh
             # displayed-content guard (the previous turn's tail must not
             # suppress legitimate output of the next turn).
@@ -1627,6 +1644,40 @@ class StreamRenderer:
             return
         self._record_token_chars(len(content))
 
+    def _close_think_card(self) -> None:
+        """Freeze the live think card and print its durable one-liner.
+
+        Called when real answer content starts (the card has served its
+        purpose; the reasoning is summarised, not dumped, into scrollback)
+        and when a turn ends without ever receiving answer text (Esc mid-
+        thinking). Idempotent: the summary line is printed at most once per
+        thinking episode -- duplicate completion/failure notices must not
+        duplicate it either.
+        """
+        self._reasoning_buffer = ""
+        if (
+            self._thought_seconds is not None
+            and not self._thought_line_printed
+            and self._thought_seconds >= 1.0
+        ):
+            self._thought_line_printed = True
+            from .think_card import thought_summary_line
+
+            self.console.print(
+                Text(thought_summary_line(self._thought_seconds), style="dim"),
+                highlight=False,
+            )
+
+    def _think_card_lines(self, width: int) -> list[str]:
+        """The live think card as prompt_toolkit HTML lines, or [] when the
+        model is not currently reasoning (or has produced too little text to
+        be worth a card)."""
+        if self._thought_seconds is not None or not self._reasoning_buffer:
+            return []
+        from .think_card import think_card_html
+
+        return think_card_html(self._reasoning_buffer, width=width, active=True)
+
     def _record_token_chars(self, chars: int) -> None:
         estimated_tokens = max(1, chars // _CHARS_PER_TOKEN_ESTIMATE)
         elapsed_ms = (time.monotonic() - self._task_start) * 1000
@@ -1889,6 +1940,10 @@ class StreamRenderer:
                 if self._reasoning_start is None:
                     self._reasoning_start = now
                 self._reasoning_last = now
+                # Feed the live think card. Bounded so a chatty reasoning
+                # model cannot grow this for the whole turn; the tail is the
+                # part still relevant to what the model is deciding NOW.
+                self._reasoning_buffer = (self._reasoning_buffer + content)[-4000:]
                 self._refresh_live()
                 if self.debug:
                     self.console.print(f"[dim italic]{escape(content)}[/dim italic]", end="")
@@ -1955,6 +2010,7 @@ class StreamRenderer:
                 self._displayed_content = (self._displayed_content + content)[-16_000:]
             if content and self._reasoning_start is not None and self._thought_seconds is None:
                 self._thought_seconds = (self._reasoning_last or self._reasoning_start) - self._reasoning_start
+                self._close_think_card()
             if not self._assistant_open:
                 self._stop_live()
                 # prompt-toolkit owns the input rows while the listener is
