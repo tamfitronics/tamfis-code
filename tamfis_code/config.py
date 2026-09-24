@@ -225,6 +225,11 @@ class Config:
     # softer rail than a hosted multi-tenant product would) once estimated
     # session spend crosses this many dollars. <= 0 disables the warning.
     session_cost_cap_usd: float = 5.0
+    # The live "Thinking" card above the composer (render.py/_think_card_lines
+    # via think_card.py). Some users prefer the quiet spinner; setting this to
+    # false hides the card and the durable "Thought for Xs" line while the
+    # reasoning still counts towards the token figure exactly as before.
+    show_think_card: bool = True
     permission_allow: list[str] = field(default_factory=list)
     permission_ask: list[str] = field(default_factory=list)
     permission_deny: list[str] = field(default_factory=list)
@@ -252,6 +257,7 @@ class Config:
             "sandbox_writable_roots": self.sandbox_writable_roots,
             "sandbox_fail_if_unavailable": self.sandbox_fail_if_unavailable,
             "session_cost_cap_usd": self.session_cost_cap_usd,
+            "show_think_card": self.show_think_card,
             "permission_allow": self.permission_allow,
             "permission_ask": self.permission_ask,
             "permission_deny": self.permission_deny,
@@ -335,6 +341,9 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "session_cost_cap_usd" in data:
             cfg.session_cost_cap_usd = float(data["session_cost_cap_usd"])
             cfg.sources["session_cost_cap_usd"] = source_name
+        if "show_think_card" in data:
+            cfg.show_think_card = bool(data["show_think_card"])
+            cfg.sources["show_think_card"] = source_name
         permissions = data.get("permissions")
         if isinstance(permissions, dict):
             for action in ("allow", "ask", "deny"):

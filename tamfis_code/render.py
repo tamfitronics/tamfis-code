@@ -808,13 +808,16 @@ class StreamRenderer:
         # Meaningful-progress clock + execution state (never refreshed by redraws).
         self.progress = ProgressTracker()
         try:
-            cost_cap = load_config().session_cost_cap_usd
+            _cfg = load_config()
+            cost_cap = _cfg.session_cost_cap_usd
+            self._show_think_card = bool(getattr(_cfg, "show_think_card", True))
         except Exception:
             # Config loading must never be able to break rendering --
             # falls back to the dataclass default rather than disabling
             # the warning outright, so a config-load hiccup doesn't
             # silently turn off a safety rail either.
             cost_cap = 5.0
+            self._show_think_card = True
         self._metrics = MetricsTracker(cost_cap_usd=cost_cap)
         # Real reasoning-phase timing (see provider_protocols.py's
         # reasoning_content extraction) -- None/None until a reasoning delta
@@ -1659,6 +1662,7 @@ class StreamRenderer:
             self._thought_seconds is not None
             and not self._thought_line_printed
             and self._thought_seconds >= 1.0
+            and getattr(self, "_show_think_card", True)
         ):
             self._thought_line_printed = True
             from .think_card import thought_summary_line
@@ -1671,7 +1675,9 @@ class StreamRenderer:
     def _think_card_lines(self, width: int) -> list[str]:
         """The live think card as prompt_toolkit HTML lines, or [] when the
         model is not currently reasoning (or has produced too little text to
-        be worth a card)."""
+        be worth a card, or the user disabled the card in config)."""
+        if not getattr(self, "_show_think_card", True):
+            return []
         if self._thought_seconds is not None or not self._reasoning_buffer:
             return []
         from .think_card import think_card_html
