@@ -26,7 +26,12 @@ class DeliveryPolicy:
 
 def build_delivery_policy(*, read_only: bool, requires_validation: bool, complexity: str) -> DeliveryPolicy:
     """Return deterministic safeguards for the current task profile."""
-    mutating = not read_only
+    # ``read_only`` is an execution-mode flag, not a task-kind flag. A plain
+    # question can run with the default (non-read-only) mode and still need no
+    # tool evidence at all. Treating every non-read-only turn as mutating made
+    # valid answers fail at the final evidence gate. Validation-required
+    # profiles are the authoritative signal for repository/execution work.
+    mutating = bool(requires_validation)
     substantial = complexity in {"moderate", "complex", "very_complex", "high"}
     return DeliveryPolicy(
         version="production-delivery-v1",
@@ -46,4 +51,3 @@ def completion_is_evidence_bound(policy: DeliveryPolicy, *, evidence_count: int,
     if policy.verification_required and evidence_count < 1:
         return False
     return True
-

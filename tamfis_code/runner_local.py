@@ -356,7 +356,9 @@ STUCK_LOOP_FINAL_CORRECTION = (
     "Use only real tool results already present. Produce exactly one concise report using "
     "Summary, Changes, Verification, and Remaining issues. Do not repeat an earlier report, "
     "invent user cancellation, or demand a mutation for an observational/read-only step. "
-    "If evidence is missing, put that fact under Remaining issues."
+    "If evidence is missing, put that fact under Remaining issues. Do not say the environment is "
+    "read-only unless an actual tool result explicitly reported that condition; a repeated-action "
+    "guard, provider stall, or unavailable route is a different diagnosis."
 )
 
 # Same one-chance-then-fallback shape as narrated tool intent, for the
@@ -1474,6 +1476,36 @@ def _grant_mcp_external_roots(mcp_server: Any, roots: Iterable[Path]) -> None:
     wrapped_allowed = getattr(wrapped, "allowed_workspace_roots", None)
     if isinstance(wrapped_allowed, set):
         wrapped_allowed.update(additions)
+
+
+def _looks_like_in_place_shell_edit(command: str) -> bool:
+    """Recognize bounded, explicit source-edit commands from a model.
+
+    A stale inspect/audit classification must not strand a user after the
+    model has read a file and selected the conventional ``sed -i``/``perl
+    -pi`` edit. This helper only identifies intent; scope normalization,
+    risk classification, and the approval gate still decide whether it runs.
+    """
+    try:
+        tokens = shlex.split(str(command or ""))
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    for index, token in enumerate(tokens):
+        name = Path(token).name
+        if name == "sed" and any(
+            item == "-i"
+            or (item.startswith("-") and not item.startswith("--") and "i" in item[1:])
+            for item in tokens[index + 1:]
+        ):
+            return True
+        if name == "perl" and any(
+            item == "-pi" or item.startswith("-pi")
+            for item in tokens[index + 1:]
+        ):
+            return True
+    return False
 
 
 def _scope_instruction(workspace_root: str, scope_roots: list[Path], *, scratch_root: Optional[Path] = None) -> str:
@@ -7247,6 +7279,10 @@ async def _run_local_agent_turn_impl(
     )
     _read_only_reject_count = 0
     selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)
+    if user_requested_read_only:
+        # An explicit no-edit request must not advertise a general shell that
+        # can mutate. Dedicated read tools remain available.
+        selected_tool_names = [name for name in selected_tool_names if name != "execute_command"]
     # A resumed checkpoint may need a bounded shell inspection to reconcile a
     # durable job. The runner still enforces safety.py's read-only command
     # allowlist and rejects every command that can write, execute nested code,
@@ -8406,11 +8442,20 @@ async def _run_local_agent_turn_impl(
                                f"({loop_nudge_count}/{MAX_LOOP_NUDGE_RETRIES})."
                 },
             })
+            recovery_hint = ""
+            if "read_file" in stuck_reason:
+                recovery_hint = (
+                    " The exact read_file request is exhausted: do not request it again. "
+                    "Use search_code or list_directory to locate the canonical path, then read "
+                    "a different concrete path; if the target is outside scope, ask for or use "
+                    "the explicit approved path instead of claiming the environment is read-only."
+                )
             working_messages.append({
                 "role": "system",
                 "content": (
                     f"You just repeated {stuck_reason}, without making progress. "
                     + ("The calls above were refused rather than executed again. " if tool_calls else "")
+                    + recovery_hint
                     + "Do not repeat the same approach. Instead: act on a "
                     "SPECIFIC result you already have (read_file a specific file, list_directory a "
                     "specific subdirectory, search_code for a concrete pattern), or, if the original "
@@ -11408,7 +11453,11 @@ async def _run_local_agent_turn_impl(
                 if (
                     _read_only_reject_count < 2
                     and not user_requested_read_only
-                    and (is_mutation_request(objective) or resume_delivery_mutation)
+                    and (
+                        is_mutation_request(objective)
+                        or resume_delivery_mutation
+                        or _looks_like_in_place_shell_edit(command_text)
+                    )
                 ):
                     _read_only_reject_count += 1
                     turn_read_only = False

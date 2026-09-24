@@ -24,3 +24,12 @@ def test_read_only_simple_work_can_finish_without_mutation_evidence():
     assert policy.planning == "proportional"
     assert policy.mutation_requires_scope is False
     assert completion_is_evidence_bound(policy, evidence_count=0, passed=True)
+
+
+def test_plain_question_does_not_inherit_mutation_evidence_requirements():
+    policy = build_delivery_policy(
+        read_only=False, requires_validation=False, complexity="trivial"
+    )
+    assert policy.mutation_requires_scope is False
+    assert policy.verification_required is False
+    assert completion_is_evidence_bound(policy, evidence_count=0, passed=True)

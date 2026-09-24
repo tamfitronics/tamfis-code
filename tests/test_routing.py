@@ -14,6 +14,7 @@ from tamfis_code.routing import (
 )
 from tamfis_code.orchestrator.planner import should_plan
 from tamfis_code.tool_policy import allowed_tools
+from tamfis_code.runner_local import _looks_like_in_place_shell_edit
 
 
 def test_greeting_requires_no_tools_or_repo_context():
@@ -142,6 +143,12 @@ def test_explicit_in_place_shell_edit_is_mutation_intent():
         "Comment out the obsolete branch and rerun the tests",
     ):
         assert is_mutation_request(text), text
+
+
+def test_in_place_shell_edit_detection_handles_common_flag_forms():
+    assert _looks_like_in_place_shell_edit("sed -i '170,172d' detection.py")
+    assert _looks_like_in_place_shell_edit("perl -pi -e 's/old/new/' config.py")
+    assert not _looks_like_in_place_shell_edit("sed -n '170,172p' detection.py")
 
 
 def test_agent_capability_upgrade_gets_a_grounded_plan():
