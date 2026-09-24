@@ -106,6 +106,33 @@ def test_all_nim_unavailable_falls_to_next_healthy_capable_provider():
     ]
 
 
+def test_fallback_can_probe_cooling_alternatives_after_any_provider_failure():
+    """A recent failure on an alternative must not make the whole pool empty.
+
+    The caller uses ``include_cooling=True`` for the one-shot recovery pass;
+    each candidate still has its own request timeout and can independently
+    succeed after the circuit's earlier failure.
+    """
+    manager = _manager_with(
+        ProviderType.NVIDIA, ProviderType.HF, ProviderType.OPENROUTER,
+    )
+    profile = classify_task("fix the validation bug and run tests")
+    manager.record_route_failure(
+        ProviderType.HF, manager.PROVIDERS[ProviderType.HF].default_model,
+        RouteError("HTTP 503"),
+    )
+    manager.record_route_failure(
+        ProviderType.OPENROUTER,
+        manager.PROVIDERS[ProviderType.OPENROUTER].default_model,
+        RouteError("timeout"),
+    )
+
+    assert manager.fallback_candidates(ProviderType.NVIDIA, profile) == []
+    assert manager.fallback_candidates(
+        ProviderType.NVIDIA, profile, include_cooling=True,
+    ) == [ProviderType.HF, ProviderType.OPENROUTER]
+
+
 def test_route_telemetry_distinguishes_eligible_selected_success_and_fallback(monkeypatch):
     # Telemetry bookkeeping is under test here, not AUTO's 85/15 weighting
     # (see test_routing.py for that) -- pin the draw to NIM so the assertions

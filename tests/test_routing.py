@@ -459,6 +459,18 @@ def test_researched_provider_routes_expose_exact_vision_models():
         assert manager.model_supports_vision(config, config.vision_models[0])
 
 
+def test_every_configured_nim_model_remains_eligible_for_vision_fallback():
+    """NIM capability is provider-level and must not be narrowed by a stale
+    two-model vision allow-list.  If an individual deployment rejects the
+    payload, the stream fallback loop handles that concrete failure and moves
+    to the next model/provider."""
+    manager = _manager_with(ProviderType.NVIDIA)
+    config = manager.PROVIDERS[ProviderType.NVIDIA]
+
+    for model in dict.fromkeys([config.default_model, *config.models]):
+        assert manager.model_supports_vision(config, model), model
+
+
 def test_vision_selection_stays_on_image_capable_defaults(monkeypatch):
     monkeypatch.delenv("TAMFIS_CODE_OLLAMA_CODING_MODEL", raising=False)
     manager = _manager_with(

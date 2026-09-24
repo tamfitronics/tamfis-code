@@ -1652,10 +1652,33 @@ class ProviderManager:
         return (config or self.PROVIDERS[provider]).context_window
 
     def model_supports_vision(self, config: ProviderConfig, model: str) -> bool:
-        """Return image-input support for the selected model, not merely
-        for some model hosted by the same provider."""
+        """Return whether a selected route may receive image input.
+
+        NVIDIA NIM is a provider-level multimodal pool in the Tamfis
+        routing contract: model availability changes faster than this
+        package's static catalogue, and NIM's OpenAI-compatible endpoint
+        performs the definitive capability check. Treating only two stale
+        catalogue entries as vision-capable caused the fallback planner to
+        discard otherwise usable NIM routes before making a request. A real
+        provider rejection is still handled by the normal cross-provider
+        fallback path.
+        """
         if not config.vision_supported:
             return False
+        provider = next(
+            (kind for kind, known in self.PROVIDERS.items() if known is config),
+            None,
+        )
+        # Some tests/integrations pass a copied ProviderConfig rather than
+        # the canonical object, so identity alone is not a reliable provider
+        # discriminator at this boundary.
+        is_nvidia = (
+            provider == ProviderType.NVIDIA
+            or str(getattr(config, "api_key_env", "")) == "NVIDIA_API_KEY"
+            or str(getattr(config, "name", "")).strip().lower() == "nvidia nim"
+        )
+        if is_nvidia:
+            return True
         if not config.vision_models:
             return True
         return model in config.vision_models
@@ -2680,10 +2703,13 @@ class ProviderManager:
                 # produce. Only bypass it for the specific failure mode it
                 # was never meant to cover.
                 allow_premium_primary=self.is_quota_or_rate_limit_error(exc),
-                # A credit/quota failure must not strand the task behind a
-                # stale cooldown on another configured free route. Each
-                # candidate still has its own timeout and health result.
-                include_cooling=self.is_quota_or_rate_limit_error(exc),
+                # A failed route must never strand the task behind a stale
+                # cooldown on another configured route. Health circuits are
+                # latency heuristics, not proof that every alternative is
+                # unavailable; each candidate still has its own timeout and
+                # result. This applies equally to 5xx, disconnects,
+                # malformed provider output, timeouts, and quota failures.
+                include_cooling=True,
             ):
                 try:
                     self.record_fallback(resolved)
