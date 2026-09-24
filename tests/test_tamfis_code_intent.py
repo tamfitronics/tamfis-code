@@ -5,6 +5,11 @@ from tamfis_code.interactive import parse_intent
 
 
 class ParseIntentTests(unittest.TestCase):
+    def test_bang_prefix_is_shell(self):
+        intent = parse_intent("! ssh user@example.com")
+        self.assertEqual(intent.kind, "shell")
+        self.assertEqual(intent.command, "ssh user@example.com")
+
     def test_dollar_prefix_is_shell(self):
         intent = parse_intent("$ pwd")
         self.assertEqual(intent.kind, "shell")

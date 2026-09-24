@@ -213,6 +213,7 @@ async def _run_remote_turn_with_live_ui(
 HELP_TEXT = """\
 Natural-language text submits a full coding-agent task (mode: coding).
 $ <command>            explicit shell command
+! <command>            explicit shell command
 /run <command>          explicit shell command
 /shell <command>        explicit shell command
 /chat <question>         conversational/read-only coding assistance
@@ -1056,6 +1057,8 @@ def _looks_like_unknown_slash_command(text: str) -> Optional[str]:
 
 def parse_intent(raw: str, custom_commands: Optional[dict[str, CustomCommand]] = None) -> Intent:
     text = raw.strip()
+    if text.startswith("!"):
+        return Intent("shell", command=text[1:].strip())
     if text.startswith("$ "):
         return Intent("shell", command=text[2:].strip())
     if _ci_startswith(text, "/run "):
