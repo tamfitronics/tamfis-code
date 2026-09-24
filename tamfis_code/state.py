@@ -838,7 +838,8 @@ def _enforce_state_caps(state: SessionState) -> None:
 # was once stored as the user's OBJECTIVE and re-appended on every resume ("...Additional user context:
 # continue from the saved checkpoint and resolve: ... Additional user context: ..."), burying the real task.
 MACHINE_OBJECTIVE_RE = re.compile(
-    r"^\s*(?:continue\s+from\s+the\s+saved\s+checkpoint|repair\s+the\s+failed\s+plan\s+step|"
+    r"^\s*(?:continue\s+(?:the\s+)?original\s+task\s+from(?:\s+the\s+saved\s+checkpoint)?|"
+    r"continue\s+from\s+the\s+saved\s+checkpoint|repair\s+the\s+failed\s+plan\s+step|"
     r"continue\s+the\s+active\s+plan\s+with|continue\s+the\s+interrupted\s+task|"
     r"resume\s+at\s+step\s+\d+|/retry\b)",
     re.IGNORECASE,

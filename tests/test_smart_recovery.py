@@ -20,6 +20,8 @@ from tamfis_code.runner_local import (
 class MachineTextIsNotAnObjectiveTests(unittest.TestCase):
     MACHINE = (
         "Continue from the saved checkpoint and resolve: execution cancelled by user.",
+        "Continue the original task from.",
+        "Continue original task from the saved checkpoint.",
         "Repair the failed plan step, then revalidate it: Read pyproject.toml and requirements.txt",
         "Continue the active plan with: Read requirements.txt for declared dependencies",
         "Continue the interrupted task from the latest saved checkpoint",
