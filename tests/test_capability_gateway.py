@@ -145,6 +145,36 @@ async def test_native_gateway_repairs_json_encoded_ask_question_arrays():
 
 
 @pytest.mark.asyncio
+async def test_native_gateway_coerces_numeric_search_arguments():
+    calls = []
+
+    class Server:
+        def list_tools(self):
+            return [{
+                "name": "search_code",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"},
+                        "offset": {"type": "integer"},
+                        "max_results": {"type": "integer"},
+                    },
+                },
+            }]
+
+        async def call_tool(self, name, arguments, **_kwargs):
+            calls.append(arguments)
+            return {"success": True, "result": []}
+
+    gateway = TamfisCodeCapabilityGateway(Server())
+    result = await gateway.execute(ExecutionRequest("native.search_code", {
+        "query": "dashboard.json", "offset": "10", "max_results": "25",
+    }))
+    assert result.error is None
+    assert calls == [{"query": "dashboard.json", "offset": 10, "max_results": 25}]
+
+
+@pytest.mark.asyncio
 async def test_remote_gateway_repairs_json_encoded_ask_question_arrays():
     calls = []
 

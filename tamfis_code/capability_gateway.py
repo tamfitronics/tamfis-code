@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import inspect
 import json
+import re
 import uuid
 from collections.abc import Iterable
 from dataclasses import dataclass, field
@@ -63,6 +64,36 @@ def _normalise_ask_user_arguments(name: str, arguments: Mapping[str, Any]) -> di
                     item["options"] = decode(item["options"])
             repaired.append(item)
         result["questions"] = repaired
+    return result
+
+
+def _normalise_schema_arguments(
+    name: str, schema: Mapping[str, Any], arguments: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Coerce conservative scalar JSON-wire variants before validation.
+
+    Some providers serialize numeric tool fields as strings even when the
+    declared schema says integer (for example search ``offset`` and
+    ``max_results``). Only schema-declared scalar fields are converted; bad
+    values remain unchanged and are rejected by the normal validator.
+    """
+    result = _normalise_ask_user_arguments(name, arguments)
+    properties = schema.get("properties") if isinstance(schema, Mapping) else None
+    if not isinstance(properties, Mapping):
+        return result
+    for key, rule in properties.items():
+        value = result.get(key)
+        if not isinstance(value, str) or not isinstance(rule, Mapping):
+            continue
+        value_type = rule.get("type")
+        text = value.strip()
+        try:
+            if value_type == "integer" and re.fullmatch(r"[+-]?\d+", text):
+                result[key] = int(text)
+            elif value_type == "number" and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text):
+                result[key] = float(text) if "." in text else int(text)
+        except (TypeError, ValueError, OverflowError):
+            continue
     return result
 
 
@@ -190,7 +221,9 @@ class RemoteCapabilityGateway:
         match = next((tool for tool in tools or [] if _safe_namespace(str(tool.get("name", ""))) == name), None)
         if match is None:
             return ExecutionResult(request.request_id, error=f"remote capability not found: {name}")
-        arguments = _normalise_ask_user_arguments(name, request.arguments)
+        arguments = _normalise_schema_arguments(
+            name, match.get("parameters", match.get("inputSchema", {})) or {}, request.arguments,
+        )
         try:
             _validate_input_schema(
                 match.get("parameters", match.get("inputSchema", {})) or {},
@@ -436,7 +469,7 @@ class TamfisCodeCapabilityGateway:
         descriptor = next((item for item in self.discover() if item.id == request.capability_id), None)
         if descriptor is None:
             return ExecutionResult(request.request_id, error=f"unknown native capability: {name}")
-        arguments = _normalise_ask_user_arguments(name, request.arguments)
+        arguments = _normalise_schema_arguments(name, descriptor.input_schema, request.arguments)
         try:
             _validate_input_schema(descriptor.input_schema, arguments)
         except ValueError as exc:
