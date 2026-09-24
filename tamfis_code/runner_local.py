@@ -3397,7 +3397,10 @@ def _next_audit_plan_target(plan: Any, scope_roots: list[Path]) -> tuple[str, Pa
         if step.status not in {"pending", "in_progress"}:
             continue
         for raw in _AUDIT_PLAN_PATH_RE.findall(str(step.name)):
-            candidate = Path(raw.rstrip(".:")).expanduser()
+            # Plan renderers commonly wrap paths in Markdown backticks or
+            # quotes. Strip presentation delimiters before resolving; the
+            # path itself remains constrained to the approved scope below.
+            candidate = Path(raw.strip("`'\"").rstrip(".:")).expanduser()
             try:
                 resolved = candidate.resolve()
                 if resolved.is_file():

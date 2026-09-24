@@ -265,6 +265,14 @@ class DeterministicResumeInspectionTests(unittest.TestCase):
             plan = SimpleNamespace(steps=[SimpleNamespace(status="pending", name=f"list_directory {target}")])
             self.assertEqual(_next_audit_plan_target(plan, [root]), ("list_directory", target.resolve()))
 
+    def test_markdown_quoted_directory_step_is_recovered(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "checkpoint"
+            target.mkdir()
+            plan = SimpleNamespace(steps=[SimpleNamespace(status="pending", name=f"Inventory `{target}`")])
+            self.assertEqual(_next_audit_plan_target(plan, [root]), ("list_directory", target.resolve()))
+
     def test_pending_file_step_is_recovered_as_file_read(self):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
