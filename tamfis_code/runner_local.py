@@ -12025,3 +12025,63 @@ async def run_local_agent_turn(
         attachment_paths=attachment_paths, image_content_blocks=image_content_blocks,
         external_mcp_servers=external_mcp_servers,
     )
+    # A model-quality failure (the draft claims work but executed no tool)
+    # needs a route change, not merely another request to the same model.
+    # Keep this separate from evidence-correction retries so a provider can
+    # be replaced once without creating an unbounded validation loop.
+    tool_evidence_route_retries = 0
+        nonlocal tool_evidence_route_retries
+                if (
+                    provider == ProviderType.AUTO
+                    and _auto_provider_fallback_enabled(manager)
+                    and tool_evidence_route_retries < 1
+                ):
+                    recovered_route = _fresh_fallback_route(
+                        manager,
+                        resolved_provider,
+                        task_profile,
+                        model,
+                        requires_vision=bool(image_content_blocks),
+                        allow_premium_primary=True,
+                    )
+                    if recovered_route is not None:
+                        (
+                            resolved_provider,
+                            config,
+                            client,
+                            resolved_model,
+                        ) = recovered_route
+                        tool_evidence_route_retries += 1
+                        orchestrator.mark_repair(
+                            "Rejected unsupported completion claim; retrying on a fresh tool-capable route.",
+                            provider_switch=True,
+                        )
+                        orchestrator.record_route(
+                            provider=resolved_provider.value,
+                            model=resolved_model,
+                            reason="automatic fallback after missing tool evidence",
+                            fallback_chain=_standalone_fallback_chain_names(manager, resolved_provider),
+                        )
+                        renderer.handle_event({
+                            "event_type": "diagnostics",
+                            "payload": {
+                                "content": (
+                                    "The previous route returned an unverified completion; "
+                                    "retrying automatically on another tool-capable route."
+                                )
+                            },
+                        })
+                        # Do not append the rejected assistant draft. It was
+                        # never emitted for tool-required turns, and putting
+                        # it into context would make the replacement route
+                        # repeat the same unverified claim.
+                        working_messages.append({
+                            "role": "system",
+                            "content": (
+                                "The previous model response was rejected because it claimed a "
+                                "change without executing a registered tool. Continue the task "
+                                "with real tool calls and verify their results before reporting completion."
+                            ),
+                        })
+                        _persist_turn_checkpoint(status="running", last_error="")
+                        return TaskOutcome(status="continue", summary="")
