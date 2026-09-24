@@ -3,6 +3,7 @@ recovery machinery contradicted or buried the user's real task."""
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from tamfis_code import state as state_module
 from tamfis_code.orchestrator import AgentOrchestrator
@@ -12,6 +13,7 @@ from tamfis_code.runner_local import (
     _checkpoint_resume_objective, _is_machine_generated_objective, _is_real_resume_objective, _is_resume_request,
     _completed_saved_plan, _enum_wire_value, _is_git_delivery_command, _normalize_provider_type, _resume_instruction_for_model,
     _resume_step_contract, _resume_step_is_read_only,
+    _next_audit_plan_target,
 )
 
 
@@ -229,6 +231,8 @@ class PollutedObjectiveRepairTests(unittest.TestCase):
             "Fix the login bug\n\nAdditional user context: it only happens on Safari",
         )
 
+
+class DeterministicResumeInspectionTests(unittest.TestCase):
     def test_clean_text_is_unchanged_and_the_repair_is_idempotent(self):
         clean = "Add a login page"
         self.assertEqual(state_module.clean_objective_chain(clean), clean)
@@ -250,6 +254,24 @@ class PollutedObjectiveRepairTests(unittest.TestCase):
     def test_the_resume_objective_of_a_polluted_checkpoint_is_the_real_task(self):
         checkpoint = {"objective": self.SNOWBALL, "messages": []}
         self.assertEqual(_checkpoint_resume_objective(checkpoint), "Fix the TypeError in serve2.py streaming")
+
+
+class DeterministicResumeInspectionTests(unittest.TestCase):
+    def test_pending_directory_step_is_recovered_as_bounded_listing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "checkpoint"
+            target.mkdir()
+            plan = SimpleNamespace(steps=[SimpleNamespace(status="pending", name=f"list_directory {target}")])
+            self.assertEqual(_next_audit_plan_target(plan, [root]), ("list_directory", target.resolve()))
+
+    def test_pending_file_step_is_recovered_as_file_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "README.md"
+            target.write_text("ok\n", encoding="utf-8")
+            plan = SimpleNamespace(steps=[SimpleNamespace(status="in_progress", name=f"read_file {target}")])
+            self.assertEqual(_next_audit_plan_target(plan, [root]), ("read_file", target.resolve()))
 
 
 class CleanerKeepsWhatAPersonWroteTests(unittest.TestCase):

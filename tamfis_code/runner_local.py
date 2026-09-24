@@ -3382,13 +3382,14 @@ def _update_unresolved_edit_paths(
 _AUDIT_PLAN_PATH_RE = re.compile(r"(?<![\w])/(?:[^\s,;()\[\]{}<>]+)")
 
 
-def _next_audit_plan_file(plan: Any, scope_roots: list[Path]) -> Optional[Path]:
-    """Return the first safe, concrete file named by an unfinished audit step.
+def _next_audit_plan_target(plan: Any, scope_roots: list[Path]) -> tuple[str, Path] | None:
+    """Return the first safe, concrete inspection target in an unfinished step.
 
     This is deliberately narrow: it never invents a path, traverses a
     directory, or executes a command.  It only turns an already-approved
     reasoning-plan step containing an absolute path into the equivalent
     read-only tool operation when a provider failed to emit native tool JSON.
+    Directory targets remain bounded ``list_directory`` calls.
     """
     if plan is None:
         return None
@@ -3399,10 +3400,14 @@ def _next_audit_plan_file(plan: Any, scope_roots: list[Path]) -> Optional[Path]:
             candidate = Path(raw.rstrip(".:")).expanduser()
             try:
                 resolved = candidate.resolve()
-                if not resolved.is_file():
+                if resolved.is_file():
+                    tool_name = "read_file"
+                elif resolved.is_dir():
+                    tool_name = "list_directory"
+                else:
                     continue
                 if any(_is_within(resolved, root.resolve()) for root in scope_roots):
-                    return resolved
+                    return tool_name, resolved
             except OSError:
                 continue
     return None
@@ -3423,9 +3428,10 @@ async def _recover_audit_plan_file(
     workspace_root: str,
 ) -> bool:
     """Execute one concrete pending audit read after a malformed completion."""
-    path = _next_audit_plan_file(plan, scope_roots)
-    if path is None:
+    target = _next_audit_plan_target(plan, scope_roots)
+    if target is None:
         return False
+    tool_name, path = target
     call_id = f"audit_recovery_{round_number}_{uuid.uuid4().hex[:8]}"
     arguments = {"path": str(path)}
     # Keep the conversation protocol valid even though the provider omitted
@@ -3437,7 +3443,7 @@ async def _recover_audit_plan_file(
         "tool_calls": [{
             "id": call_id,
             "type": "function",
-            "function": {"name": "read_file", "arguments": json.dumps(arguments)},
+            "function": {"name": tool_name, "arguments": json.dumps(arguments)},
         }],
     })
     # This is a runtime-synthesized tool call (the model itself never
@@ -3448,31 +3454,31 @@ async def _recover_audit_plan_file(
     # model-requested one; read_file is non-mutating today, but the bypass
     # was in the dispatch shape, not in what this particular tool happens to do.
     blocked = await _run_pre_tool_use_hooks(
-        configured_hooks, tool_name="read_file", arguments=arguments,
+        configured_hooks, tool_name=tool_name, arguments=arguments,
         session_id=session_id, workspace_root=workspace_root, renderer=renderer,
     )
     if blocked is not None:
         working_messages.append({"role": "tool", "tool_call_id": call_id, "content": json.dumps(blocked)})
-        renderer.handle_event({"event_type": "tool_output", "payload": {"tool": "read_file", "result": blocked}})
+        renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tool_name, "result": blocked}})
         return True
     envelope = ToolEnvelope(
         tool_call_id=call_id,
-        tool_name="read_file",
+        tool_name=tool_name,
         arguments=arguments,
-        purpose=f"Recover pending audit inspection for: {objective[:160]}",
+        purpose=f"Recover pending inspection for: {objective[:160]}",
         cwd=str(path.parent),
     )
-    result = await mcp_server.call_tool("read_file", arguments)
-    result = _normalise_tool_result("read_file", arguments, result, str(scope_roots[0]))
+    result = await _bounded_tool_call(mcp_server, tool_name, arguments)
+    result = _normalise_tool_result(tool_name, arguments, result, str(scope_roots[0]))
     envelope.finish(result=result, success=bool(result.get("success")))
     orchestrator.record_tool(envelope)
     renderer.handle_event({
         "event_type": "diagnostics",
-        "payload": {"content": f"Recovered pending audit read through read_file: {path}"},
+        "payload": {"content": f"Recovered pending inspection through {tool_name}: {path}"},
     })
     renderer.handle_event({
         "event_type": "tool_output",
-        "payload": {"tool": "read_file", "result": _tool_output_for_render(result)},
+        "payload": {"tool": tool_name, "result": _tool_output_for_render(result)},
     })
     working_messages.append({
         "role": "tool",
@@ -9287,7 +9293,10 @@ async def _run_local_agent_turn_impl(
             if (
                 tools
                 and task_profile.requires_tools
-                and getattr(task_profile.task_type, "value", "") == "audit"
+                and (
+                    getattr(task_profile.task_type, "value", "") in {"audit", "inspect"}
+                    or resume_requested
+                )
                 and orchestrator.run is not None
                 and orchestrator.run.reasoning_plan
                 and orchestrator.run.plan is not None
@@ -9468,7 +9477,10 @@ async def _run_local_agent_turn_impl(
             if (
                 tools
                 and task_profile.requires_tools
-                and getattr(task_profile.task_type, "value", "") == "audit"
+                and (
+                    getattr(task_profile.task_type, "value", "") in {"audit", "inspect"}
+                    or resume_requested
+                )
                 and orchestrator.run is not None
                 and orchestrator.run.reasoning_plan
                 and orchestrator.run.plan is not None
