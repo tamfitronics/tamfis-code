@@ -617,6 +617,19 @@ async def test_execute_command_accepts_a_string_timeout(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_execute_command_reads_plain_cat_without_shell_timeout(tmp_path):
+    target = tmp_path / "cron.conf"
+    target.write_text("25 4 * * 0 tamfitronics audit\n")
+    server = MCPServer(workspace_root=str(tmp_path), session_id=9918)
+    result = await server.call_tool("execute_command", {
+        "command": f"cat {target}", "timeout": 1,
+    })
+    assert result["result"]["success"] is True
+    assert result["result"]["stdout"] == target.read_text()
+    assert result["result"]["sandbox"]["backend"] == "direct-read"
+
+
+@pytest.mark.asyncio
 async def test_execute_command_falls_back_to_default_on_unparseable_timeout(tmp_path):
     server = MCPServer(workspace_root=str(tmp_path), session_id=9915)
     result = await server.call_tool('execute_command', {'command': 'echo hi', 'timeout': 'not-a-number'})

@@ -8,6 +8,7 @@ import html
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import fnmatch
@@ -2810,6 +2811,34 @@ class MCPServer:
         # shell snippets.  Raise a model-supplied short default (for example
         # 120s) to the workload-aware package floor before wait_for() starts.
         timeout = adaptive_command_timeout(command, run_dir, timeout)
+
+        # A plain `cat file...` is a bounded read, not a shell workload. Some
+        # approved external reads (notably /etc/cron.d files) have sporadically
+        # spent the whole shell timeout in the approval/sandbox path even
+        # though the same file is immediately readable by the host. Resolve
+        # every operand through the normal workspace boundary and read it
+        # directly; shell features continue through the normal policy path.
+        try:
+            cat_argv = shlex.split(command)
+        except ValueError:
+            cat_argv = []
+        if cat_argv and cat_argv[0] == "cat" and len(cat_argv) > 1 and all(
+            not item.startswith("-") for item in cat_argv[1:]
+        ):
+            chunks: list[bytes] = []
+            try:
+                for operand in cat_argv[1:]:
+                    path = self._resolve_in_workspace(operand)
+                    if not path.is_file():
+                        return {"error": f"cat: {operand}: not a regular file", "success": False}
+                    chunks.append(path.read_bytes())
+            except (OSError, PermissionError) as exc:
+                return {"error": str(exc), "success": False}
+            return {
+                "stdout": b"".join(chunks).decode("utf-8", errors="replace"),
+                "stderr": "", "return_code": 0, "success": True,
+                "sandbox": {"active": False, "backend": "direct-read"},
+            }
 
         # Training and frontier jobs are durable, stateful workloads. Killing
         # one merely because the foreground wait ended, then launching a
