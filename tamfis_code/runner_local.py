@@ -6311,7 +6311,7 @@ def _validate_reasoning_plan_scope(
                 continue
 
             if re.search(
-                rf"(?<![A-Za-z0-9._-]){re.escape(sibling_name)}(?:/|\\)",
+                rf"(?<![A-Za-z0-9._-]){re.escape(sibling_name)}(?![A-Za-z0-9._-])",
                 lowered_name,
             ):
                 reject = True
@@ -8100,6 +8100,21 @@ async def _run_local_agent_turn_impl(
                     workspace_summary=repository_context, scope_roots=scope_roots,
                     reasoning_effort=_plan_reasoning_effort,
                 )
+
+        if selected_plan is not None:
+            selected_plan, removed_scope_steps = _validate_reasoning_plan_scope(
+                selected_plan, scope_roots=planning_roots, objective=objective,
+            )
+            if removed_scope_steps:
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"Removed {len(removed_scope_steps)} plan step(s) outside the focused "
+                            "workspace scope before execution."
+                        ),
+                    },
+                })
 
         if selected_plan is not None and orchestrator.run is not None:
             orchestrator.replace_plan(selected_plan)

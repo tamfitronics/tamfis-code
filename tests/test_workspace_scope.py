@@ -15,7 +15,9 @@ from tamfis_code.runner_local import (
     _detect_workspace_scope,
     _excluded_root_names,
     _scope_tool_arguments,
+    _validate_reasoning_plan_scope,
 )
+from tamfis_code.orchestrator.planner import ExecutionPlan, PlanStep
 from tamfis_code.workspace import classify_root
 from tamfis_code.safety import classify_tool_call_risk
 
@@ -102,6 +104,27 @@ class DetectWorkspaceScopeTests(unittest.TestCase):
                 f"check the project at {project / 'package.json'} and fix its bugs",
             )
             self.assertEqual(scope, [project.resolve()])
+
+    def test_generated_plan_cannot_name_an_unselected_sibling_project(self):
+        with tempfile.TemporaryDirectory() as ws:
+            root = Path(ws)
+            focused = _make_project(root, "tamgpt6")
+            _make_project(root, "betpredict")
+            plan = ExecutionPlan(
+                objective="focused", assumptions=[], components=[], steps=[],
+                validation_criteria=[], risks=[],
+            )
+            plan.steps = [
+                PlanStep(index=1, name="List contents of betpredict project root"),
+                PlanStep(index=2, name="Read tamgpt6/pyproject.toml"),
+            ]
+
+            filtered, removed = _validate_reasoning_plan_scope(
+                plan, scope_roots=[focused], objective="fix the stream in tamgpt6",
+            )
+            self.assertIsNotNone(filtered)
+            self.assertEqual([step.name for step in filtered.steps], ["Read tamgpt6/pyproject.toml"])
+            self.assertEqual(removed, ["List contents of betpredict project root"])
 
     def test_explicitly_named_root_is_honored_even_if_archived(self):
         """A user who explicitly names a backup directory is making a
