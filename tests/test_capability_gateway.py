@@ -13,7 +13,7 @@ from tamfis_code.capability_gateway import (
 )
 from tamfis_code.mcp import MCPServer
 from tamfis_code.mcp_client import MCPTransportError
-from tamfis_code.runner_local import _scope_tool_arguments
+from tamfis_code.runner_local import _grant_mcp_external_roots, _scope_tool_arguments
 
 
 @pytest.mark.asyncio
@@ -44,6 +44,23 @@ async def test_gateway_writes_the_scope_normalized_project_path(tmp_path):
     result = await gateway.call_tool("write_file", arguments)
     assert result["success"] is True
     assert (project / "configs" / "mixture_weights.yaml").read_text() == "x"
+
+
+@pytest.mark.asyncio
+async def test_approved_external_read_updates_gateway_and_wrapped_server(tmp_path):
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    target = outside / "cron-entry"
+    target.write_text("0 * * * * root true\n")
+    gateway = TamfisCodeCapabilityGateway(
+        MCPServer(workspace_root=str(tmp_path), allowed_workspace_roots=[str(tmp_path)])
+    )
+    _grant_mcp_external_roots(gateway, (outside,))
+    result = await gateway.call_tool(
+        "execute_command", {"command": f"cat {target}", "cwd": str(tmp_path)}
+    )
+    assert result["success"] is True
+    assert "0 * * * * root true" in result["result"]["stdout"]
 
 
 def test_gateway_filters_side_effects_without_exposing_everything():

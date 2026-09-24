@@ -40,7 +40,7 @@ import uuid
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Any, Callable, Iterable, Optional
 
 from rich.console import Console
 
@@ -1447,6 +1447,33 @@ def _apply_mcp_task_scope(
     wrapped = getattr(mcp_server, "server", None)
     if wrapped is not None and hasattr(wrapped, "allowed_workspace_roots"):
         wrapped.allowed_workspace_roots = set(allowed)
+
+
+def _grant_mcp_external_roots(mcp_server: Any, roots: Iterable[Path]) -> None:
+    """Extend the live tool boundary after an approved external-path gate.
+
+    The local runner normally receives a ``TamfisCodeCapabilityGateway``
+    facade, while the actual path checks live on its wrapped ``MCPServer``.
+    Updating only the facade (the old behaviour) made an approved read such
+    as ``cat /etc/cron.d/...`` fail again at dispatch with the *original*
+    workspace roots.  Keep both references synchronized so an approval is
+    effective for the exact call it approved, without widening the turn
+    scope before the gate.
+    """
+    additions = {
+        Path(root).expanduser().resolve()
+        for root in roots
+        if root
+    }
+    if not additions:
+        return
+    allowed = getattr(mcp_server, "allowed_workspace_roots", None)
+    if isinstance(allowed, set):
+        allowed.update(additions)
+    wrapped = getattr(mcp_server, "server", None)
+    wrapped_allowed = getattr(wrapped, "allowed_workspace_roots", None)
+    if isinstance(wrapped_allowed, set):
+        wrapped_allowed.update(additions)
 
 
 def _scope_instruction(workspace_root: str, scope_roots: list[Path], *, scratch_root: Optional[Path] = None) -> str:
@@ -7487,7 +7514,7 @@ async def _run_local_agent_turn_impl(
     if provider == ProviderType.AUTO and hasattr(manager, "resolve_route"):
         try:
             resolved_provider, config = manager.resolve_route(provider, task_profile, quality_mode="quality")
-        except ValueError:
+        except ValueError as exc:
             # Keep the premium-primary route visible so the normal provider
             # fallback approval can handle an unavailable Ollama daemon.
             if (
@@ -7496,9 +7523,36 @@ async def _run_local_agent_turn_impl(
                 resolved_provider = ProviderType.OLLAMA_CLOUD
                 config = manager.PROVIDERS[resolved_provider]
             else:
-                raise
+                error = (
+                    f"{exc}. No model request was sent. Configure or select a provider with "
+                    "`/model`, run `/doctor` for provider diagnostics, then retry the "
+                    "original task."
+                )
+                orchestrator.fail(error)
+                renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+                local_state.save_turn_checkpoint(
+                    session_id, objective=objective,
+                    mode=("read_only" if turn_read_only else "execute"),
+                    messages=messages, status="failed", last_error=error,
+                )
+                return TaskOutcome(status="failed", error=error)
     else:
-        resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
+        try:
+            resolved_provider = provider if provider != ProviderType.AUTO else manager._select_best_provider()
+        except ValueError as exc:
+            error = (
+                f"{exc}. No model request was sent. Configure or select a provider with "
+                "`/model`, run `/doctor` for provider diagnostics, then retry the "
+                "original task."
+            )
+            orchestrator.fail(error)
+            renderer.handle_event({"event_type": "ai_task_failed", "payload": {"error": error}})
+            local_state.save_turn_checkpoint(
+                session_id, objective=objective,
+                mode=("read_only" if turn_read_only else "execute"),
+                messages=messages, status="failed", last_error=error,
+            )
+            return TaskOutcome(status="failed", error=error)
         config = manager.PROVIDERS.get(resolved_provider)
     client = manager.get_client(resolved_provider)
     # Automatic route policy is an internal deployment concern.  Do not emit
@@ -11567,7 +11621,7 @@ async def _run_local_agent_turn_impl(
             for raw_path in external_scope_paths:
                 candidate = Path(str(raw_path)).expanduser().resolve()
                 grant_root = candidate if candidate.is_dir() else candidate.parent
-                mcp_server.allowed_workspace_roots.add(grant_root)
+                _grant_mcp_external_roots(mcp_server, (grant_root,))
 
             if configured_hooks:
                 pre_hook_results = await run_tool_hooks(

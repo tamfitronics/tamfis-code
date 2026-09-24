@@ -577,6 +577,12 @@ _NO_TOOL_EVIDENCE_ERROR_RE = re.compile(
     re.IGNORECASE,
 )
 
+_NO_PROVIDER_ERROR_RE = re.compile(
+    r"no configured ai provider|no configured route|no configured ai provider with "
+    r"(?:native tool calling|required context capacity)|no model request was sent",
+    re.IGNORECASE,
+)
+
 
 def next_message_suggestion(
     answer: Optional[str], previous_objective: Optional[str] = None,
@@ -667,6 +673,12 @@ def next_message_suggestion(
             # otherwise enforces everywhere else.
             from .public_identity import redact_routing_text
             error = redact_routing_text(checkpoint.get("last_error") or "").strip()
+            if error and _NO_PROVIDER_ERROR_RE.search(error):
+                # Provider availability is an environment/configuration
+                # failure, not unfinished repository work. Replaying the
+                # checkpoint only creates a new "fix the stream" objective
+                # and repeats the same failure on every Continue press.
+                return "Run /doctor, select/configure a provider with /model, then /retry"
             if error and _NO_TOOL_EVIDENCE_ERROR_RE.search(error):
                 # Retrying the same route cannot recover a turn that never
                 # executed a tool. Require an explicit provider/model choice

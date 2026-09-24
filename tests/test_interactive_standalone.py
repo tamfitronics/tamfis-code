@@ -243,6 +243,22 @@ class NextMessageSuggestionTests(unittest.TestCase):
             "Select a tool-capable provider/model with /model, then /retry",
         )
 
+    def test_provider_configuration_failure_does_not_replay_checkpoint(self):
+        state = SimpleNamespace(
+            turn_checkpoint={
+                "status": "failed",
+                "last_error": (
+                    "No configured AI provider is available. No model request was sent."
+                ),
+            },
+            saved_plans=[], active_plan_id=None, unresolved_issues=[],
+            validation_results=[], modified_files=[],
+        )
+        self.assertEqual(
+            next_message_suggestion(None, state=state),
+            "Run /doctor, select/configure a provider with /model, then /retry",
+        )
+
     def test_interrupted_checkpoint_error_never_leaks_the_real_backend_name(self):
         """FIX: turn_checkpoint's last_error is a raw internal message
         persisted straight from runner_local.py (e.g. "Provider streaming
