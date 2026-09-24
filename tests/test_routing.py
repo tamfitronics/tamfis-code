@@ -135,6 +135,15 @@ def test_read_only_constraint_overrides_improvement_language():
     assert classify_task(text).task_type == TaskType.INSPECT
 
 
+def test_explicit_in_place_shell_edit_is_mutation_intent():
+    for text in (
+        "Apply this fix with sed -i '221d' detection.py",
+        "Use perl -pi -e 's/old/new/' config.py",
+        "Comment out the obsolete branch and rerun the tests",
+    ):
+        assert is_mutation_request(text), text
+
+
 def test_agent_capability_upgrade_gets_a_grounded_plan():
     text = "Improve this coding agent's reasoning abilities and developer experience"
     profile = classify_task(text)

@@ -119,6 +119,13 @@ _EXPLICIT_MUTATION_RE = re.compile(
     # write_file, so the model could only heredoc the script through the shell.
     r"\bwrite\b.{0,40}\b(?:scripts?|programs?|modules?|snippets?)\b|"
     r"\bcommit\b|\bpush\b|\brestart\b|\binstall\b|"
+    # A follow-up may contain the concrete shell edit instead of repeating
+    # "fix" (for example ``sed -i ...`` or ``perl -pi ...``). Treat those
+    # explicit in-place editing commands as mutation intent so a stale
+    # inspect/audit classification can be lifted into execute mode. The
+    # normal command-risk and approval gates still protect the actual call.
+    r"\b(?:sed|perl)\b[^\n]{0,80}\s-(?:[^\s]*i|pi)\b|"
+    r"\b(?:comment\s+out|uncomment)\b|"
     # Training/benchmark requests are execution work even when they do not
     # say "edit" or "run". They can write checkpoints, metrics and model
     # artifacts, so classifying "train the model" as inspection silently
