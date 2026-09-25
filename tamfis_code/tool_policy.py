@@ -35,6 +35,10 @@ READ_TOOLS = [
     "get_git_info", "ask_user_question", "inspect_artifact", "save_memory",
     "list_external_agent_sessions", "read_external_agent_session", "list_agent_types",
     "write_todos",
+    # glob_files is a pure filename-pattern lookup over the workspace (same
+    # class as search_code/list_directory) -- audit/plan turns need it to
+    # locate candidate files before reading.
+    "glob_files",
     # memory_search (recall) is read-only like every other lookup here.
     # memory_remember (write) mutates only TamfisGPT's remote agent-memory
     # collection -- never a workspace file -- for the same reason save_memory
@@ -63,7 +67,7 @@ EDIT_TOOLS = [
 EXECUTE_TOOLS = [*READ_TOOLS, "execute_command"]
 GIT_TOOLS = ["get_git_info", "read_file", "search_code", "find_references", "execute_command", "ask_user_question"]
 RESEARCH_TOOLS = [
-    "web_search", "browser", "knowledge_base_search", "knowledge_base_index",
+    "web_search", "web_fetch", "browser", "knowledge_base_search", "knowledge_base_index",
     "read_file", "read_archive", "search_code", "find_references", "ask_user_question",
     # memory_remember: a research turn that earned a hard-won fact (the only
     # working endpoint, the correct API flag) should be able to persist it for
@@ -72,9 +76,15 @@ RESEARCH_TOOLS = [
 ]
 
 
-def allowed_tools(profile: TaskProfile, *, read_only: bool) -> list[str]:
+def allowed_tools(
+    profile: TaskProfile, *, read_only: bool, explicit_change_request: bool = False,
+) -> list[str]:
     if profile.is_plain_conversation:
         return []
+    # An explicit fix/edit instruction outranks a mistaken heuristic
+    # INSPECT/AUDIT/PLAN label. Explicit read-only remains absolute.
+    if explicit_change_request and not read_only:
+        return EDIT_TOOLS
     if read_only or profile.task_type in {TaskType.INSPECT, TaskType.AUDIT, TaskType.PLAN}:
         return READ_ONLY_INSPECTION_TOOLS
     if profile.task_type in {TaskType.EDIT, TaskType.DEBUG, TaskType.MIXED, TaskType.QUESTION}:

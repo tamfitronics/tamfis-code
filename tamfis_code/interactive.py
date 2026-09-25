@@ -31,6 +31,7 @@ from rich.markup import escape
 from rich.markdown import Markdown
 from rich.panel import Panel
 from rich.table import Table
+from rich.text import Text
 
 from . import __version__
 from . import state as local_state
@@ -2615,6 +2616,7 @@ async def _run_interactive_impl(
             table.add_row("read_file", "Read a file's contents", "Read-only")
             table.add_row("list_directory", "List a directory's contents", "Read-only")
             table.add_row("search_code", "ripgrep-backed content search", "Read-only")
+            table.add_row("glob_files", "Find files by glob pattern (filename matching)", "Read-only")
             table.add_row("find_references", "Find where a symbol is defined and referenced", "Read-only")
             table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
             table.add_row("read_archive", "List/read files inside ZIP/TAR archives (no size limit, nested)", "Read-only")
@@ -2628,6 +2630,7 @@ async def _run_interactive_impl(
             table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
             table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
             table.add_row("web_search", "Tavily (if TAVILY_API_KEY set) or DuckDuckGo fallback", "Read-only; self-contained, no monorepo required")
+            table.add_row("web_fetch", "Fetch a public URL and read its text (SSRF-guarded)", "Outbound read; approval-gated")
             table.add_row("memory_search", "Semantic recall over your own saved memory notes (TamfisGPT vector memory)", "Read-only; needs TamfisGPT Tier IV")
             table.add_row("memory_remember", "Save a memory note future sessions can recall by meaning", "Approval-gated; needs TamfisGPT Tier IV")
             console.print(table)
@@ -3362,7 +3365,7 @@ async def _run_interactive_impl(
                     submitted_text = _correction.corrected
                     _note = correction_note(_correction, text)
                     if _note:
-                        print_error(console, f"[dim]{_note}[/dim]")
+                        console.print(Text(_note, style="dim"), highlight=False)
         except Exception:
             submitted_text = text
         intent = parse_intent(submitted_text, custom_commands=custom_commands)

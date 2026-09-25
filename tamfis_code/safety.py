@@ -44,6 +44,9 @@ READ_ONLY_TOOLS = {
     # approval prompt for a lookup -- the exact interruption the memory tools
     # exist to reduce.
     "memory_search",
+    # glob_files is a workspace-bounded filename lookup -- the same class as
+    # search_code/list_directory above.
+    "glob_files",
 }
 MUTATING_FILE_TOOLS = {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"}
 
@@ -563,6 +566,15 @@ def classify_tool_call_risk(
             return RISK_DANGEROUS
         return classify_command_risk(str(arguments.get("command") or ""))
     if name == "browser":
+        return RISK_MEDIUM
+    if name in {"web_search", "web_fetch", "knowledge_base_search"}:
+        # Outbound network READS: no workspace mutation, but they do contact
+        # external services, so they are governed medium-risk (a permissive
+        # policy auto-approves them; read-only turns never see web_fetch/
+        # knowledge_base_search offered, and they are not silently classified
+        # as local read-only lookups). Previously these fell through to the
+        # unknown-tool "dangerous" default, which meant an approval prompt for
+        # every web search even under the default policy.
         return RISK_MEDIUM
     if name == "kill_background_job":
         # Stops a process the agent itself started (SIGTERM to its process

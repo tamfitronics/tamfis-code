@@ -3,6 +3,7 @@
 
 import sys
 import os
+import subprocess
 import tempfile
 import tarfile
 import zipfile
@@ -674,6 +675,24 @@ async def test_wp_cli_root_guard_retries_approved_read_with_allow_root(tmp_path)
 
 
 @pytest.mark.asyncio
+async def test_git_show_no_stat_is_normalized_before_revision(tmp_path):
+    subprocess.run(["git", "init", "-q"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.email", "test@example.com"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "config", "user.name", "Test"], cwd=tmp_path, check=True)
+    (tmp_path / "README.md").write_text("hello\n")
+    subprocess.run(["git", "add", "README.md"], cwd=tmp_path, check=True)
+    subprocess.run(["git", "commit", "-qm", "initial"], cwd=tmp_path, check=True)
+
+    server = MCPServer(workspace_root=str(tmp_path), session_id=9922)
+    result = await server.call_tool("execute_command", {
+        "command": "git show HEAD --no-stat",
+    })
+
+    assert result["result"]["success"] is True
+    assert "initial" in result["result"]["stdout"]
+
+
+@pytest.mark.asyncio
 async def test_approved_external_read_is_not_blocked_by_workspace_boundary(tmp_path):
     external_dir = tmp_path.parent / "tamfis-approved-external-root"
     external_dir.mkdir()
@@ -1154,3 +1173,137 @@ class TestMemoryTools:
         assert search_outcome["result"]["results"] == []
         assert remember_outcome["success"] is True
         assert remember_outcome["result"]["indexed"] is True
+
+
+class TestGlobFilesTool:
+    """glob_files -- filename-pattern search (Codex/Claude Glob parity).
+    Workspace-scoped, noise-dir-excluded, deterministic, capped."""
+
+    def setup_method(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.server = MCPServer(workspace_root=self._tmp.name)
+        root = Path(self._tmp.name)
+        (root / "src").mkdir()
+        (root / "tests").mkdir()
+        (root / "node_modules" / "pkg").mkdir(parents=True)
+        (root / "src" / "app.py").write_text("x = 1\n")
+        (root / "src" / "util.ts").write_text("export {};\n")
+        (root / "tests" / "test_app.py").write_text("def test_x(): pass\n")
+        (root / "node_modules" / "pkg" / "index.js").write_text("module.exports = 1;\n")
+
+    def teardown_method(self):
+        self._tmp.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_finds_python_files_recursively_excluding_noise(self):
+        result = await self.server._glob_files(pattern="**/*.py")
+        assert result["files"] == ["src/app.py", "tests/test_app.py"]
+        assert result["truncated"] is False
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_no_match_returns_empty_list_not_error(self):
+        result = await self.server._glob_files(pattern="**/*.rs")
+        assert result["files"] == []
+
+    @pytest.mark.asyncio
+    async def test_pattern_scope_and_missing_dir(self):
+        # Paths are returned relative to the SEARCH BASE, so scoping to src/
+        # yields workspace-relative-of-base names ('app.py', not 'src/app.py').
+        result = await self.server._glob_files(pattern="*.py", path="src")
+        assert result["files"] == ["app.py"]
+        result = await self.server._glob_files(pattern="*.py", path="does-not-exist")
+        assert "error" in result
+
+    @pytest.mark.asyncio
+    async def test_rejects_empty_pattern(self):
+        with pytest.raises(ValueError):
+            await self.server._glob_files(pattern="   ")
+
+    @pytest.mark.asyncio
+    async def test_registered_and_reachable_via_call_tool(self):
+        tool_names = {tool["name"] for tool in self.server.list_tools()}
+        assert "glob_files" in tool_names
+        outcome = await self.server.call_tool("glob_files", {"pattern": "tests/*.py"})
+        assert outcome["success"] is True
+        assert outcome["result"]["files"] == ["tests/test_app.py"]
+
+
+class TestWebFetchTool:
+    """web_fetch -- Claude WebFetch parity: SSRF-guarded public-URL text
+    reader. Complements web_search (which finds pages, this reads them)."""
+
+    def setup_method(self):
+        self.server = MCPServer(workspace_root=tempfile.mkdtemp())
+
+    @pytest.mark.asyncio
+    async def test_rejects_non_http_schemes_and_credentials(self):
+        for url in ("ftp://example.com/x", "file:///etc/passwd", "https://user:pw@example.com/"):
+            result = await self.server._web_fetch(url=url)
+            assert "error" in result, url
+
+    @pytest.mark.asyncio
+    async def test_refuses_private_and_metadata_addresses(self):
+        for url in ("http://127.0.0.1:9555/v1/health", "http://169.254.169.254/latest/meta-data", "http://10.0.0.5/x"):
+            result = await self.server._web_fetch(url=url)
+            assert "error" in result, url
+            assert "refuses non-public" in result["error"] or "Could not resolve" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_strips_html_and_reports_truncation(self):
+        page = MagicMock()
+        page.status_code = 200
+        page.url = "https://example.com/docs"
+        page.headers = {"content-type": "text/html; charset=utf-8"}
+        page.text = (
+            "<html><head><title>Docs</title>"
+            "<style>body{color:red}</style></head><body>"
+            "<script>var x = 1;</script>"
+            "<h1>Hello</h1><p>World &amp; more</p></body></html>"
+        )
+
+        async def fake_get(url, **kwargs):
+            return page
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient") as client_cls:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(get=fake_get))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await self.server._web_fetch(url="https://example.com/docs")
+        assert result["title"] == "Docs"
+        assert "Hello" in result["content"] and "World & more" in result["content"]
+        assert "<script>" not in result["content"] and "body{color:red}" not in result["content"]
+        assert result["truncated"] is False
+
+    @pytest.mark.asyncio
+    async def test_reports_http_error_status(self):
+        page = MagicMock()
+        page.status_code = 404
+
+        async def fake_get(url, **kwargs):
+            return page
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient") as client_cls:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(get=fake_get))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            result = await self.server._web_fetch(url="https://example.com/missing")
+        assert "HTTP 404" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_registered_and_reachable_via_call_tool(self):
+        tool_names = {tool["name"] for tool in self.server.list_tools()}
+        assert "web_fetch" in tool_names
+        page = MagicMock()
+        page.status_code = 200
+        page.url = "https://example.com/"
+        page.headers = {"content-type": "text/plain"}
+        page.text = "plain text body"
+
+        async def fake_get(url, **kwargs):
+            return page
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient") as client_cls:
+            client_cls.return_value.__aenter__ = AsyncMock(return_value=MagicMock(get=fake_get))
+            client_cls.return_value.__aexit__ = AsyncMock(return_value=False)
+            outcome = await self.server.call_tool("web_fetch", {"url": "https://example.com/"})
+        assert outcome["success"] is True
+        assert "plain text body" in outcome["result"]["content"]

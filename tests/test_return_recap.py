@@ -68,6 +68,34 @@ class RecapTests(unittest.TestCase):
         self.assertIn("updated b.py", recap.standing)
         self.assertNotIn("a.py", recap.standing)
 
+    def test_noisy_request_is_synthesized_and_speculative_reasoning_is_not_status(self):
+        objective = (
+            "The bulk process isnot work; meanwhiel I had made a lot of changes using codex. "
+            "SO pelase re-investigate deeply and see why bulkk oprations still failes and no "
+            "progres across ll WP sites. then also why posts are rnot geenrated especiall yfor "
+            "tistalents and finima. Please fix thi and enure all three."
+        )
+        answer = (
+            "So the default source_min is 300. Thus only posts with 300-899 words are eligible. "
+            "The user should adjust the UI.\nNext: Check worker connectivity**"
+        )
+        self._history(
+            51, objective, answer,
+            saved_plans=[{
+                "id": "p1", "objective": objective,
+                "steps": [{"status": "completed", "description": f"step {i}"} for i in range(5)],
+            }],
+            active_plan_id="p1",
+        )
+        recap = build_return_recap(51)
+        self.assertEqual(
+            recap.objective,
+            "Diagnose and fix stalled bulk operations and post-generation failures across all WordPress sites, especially tistalents and finima",
+        )
+        self.assertIn("plan 5/5 steps done", recap.standing)
+        self.assertNotIn("source_min", recap.standing)
+        self.assertEqual(recap.next_step, NO_NEXT_STEP)
+
     def test_render_prints_the_titled_block(self):
         self._history(6, "Do a thing", "It is done.")
         console = Console(file=io.StringIO(), width=100)

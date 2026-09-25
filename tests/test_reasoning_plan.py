@@ -666,6 +666,52 @@ class ReasoningPlanIntegrationTests(_StatePatchMixin, unittest.TestCase):
             ]
             self.assertTrue(any("finish without evidence" in item for item in diagnostics))
 
+    def test_misclassified_fix_cannot_finish_as_advice_without_a_mutation(self):
+        """Explicit change intent outranks a mistaken inspect classification."""
+        with tempfile.TemporaryDirectory() as ws:
+            Path(ws, "calc.py").write_text("def total(n):\n    return n + 2\n")
+            rounds = [
+                [_chunk(_delta(content=(
+                    "Thus the user should change the setting and check worker connectivity."
+                )))],
+                [_chunk(_delta(content=(
+                    "What to change: set the minimum lower, then re-run the batch."
+                )))],
+            ]
+            client = _FakeClient(rounds)
+            renderer = _RecordingRenderer()
+            mistaken_profile = TaskProfile(
+                TaskType.INSPECT, "low", True, True, False, False, "standard",
+            )
+
+            with patch(
+                "tamfis_code.orchestrator.engine.classify_task",
+                return_value=mistaken_profile,
+            ), self._no_real_validation_commands():
+                outcome = asyncio.run(run_local_agent_turn(
+                    _FakeManager(client), ProviderType.NVIDIA, None,
+                    [{"role": "user", "content": "Please fix the bulk worker in calc.py"}],
+                    self._console(), renderer,
+                    workspace_root=ws, session_id=1, approval_policy="auto", interactive=False,
+                    cli_config=Config(
+                        approval_policy="auto", sandbox_mode="danger-full-access",
+                    ),
+                ))
+
+            self.assertEqual(outcome.status, "failed")
+            self.assertIn("stopped at analysis/advice", outcome.error)
+            offered = {
+                tool["function"]["name"]
+                for call in client.calls for tool in call.get("tools", [])
+            }
+            self.assertIn("edit_file", offered)
+            visible_drafts = [
+                event for event in renderer.events
+                if event["event_type"] == "assistant_delta"
+                and "user should" in event["payload"].get("content", "")
+            ]
+            self.assertEqual(visible_drafts, [])
+
     def test_duplicate_reads_after_real_edit_recover_instead_of_failing_task(self):
         """A completed mutation must survive a no-new-evidence read loop."""
         with tempfile.TemporaryDirectory() as ws:

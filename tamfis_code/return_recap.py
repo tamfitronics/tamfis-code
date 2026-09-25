@@ -58,6 +58,87 @@ def _strip_context_chain(objective: str) -> str:
     return head.strip() or str(objective or "")
 
 
+def _clean_recap_text(text: str) -> str:
+    """Remove presentation syntax and repair only high-confidence typos."""
+    value = str(text or "")
+    try:
+        from .text_corrector import correct_objective_text
+
+        value = correct_objective_text(value).corrected
+    except Exception:
+        pass
+    value = re.sub(r"```.*?```", " ", value, flags=re.DOTALL)
+    value = re.sub(r"(?:^|\s)[#>*`]+", " ", value)
+    value = re.sub(r"\*+", "", value)
+    return " ".join(value.split()).strip(" -:;,.\t\n")
+
+
+def _smart_objective(objective: str) -> str:
+    """Turn a noisy request into a compact intent statement.
+
+    This is deliberately evidence-free: it rewrites what the user wants, not
+    what supposedly happened. Status and conclusions are built separately
+    from the task ledger below.
+    """
+    cleaned = _clean_recap_text(_strip_context_chain(objective))
+    if not cleaned:
+        return "not recorded"
+
+    lowered = cleaned.casefold()
+    bulk_failure = bool(re.search(
+        r"\bbulk\b.{0,80}\b(?:not work(?:ing)?|fail(?:s|ed|ing)?|no progress|stuck|stall(?:ed|ing)?)\b",
+        lowered,
+    ))
+    post_failure = bool(re.search(
+        r"\bposts?\b.{0,70}\b(?:not (?:be )?generated|generation.{0,20}fail|fail(?:s|ed|ing)?.{0,20}generat)",
+        lowered,
+    ))
+    if bulk_failure or post_failure:
+        subjects: list[str] = []
+        if bulk_failure:
+            subjects.append("stalled bulk operations")
+        if post_failure:
+            subjects.append("post-generation failures")
+        scope = ""
+        if re.search(r"\b(?:all|three)\s+(?:wp|wordpress)\s+sites?\b", lowered):
+            scope = " across all WordPress sites"
+        names_match = re.search(
+            r"\b(?:especially|particularly)(?:\s+for|\s+on)?\s+([A-Za-z][A-Za-z0-9_-]*(?:\s+and\s+[A-Za-z][A-Za-z0-9_-]*)?)",
+            cleaned,
+            flags=re.IGNORECASE,
+        )
+        emphasis = f", especially {names_match.group(1)}" if names_match else ""
+        if len(subjects) == 2:
+            subject_text = f"{subjects[0]} and {subjects[1]}"
+        else:
+            subject_text = subjects[0]
+        return _clip(f"Diagnose and fix {subject_text}{scope}{emphasis}", 240)
+
+    # Generic cleanup for long conversational requests: remove politeness
+    # and background asides, then retain task-bearing clauses. Short, already
+    # clear objectives stay intact.
+    if len(cleaned) <= 180 and len(re.split(r"[.!?]", cleaned)) <= 2:
+        return _clip(cleaned, 240)
+    clauses = re.split(r"(?<=[.!?;])\s+|\bthen also\b", cleaned, flags=re.IGNORECASE)
+    task_clauses = [
+        clause for clause in clauses
+        if not re.search(r"^\s*(?:meanwhile|for context|background|i (?:had|have|was))\b", clause, re.IGNORECASE)
+    ]
+    concise = " ".join(task_clauses or clauses)
+    concise = re.sub(r"\b(?:so\s+)?please\b", "", concise, flags=re.IGNORECASE)
+    concise = re.sub(r"\bre-?investigate deeply and see why\b", "Diagnose", concise, flags=re.IGNORECASE)
+    return _first_sentences(concise, 240) or _clip(cleaned, 240)
+
+
+def _clean_next_action(text: str) -> str:
+    value = _clean_recap_text(text)
+    value = re.sub(r"^(?:next(?:\s+step)?|todo|action)\s*[:\-]\s*", "", value, flags=re.IGNORECASE)
+    value = re.sub(r"^\s*(?:[-+]|\d+[.)])\s*", "", value)
+    if value.casefold() in {"", "none", "done", "completed", "n/a", "no next step"}:
+        return NO_NEXT_STEP
+    return _clip(value, 240)
+
+
 def _next_step(state: Any, session_id: int, last_answer: str) -> str:
     try:
         from .runtime.resume import describe_resume_point
@@ -65,28 +146,33 @@ def _next_step(state: Any, session_id: int, last_answer: str) -> str:
         point = describe_resume_point(session_id)
         if point:
             action = f" -- {point['next_action']}" if point.get("next_action") else ""
-            return _clip(f"continue at step {point['step']}/{point['total']}: {point['name']}{action}", 240)
+            return _clean_next_action(f"continue at step {point['step']}/{point['total']}: {point['name']}{action}")
     except Exception:
         pass
     plan = next((p for p in reversed(state.saved_plans or []) if p.get("id") == state.active_plan_id), None)
     if plan:
         pending = next((s for s in plan.get("steps") or [] if str(s.get("status")) in {"pending", "in_progress"}), None)
         if pending:
-            return _clip(str(pending.get("description") or pending.get("title") or pending.get("name") or "the next plan step"), 240)
+            return _clean_next_action(str(pending.get("description") or pending.get("title") or pending.get("name") or "the next plan step"))
     try:
         from .runtime.ledger import load_ledger
 
         ledger = load_ledger(str(session_id))
         if ledger is not None and ledger.next_action and ledger.status in {"running", "partial", "blocked", "checkpointing"}:
-            return _clip(ledger.next_action, 240)
+            return _clean_next_action(ledger.next_action)
     except Exception:
         pass
+    # A completed structured plan has no verified remaining step. Do not
+    # resurrect a speculative "Next:" line from the model's last prose (the
+    # source of unsupported items such as "Check worker connectivity**").
+    if plan:
+        return NO_NEXT_STEP
     try:
         from .interactive import next_message_suggestion
 
         suggestion = next_message_suggestion(last_answer, None, state=state)
         if suggestion:
-            return _clip(suggestion, 240)
+            return _clean_next_action(suggestion)
     except Exception:
         pass
     return NO_NEXT_STEP
@@ -116,6 +202,7 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
     else:
         objective = state.session_title or ""
 
+    objective = _smart_objective(objective)
     last_answer = turns[-1]["answer"] if turns else ""
     parts: list[str] = []
     status = str(state.execution_status or "")
@@ -170,10 +257,33 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
             for name, values in grouped.items() if values
         ]
         parts.append("; ".join(labels))
-    outcome = _first_sentences(last_answer or state.conversation_summary, 260) if (last_answer or state.conversation_summary) else ""
-    standing = "; ".join(filter(None, [outcome, ", ".join(parts)])) or "no progress was recorded"
+    # Structured task facts outrank assistant prose. The old implementation
+    # copied the opening of the last answer, turning tentative reasoning such
+    # as "So source_min is 300..." into an asserted project status.
+    structured = bool(plan or unique_files or status in {"failed", "interrupted", "cancelled"})
+    validation = ""
+    try:
+        from .runtime.ledger import load_ledger
+
+        ledger = load_ledger(str(session_id))
+        if ledger is not None:
+            structured = True
+            tests = [test for test in ledger.tests if test.status != "not_run"]
+            if tests:
+                passed = sum(1 for test in tests if test.status == "passed")
+                validation = f"validation {passed}/{len(tests)} passed"
+            elif ledger.status in {"running", "partial", "blocked", "checkpointing"}:
+                validation = "no completed validation is recorded"
+            if ledger.status in {"partial", "blocked", "failed"}:
+                parts.insert(0, f"task status is {ledger.status}")
+    except Exception:
+        pass
+    outcome = ""
+    if not structured and (last_answer or state.conversation_summary):
+        outcome = _first_sentences(last_answer or state.conversation_summary, 260)
+    standing = "; ".join(filter(None, [outcome, ", ".join(parts), validation])) or "no verified progress was recorded"
     return ReturnRecap(
-        objective=_clip(objective, 300) or "not recorded",
+        objective=objective,
         standing=standing,
         next_step=_next_step(state, session_id, last_answer),
         files=unique_files,

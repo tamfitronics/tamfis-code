@@ -377,6 +377,25 @@ class ClassifyToolCallRiskTests(unittest.TestCase):
                 RISK_MEDIUM,
             )
 
+    def test_new_read_tools_and_network_reads_are_correctly_rated(self):
+        # glob_files is a workspace-bounded filename lookup -- read-only.
+        # web_search/web_fetch/knowledge_base_search are outbound network
+        # READS: governed medium (never the unknown-tool "dangerous" default
+        # that made every web search prompt, never silently "read_only" --
+        # they reach external services, so a read-only turn must not offer
+        # them).
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                classify_tool_call_risk("glob_files", {"pattern": "**/*.py"}, workspace_root=root),
+                RISK_READ_ONLY,
+            )
+            for name in ("web_search", "web_fetch", "knowledge_base_search"):
+                self.assertEqual(
+                    classify_tool_call_risk(name, {"query": "x", "url": "https://example.com"}, workspace_root=root),
+                    RISK_MEDIUM,
+                    name,
+                )
+
     def test_memory_tools_risk_ratings_match_their_side_effects(self):
         # memory_search is a pure lookup offered in every non-plain turn -- if
         # it ever fell through to the unknown-tool "dangerous" default it

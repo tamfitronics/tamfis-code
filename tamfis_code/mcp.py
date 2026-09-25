@@ -95,6 +95,29 @@ def _wp_cli_root_retry_command(command: str, output: str) -> Optional[str]:
     return shlex.join([argv[0], "--allow-root", *argv[1:]])
 
 
+def _normalize_git_show_options(command: str) -> str:
+    """Remove the unsupported, redundant ``git show --no-stat`` option.
+
+    ``git show`` does not enable diffstat by default and some supported Git
+    versions reject ``--no-stat`` outright.  Dropping it therefore preserves
+    the command's output while preventing exit 128.  Normalize only a single,
+    plain git-show invocation (no shell syntax).
+    """
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    if len(argv) < 4 or Path(argv[0]).name != "git" or argv[1] != "show":
+        return command
+    if any(token in command for token in ("|", ";", "&&", "||", "\n")):
+        return command
+    try:
+        option_index = argv.index("--no-stat")
+    except ValueError:
+        return command
+    return shlex.join([*argv[:option_index], *argv[option_index + 1:]])
+
+
 def _sandbox_result(command: Any) -> Dict[str, Any]:
     if command is None:
         return {"active": False, "backend": "not-configured"}
@@ -700,6 +723,13 @@ class MCPServer:
         # either the user's repository or home directory. TemporaryDirectory
         # owns cleanup when this MCPServer/turn is released.
         self._symbol_index_dirs: Dict[str, tempfile.TemporaryDirectory] = {}
+        # Real agent turns must orient themselves before searching a repository.
+        # Prompt guidance alone was not enough: weaker models repeatedly jumped
+        # straight into a broad grep, formed a theory from one match, and never
+        # understood the project layout.  Keep the evidence turn-local and
+        # execution-layer enforced.  Bare MCPServer instances retain the low-
+        # level test/debug API; runner_local always supplies session_id.
+        self._oriented_directory_roots: set[Path] = set()
         self.tools: Dict[str, ToolDefinition] = {}
         self._register_default_tools()
         from .plugins import register_plugin_tools
@@ -1209,6 +1239,48 @@ class MCPServer:
                 "required": ["query"],
             },
             handler=self._web_search,
+        )
+
+        self.register_tool(
+            name="glob_files",
+            description=(
+                "Find files whose PATH matches a glob pattern (e.g. '**/*.py', "
+                "'tests/test_*.py', 'src/**/*.tsx'). Filename matching only -- "
+                "use search_code to search file CONTENTS, or find_references for "
+                "an exact symbol's definition and call sites. Common noise "
+                "directories (node_modules, __pycache__, .git, dist, ...) are "
+                "excluded and results are sorted and capped." 
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Glob pattern, e.g. '**/*.py'"},
+                    "path": {"type": "string", "description": "Directory to search under (default: workspace root)"},
+                    "limit": {"type": "integer", "minimum": 1, "maximum": 1000, "description": "Maximum files to return (default 200)"},
+                },
+                "required": ["pattern"],
+            },
+            handler=self._glob_files,
+        )
+
+        self.register_tool(
+            name="web_fetch",
+            description=(
+                "Fetch a public web page by URL and return its readable text "
+                "(paired with web_search: search finds WHICH page, fetch reads "
+                "it). Read-only. Refuses private/loopback/metadata addresses, "
+                "non-http(s) schemes, and credentials in URLs. Binary content "
+                "types are rejected; HTML is reduced to text and capped in size." 
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {"type": "string", "description": "Absolute public http(s) URL to fetch"},
+                    "max_chars": {"type": "integer", "minimum": 500, "maximum": 100000, "description": "Maximum characters of text to return (default 20000)"},
+                },
+                "required": ["url"],
+            },
+            handler=self._web_fetch,
         )
 
         self.register_tool(
@@ -2557,7 +2629,30 @@ class MCPServer:
                 "note": f"{excluded_count} ignored subdirectory name(s) not listed "
                         f"({', '.join(sorted(EXCLUDED_DIR_NAMES))}, when present).",
             })
+        if self.session_id is not None:
+            self._oriented_directory_roots.add(p.resolve())
         return results
+
+    def _repository_orientation_error(self, path: str) -> Optional[str]:
+        """Require a bounded tree view before repository-wide search tools."""
+        if self.session_id is None:
+            return None
+        try:
+            target = self._resolve_in_workspace(path).resolve()
+        except PermissionError as exc:
+            return str(exc)
+        for root in self._oriented_directory_roots:
+            try:
+                target.relative_to(root)
+                return None
+            except ValueError:
+                continue
+        display = self._display_workspace_path(target)
+        return (
+            f"Repository orientation required before searching '{display}'. "
+            f"Call list_directory on '{display}' first (use a bounded depth such as 2), "
+            "inspect the returned structure, then retry this search in the most relevant scope."
+        )
 
     async def _search_code(
         self, query: str, path: str = ".", file_pattern: str = None,
@@ -2592,6 +2687,9 @@ class MCPServer:
     async def _search_code_matches(
         self, query: str, path: str = ".", file_pattern: str = None,
     ) -> List[Dict[str, Any]]:
+        orientation_error = self._repository_orientation_error(path)
+        if orientation_error:
+            return [{"error": orientation_error}]
         try:
             resolved_path = self._resolve_in_workspace(path)
         except PermissionError as exc:
@@ -3006,6 +3104,8 @@ class MCPServer:
         background_signal: Optional[asyncio.Event] = None,
         _wp_root_retry: bool = False,
     ) -> Dict[str, Any]:
+        command = _normalize_git_show_options(command)
+
         # `background_signal` is never part of this tool's schema and the
         # model never sets it -- runner_local.py injects it into arguments
         # right before dispatch, sourced from the live REPL's Ctrl+B
@@ -3491,6 +3591,129 @@ class MCPServer:
         if not results:
             return {"query": query, "provider": None, "results": [], "message": "No results found."}
         return {"query": query, "provider": provider, "results": results}
+
+    # Directories that are structure, not content -- glob_files skips them
+    # the same way search_code's ripgrep invocation always has, so a broad
+    # filename search does not return 400 vendored dependency hits.
+    _GLOB_NOISE_DIRS = frozenset({
+        ".git", ".hg", ".svn", "node_modules", "__pycache__", ".venv", "venv",
+        "vendor", "dist", "build", ".next", ".cache", ".tox", ".mypy_cache",
+    })
+
+    async def _glob_files(self, pattern: str, path: str = ".", limit: int = 200) -> Dict[str, Any]:
+        """Find files whose PATH matches a glob pattern (Codex's equivalent of
+        Claude's Glob tool). This is filename matching only -- for searching
+        file CONTENTS use search_code, and for an exact symbol's definition
+        and every call site use find_references. Results are workspace-scoped
+        (same boundary as read_file) and deterministic (sorted paths)."""
+        pattern = (pattern or "").strip()
+        if not pattern:
+            raise ValueError("glob_files requires a non-empty pattern")
+        try:
+            limit = max(1, min(int(limit), 1000))
+        except (TypeError, ValueError):
+            limit = 200
+        try:
+            base = self._resolve_in_workspace(path or ".")
+        except PermissionError as exc:
+            return {"pattern": pattern, "files": [], "error": str(exc)}
+        if not base.exists():
+            return {"pattern": pattern, "files": [], "error": f"Directory '{path}' not found."}
+        if not base.is_dir():
+            return {"pattern": pattern, "files": [], "error": f"'{path}' is not a directory"}
+        files: list[str] = []
+        truncated = False
+        try:
+            for candidate in base.glob(pattern):
+                if not candidate.is_file():
+                    continue
+                if any(part in self._GLOB_NOISE_DIRS for part in candidate.relative_to(base).parts[:-1]):
+                    continue
+                if len(files) >= limit:
+                    truncated = True
+                    break
+                files.append(str(candidate.relative_to(base)))
+        except (OSError, ValueError) as exc:
+            # ValueError covers an invalid glob pattern itself.
+            return {"pattern": pattern, "files": [], "error": f"Invalid pattern or unreadable directory: {exc}"}
+        files.sort()
+        return {"pattern": pattern, "base": str(base), "files": files, "truncated": truncated}
+
+    async def _web_fetch(self, url: str, max_chars: int = 20000) -> Dict[str, Any]:
+        """Fetch a public web page and return readable text (Claude's WebFetch
+        parity). Complements web_search: search finds WHICH page, fetch reads
+        it. SSRF-guarded -- hostnames must resolve to public addresses (no
+        loopback/link-local/private targets, no cloud metadata endpoint),
+        only http(s), no credentials in the URL. HTML is reduced to text
+        (script/style dropped) and capped at max_chars."""
+        import ipaddress
+        import socket
+        from urllib.parse import urlparse
+
+        url = (url or "").strip()
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return {"url": url, "error": "web_fetch requires an absolute http(s) URL."}
+        if parsed.username or parsed.password:
+            return {"url": url, "error": "web_fetch rejects URLs with embedded credentials."}
+        try:
+            max_chars = max(500, min(int(max_chars), 100_000))
+        except (TypeError, ValueError):
+            max_chars = 20_000
+
+        hostname = parsed.hostname
+        try:
+            addrinfos = await asyncio.to_thread(
+                socket.getaddrinfo, hostname, None,
+            )
+        except OSError as exc:
+            return {"url": url, "error": f"Could not resolve host '{hostname}': {exc}"}
+        for info in addrinfos:
+            try:
+                address = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                continue
+            if (
+                address.is_private or address.is_loopback or address.is_link_local
+                or address.is_reserved or address.is_multicast or address.is_unspecified
+            ):
+                return {
+                    "url": url,
+                    "error": f"web_fetch refuses non-public host '{hostname}' (resolved {address}).",
+                }
+
+        try:
+            async with httpx.AsyncClient(
+                timeout=30.0, follow_redirects=True, headers=_DUCKDUCKGO_HEADERS,
+            ) as client:
+                response = await client.get(url)
+        except httpx.HTTPError as exc:
+            return {"url": url, "error": f"Fetch failed: {exc}"}
+        if response.status_code != 200:
+            return {"url": url, "error": f"HTTP {response.status_code} fetching {url}."}
+        content_type = (response.headers.get("content-type") or "").lower()
+        if not any(kind in content_type for kind in ("html", "xml", "text/plain", "text/markdown", "json")):
+            return {
+                "url": url, "content_type": content_type,
+                "error": "Binary content types are not supported by web_fetch.",
+            }
+        body = response.text or ""
+        body = re.sub(r"(?is)<(script|style|noscript)[^>]*>.*?</\1>", " ", body)
+        title_match = re.search(r"(?is)<title[^>]*>(.*?)</title>", body)
+        title = _HTML_TAG_RE.sub("", title_match.group(1)).strip() if title_match else ""
+        text = _HTML_TAG_RE.sub(" ", body)
+        text = html.unescape(text)
+        lines = [line.strip() for line in text.splitlines()]
+        text = re.sub(r"\n{3,}", "\n\n", "\n".join(line for line in lines if line)).strip()
+        truncated = len(text) > max_chars
+        result: Dict[str, Any] = {
+            "url": str(response.url), "status": response.status_code,
+            "content_type": content_type, "content": text[:max_chars],
+            "truncated": truncated,
+        }
+        if title:
+            result["title"] = title
+        return result
 
     async def _knowledge_base_search(self, query: str, limit: int = 10) -> Dict[str, Any]:
         """Query TamfisGPT's shared research corpus via its internal Tier IV

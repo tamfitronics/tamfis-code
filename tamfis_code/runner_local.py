@@ -38,7 +38,7 @@ import tempfile
 import time
 import uuid
 from collections import Counter
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable, Optional
 
@@ -7493,6 +7493,31 @@ async def _run_local_agent_turn_impl(
             "payload": {"content": resume_snapshot.banner()},
         })
     task_profile = orchestration.profile
+    explicit_change_request = _looks_like_change_request(objective)
+    explicit_read_only_request = is_explicit_read_only_request(objective)
+    # Routing is heuristic and typo-heavy prompts have been misclassified as
+    # INSPECT/QUESTION, which admitted chat-style routes and produced advice
+    # instead of edits. Promote explicit implementation intent to an agentic
+    # profile before provider/model selection and tool schema construction.
+    if (
+        explicit_change_request
+        and not explicit_read_only_request
+        and not (read_only and not interactive)
+        and (
+            not task_profile.requires_tools
+            or task_profile.task_type in {TaskType.INSPECT, TaskType.AUDIT, TaskType.PLAN, TaskType.QUESTION}
+        )
+    ):
+        task_profile = replace(
+            task_profile,
+            task_type=TaskType.DEBUG,
+            requires_tools=True,
+            requires_repository_context=True,
+            requires_validation=True,
+            preferred_quality_tier="frontier",
+        )
+        if orchestrator.run is not None:
+            orchestrator.run.profile = task_profile
     resume_plan_read_only = _resume_step_is_read_only(
         incoming_objective,
         resume_snapshot,
@@ -7515,6 +7540,7 @@ async def _run_local_agent_turn_impl(
         or (
             getattr(task_profile.task_type, "value", "") in {"inspect", "audit", "plan"}
             and not resume_plan_mutating
+            and not explicit_change_request
         )
     )
     # A CLI/--read-only flag (or an explicit read-only objective) is an
@@ -7529,14 +7555,17 @@ async def _run_local_agent_turn_impl(
     # An explicit read-only/no-edit instruction remains absolute; a CLI-level
     # mode with a contradictory mutation request is still surfaced through
     # the normal escalation path rather than silently auto-approved.
-    explicit_read_only_request = is_explicit_read_only_request(objective)
     user_requested_read_only = (
         explicit_read_only_request
         or (read_only and not interactive)
         or (resume_plan_read_only and not resume_plan_mutating and not is_mutation_request(objective))
     )
     _read_only_reject_count = 0
-    selected_tool_names = allowed_tools(task_profile, read_only=turn_read_only)
+    selected_tool_names = allowed_tools(
+        task_profile,
+        read_only=turn_read_only,
+        explicit_change_request=explicit_change_request,
+    )
     if user_requested_read_only:
         # An explicit no-edit request must not advertise a general shell that
         # can mutate. Dedicated read tools remain available.
@@ -7555,7 +7584,12 @@ async def _run_local_agent_turn_impl(
     # assistant answer is emitted only after the evidence gate passes.  This
     # prevents a rejected draft such as "Phase 0 is complete" from appearing
     # as a real result and prevents each evidence retry from duplicating it.
-    buffer_assistant_answer = bool(task_profile.requires_tools)
+    # Classification is probabilistic and typo-heavy objectives can be
+    # misrouted as advice. An explicit change verb is independent authority:
+    # hold back unverified prose even when the classifier missed the task.
+    buffer_assistant_answer = bool(
+        task_profile.requires_tools or explicit_change_request
+    )
     # Extension tools are not implicitly safe merely because they expose an
     # OpenAI/MCP schema. Until Tamfis Code has a verified per-tool read-only
     # annotation contract, keep every plugin and external MCP tool out of an
@@ -10549,6 +10583,33 @@ async def _run_local_agent_turn_impl(
                 project_instructions=preflight_instructions,
                 read_only=turn_read_only,
             )
+            # Do not let a mistaken task classification turn an explicit
+            # implementation request into an advice-only completion.  User
+            # intent is the authority here: a fix/change request needs a real
+            # mutation, verified existing diff, or evidence-backed no-change
+            # conclusion regardless of whether routing labelled it QUESTION,
+            # INSPECT, or AUDIT.
+            explicit_change_evidence_missing = bool(
+                tools
+                and explicit_change_request
+                and not turn_read_only
+                and not any_mutation
+                and not verified_no_change_completion(
+                    tool_records=tool_records,
+                    final_text=content,
+                )
+                and not changed_paths_from_evidence(tool_records, workspace_root)
+            )
+            if explicit_change_evidence_missing:
+                finding = (
+                    "the user requested an implementation, but no successful workspace "
+                    "mutation, verified existing change, or evidence-backed no-change "
+                    "diagnosis exists"
+                )
+                preflight.passed = False
+                preflight.severity = "error"
+                if finding not in preflight.unresolved:
+                    preflight.unresolved.append(finding)
             if (
                 tools
                 and preflight.severity == "error"
@@ -10576,6 +10637,29 @@ async def _run_local_agent_turn_impl(
                 })
                 _persist_turn_checkpoint()
                 continue
+
+            if explicit_change_evidence_missing:
+                message = (
+                    "The model repeatedly stopped at analysis/advice without implementing "
+                    "the requested change. No unverified draft was shown. The task was "
+                    "checkpointed so it can resume with a tool-capable route."
+                )
+                renderer.handle_event({
+                    "event_type": "ai_task_failed",
+                    "payload": {
+                        "error": message,
+                        "internal_error": "; ".join(preflight.unresolved),
+                        "unverified_draft": True,
+                    },
+                })
+                _persist_turn_checkpoint(
+                    partial_assistant=content,
+                    status="interrupted",
+                    last_error=message,
+                )
+                await _fire_session_interrupted_hooks(message)
+                orchestrator.fail(message)
+                return TaskOutcome(status="failed", error=message, summary=content)
 
             outcome = await _finalize_completed_answer(content, finish_reason)
             if outcome.status == "continue":
@@ -11893,7 +11977,11 @@ async def _run_local_agent_turn_impl(
                             "read-only to execute mode and continuing."
                         )},
                     })
-                    selected_tool_names = allowed_tools(task_profile, read_only=False)
+                    selected_tool_names = allowed_tools(
+                        task_profile,
+                        read_only=False,
+                        explicit_change_request=explicit_change_request,
+                    )
                     tools = (
                         mcp_server.tool_schemas_openai(names=selected_tool_names)
                         if selected_tool_names else []

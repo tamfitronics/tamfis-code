@@ -85,12 +85,12 @@ class OrchestratorTests(unittest.TestCase):
             # message, not duplicated inside the system message itself.
             # Bound recalibrated 2026-09-18 when build_system_prompt was
             # rebuilt into the agentic identity/workflow form (bare prompt
-            # ~5.6k chars; supplemental adds the 400-char objective preview,
+            # ~5.6k chars; supplemental adds the bounded objective preview,
             # the bounded plan dict, and validation evidence). This bound
             # exists to catch the actual regression class -- a 300k-char
             # objective being duplicated into the system message -- not to
             # pin the prompt's exact baseline size.
-            self.assertLess(len(system_message["content"]), 16_000)
+            self.assertLess(len(system_message["content"]), 17_000)
 
     def test_tool_result_is_persisted_and_observed(self):
         with tempfile.TemporaryDirectory() as root:

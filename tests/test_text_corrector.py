@@ -4,7 +4,10 @@ Covers the offline dictionary tier (the always-on path), the protected-span
 guarantees (paths/identifiers/quotes must survive), and the degradation
 contract (never raises; ambiguous near-misses are left alone).
 """
-from tamfis_code.text_corrector import correct_objective_text
+from tamfis_code.text_corrector import (
+    _MODEL_STATE,
+    correct_objective_text,
+)
 
 
 def test_common_dev_typos_are_repaired():
@@ -20,6 +23,48 @@ def test_clean_text_is_left_untouched():
     assert not result.changed
     assert result.source == "none"
     assert result.corrected == "implement the web search feature"
+
+
+def test_common_pronouns_are_not_corrupted_as_typos():
+    result = correct_objective_text("they said the tests are ready for them")
+    assert not result.changed
+    assert result.corrected == "they said the tests are ready for them"
+
+
+def test_valid_coding_words_from_live_prompts_are_not_corrupted():
+    text = "Confirm why the Codex changes stall across the sites. It still fails; check the process."
+    result = correct_objective_text(text)
+    assert result.corrected == text
+    assert not result.changed
+
+
+def test_fast_typing_and_split_key_errors_are_repaired_without_losing_intent():
+    result = correct_objective_text(
+        "You nee dto impove the world-calss coding agent so it can comept e, "
+        "with intellgent disgnotics and a better dictonery"
+    )
+    assert "need to improve" in result.corrected
+    assert "world-class coding agent" in result.corrected
+    assert "can compete" in result.corrected
+    assert "intelligent diagnostics" in result.corrected
+    assert "better dictionary" in result.corrected
+
+
+def test_short_valid_words_are_not_fuzzy_rewritten():
+    result = correct_objective_text("they lie low and use the new key")
+    assert result.corrected == "they lie low and use the new key"
+
+
+def test_model_output_cannot_drop_negation_path_flag_or_version(monkeypatch):
+    class UnsafePipeline:
+        def __call__(self, *_args, **_kwargs):
+            return [{"generated_text": "delete release 3.12 from another place"}]
+
+    monkeypatch.setitem(_MODEL_STATE, "pipeline", UnsafePipeline())
+    original = "do not delete /srv/app/config.py --keep version 3.12"
+    result = correct_objective_text(original, use_model=True)
+    assert result.corrected == original
+    assert not result.changed
 
 
 def test_paths_are_never_corrected():

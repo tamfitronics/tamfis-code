@@ -68,6 +68,22 @@ def test_permission_repair_preserves_canonical_workspace():
     assert "copying the project" in decision.strategy
 
 
+@pytest.mark.parametrize(
+    ("output", "expected"),
+    [
+        ("fatal: unrecognized argument: --no-stat", FailureClass.GIT_USAGE_ERROR),
+        ("ModuleNotFoundError: No module named 'ruff'", FailureClass.DEPENDENCY_MISSING),
+        ("pytest: AssertionError: expected 2 but got 3", FailureClass.TEST_FAILURE),
+        ("HTTP 429: rate limit exceeded", FailureClass.RATE_LIMITED),
+        ("curl: could not resolve host: api.example.test", FailureClass.NETWORK_FAILURE),
+    ],
+)
+def test_diagnostics_classify_actionable_root_causes(output, expected):
+    decision = choose_repair(tool_name="execute_command", result=output, attempt=0)
+    assert decision.failure_class == expected
+    assert decision.strategy
+
+
 def test_truthful_completion_statuses():
     assert determine_completion(
         requested_mutation=True, changed_files=["a.py"], validation_passed=True, unresolved=[]
