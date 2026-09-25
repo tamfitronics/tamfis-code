@@ -563,7 +563,18 @@ def _requests_no_confirmation(text: str) -> bool:
 # (_CHARS_PER_TOKEN_ESTIMATE) -- good enough to budget against a context
 # window, not meant to match a real tokenizer exactly.
 _CHARS_PER_TOKEN_ESTIMATE = 4
-MAX_TOKENS_PER_REQUEST = 4096
+# Per-request output ceiling. 4096 was sized for chat answers; for long-artifact
+# generation the owner wants million-token deliverables, so the value is
+# env-tunable (TAMFIS_CODE_MAX_OUTPUT_TOKENS) with a 4096 default that keeps
+# every existing budget identical when the var is absent. Raising it lets a
+# single response carry much more output AND multiplies the truncation-
+# continuation ceiling's reach (rounds x max_tokens = the real total).
+try:
+    MAX_TOKENS_PER_REQUEST = max(
+        1024, int(os.getenv("TAMFIS_CODE_MAX_OUTPUT_TOKENS", "4096"))
+    )
+except (TypeError, ValueError):
+    MAX_TOKENS_PER_REQUEST = 4096
 
 # Pre-emptive write chunking: a single response carries at most
 # MAX_TOKENS_PER_REQUEST of output, so a write_file whose `content` runs far
