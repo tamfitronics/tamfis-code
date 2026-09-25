@@ -11,7 +11,7 @@ only when nothing else answers. An explicit choice (``--provider`` / ``/model``)
 
 Ollama publishes a percentage, not a request quota, so the budget is an estimate:
 
-    TAMFIS_CODE_OLLAMA_WEEKLY_BUDGET   requests per rolling 7 days (default 500; 0 disables)
+    TAMFIS_CODE_OLLAMA_WEEKLY_BUDGET   requests per rolling 7 days (default 700; 0 disables)
     TAMFIS_CODE_OLLAMA_DAILY_PACE      multiple of budget/7 allowed in any 24h (default 1.5)
 
 TamfisGPT keeps its own, larger share (TAMGPT_OLLAMA_WEEKLY_REQUEST_BUDGET); together they stay
@@ -38,10 +38,14 @@ _paced_logged = False
 
 
 def weekly_budget() -> int:
+    # Raised 500 -> 700 (owner, 2026-09-25): the combined tamfis-code + TamfisGPT
+    # draw was tripping the pacing gate mid-work; 700 still keeps both shares
+    # under the ~2,860 requests that exhausted the account (TamfisGPT's share:
+    # TAMGPT_OLLAMA_WEEKLY_REQUEST_BUDGET).
     try:
-        return max(0, int(os.environ.get("TAMFIS_CODE_OLLAMA_WEEKLY_BUDGET", "500")))
+        return max(0, int(os.environ.get("TAMFIS_CODE_OLLAMA_WEEKLY_BUDGET", "700")))
     except ValueError:
-        return 500
+        return 700
 
 
 def daily_budget() -> int:
