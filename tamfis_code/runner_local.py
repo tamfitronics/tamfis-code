@@ -2082,7 +2082,23 @@ def _same_provider_recovery_models(config: Any, current_model: str) -> list[str]
 # times a still-truncated answer gets asked to keep going before giving up
 # and labeling it partial rather than looping forever on a pathological
 # case (e.g. a model that never naturally reaches finish_reason=="stop").
-MAX_TRUNCATION_CONTINUATIONS = 6
+#
+# TAMFIS_CODE_TRUNCATION_CONTINUATIONS overrides the cap. Owner direction
+# (2026-09-25): low-output-limit models (free NIM / OpenRouter Free tiers
+# often cap at 1-2k output tokens) routinely need far more than 6 rounds to
+# finish a large artifact, and TamfisGPT solves the same problem with a
+# server-side auto-continuation loop -- this is the standalone equivalent.
+# The override also makes the budget a real wall-clock/billing decision:
+# raising it costs more rounds, so the operator, not this constant, owns it.
+# Each round is a genuine new provider request seeded with the accumulated
+# text, so a higher cap cannot loop on identical output (the dedup below
+# stops when a continuation returns nothing novel).
+try:
+    MAX_TRUNCATION_CONTINUATIONS = max(
+        1, int(os.getenv("TAMFIS_CODE_TRUNCATION_CONTINUATIONS", "6"))
+    )
+except (TypeError, ValueError):
+    MAX_TRUNCATION_CONTINUATIONS = 6
 TRUNCATION_CONTINUATION_INSTRUCTION = (
     "Your previous response was cut off by the output length limit before it finished. "
     "Continue writing EXACTLY where it left off -- do not repeat anything already written, "
@@ -2535,6 +2551,14 @@ def _requested_fallback_choice(
 # 429 / 503 / 403 / 402 is parked, never retried "anyway". When no alternative
 # can answer, the task goes back to NIM and keeps trying (rotating NIM models
 # and keys) until a 200 arrives, instead of handing the user a raw 429 / 503.
+#
+# POOL-WIDE ANCHOR (2026-09-25, owner direction "one model failing after 90s is
+# really a bug -- we have pools of over 75 models"): the keep-trying guarantee
+# must not depend on NVIDIA being configured. When NIM is absent the anchor
+# becomes the whole configured pool: each pass rotates to the provider's NEXT
+# model (not a re-roll of one), and the pass repeats until the budget expires.
+# With NIM present the original NIM-anchored behaviour is byte-for-byte
+# unchanged, so the owner ruling's tests keep pinning it.
 _NIM_RETRY_SECONDS_DEFAULT = 600.0
 _NIM_RETRY_MAX_DELAY_SECONDS = 30.0
 # A NIM attempt that fails deterministically (bad key, 403/404 entitlement)
@@ -2561,15 +2585,20 @@ def _nim_retry_delay(attempt: int) -> float:
     return base + random.uniform(0.0, 1.0)
 
 
-def _nim_anchor_available(manager: Any) -> bool:
-    """Whether NVIDIA NIM is configured with a usable client on this manager."""
+def _anchor_provider_available(manager: Any, provider: ProviderType) -> bool:
+    """Whether `provider` is configured with a usable client on this manager."""
     providers = getattr(manager, "PROVIDERS", None) or {}
-    if ProviderType.NVIDIA not in providers:
+    if provider not in providers:
         return False
     try:
-        return manager.get_client(ProviderType.NVIDIA) is not None
+        return manager.get_client(provider) is not None
     except Exception:
         return False
+
+
+def _nim_anchor_available(manager: Any) -> bool:
+    """Whether NVIDIA NIM is configured with a usable client on this manager."""
+    return _anchor_provider_available(manager, ProviderType.NVIDIA)
 
 
 def _nim_retry_model(config: Any, attempt: int) -> Optional[str]:
@@ -2579,11 +2608,31 @@ def _nim_retry_model(config: Any, attempt: int) -> Optional[str]:
     the whole point of the retry loop is to keep going until a 200 -- so rotate
     through the configured models in order (default first) instead of giving up.
     """
+    return _anchor_retry_model(config, attempt)
+
+
+def _anchor_retry_model(config: Any, attempt: int) -> Optional[str]:
+    """Provider-generic model rotation for the persistent retry loop: the
+    attempt-th configured model (default first), wrapping. Used for NIM and,
+    since the pool-wide anchor, for any provider the loop lands on when NIM
+    is not configured."""
     models = list(dict.fromkeys(filter(None, [
         getattr(config, "default_model", None),
         *(getattr(config, "models", ()) or ()),
     ])))
     return str(models[(max(1, attempt) - 1) % len(models)]) if models else None
+
+
+def _anchor_model_pool(manager: Any, provider: ProviderType, config: Any) -> list[str]:
+    """Return configured retry models in the endpoint's canonical names."""
+    models = list(dict.fromkeys(filter(None, [
+        getattr(config, "default_model", None),
+        *(getattr(config, "models", ()) or ()),
+    ])))
+    normalize = getattr(manager, "normalize_model_for_endpoint", None)
+    if callable(normalize):
+        models = [normalize(provider, model) for model in models]
+    return list(dict.fromkeys(str(model) for model in models if model))
 
 
 # Infrastructure internals a provider's crash text can carry: GPU/driver/engine names and sizes, stack-trace
@@ -9518,6 +9567,35 @@ async def _run_local_agent_turn_impl(
                 # there nothing to go back to, and the older cooling re-ask
                 # applies.
                 nim_anchor = _nim_anchor_available(manager) and _nim_retry_budget_seconds() > 0
+                # Pool-wide anchor (2026-09-25): without NIM, "keep trying
+                # until a 200" must still mean SOMETHING. Every configured,
+                # key-valid provider with a client is the anchor, so the loop
+                # keeps rotating models across the full pool instead of
+                # stopping after one pass. NIM-anchored runs keep the exact
+                # original behaviour (anchor_pool stays [NVIDIA] via the
+                # branch below).
+                if nim_anchor:
+                    anchor_pool: list[ProviderType] = [ProviderType.NVIDIA]
+                else:
+                    anchor_pool = [
+                        failed_provider,
+                        *[
+                            candidate
+                            for candidate in _fallback_candidates_for_turn(
+                                manager,
+                                failed_provider,
+                                task_profile,
+                                allow_premium_primary=allow_premium_primary,
+                                include_cooling=True,
+                            )
+                            if _anchor_provider_available(manager, candidate)
+                        ],
+                    ] or (
+                        # Nothing selectable this instant (e.g. everything is
+                        # cooling AND unselected): still anchor on the cooling
+                        # list so the rotation has somewhere to go.
+                        list(candidates)
+                    )
                 if not candidates:
                     # Nothing healthy was available -- but "not healthy" here
                     # means a route is COOLING DOWN after a recent failure, not
@@ -9552,6 +9630,21 @@ async def _run_local_agent_turn_impl(
                 nim_retry_deadline = time.monotonic() + _nim_retry_budget_seconds()
                 nim_retry_attempt = 0
                 nim_deterministic_failures = 0
+                # Models already failed per provider inside THIS retry loop.
+                # Selection (manager.select_model / route_stats) is
+                # deterministic per provider, so without this bookkeeping a
+                # retry pass re-selects the identical model that just failed
+                # and burns the whole budget on one dead route -- the exact
+                # "one model failing after 90s" complaint. Rotation reads
+                # this set to advance to the provider's NEXT model.
+                anchor_failed_models: dict[ProviderType, set[str]] = (
+                    {
+                        failed_provider: {
+                            str(getattr(manager, "normalize_model_for_endpoint", lambda _p, m: m)(failed_provider, failed_model))
+                        }
+                    }
+                    if not nim_anchor and failed_model else {}
+                )
                 while True:
                     error_before_pass = last_error
                     for candidate in candidates:
@@ -9564,19 +9657,59 @@ async def _run_local_agent_turn_impl(
                             requires_vision=bool(image_content_blocks),
                         )
                         if (
-                            candidate_model is None
-                            and candidate == ProviderType.NVIDIA
-                            and nim_retry_attempt > 0
-                        ):
-                            candidate_model = _nim_retry_model(candidate_config, nim_retry_attempt)
-                        if candidate_model is None:
-                            continue
-                        if (
                             failed_provider == ProviderType.OLLAMA_CLOUD
                             and premium_choices
                             and candidate == premium_choices[0][0]
                         ):
                             candidate_model = premium_choices[0][1]
+                        if candidate_model is not None and nim_retry_attempt > 0:
+                            tried = anchor_failed_models.get(candidate)
+                            if tried and candidate_model in tried:
+                                # Retry-attempt model rotation. NIM (the
+                                # original anchor) always rotates; without NIM
+                                # the pool-wide anchor rotates too. Selection
+                                # is deterministic, so a plain re-select would
+                                # repeat the exact model that just failed --
+                                # the 90s-stall incident: one model hung, the
+                                # loop re-picked it, and a 75-model pool never
+                                # got used. Advance to the next configured
+                                # model this provider has not failed with.
+                                models = _anchor_model_pool(manager, candidate, candidate_config)
+                                start_index = models.index(candidate_model) if candidate_model in models else -1
+                                for _offset in range(1, max(1, len(models))):
+                                    rotated = models[(start_index + _offset) % len(models)] if models else None
+                                    if rotated is not None and rotated not in tried:
+                                        candidate_model = rotated
+                                        break
+                        if (
+                            candidate_model is None
+                            and nim_retry_attempt > 0
+                            and (
+                                candidate == ProviderType.NVIDIA
+                                or (not nim_anchor and candidate in candidates)
+                            )
+                        ):
+                            if not nim_anchor:
+                                models = _anchor_model_pool(manager, candidate, candidate_config)
+                                tried = anchor_failed_models.get(candidate, set())
+                                candidate_model = next(
+                                    (item for item in models if item not in tried),
+                                    _anchor_retry_model(candidate_config, nim_retry_attempt),
+                                )
+                            else:
+                                candidate_model = _anchor_retry_model(candidate_config, nim_retry_attempt)
+                        if not nim_anchor and nim_retry_attempt > 0:
+                            # The ordinary selector is health- and history-
+                            # weighted and can keep choosing a cooled default.
+                            # During the pool anchor, deterministically choose
+                            # the first not-yet-failed canonical model instead.
+                            models = _anchor_model_pool(manager, candidate, candidate_config)
+                            tried = anchor_failed_models.get(candidate, set())
+                            next_model = next((item for item in models if item not in tried), None)
+                            if next_model is not None:
+                                candidate_model = next_model
+                        if candidate_model is None:
+                            continue
                         status = manager.provider_error_status(last_error) if hasattr(manager, "provider_error_status") else None
                         reason = f"HTTP {status}" if status is not None else str(last_error)
                         # A real repair attempt, tracked at the point it's actually
@@ -9649,6 +9782,14 @@ async def _run_local_agent_turn_impl(
                                     stream=True,
                                     tool_call=bool(tools),
                                 )
+                            # Bookkeep for rotation: this exact model failed
+                            # inside this retry loop, so later passes must
+                            # select a DIFFERENT sibling instead of repeating
+                            # it (see anchor_failed_models above).
+                            if candidate_model:
+                                anchor_failed_models.setdefault(candidate, set()).add(
+                                    str(candidate_model)
+                                )
                             failed_provider = candidate
                             failed_model = candidate_model
                             if not manager.is_retryable_provider_error(last_error):
@@ -9670,18 +9811,33 @@ async def _run_local_agent_turn_impl(
                         break
                     if fallback_succeeded:
                         break
-                    # Back to NIM (owner ruling 2026-09-19): every alternative
-                    # that had credit has been tried and failed, or none had
-                    # credit. Keep going back to NIM -- rotating its models and
-                    # keys through the normal route selection -- until a 200
-                    # arrives, rather than surfacing a 429 / 503 to the user.
-                    # Bounded by TAMFIS_CODE_NIM_RETRY_SECONDS (default 600s),
-                    # and Esc still cancels the sleep.
-                    if not nim_anchor or time.monotonic() >= nim_retry_deadline:
+                    # Back to the anchor (owner ruling 2026-09-19: NIM when
+                    # configured; otherwise the whole pool -- 2026-09-25):
+                    # every alternative that had credit has been tried and
+                    # failed, or none had credit. Keep going back to the
+                    # anchor -- rotating models and keys through the normal
+                    # route selection -- until a 200 arrives, rather than
+                    # surfacing a 429 / 503 to the user. Bounded by
+                    # TAMFIS_CODE_NIM_RETRY_SECONDS (default 600s), and Esc
+                    # still cancels the sleep.
+                    if time.monotonic() >= nim_retry_deadline:
                         break
                     if not manager.is_retryable_provider_error(last_error):
                         break
-                    if candidates == [ProviderType.NVIDIA]:
+                    if not nim_anchor and candidates == list(anchor_pool):
+                        # Pool-wide anchor: a full pass over the configured
+                        # providers produced no selectable model at all
+                        # (identical last_error means selection itself never
+                        # advanced -- rotating would repeat it forever).
+                        if last_error is error_before_pass:
+                            break  # no model could even be selected
+                        if manager.provider_error_status(last_error) in _NIM_DETERMINISTIC_STATUSES:
+                            nim_deterministic_failures += 1
+                            if nim_deterministic_failures >= _NIM_DETERMINISTIC_FAILURE_LIMIT:
+                                break
+                        else:
+                            nim_deterministic_failures = 0
+                    elif candidates == [ProviderType.NVIDIA]:
                         if last_error is error_before_pass:
                             break  # no NIM model could even be selected
                         if manager.provider_error_status(last_error) in _NIM_DETERMINISTIC_STATUSES:
@@ -9702,7 +9858,11 @@ async def _run_local_agent_turn_impl(
                             },
                         })
                     await asyncio.sleep(_nim_retry_delay(nim_retry_attempt))
-                    candidates = [ProviderType.NVIDIA]
+                    # Re-anchor for the next pass. NIM keeps its exclusive
+                    # anchor; without NIM the anchor is the whole configured
+                    # pool (cooling routes included -- a short cooldown is a
+                    # heuristic, and the loop's whole point is to outlive it).
+                    candidates = list(anchor_pool)
             if not fallback_succeeded:
                 # Candidate health is dynamic. The list used by the loop
                 # above was a snapshot taken before potentially lengthy
@@ -10617,6 +10777,7 @@ async def _run_local_agent_turn_impl(
                     "stdout": "",
                     "stderr": "",
                     "purpose": "session mutation ledger (recorded at the tool boundary)",
+                    "session_ledger": True,
                 })
             try:
                 preflight_instructions = load_instruction_text(Path(workspace_root))
