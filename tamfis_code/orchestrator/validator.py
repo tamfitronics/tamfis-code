@@ -742,7 +742,14 @@ def validate_completion(
             # rejected purely because this gate counted only this run's
             # execute_command calls, of which a verification-only retry has
             # none by definition.
-            mutated_paths = _successful_mutation_paths(tool_records, workspace_root)
+            # Only prior-session ledger entries get this readback exception.
+            # A write followed by reading the same file in the CURRENT run
+            # still requires an actual validation command; otherwise a plain
+            # read after the edit would bypass the verify-after-change gate.
+            ledger_records = [
+                item for item in tool_records if item.get("session_ledger") is True
+            ]
+            mutated_paths = _successful_mutation_paths(ledger_records, workspace_root)
             if mutated_paths:
                 base = Path(workspace_root or ".").resolve()
                 for item in tool_records:

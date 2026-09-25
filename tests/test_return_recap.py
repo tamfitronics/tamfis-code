@@ -5,6 +5,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from rich.console import Console
@@ -94,6 +95,22 @@ class RecapTests(unittest.TestCase):
         )
         self.assertIn("plan 5/5 steps done", recap.standing)
         self.assertNotIn("source_min", recap.standing)
+        self.assertEqual(recap.next_step, NO_NEXT_STEP)
+
+    def test_stale_ledger_with_reused_session_id_cannot_replace_current_status(self):
+        self._history(
+            52,
+            "Build the current feature",
+            "The current feature has a verified implementation.",
+        )
+        stale = SimpleNamespace(
+            objective="An unrelated old task",
+            edits=[], tests=[], status="running", next_action="continue old task",
+        )
+        with patch("tamfis_code.runtime.ledger.load_ledger", return_value=stale):
+            recap = build_return_recap(52)
+        self.assertIn("current feature has a verified implementation", recap.standing)
+        self.assertNotIn("old task", recap.standing)
         self.assertEqual(recap.next_step, NO_NEXT_STEP)
 
     def test_render_prints_the_titled_block(self):

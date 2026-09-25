@@ -139,7 +139,14 @@ def _clean_next_action(text: str) -> str:
     return _clip(value, 240)
 
 
-def _next_step(state: Any, session_id: int, last_answer: str) -> str:
+def _ledger_matches_objective(ledger: Any, objective: str) -> bool:
+    """Reject a stale ledger that merely reused the numeric session id."""
+    ledger_objective = " ".join(str(getattr(ledger, "objective", "") or "").split()).casefold()
+    current = " ".join(_strip_context_chain(objective).split()).casefold()
+    return bool(ledger_objective and current and ledger_objective == current)
+
+
+def _next_step(state: Any, session_id: int, last_answer: str, objective: str) -> str:
     try:
         from .runtime.resume import describe_resume_point
 
@@ -158,7 +165,12 @@ def _next_step(state: Any, session_id: int, last_answer: str) -> str:
         from .runtime.ledger import load_ledger
 
         ledger = load_ledger(str(session_id))
-        if ledger is not None and ledger.next_action and ledger.status in {"running", "partial", "blocked", "checkpointing"}:
+        if (
+            ledger is not None
+            and _ledger_matches_objective(ledger, objective)
+            and ledger.next_action
+            and ledger.status in {"running", "partial", "blocked", "checkpointing"}
+        ):
             return _clean_next_action(ledger.next_action)
     except Exception:
         pass
@@ -202,7 +214,8 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
     else:
         objective = state.session_title or ""
 
-    objective = _smart_objective(objective)
+    raw_objective = objective
+    objective = _smart_objective(raw_objective)
     last_answer = turns[-1]["answer"] if turns else ""
     parts: list[str] = []
     status = str(state.execution_status or "")
@@ -222,7 +235,7 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
         from .runtime.ledger import load_ledger
 
         ledger = load_ledger(str(session_id))
-        if ledger is not None:
+        if ledger is not None and _ledger_matches_objective(ledger, raw_objective):
             edits = [
                 {
                     "path": edit.file,
@@ -266,7 +279,7 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
         from .runtime.ledger import load_ledger
 
         ledger = load_ledger(str(session_id))
-        if ledger is not None:
+        if ledger is not None and _ledger_matches_objective(ledger, raw_objective):
             structured = True
             tests = [test for test in ledger.tests if test.status != "not_run"]
             if tests:
@@ -285,7 +298,7 @@ def build_return_recap(session_id: int) -> Optional[ReturnRecap]:
     return ReturnRecap(
         objective=objective,
         standing=standing,
-        next_step=_next_step(state, session_id, last_answer),
+        next_step=_next_step(state, session_id, last_answer, raw_objective),
         files=unique_files,
     )
 

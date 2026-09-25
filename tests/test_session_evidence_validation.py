@@ -43,6 +43,7 @@ def _ledger_tool_record(entry: dict) -> dict | None:
         "stdout": "",
         "stderr": "",
         "purpose": "session mutation ledger (recorded at the tool boundary)",
+        "session_ledger": True,
     }
 
 

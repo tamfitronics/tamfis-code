@@ -482,7 +482,7 @@ class StandaloneStatusAndToolsTests(_StatePatchMixin, unittest.TestCase):
         output = _run(["/tools", EOFError()])
         self.assertIn("edit_file", output)
         self.assertIn("execute_command", output)
-        self.assertNotIn("glob_files", output)  # old remote-only tool name
+        self.assertIn("glob_files", output)
 
     def test_help_mentions_standalone_limitations(self):
         output = _run(["/help", EOFError()])
