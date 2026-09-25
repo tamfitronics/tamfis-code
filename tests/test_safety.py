@@ -377,6 +377,29 @@ class ClassifyToolCallRiskTests(unittest.TestCase):
                 RISK_MEDIUM,
             )
 
+    def test_memory_tools_risk_ratings_match_their_side_effects(self):
+        # memory_search is a pure lookup offered in every non-plain turn -- if
+        # it ever fell through to the unknown-tool "dangerous" default it
+        # would produce an approval prompt for a lookup (the exact failure
+        # mode the write_todos entry documents) instead of running silently.
+        # memory_remember writes outside the workspace (TamfisGPT's shared
+        # agent-memory collection), so it gets save_memory's ordinary
+        # medium-risk treatment -- gated, not bypassed, not failed-safe to
+        # dangerous.
+        with tempfile.TemporaryDirectory() as root:
+            self.assertEqual(
+                classify_tool_call_risk(
+                    "memory_search", {"query": "how do we run the tests"}, workspace_root=root,
+                ),
+                RISK_READ_ONLY,
+            )
+            self.assertEqual(
+                classify_tool_call_risk(
+                    "memory_remember", {"text": "pytest lives in .venv/bin/python"}, workspace_root=root,
+                ),
+                RISK_MEDIUM,
+            )
+
     def test_common_inspection_pipelines_are_read_only(self):
         with tempfile.TemporaryDirectory() as root:
             commands = (

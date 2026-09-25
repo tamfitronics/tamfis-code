@@ -5753,6 +5753,33 @@ READ_BACKGROUND_JOB_TOOL_SCHEMA: dict[str, Any] = {
 }
 
 
+KILL_BACKGROUND_JOB_TOOL_SCHEMA: dict[str, Any] = {
+    "type": "function",
+    "function": {
+        "name": "kill_background_job",
+        "description": (
+            "Terminate a still-running command that was moved to the background "
+            "(an execute_command result with backgrounded=true and a job_id) -- e.g. a "
+            "build or dev server you no longer need, or one blocking the task. Sends "
+            "SIGTERM to the job's whole process group (children die with it); pass "
+            "force=true only if the job ignored an earlier SIGTERM. Confirm the exit "
+            "with read_background_job afterwards."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "job_id": {"type": "string", "description": "The job_id from the backgrounded execute_command result"},
+                "force": {
+                    "type": "boolean",
+                    "description": "Send SIGKILL instead of SIGTERM (only after a normal kill was ignored)",
+                },
+            },
+            "required": ["job_id"],
+        },
+    },
+}
+
+
 SWARM_TOOL_SCHEMA: dict[str, Any] = {
     "type": "function",
     "function": {
@@ -6375,6 +6402,7 @@ def _claim_live_queued_instructions(session_id: int, *, since: Optional[str] = N
 
 def _apply_live_queued_instruction(
     live: dict[str, Any], *, session_id: int, working_messages: list[dict[str, Any]], renderer: StreamRenderer,
+    orchestrator: Any = None,
 ) -> Optional["TaskOutcome"]:
     """Apply one claimed (already `running`-marked) live instruction.
     Returns a TaskOutcome to end the turn immediately (cancel/pause), or
@@ -6417,6 +6445,30 @@ def _apply_live_queued_instruction(
             "if it changes what you should do next, rather than only noting it at the end."
         ),
     })
+    # User-requested (2026-09-24): a mid-task follow-up must become part of the
+    # ACTIVE PLAN immediately, not only a queued message the model may or may
+    # not fold into its own working memory. An additive/clarifying follow-up
+    # gets an explicit plan step now; the plan-completion validator already
+    # refuses to report the task done while any step is pending, so the
+    # follow-up is guaranteed to actually be worked, and the pinned plan panel
+    # shows it the moment the next plan_step_progress sync runs.
+    if classification in {"append", "clarification"}:
+        plan = getattr(getattr(orchestrator, "run", None), "plan", None)
+        if plan is not None:
+            step_name = f"Address follow-up: {text[:80]}{'…' if len(text) > 80 else ''}"
+            try:
+                orchestrator.add_plan_step(step_name)
+                renderer.handle_event({
+                    "event_type": "diagnostics",
+                    "payload": {
+                        "content": (
+                            f"◆ Follow-up added to the active plan as a step "
+                            f"({instruction_id}): {step_name}"
+                        ),
+                    },
+                })
+            except Exception as exc:  # plan-step add must never break the splice
+                _log.debug("follow-up plan step not added: %s", exc)
     return None
 
 
@@ -7522,7 +7574,13 @@ async def _run_local_agent_turn_impl(
     # is offered costs one small schema entry each and means the model
     # never has to be told about them mid-turn.
     if tools or oversized_evidence_id:
+        # kill_background_job rides along with read_background_job: it only
+        # becomes offerable once a backgrounded command exists, and it is a
+        # MUTATING action (stops a process), so its per-call approval gate is
+        # safety.py's classify_tool_call_risk -> RISK_MEDIUM, never read-only.
         tools = [*tools, RETRIEVE_EVIDENCE_TOOL_SCHEMA, READ_BACKGROUND_JOB_TOOL_SCHEMA]
+        if not turn_read_only:
+            tools = [*tools, KILL_BACKGROUND_JOB_TOOL_SCHEMA]
         if allow_swarm_tool and not turn_read_only and cli_config is not None and cli_config.enable_subagent_delegation:
             tools = [*tools, SWARM_TOOL_SCHEMA]
             tools = [*tools, DELEGATE_AGENT_TOOL_SCHEMA]
@@ -8608,6 +8666,15 @@ async def _run_local_agent_turn_impl(
             _persist_turn_checkpoint(status="running", last_error=reason)
             return TaskOutcome(status="continue", summary="")
 
+        # Delivering the final report IS the completion of report/delivery-type
+        # plan steps -- no tool call can ever produce their evidence (live
+        # 2026-09-24: a verified edit + successful check still failed with
+        # "pending steps: Report evidence-backed findings..." because this
+        # step sat pending forever). Complete them now, BEFORE validation's
+        # plan-completeness gate runs, so a genuinely finished task stops
+        # failing on a step whose only possible evidence is this answer.
+        with contextlib.suppress(Exception):
+            orchestrator.complete_delivery_steps()
         validation = orchestrator.complete(final_text=content, any_mutation=any_mutation)
         if not validation.passed:
             blockers = "; ".join(str(item) for item in validation.unresolved[:3]).strip()
@@ -9021,6 +9088,7 @@ async def _run_local_agent_turn_impl(
         for live in _claim_live_queued_instructions(session_id, since=_turn_started_at):
             outcome = _apply_live_queued_instruction(
                 live, session_id=session_id, working_messages=working_messages, renderer=renderer,
+                orchestrator=orchestrator,
             )
             if outcome is not None:
                 return outcome
@@ -10268,6 +10336,16 @@ async def _run_local_agent_turn_impl(
 
             pending_plan_steps = []
             if orchestrator.run is not None and orchestrator.run.reasoning_plan and orchestrator.run.plan is not None:
+                # The model just produced final prose with no pending tool
+                # calls: delivering that report IS the evidence for
+                # report/delivery-type steps ("Report evidence-backed
+                # findings..."). Complete them here, before the pending
+                # check below counts them, so a verified final answer is
+                # not rejected and looped into an impossible extra round
+                # (the exact 2026-09-24 "5/6 steps done, stopped" failure).
+                if content and not tool_calls:
+                    with contextlib.suppress(Exception):
+                        orchestrator.complete_delivery_steps()
                 pending_plan_steps = [
                     step.name for step in orchestrator.run.plan.steps
                     if step.status in {"pending", "in_progress"}
@@ -10285,6 +10363,20 @@ async def _run_local_agent_turn_impl(
                 # unfinished work regardless of task type; the mutation
                 # safeguards below (verification-command requirement,
                 # evidence preflight) still gate the actual final delivery.
+                # BUT a plan step whose wording matches no tool (e.g.
+                # "Change the off-by-one increment to the correct value" --
+                # no path, and the matching edit already completed a
+                # different step) can never complete by evidence matching.
+                # When the turn already holds VERIFIED MUTATION evidence --
+                # a successful code edit followed by a successful
+                # execute_command -- the final prose is a legitimate report
+                # of finished work, not a premature stop; retrying it here
+                # burned the retry budget and failed the very task the
+                # verification evidence says succeeded.
+                and not (
+                    any_mutation and any_code_mutation
+                    and any_execute_command_since_mutation
+                )
             ):
                 plan_completion_retries += 1
                 working_messages.append({"role": "assistant", "content": content})
@@ -11498,6 +11590,15 @@ async def _run_local_agent_turn_impl(
                 working_messages.append({"role": "tool", "tool_call_id": tc.call_id, "content": json.dumps(result, default=str)})
                 renderer.handle_event({"event_type": "tool_output", "payload": {"tool": tc.name, "result": result}})
                 continue
+
+            if tc.name == "kill_background_job":
+                # Unlike read_background_job above, this STOPS a process -- a
+                # real mutation of machine state -- so it does NOT get the
+                # bypass-on-read-only treatment: it goes through the normal
+                # approval/risk gate (classify_tool_call_risk rates it medium
+                # via the registered-tool table in mcp.py) by falling through
+                # to generic dispatch. Same PreToolUse applies.
+                pass
 
             if tc.name in {"delegate_parallel_tasks", "delegate_agent"}:
                 # Not a filesystem/shell tool either -- no per-call workspace

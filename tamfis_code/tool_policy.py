@@ -35,6 +35,11 @@ READ_TOOLS = [
     "get_git_info", "ask_user_question", "inspect_artifact", "save_memory",
     "list_external_agent_sessions", "read_external_agent_session", "list_agent_types",
     "write_todos",
+    # memory_search (recall) is read-only like every other lookup here.
+    # memory_remember (write) mutates only TamfisGPT's remote agent-memory
+    # collection -- never a workspace file -- for the same reason save_memory
+    # (writes to CONFIG_DIR/memory) is offered in every non-plain turn.
+    "memory_search", "memory_remember",
 ]
 # Safe shell inspection is part of the read-only contract.  The tool is still
 # constrained twice at runtime: safety.classify_command_risk() admits only
@@ -60,6 +65,10 @@ GIT_TOOLS = ["get_git_info", "read_file", "search_code", "find_references", "exe
 RESEARCH_TOOLS = [
     "web_search", "browser", "knowledge_base_search", "knowledge_base_index",
     "read_file", "read_archive", "search_code", "find_references", "ask_user_question",
+    # memory_remember: a research turn that earned a hard-won fact (the only
+    # working endpoint, the correct API flag) should be able to persist it for
+    # memory_search -- otherwise the next research task re-derives it.
+    "memory_search", "memory_remember",
 ]
 
 

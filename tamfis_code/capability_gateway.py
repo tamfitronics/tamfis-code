@@ -15,7 +15,7 @@ import json
 import re
 import uuid
 from collections.abc import Iterable
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Mapping
 
 from .mcp_client import MCPTransportError
@@ -128,6 +128,28 @@ def _normalise_schema_arguments(
                 result[key] = int(text)
             elif value_type == "number" and re.fullmatch(r"[+-]?(?:\d+(?:\.\d*)?|\.\d+)", text):
                 result[key] = float(text) if "." in text else int(text)
+            elif value_type == "object" and text.startswith(("{", "[")):
+                # Live failure (2026-09-24): execute_command arrived with
+                # ``environment`` as a JSON-encoded string -- the strict
+                # validator rejected it ("argument 'environment' must have
+                # type object"), the provider re-sent the identical call,
+                # and the stuck-detector killed the round. Decode the JSON
+                # string like the ask_user arrays already are; a value that
+                # still isn't an object is left for the validator to reject
+                # with the normal message.
+                try:
+                    decoded = json.loads(text)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    try:
+                        decoded = ast.literal_eval(text)
+                    except (SyntaxError, ValueError):
+                        decoded = None
+                if isinstance(decoded, Mapping):
+                    result[key] = dict(decoded)
+                elif value_type == "object" and decoded is None:
+                    continue
+                elif decoded is not None:
+                    result[key] = decoded
         except (TypeError, ValueError, OverflowError):
             continue
     return result
@@ -499,6 +521,32 @@ class TamfisCodeCapabilityGateway:
         return sorted(descriptors, key=lambda item: item.id)
 
     async def execute(self, request: ExecutionRequest, *, extra_kwargs: dict[str, Any] | None = None) -> ExecutionResult:
+        # Live failure (2026-09-24): a provider emitted the MCP wire form
+        # ``mcp__huggingface_hub__hub_repo_search`` as a capability id. The
+        # strict "native.<name>" contract rejected it ("unknown native
+        # capability"), the provider re-sent the identical call, and the
+        # round was killed by the stuck-detector. Accept the MCP wire form:
+        # strip the server namespace and route to the local native tool of
+        # that name when one exists (verified against the local registry,
+        # not assumed), otherwise keep a clear namespace error so
+        # genuinely-remote capabilities surface as unavailable rather than
+        # being silently misrouted onto a wrong local tool.
+        wire_id = str(request.capability_id or "")
+        mcp_wire = re.fullmatch(r"mcp__([A-Za-z0-9_-]+)__([A-Za-z0-9_-]+)", wire_id)
+        if mcp_wire is not None:
+            server_part, bare = mcp_wire.group(1), mcp_wire.group(2)
+            local_names = {str(tool["name"]) for tool in self.server.list_tools()}
+            if bare in local_names:
+                request = replace(request, capability_id=f"native.{bare}")
+            else:
+                return ExecutionResult(
+                    request.request_id,
+                    error=(
+                        f"capability '{wire_id}' is an external MCP tool "
+                        f"(server '{server_part}'); it is not registered locally -- "
+                        "configure it under external MCP servers or use a native tool."
+                    ),
+                )
         prefix, _, name = request.capability_id.partition(".")
         if prefix != "native" or not name:
             return ExecutionResult(request.request_id, error="unknown capability namespace")

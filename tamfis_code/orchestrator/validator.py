@@ -170,8 +170,12 @@ _DOCUMENTATION_NAMES = frozenset({
 # externally-maintained corpus (TamfisGPT's Tier VI research corpus) rather
 # than the model's own knowledge, so it's exactly as legitimate evidence as a
 # live web search -- knowledge_base_index (writing to that corpus, not
-# reading it) is deliberately excluded here.
-_REAL_RESEARCH_TOOLS = {"web_search", "browser", "knowledge_base_search"}
+# reading it) is deliberately excluded here. memory_search (added 2026-09-25)
+# recalls the agent's OWN saved notes -- prior sessions' earned findings about
+# real work, not training data -- so it counts as legitimate evidence the same
+# way knowledge_base_search does; memory_remember (writing) is excluded for
+# the same reason knowledge_base_index is.
+_REAL_RESEARCH_TOOLS = {"web_search", "browser", "knowledge_base_search", "memory_search"}
 
 # Confirmed live: a turn that finds an objective already fully committed
 # (by a prior turn, or already sitting on disk before this one started) and

@@ -995,3 +995,162 @@ class TestKnowledgeBaseTools:
             outcome = await server.call_tool("knowledge_base_search", {"query": "anything"})
         assert outcome["success"] is True
         assert outcome["result"]["results"] == []
+
+
+class TestMemoryTools:
+    """memory_search / memory_remember call TamfisGPT's internal Tier IV
+    /v1/memory/* endpoints (backed by a dedicated "agent_memory" ChromaDB
+    collection -- deliberately separate from the research corpus that
+    knowledge_base_search reads, which hard-filters source="research_document").
+    Same failure contract as the knowledge_base tools: TamfisGPT-dependent, so
+    a connectivity failure is reported clearly in the result, never raised."""
+
+    @pytest.mark.asyncio
+    async def test_memory_search_rejects_empty_query(self):
+        server = MCPServer()
+        with pytest.raises(ValueError):
+            await server._memory_search(query="   ")
+
+    @pytest.mark.asyncio
+    async def test_memory_search_returns_results_on_success(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"results": [
+            {"id": "tamfiscode:gotcha:test-runner", "text": "pytest via .venv/bin/python", "kind": "gotcha"},
+        ]}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._memory_search(query="how do we run the tests")
+        assert result["results"] == [
+            {"id": "tamfiscode:gotcha:test-runner", "text": "pytest via .venv/bin/python", "kind": "gotcha"},
+        ]
+        assert "error" not in result
+
+    @pytest.mark.asyncio
+    async def test_memory_search_sends_project_filter_only_when_set(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"results": []}
+        captured = {}
+
+        async def fake_post(url, json=None, **kwargs):
+            captured["url"] = url
+            captured["json"] = json
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            await MCPServer()._memory_search(query="deploy steps", project="tamfiscode")
+            assert captured["url"].endswith("/v1/memory/search")
+            assert captured["json"]["project"] == "tamfiscode"
+            await MCPServer()._memory_search(query="deploy steps")
+            assert "project" not in captured["json"]
+
+    @pytest.mark.asyncio
+    async def test_memory_search_reports_unreachable_instead_of_raising(self):
+        async def fake_post(*args, **kwargs):
+            raise httpx.ConnectError("boom")
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._memory_search(query="deploy steps")
+        assert result["results"] == []
+        assert "unreachable" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_memory_search_reports_non_200_instead_of_raising(self):
+        response = MagicMock()
+        response.status_code = 500
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._memory_search(query="deploy steps")
+        assert result["results"] == []
+        assert "HTTP 500" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_memory_remember_rejects_empty_text(self):
+        server = MCPServer()
+        with pytest.raises(ValueError):
+            await server._memory_remember(text="   ")
+
+    @pytest.mark.asyncio
+    async def test_memory_remember_success_returns_indexed(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"indexed": True, "memory_id": "tamfiscode:gotcha:test-runner"}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._memory_remember(
+                text="pytest via .venv/bin/python",
+                memory_id="tamfiscode:gotcha:test-runner",
+                kind="gotcha",
+                project="tamfiscode",
+                tags=["tests"],
+            )
+        assert result == {"indexed": True, "memory_id": "tamfiscode:gotcha:test-runner"}
+
+    @pytest.mark.asyncio
+    async def test_memory_remember_without_id_is_idempotent_on_verbatim_resave(self):
+        # No explicit memory_id -> derived from a hash of the text, so a
+        # verbatim re-save hits the SAME id (Tier IV upserts -> replaces, not
+        # duplicates) while a reworded note gets a fresh id.
+        captured = {}
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"indexed": True}
+
+        async def fake_post(url, json=None, **kwargs):
+            captured["json"] = json
+            return response
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            first = await MCPServer()._memory_remember(text="pytest via .venv/bin/python")
+            first_id = captured["json"]["memory_id"]
+            second = await MCPServer()._memory_remember(text="pytest via .venv/bin/python")
+            second_id = captured["json"]["memory_id"]
+        assert first["indexed"] is True and second["indexed"] is True
+        assert first_id == second_id
+        assert first_id.startswith("auto:")
+
+    @pytest.mark.asyncio
+    async def test_memory_remember_reports_unreachable_instead_of_raising(self):
+        async def fake_post(*args, **kwargs):
+            raise httpx.ConnectError("boom")
+
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            result = await MCPServer()._memory_remember(text="a note")
+        assert result["indexed"] is False
+        assert "unreachable" in result["error"]
+
+    @pytest.mark.asyncio
+    async def test_memory_remember_rejects_overlong_memory_id(self):
+        with pytest.raises(ValueError):
+            await MCPServer()._memory_remember(text="a note", memory_id="x" * 201)
+
+    @pytest.mark.asyncio
+    async def test_memory_tools_are_registered_and_reachable_via_call_tool(self):
+        response = MagicMock()
+        response.status_code = 200
+        response.json.return_value = {"results": [], "indexed": True}
+
+        async def fake_post(*args, **kwargs):
+            return response
+
+        server = MCPServer()
+        tool_names = {tool["name"] for tool in server.list_tools()}
+        assert "memory_search" in tool_names
+        assert "memory_remember" in tool_names
+        with patch("tamfis_code.mcp.httpx.AsyncClient", _fake_async_client(fake_post)):
+            search_outcome = await server.call_tool("memory_search", {"query": "anything"})
+            remember_outcome = await server.call_tool("memory_remember", {"text": "a note"})
+        assert search_outcome["success"] is True
+        assert search_outcome["result"]["results"] == []
+        assert remember_outcome["success"] is True
+        assert remember_outcome["result"]["indexed"] is True

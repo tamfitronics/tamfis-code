@@ -22,6 +22,7 @@ from tamfis_code import state as state_module
 from tamfis_code.config import Config
 from tamfis_code.live_input import LiveInputListener
 from tamfis_code.render import StreamRenderer
+from tamfis_code import think_card
 from tamfis_code.think_card import think_card_html, thought_summary_line
 
 
@@ -66,10 +67,27 @@ class ThinkCardLayoutTests(unittest.TestCase):
         lines = think_card_html(text, width=80)
         plain = [_plain(line) for line in lines]
         # Bounded card: never more than the max row count plus the borders.
-        self.assertLessEqual(len(plain), 8)
+        self.assertLessEqual(len(plain), 10)
         # The newest words survive; the oldest are the ones dropped.
         self.assertIn("word499", " ".join(plain))
         self.assertNotIn("word0", " ".join(plain))
+
+    def test_card_body_is_rendered_in_the_readable_style(self):
+        # Regression: the body used <ansibrightblack> (dark grey, colour 8),
+        # which was effectively unreadable on the dark terminals this card
+        # runs on. It must render in the lighter BODY_STYLE instead.
+        text = " ".join(f"word{i}" for i in range(60))
+        joined = "".join(think_card_html(text, width=80))
+        self.assertIn(f"<{think_card.BODY_STYLE}>", joined)
+        self.assertNotIn("<ansibrightblack>", joined)
+
+    def test_card_can_show_up_to_the_full_row_budget(self):
+        # MAX_ROWS was raised from 6 to 8 so the tail scrolls less and the
+        # thought is easier to follow; a long reasoning stream must actually
+        # fill the larger budget rather than staying at the old cap.
+        text = " ".join(f"word{i}" for i in range(500))
+        lines = think_card_html(text, width=80)
+        self.assertEqual(len(lines), think_card.MAX_ROWS + 2)  # body rows + borders
 
     def test_card_terminates_markup_and_escapes_angle_brackets(self):
         lines = think_card_html("checking <SuspiciousTag> and things " * 4, width=80)

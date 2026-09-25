@@ -811,6 +811,11 @@ class StreamRenderer:
             _cfg = load_config()
             cost_cap = _cfg.session_cost_cap_usd
             self._show_think_card = bool(getattr(_cfg, "show_think_card", True))
+            # Configurable think-card look (config.py: think_card_style / 
+            # think_card_max_width). The style is a prompt_toolkit ANSI tag;
+            # think_card_html validates it before interpolating into markup.
+            self._think_card_style = str(getattr(_cfg, "think_card_style", "") or "")
+            self._think_card_max_width = getattr(_cfg, "think_card_max_width", None)
         except Exception:
             # Config loading must never be able to break rendering --
             # falls back to the dataclass default rather than disabling
@@ -818,6 +823,8 @@ class StreamRenderer:
             # silently turn off a safety rail either.
             cost_cap = 5.0
             self._show_think_card = True
+            self._think_card_style = ""
+            self._think_card_max_width = None
         self._metrics = MetricsTracker(cost_cap_usd=cost_cap)
         # Real reasoning-phase timing (see provider_protocols.py's
         # reasoning_content extraction) -- None/None until a reasoning delta
@@ -1682,7 +1689,11 @@ class StreamRenderer:
             return []
         from .think_card import think_card_html
 
-        return think_card_html(self._reasoning_buffer, width=width, active=True)
+        return think_card_html(
+            self._reasoning_buffer, width=width, active=True,
+            style=getattr(self, "_think_card_style", None),
+            max_width=getattr(self, "_think_card_max_width", None),
+        )
 
     def _record_token_chars(self, chars: int) -> None:
         estimated_tokens = max(1, chars // _CHARS_PER_TOKEN_ESTIMATE)

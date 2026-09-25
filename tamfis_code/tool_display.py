@@ -43,6 +43,7 @@ _DISPLAY_NAMES = {
     "run_command": "Bash",
     "remote_exec": "Bash",
     "read_background_job": "BackgroundJob",
+    "kill_background_job": "KillJob",
     "web_search": "Web Search",
     "web_fetch": "Fetch",
     "fetch_url": "Fetch",

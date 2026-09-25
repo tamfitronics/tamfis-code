@@ -230,6 +230,26 @@ class Config:
     # false hides the card and the durable "Thought for Xs" line while the
     # reasoning still counts towards the token figure exactly as before.
     show_think_card: bool = True
+    # The think card's body text colour, as a prompt_toolkit ANSI style name
+    # ("ansigray", "ansiwhite", "ansicyan", "ansibrightblack", ...). The
+    # default is the legible-on-dark-theme light grey the card was moved to
+    # after users reported the original dark grey as unreadable; light-theme
+    # terminal users can pick "ansibrightblack" to dim it back down.
+    think_card_style: str = "ansigray"
+    # Widest content width the think card may use, in terminal columns. The
+    # card sizes itself to the terminal up to this cap (like the plan panel
+    # does); users on very wide terminals who find a 100-column card still
+    # too compact can raise it, and narrow-terminal users need not touch it.
+    think_card_max_width: int = 100
+    # Read typo'd objectives by intent instead of taking them verbatim: an
+    # offline dictionary repair pass runs on every submitted objective
+    # (never inside code/paths/quotes/identifiers). "false" disables it.
+    typo_autocorrect: bool = True
+    # ALSO run a small local Hugging Face grammar-correction model on short
+    # objectives the dictionary pass could not repair. Off by default: the
+    # first use downloads model weights (via any ambient HF_TOKEN, e.g. the
+    # one exported from tamgpt6's .env) and loads transformers.
+    typo_autocorrect_model: bool = False
     permission_allow: list[str] = field(default_factory=list)
     permission_ask: list[str] = field(default_factory=list)
     permission_deny: list[str] = field(default_factory=list)
@@ -258,6 +278,10 @@ class Config:
             "sandbox_fail_if_unavailable": self.sandbox_fail_if_unavailable,
             "session_cost_cap_usd": self.session_cost_cap_usd,
             "show_think_card": self.show_think_card,
+            "think_card_style": self.think_card_style,
+            "think_card_max_width": self.think_card_max_width,
+            "typo_autocorrect": self.typo_autocorrect,
+            "typo_autocorrect_model": self.typo_autocorrect_model,
             "permission_allow": self.permission_allow,
             "permission_ask": self.permission_ask,
             "permission_deny": self.permission_deny,
@@ -344,6 +368,26 @@ def load_config(project_root: Optional[Path] = None) -> Config:
         if "show_think_card" in data:
             cfg.show_think_card = bool(data["show_think_card"])
             cfg.sources["show_think_card"] = source_name
+        if "think_card_style" in data and str(data["think_card_style"]).strip():
+            cfg.think_card_style = str(data["think_card_style"]).strip()
+            cfg.sources["think_card_style"] = source_name
+        if "think_card_max_width" in data:
+            try:
+                width = int(data["think_card_max_width"])
+            except (TypeError, ValueError):
+                width = 0
+            # A degenerate value (0/negative) would make the card a single
+            # unreadable column; ignore it and keep the default rather than
+            # honouring a typo the user cannot see the effect of.
+            if width >= 20:
+                cfg.think_card_max_width = width
+                cfg.sources["think_card_max_width"] = source_name
+        if "typo_autocorrect" in data:
+            cfg.typo_autocorrect = bool(data["typo_autocorrect"])
+            cfg.sources["typo_autocorrect"] = source_name
+        if "typo_autocorrect_model" in data:
+            cfg.typo_autocorrect_model = bool(data["typo_autocorrect_model"])
+            cfg.sources["typo_autocorrect_model"] = source_name
         permissions = data.get("permissions")
         if isinstance(permissions, dict):
             for action in ("allow", "ask", "deny"):

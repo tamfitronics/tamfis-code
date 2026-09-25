@@ -38,6 +38,12 @@ READ_ONLY_TOOLS = {
     # unknown-tool default, so it was rated "dangerous" (an approval prompt for a to-do list, even in
     # auto mode) and, in a read-only turn, was offered and then refused ("not available in read-only mode").
     "write_todos",
+    # Read-only semantic recall over the agent's own saved memory notes (TamfisGPT
+    # vector memory). Same story as write_todos above: tool_policy offers it in
+    # every non-plain turn, so an unknown-tool "dangerous" rating would mean an
+    # approval prompt for a lookup -- the exact interruption the memory tools
+    # exist to reduce.
+    "memory_search",
 }
 MUTATING_FILE_TOOLS = {"write_file", "edit_file", "extract_archive", "repackage_archive", "create_artifact"}
 
@@ -558,6 +564,16 @@ def classify_tool_call_risk(
         return classify_command_risk(str(arguments.get("command") or ""))
     if name == "browser":
         return RISK_MEDIUM
+    if name == "kill_background_job":
+        # Stops a process the agent itself started (SIGTERM to its process
+        # group; force=true escalates to SIGKILL) -- a real machine-state
+        # change, so it is a governed medium-risk action just like the writes
+        # above, never read-only: a read-only turn must not be able to kill a
+        # job, and even a permissive policy surfaces it as an ordinary
+        # approvable action. Scoped by construction to jobs this session
+        # spawned (the registry only ever records this process's own
+        # execute_command children).
+        return RISK_MEDIUM
     if name == "save_memory":
         # Auto memory writes to CONFIG_DIR/memory, outside the declared
         # workspace root by design (it's cross-session, cross-project
@@ -566,6 +582,12 @@ def classify_tool_call_risk(
         # governed by the ordinary approval policy (medium, not read-only)
         # rather than being hardcoded to bypass it. A permissive policy can
         # still auto-approve it same as any other medium-risk tool.
+        return RISK_MEDIUM
+    if name == "memory_remember":
+        # Writes outside the workspace by design (TamfisGPT's shared
+        # agent-memory collection, the store memory_search reads) -- same
+        # reasoning and same ordinary-approval treatment as save_memory
+        # directly above.
         return RISK_MEDIUM
     return RISK_DANGEROUS  # unknown tool name -- fail safe, never default to permissive
 

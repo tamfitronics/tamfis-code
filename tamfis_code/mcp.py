@@ -388,6 +388,72 @@ def read_background_job_status(job_id: str) -> Dict[str, Any]:
     return result
 
 
+def kill_background_job(job_id: str, force: bool = False) -> Dict[str, Any]:
+    """Terminate a still-running backgrounded job (Claude Code's KillShell
+    parity -- until now a Ctrl+B-backgrounded command could be polled forever
+    but never stopped by the agent). Only jobs THIS session started can be
+    killed (the registry is module-level but only ever populated from this
+    process's own execute_command), and only by signal: no shell is spawned,
+    so nothing else on the machine is reachable through this tool.
+
+    SIGTERM by default so the child can clean up; force=True escalates to
+    SIGKILL for a child ignoring SIGTERM. The process was spawned with
+    start_new_session=True, so the kill goes to the child's whole process
+    group -- a `make test` that spawned workers dies with its children
+    instead of orphaning them. Returns immediately after signalling; poll
+    read_background_job to confirm exit (the in-flight communicate() still
+    reaps the real return code into the job record)."""
+    job = _BACKGROUND_JOBS.get(job_id)
+    if job is None:
+        return {"success": False, "error": f"No background job found with id {job_id!r}."}
+    if job.finished:
+        return {
+            "success": True, "job_id": job_id, "command": job.command,
+            "status": "already_finished", "return_code": job.return_code,
+            "message": "Job already finished; nothing to kill.",
+        }
+    killed = False
+    signal_name = "SIGKILL" if force else "SIGTERM"
+    errors: list[str] = []
+    if hasattr(os, "killpg"):
+        try:
+            os.killpg(os.getpgid(job.proc.pid), signal.SIGKILL if force else signal.SIGTERM)
+            killed = True
+        except (ProcessLookupError, PermissionError, OSError) as exc:
+            errors.append(str(exc))
+    if not killed:
+        # Either a platform without killpg, or the group kill raced the
+        # child's exit / lacked permission -- try the direct child only.
+        try:
+            if force:
+                job.proc.kill()
+            else:
+                job.proc.terminate()
+            killed = True
+        except ProcessLookupError:
+            # Exited between the running check and here -- treat as done.
+            killed = True
+        except OSError as exc:
+            errors.append(str(exc))
+    if not killed:
+        return {
+            "success": False, "job_id": job_id, "command": job.command,
+            "error": "Could not signal the job's process: " + "; ".join(errors),
+        }
+    result: Dict[str, Any] = {
+        "success": True, "job_id": job_id, "command": job.command,
+        "killed": True, "signal": signal_name,
+        "status": "signalled",
+        "message": (
+            f"Sent {signal_name} to the job's process group. Call read_background_job "
+            "with this job_id to confirm it exited."
+        ),
+    }
+    if errors:
+        result["detail"] = "; ".join(errors)
+    return result
+
+
 @dataclass
 class ToolDefinition:
     """Definition of a tool for MCP"""
@@ -878,6 +944,30 @@ class MCPServer:
         )
 
         self.register_tool(
+            name="kill_background_job",
+            description=(
+                "Terminate a still-running command that was moved to the background "
+                "(an execute_command result with backgrounded=true and a job_id) -- e.g. a "
+                "build or dev server you no longer need, or one blocking the task. Sends "
+                "SIGTERM to the job's whole process group (children die with it); pass "
+                "force=true only if the job ignored an earlier SIGTERM. Finished jobs are "
+                "reported, not an error. Confirm the exit with read_background_job afterwards."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job_id from the backgrounded execute_command result"},
+                    "force": {
+                        "type": "boolean",
+                        "description": "Send SIGKILL instead of SIGTERM (only after a normal kill was ignored)",
+                    },
+                },
+                "required": ["job_id"],
+            },
+            handler=self._kill_background_job,
+        )
+
+        self.register_tool(
             name="read_archive",
             description=(
                 "Read-only look inside a ZIP or TAR archive (.zip .tar .tar.gz .tgz .tar.bz2 .tar.xz), "
@@ -1166,6 +1256,79 @@ class MCPServer:
                 "required": ["title", "text"],
             },
             handler=self._knowledge_base_index,
+        )
+
+        self.register_tool(
+            name="memory_search",
+            description=(
+                "Semantic recall over YOUR OWN saved memory notes (memory_remember's store, "
+                "backed by TamfisGPT's vector memory) -- meaning-matched, not keyword-matched, "
+                "so 'how do we run the tests again' finds the note that says 'pytest via "
+                ".venv/bin/python'. Use it at the START of a task to recall prior gotchas, "
+                "conventions, build commands, or user preferences before re-deriving them. "
+                "Optionally filter to one project. Distinct from knowledge_base_search (shared "
+                "research corpus of external papers) and from save_memory (local key-value "
+                "records -- prefer memory_remember when semantic recall matters). Only works on "
+                "a host running TamfisGPT; returns a clear error, not a crash, if that's "
+                "unavailable. Read-only, no side effects."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "What to recall, phrased naturally"},
+                    "project": {
+                        "type": "string",
+                        "description": "Only return memories saved for this project name (default: no filter)",
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 50,
+                        "description": "Maximum memories to return (default 8)",
+                    },
+                },
+                "required": ["query"],
+            },
+            handler=self._memory_search,
+        )
+
+        self.register_tool(
+            name="memory_remember",
+            description=(
+                "Save a memory note into TamfisGPT's vector memory so memory_search can recall it "
+                "by MEANING in any future session (e.g. 'pytest lives in .venv/bin/python; never "
+                "bare python', 'user prefers PRs under 300 lines', 'deploy needs TAMGPT_TIER_IV_URL "
+                "set'). A stable memory_id makes re-saving overwrite the old note -- correct "
+                "instead of duplicate. Keep each note short and self-contained. Distinct from "
+                "save_memory (local key-value records, no semantic recall) and knowledge_base_index "
+                "(external research sources, not your own learnings). Only works on a host running "
+                "TamfisGPT; returns a clear error, not a crash, if that's unavailable."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string", "description": "The memory note itself -- short, self-contained"},
+                    "memory_id": {
+                        "type": "string",
+                        "description": "Stable id so re-saving replaces the old note, e.g. '<project>:<topic>' -- omit for a fresh note",
+                    },
+                    "kind": {
+                        "type": "string",
+                        "description": "Note type: note (default), command, preference, gotcha, convention",
+                    },
+                    "project": {
+                        "type": "string",
+                        "description": "Project name to scope this memory to (recommended; enables project-filtered recall)",
+                    },
+                    "tags": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Optional short tags",
+                    },
+                },
+                "required": ["text"],
+            },
+            handler=self._memory_remember,
         )
 
         self.register_tool(
@@ -3391,6 +3554,96 @@ class MCPServer:
             return {"indexed": False, "error": f"TamfisGPT knowledge index failed (HTTP {response.status_code})."}
         payload = response.json() or {}
         return {"indexed": True, "chunks_indexed": payload.get("chunks_indexed", 0)}
+
+    async def _memory_search(self, query: str, project: str = "", limit: int = 8) -> Dict[str, Any]:
+        """Meaning-matched recall over THIS AGENT's own saved memory notes via
+        TamfisGPT's agent-memory collection (Tier IV /v1/memory/search ->
+        tier_vi_knowledge/embeddings/agent_memory_index.py, a dedicated
+        ChromaDB collection -- nothing here can leak into or out of the
+        research corpus that knowledge_base_search reads). Same trust model
+        and failure contract as _knowledge_base_search: TamfisGPT-dependent,
+        no portable fallback, so a connectivity failure is reported clearly
+        rather than raised.
+        """
+        query = (query or "").strip()
+        if not query:
+            raise ValueError("memory_search requires a non-empty query")
+        try:
+            limit = int(limit)
+        except (TypeError, ValueError):
+            limit = 8
+        limit = max(1, min(limit, 50))
+
+        body: Dict[str, Any] = {"query": query, "limit": limit}
+        if (project or "").strip():
+            body["project"] = project.strip()
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{_TAMGPT_TIER_IV_BASE}/v1/memory/search",
+                    json=body,
+                )
+        except httpx.HTTPError as exc:
+            return {
+                "query": query, "results": [],
+                "error": f"TamfisGPT vector memory unreachable ({exc}) -- recall is unavailable this session.",
+            }
+        if response.status_code != 200:
+            return {
+                "query": query, "results": [],
+                "error": f"TamfisGPT memory search failed (HTTP {response.status_code}) -- recall is unavailable this session.",
+            }
+        payload = response.json() or {}
+        return {"query": query, "results": payload.get("results") or []}
+
+    async def _memory_remember(
+        self, text: str, memory_id: str = "", kind: str = "note",
+        project: str = "", tags: Optional[List[str]] = None,
+    ) -> Dict[str, Any]:
+        """Store one memory note into TamfisGPT's agent-memory collection
+        (Tier IV /v1/memory/index -- see _memory_search for the trust model).
+        A stable memory_id makes the write idempotent: Tier IV upserts the
+        single chunk behind that id, so a re-save REPLACES the old text
+        instead of duplicating it. memory_id omitted -> derived from a hash
+        of the text, so a verbatim re-save is still idempotent while a
+        reworded note starts a fresh id (the model should pass an explicit
+        id when it intends to update)."""
+        text = (text or "").strip()
+        if not text:
+            raise ValueError("memory_remember requires non-empty text")
+        memory_id = (memory_id or "").strip()
+        if not memory_id:
+            memory_id = f"auto:{hashlib.sha256(text.encode('utf-8')).hexdigest()[:32]}"
+        if len(memory_id) > 200:
+            raise ValueError("memory_remember requires a memory_id of at most 200 characters")
+        clean_tags = [str(tag).strip() for tag in (tags or []) if str(tag).strip()][:10]
+
+        body: Dict[str, Any] = {
+            "text": text,
+            "memory_id": memory_id,
+            "kind": (kind or "note").strip() or "note",
+            "project": (project or "").strip(),
+            "tags": clean_tags,
+            "source_tool": "tamfis-code",
+        }
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"{_TAMGPT_TIER_IV_BASE}/v1/memory/index",
+                    json=body,
+                )
+        except httpx.HTTPError as exc:
+            return {"indexed": False, "error": f"TamfisGPT vector memory unreachable ({exc})."}
+        if response.status_code != 200:
+            return {"indexed": False, "error": f"TamfisGPT memory index failed (HTTP {response.status_code})."}
+        payload = response.json() or {}
+        return {"indexed": True, "memory_id": payload.get("memory_id", memory_id)}
+
+    async def _kill_background_job(self, job_id: str, force: bool = False) -> Dict[str, Any]:
+        """Thin async wrapper over the module-level kill (see kill_background_job
+        for the signal/group reasoning); module-level like the status reader so
+        it can also be reused outside an MCPServer instance."""
+        return kill_background_job(str(job_id or ""), force=bool(force))
 
 # Convenience function for CLI use
 async def call_tool(name: str, **kwargs):

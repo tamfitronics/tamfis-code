@@ -21,12 +21,37 @@ from __future__ import annotations
 
 from xml.sax.saxutils import escape as _xml_escape
 
-_TITLE = "Thinking"
+TITLE = "Thinking"
 MIN_CHARS = 24          # below this the card is noise, not signal
 MAX_CHARS = 400         # bounded window of the LATEST reasoning, always the tail
 MIN_ROWS = 2
-MAX_ROWS = 6
-MAX_WIDTH = 100         # content-width like the plan panel, never wall-to-wall
+MAX_ROWS = 8            # was 6: six rows forced constant scrolling of the tail,
+                        # which read as a flickering, hard-to-follow strip
+DEFAULT_MAX_WIDTH = 100  # content-width like the plan panel, never wall-to-wall
+# Body text style. `ansibrightblack` (colour 8, dark grey) was nearly
+# invisible on the dark terminals this card actually runs on -- users read
+# it as "too dark to read". `ansigray` (colour 7, light grey) keeps the
+# text visually secondary to the answer while staying comfortably legible,
+# and matches the composer's existing convention (live_input.py renders the
+# activity line in <ansigray> too). Configurable via think_card_style.
+DEFAULT_BODY_STYLE = "ansigray"
+# Kept as an alias because tests and config.py's loader referenced the old
+# module-level constant name.
+BODY_STYLE = DEFAULT_BODY_STYLE
+
+
+def _safe_style(style: str | None) -> str:
+    """Validate a configured prompt_toolkit style tag before interpolating it.
+
+    The value reaches the composer as `<{style}>...</{style}>` markup; a
+    malicious/typo'd config value containing markup characters (e.g.
+    `<script>` or a stray `<`) must fall back to the default rather than
+    produce broken prompt_toolkit HTML.
+    """
+    candidate = str(style or "").strip()
+    if candidate and all(ch.isalnum() or ch == "_" for ch in candidate):
+        return candidate
+    return DEFAULT_BODY_STYLE
 
 
 def _plain_lines(text: str, *, width: int, rows: int) -> list[str]:
@@ -55,16 +80,33 @@ def _plain_lines(text: str, *, width: int, rows: int) -> list[str]:
     return wrapped[-rows:]
 
 
-def think_card_html(text: str, *, width: int, active: bool = True) -> list[str]:
+def think_card_html(
+    text: str, *, width: int, active: bool = True,
+    style: str | None = None, max_width: int | None = None,
+) -> list[str]:
     """The card as prompt_toolkit HTML lines, or [] when there is nothing
     worth showing (below MIN_CHARS of accumulated reasoning). Content-width
-    like plan_panel_html; `width` is the terminal width."""
+    like plan_panel_html; `width` is the terminal width.
+
+    `style` overrides the body text colour (a validated prompt_toolkit ANSI
+    tag -- see _safe_style); `max_width` raises the card's widest content
+    width, so a user on a very wide terminal can let the card use more of
+    the screen instead of wrapping at the 100-column default.
+    """
     terminal = max(20, int(width or 0))
-    inner = max(MIN_CHARS, min(MAX_WIDTH, terminal) - 6)  # borders + padding
+    cap = DEFAULT_MAX_WIDTH
+    try:
+        configured = int(max_width) if max_width is not None else DEFAULT_MAX_WIDTH
+    except (TypeError, ValueError):
+        configured = DEFAULT_MAX_WIDTH
+    if configured >= 20:
+        cap = configured
+    inner = max(MIN_CHARS, min(cap, terminal) - 6)  # borders + padding
     body = _plain_lines(text, width=inner, rows=MAX_ROWS)
     if sum(len(line) for line in body) < MIN_CHARS:
         return []
-    title_text = f" {_TITLE} "
+    body_style = _safe_style(style)
+    title_text = f" {TITLE} "
     left = (inner + 2 - len(title_text)) // 2
     right = inner + 2 - len(title_text) - left
     top = f"<ansicyan>╭{'─' * left}{_xml_escape(title_text)}{'─' * right}╮</ansicyan>"
@@ -72,7 +114,7 @@ def think_card_html(text: str, *, width: int, active: bool = True) -> list[str]:
     for line in body:
         pad = " " * max(0, inner - len(line))
         lines.append(
-            f"<ansicyan>│</ansicyan> <ansibrightblack>{_xml_escape(line)}</ansibrightblack>{pad} <ansicyan>│</ansicyan>"
+            f"<ansicyan>│</ansicyan> <{body_style}>{_xml_escape(line)}</{body_style}>{pad} <ansicyan>│</ansicyan>"
         )
     lines.append(f"<ansicyan>╰{'─' * (inner + 2)}╯</ansicyan>")
     return lines

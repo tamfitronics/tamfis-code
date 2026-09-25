@@ -761,6 +761,43 @@ class AgentOrchestrator:
             return bool(words & {"ask", "clarify", "confirm"})
         return False
 
+    # Steps whose completion IS the act of delivering the final answer.
+    # The deterministic template always ends with "Report evidence-backed
+    # findings, changes, validations, and risks." -- no tool call can ever
+    # produce evidence for it (confirmed live 2026-09-24: an edit + a
+    # successful verification command left this one step pending, the
+    # runner then rejected the verified final answer, burned its plan
+    # retries demanding impossible evidence, and failed the task with
+    # "Execution plan incomplete; pending steps: Report evidence-backed
+    # findings..."). Such steps complete WHEN the report is delivered.
+    _DELIVERY_STEP_RE = re.compile(
+        r"\b(?:report|findings?|summar\w*|deliver\w*|document\w*|present\w*)\b",
+        re.IGNORECASE,
+    )
+
+    def complete_delivery_steps(self, *, evidence_note: str = "final report delivered") -> int:
+        """Mark report/delivery-type plan steps completed at delivery time.
+
+        Called by the runner the moment the model produces its final prose
+        answer (before the plan-completion gate looks at pending steps).
+        Returns how many steps were completed. Work steps (inspect, edit,
+        validate...) are never touched -- only the delivery vocabulary
+        above matches, so genuinely unfinished work still blocks delivery
+        exactly as the gate intends.
+        """
+        if self.run is None or self.run.plan is None or not self.run.plan.steps:
+            return 0
+        changed = 0
+        for step in self.run.plan.steps:
+            if step.status in {"pending", "in_progress"} and self._DELIVERY_STEP_RE.search(step.name):
+                step.status = "completed"
+                if evidence_note not in step.evidence:
+                    step.evidence.append(evidence_note)
+                changed += 1
+        if changed:
+            self._sync_plan_progress()
+        return changed
+
     def _advance_plan_step(self, decision: ObservationDecision, tool: ToolEnvelope) -> None:
         """Advance only when useful evidence corresponds to the active step."""
         assert self.run is not None

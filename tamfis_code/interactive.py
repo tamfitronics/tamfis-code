@@ -1037,6 +1037,21 @@ def session_title_report(previous_title: str, current_title: str, model_name: st
     return f"[green]Session title[/green] · {new_title}{model_note}{detail}"
 
 
+def _resolve_typo_slash_command(head: str, known_names: set[str], cutoff: float = 0.6) -> Optional[str]:
+    """The intended command when `head` is a near-miss of exactly one known one.
+
+    A `/retryy`, `/strtus` or `/mdl` used to cost a full explanatory error + a
+    retype. With exactly one close match (cutoff 0.6, the same tolerance
+    difflib already used for the old "did you mean" hint), the typo now RUNS
+    the intended command directly. Two or more plausible matches ("/st" could
+    be /status or /stop) stay ambiguous and keep the suggest-only behaviour --
+    guessing between two commands risks doing the opposite of what the user
+    wanted.
+    """
+    matches = difflib.get_close_matches(head, sorted(known_names), n=2, cutoff=cutoff)
+    return matches[0] if len(matches) == 1 else None
+
+
 def _looks_like_unknown_slash_command(text: str) -> Optional[str]:
     """The command name when `text` is shaped like a slash command (a single
     `/word` token) that matched no built-in -- else None.
@@ -2604,6 +2619,7 @@ async def _run_interactive_impl(
             table.add_row("get_git_info", "Branch/HEAD/status for a repo path", "Read-only")
             table.add_row("read_archive", "List/read files inside ZIP/TAR archives (no size limit, nested)", "Read-only")
             table.add_row("read_background_job", "Check on a Ctrl+B-backgrounded command", "Read-only")
+            table.add_row("kill_background_job", "Stop a backgrounded command (SIGTERM its process group)", "Risk classifier + approval")
             table.add_row("list_external_agent_sessions", "List sessions from Claude Code/Codex/Copilot/etc on this machine", "Read-only")
             table.add_row("read_external_agent_session", "Read one of those sessions to continue its work", "Read-only")
             table.add_row("edit_file", "Exact, uniqueness-checked replacement", "Local risk classifier + approval + mutation ledger")
@@ -2612,6 +2628,8 @@ async def _run_interactive_impl(
             table.add_row("execute_command", "Run a shell command", "Local risk classifier + approval (no sandboxing)")
             table.add_row("browser", "Public Chromium navigation and screenshots", "Only if a monorepo browser tool is co-located")
             table.add_row("web_search", "Tavily (if TAVILY_API_KEY set) or DuckDuckGo fallback", "Read-only; self-contained, no monorepo required")
+            table.add_row("memory_search", "Semantic recall over your own saved memory notes (TamfisGPT vector memory)", "Read-only; needs TamfisGPT Tier IV")
+            table.add_row("memory_remember", "Save a memory note future sessions can recall by meaning", "Approval-gated; needs TamfisGPT Tier IV")
             console.print(table)
             console.print(
                 "[dim]This is the real local tool set (mcp.py) every turn uses -- see safety.py for how "
@@ -3313,13 +3331,41 @@ async def _run_interactive_impl(
             except (OSError, ValueError):
                 is_real_path = False
             if trimmed not in known_names and trimmed not in custom_names and not is_real_path:
-                matches = difflib.get_close_matches(trimmed, sorted(known_names | custom_names), n=1, cutoff=0.6)
-                hint = f" Did you mean {matches[0]}?" if matches else " Type /help for the command list."
-                print_error(console, f"'{unknown_command}' is not a command -- nothing was run.{hint}")
-                continue
+                resolved = _resolve_typo_slash_command(trimmed, known_names | custom_names)
+                if resolved:
+                    print_error(console, f"'{unknown_command}' is not a command -- running {resolved} instead.")
+                    text = resolved + text[len(unknown_command):].rstrip(".")
+                else:
+                    matches = difflib.get_close_matches(trimmed, sorted(known_names | custom_names), n=1, cutoff=0.6)
+                    hint = f" Did you mean {matches[0]}?" if matches else " Type /help for the command list."
+                    print_error(console, f"'{unknown_command}' is not a command -- nothing was run.{hint}")
+                    continue
 
+        # Read the objective past its typos before routing it (config.py:
+        # typo_autocorrect). The correction is announced, never silent, and
+        # never touches code/paths/quotes/identifiers -- see text_corrector.
+        # Only corrections that actually change text are applied; slash
+        # commands, shell escapes and other intents are corrected BEFORE
+        # parse_intent so a typo'd routing word ("implment") still reaches
+        # the model as the intended instruction.
         submitted_text = text
-        intent = parse_intent(text, custom_commands=custom_commands)
+        try:
+            from .routing import classify_task as _classify_for_typo
+            from .text_corrector import correct_objective_text, correction_note
+
+            _use_model = bool(getattr(config, "typo_autocorrect_model", False))
+            _should_correct = bool(getattr(config, "typo_autocorrect", True)) or _use_model
+            _profile = _classify_for_typo(text)
+            if _should_correct and not _profile.is_plain_conversation:
+                _correction = correct_objective_text(text, use_model=_use_model)
+                if _correction.changed:
+                    submitted_text = _correction.corrected
+                    _note = correction_note(_correction, text)
+                    if _note:
+                        print_error(console, f"[dim]{_note}[/dim]")
+        except Exception:
+            submitted_text = text
+        intent = parse_intent(submitted_text, custom_commands=custom_commands)
         try:
             if intent.kind == "shell":
                 if not intent.command:

@@ -226,3 +226,94 @@ class TestReadBackgroundJobToolWiring:
                 assert "from-background" in status["stdout"]
         finally:
             harness.tearDown()
+
+
+class TestKillBackgroundJob:
+    """kill_background_job -- the missing KillShell parity half of the
+    background-job feature: until now a Ctrl+B-backgrounded command could be
+    polled forever but never stopped by the agent."""
+
+    def setup_method(self):
+        self.temp_dir = tempfile.mkdtemp()
+        self.server = MCPServer(workspace_root=self.temp_dir, session_id=1)
+
+    @pytest.mark.asyncio
+    async def test_sigterm_terminates_a_running_job(self):
+        signal = asyncio.Event()
+        signal.set()
+        result = await self.server.call_tool(
+            "execute_command",
+            {"command": "sleep 30"},
+            extra_kwargs={"background_signal": signal},
+        )
+        job_id = result["result"]["job_id"]
+        assert read_background_job_status(job_id)["status"] == "running"
+
+        killed = await self.server.call_tool(
+            "kill_background_job", {"job_id": job_id},
+        )
+        payload = killed["result"]
+        assert payload["success"] is True
+        assert payload["killed"] is True
+        assert payload["signal"] == "SIGTERM"
+
+        # The signalled process is reaped by the still-in-flight communicate()
+        # (via _watch_background_job), so the job record flips to finished --
+        # poll with a bounded budget rather than one fixed sleep.
+        status = read_background_job_status(job_id)
+        for _ in range(30):
+            status = read_background_job_status(job_id)
+            if status["status"] != "running":
+                break
+            await asyncio.sleep(0.2)
+        assert status["status"] in {"finished", "failed"}
+
+    @pytest.mark.asyncio
+    async def test_unknown_job_id_reports_not_found(self):
+        result = await self.server.call_tool(
+            "kill_background_job", {"job_id": "no-such-job"},
+        )
+        payload = result["result"]
+        assert payload["success"] is False
+        assert "No background job" in payload["error"]
+
+    @pytest.mark.asyncio
+    async def test_finished_job_is_reported_not_an_error(self):
+        signal = asyncio.Event()
+        signal.set()
+        result = await self.server.call_tool(
+            "execute_command",
+            {"command": "echo quick"},
+            extra_kwargs={"background_signal": signal},
+        )
+        job_id = result["result"]["job_id"]
+        status = read_background_job_status(job_id)
+        for _ in range(30):
+            status = read_background_job_status(job_id)
+            if status["status"] != "running":
+                break
+            await asyncio.sleep(0.2)
+        assert status["status"] == "finished"
+
+        killed = await self.server.call_tool(
+            "kill_background_job", {"job_id": job_id},
+        )
+        payload = killed["result"]
+        assert payload["success"] is True
+        assert payload["status"] == "already_finished"
+
+    def test_kill_is_governed_medium_risk_not_read_only(self):
+        # A read-only turn must not be able to stop a process, and even under
+        # a permissive approval policy this stays an ordinary (auto-approvable
+        # but visible) medium-risk action -- never a silent read-only bypass.
+        from tamfis_code.safety import classify_tool_call_risk
+
+        assert classify_tool_call_risk(
+            "kill_background_job", {"job_id": "x"}, workspace_root="/tmp",
+        ) == "medium"
+
+    def test_kill_schema_not_offered_in_read_only_turns(self):
+        from tamfis_code.runner_local import KILL_BACKGROUND_JOB_TOOL_SCHEMA
+
+        assert KILL_BACKGROUND_JOB_TOOL_SCHEMA["function"]["name"] == "kill_background_job"
+        assert "job_id" in KILL_BACKGROUND_JOB_TOOL_SCHEMA["function"]["parameters"]["required"]

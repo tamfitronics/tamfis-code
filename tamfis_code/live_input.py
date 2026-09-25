@@ -1916,13 +1916,21 @@ class LiveInputListener:
                 note(f"queued {item.get('id')} ({item.get('classification')}): {_truncate(str(item.get('text')), 100)}")
             return True
 
-        from .interactive import SLASH_COMMANDS
+        from .interactive import SLASH_COMMANDS, _resolve_typo_slash_command
 
         known = {name.lower() for name, _ in SLASH_COMMANDS}
         if head not in known:
-            close = difflib.get_close_matches(head, sorted(known), n=1)
-            note(f"Unknown command {head}" + (f" -- did you mean {close[0]}?" if close else ". Type /help for what works mid-task."))
-            return True
+            # A near-miss of exactly ONE known command runs it instead of
+            # bouncing the typo back (same policy as the idle REPL path in
+            # interactive.py); ambiguous near-misses still only suggest.
+            resolved = _resolve_typo_slash_command(head, known)
+            if resolved:
+                note(f"{head} is not a command -- running {resolved} instead.")
+                head, text = resolved, resolved + text[len(head):]
+            else:
+                close = difflib.get_close_matches(head, sorted(known), n=1)
+                note(f"Unknown command {head}" + (f" -- did you mean {close[0]}?" if close else ". Type /help for what works mid-task."))
+                return True
         item = local_state.enqueue_instruction(self.session_id, text, classification="command", priority=50)
         note(f"{head} can't run inside a running task. Queued ({item.id}): it runs as soon as the task finishes.")
         return True

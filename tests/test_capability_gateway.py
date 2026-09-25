@@ -99,6 +99,71 @@ def test_openai_schemas_are_generated_from_canonical_descriptors():
 
 
 @pytest.mark.asyncio
+async def test_gateway_repairs_json_encoded_object_arguments(tmp_path):
+    """Live failure 2026-09-24: execute_command arrived with ``environment``
+    as a JSON-encoded string; the strict validator rejected it, the provider
+    re-sent the identical call, and the stuck-detector killed the round.
+    The normaliser must decode it before validation."""
+    calls = []
+
+    class Server:
+        def list_tools(self):
+            return [{
+                "name": "execute_command",
+                "description": "Run a command",
+                "parameters": {
+                    "type": "object",
+                    "required": ["command"],
+                    "properties": {
+                        "command": {"type": "string"},
+                        "environment": {
+                            "type": "object",
+                            "additionalProperties": {"type": "string"},
+                        },
+                    },
+                },
+            }]
+
+        async def call_tool(self, name, arguments, **_kwargs):
+            calls.append((name, arguments))
+            return {"success": True, "result": "ok"}
+
+    gateway = TamfisCodeCapabilityGateway(Server())
+    result = await gateway.execute(ExecutionRequest("native.execute_command", {
+        "command": "echo hi",
+        "environment": '{"FOO": "bar"}',
+    }))
+    assert result.error is None
+    assert calls == [("execute_command", {"command": "echo hi", "environment": {"FOO": "bar"}})]
+
+
+@pytest.mark.asyncio
+async def test_gateway_accepts_mcp_namespaced_capability_for_a_native_tool(tmp_path):
+    """Live failure 2026-09-24: a provider emitted
+    ``mcp__huggingface_hub__hub_repo_search`` as the capability id and got
+    "unknown native capability" on every retry until the round was killed.
+    An MCP-namespaced id whose bare name IS a registered native tool must
+    route to it."""
+    gateway = TamfisCodeCapabilityGateway(MCPServer(workspace_root=str(tmp_path)))
+    result = await gateway.execute(ExecutionRequest("mcp__local__list_agent_types", {}))
+    assert result.error is None
+    assert result.output["built_in"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_reports_an_mcp_only_tool_clearly_instead_of_misrouting():
+    class Server:
+        def list_tools(self):
+            return [{"name": "read_file", "description": "read", "parameters": {}}]
+
+    gateway = TamfisCodeCapabilityGateway(Server())
+    result = await gateway.execute(ExecutionRequest("mcp__huggingface_hub__hub_repo_search", {}))
+    assert result.error is not None
+    assert "external MCP tool" in result.error
+    assert "huggingface_hub" in result.error
+
+
+@pytest.mark.asyncio
 async def test_native_gateway_rejects_invalid_contract_before_dispatch():
     calls = []
 

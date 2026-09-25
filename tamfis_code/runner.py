@@ -772,7 +772,9 @@ async def _stream_task(
                         "search_code", "find_references", "read_archive", "extract_archive",
                         "repackage_archive", "create_artifact", "inspect_artifact",
                         "execute_command", "get_git_info", "read_background_job",
+                        "kill_background_job",
                         "ask_user_question", "save_memory", "browser", "web_search",
+                        "memory_search", "memory_remember",
                     }
                     canonical_tool_name, _ = normalize_tool_call(
                         raw_tool_name, allowed_names=known_tool_names,
