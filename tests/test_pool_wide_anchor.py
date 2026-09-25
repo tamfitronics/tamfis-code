@@ -370,7 +370,21 @@ class TruncationContinuationBudgetTests(unittest.TestCase):
                 importlib.reload(runner_local)
 
     def test_default_cap_unchanged_for_existing_suites(self):
-        self.assertEqual(MAX_TRUNCATION_CONTINUATIONS, 6)
+        """The CODE default stays 6 regardless of the operator machine's
+        environment: providers.py loads the deployment .env at import (the
+        operator pins 18 there), so the module-level constant legitimately
+        differs per machine. The default is the no-env value."""
+        import importlib
+        from tamfis_code import runner_local
+
+        with patch.dict("os.environ", {}, clear=False):
+            import os as _os
+            _os.environ.pop("TAMFIS_CODE_TRUNCATION_CONTINUATIONS", None)
+            importlib.reload(runner_local)
+            try:
+                self.assertEqual(runner_local.MAX_TRUNCATION_CONTINUATIONS, 6)
+            finally:
+                importlib.reload(runner_local)  # restore the operator view
 
 
 if __name__ == "__main__":
