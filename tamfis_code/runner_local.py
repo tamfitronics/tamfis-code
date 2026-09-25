@@ -8349,11 +8349,31 @@ async def _run_local_agent_turn_impl(
     _restored_records = [
         item.to_dict() for item in (orchestrator.run.tool_records if orchestrator.run else [])
     ]
+    # Session-cumulative mutation evidence (mirror of the preflight merge at
+    # the completion gate): after /retry or resume, this run's tool_records
+    # start empty while the durable ledger (safety.record_mutation ->
+    # SessionState.modified_files) still holds the real, successful writes
+    # earlier runs made. Without merging them here, `any_mutation` stays
+    # False and orchestrator.complete() rejects a truthful final report with
+    # "no successful file mutation was recorded" even though the session
+    # itself made and verified the changes. Only merged on a resumed turn:
+    # a brand-new task must still prove its own work.
+    _ledger_mutations: list[dict[str, Any]] = []
+    if (resumed_from_checkpoint or resumed_from_legacy or resume_requested) and session_id is not None:
+        try:
+            _ledger_mutations = [
+                entry for entry in (local_state.get_session_state(session_id).modified_files or [])
+                if entry.get("revert_status") != "reverted"
+            ]
+        except Exception:
+            _ledger_mutations = []
     _restored_successful_mutations = {
         str(item.get("tool_name")) for item in _restored_records
         if item.get("success") is True
         and str(item.get("tool_name")) in {"write_file", "edit_file", "create_file", "patch_file", "extract_archive", "repackage_archive", "create_artifact"}
     }
+    if _ledger_mutations:
+        _restored_successful_mutations.add("edit_file")
     any_mutation = bool(_restored_successful_mutations)
     any_code_mutation = any(
         not _is_documentation_path((item.get("arguments") or {}).get("path"))
@@ -10569,6 +10589,35 @@ async def _run_local_agent_turn_impl(
                 item.to_dict()
                 for item in (orchestrator.run.tool_records if orchestrator.run else [])
             ]
+            # Completion evidence is SESSION-cumulative, not run-scoped.
+            # Confirmed live (2026-09-25, multi-/retry WP turn): a prior run
+            # of the same session made real, successful file mutations (the
+            # recap even lists them under Added/Updated), but /retry starts a
+            # fresh AgentRun with empty tool_records -- so the preflight saw
+            # "no successful file mutation", rejected the truthful final
+            # report, burned the evidence-retry budget, and hard-failed with
+            # "no successful file mutation was recorded" / "repeatedly
+            # stopped at analysis/advice". The durable mutation ledger
+            # (safety.record_mutation -> SessionState.modified_files, written
+            # at the tool boundary for every successful write/edit) is the
+            # authoritative record of what this SESSION changed on disk;
+            # merge its recent entries in as synthetic tool records so the
+            # validator judges reality instead of only the current run.
+            prior_mutations = list(
+                (local_state.get_session_state(session_id).modified_files or [])
+            )
+            for entry in prior_mutations[-50:]:
+                if entry.get("revert_status") == "reverted":
+                    continue  # a reverted write is no longer a workspace fact
+                tool_records.append({
+                    "tool_name": "edit_file",
+                    "success": True,
+                    "arguments": {"path": str(entry.get("path") or "")},
+                    "files_changed": [str(entry.get("path") or "")],
+                    "stdout": "",
+                    "stderr": "",
+                    "purpose": "session mutation ledger (recorded at the tool boundary)",
+                })
             try:
                 preflight_instructions = load_instruction_text(Path(workspace_root))
             except Exception:
@@ -10639,10 +10688,26 @@ async def _run_local_agent_turn_impl(
                 continue
 
             if explicit_change_evidence_missing:
+                # Tell the model exactly where the already-recorded work lives,
+                # so the resumed turn reports it instead of re-deriving it from
+                # scratch (the failure this replaces was a silent dead end).
+                prior_paths_summary = ""
+                if prior_mutations:
+                    recent_paths = sorted({
+                        str(entry.get("path")) for entry in prior_mutations[-12:]
+                        if entry.get("path")
+                    })
+                    prior_paths_summary = (
+                        " This session's durable mutation ledger already records real successful "
+                        "writes from earlier runs (retry/resume keeps them valid): "
+                        + ", ".join(recent_paths[:10])
+                        + ". Report against that recorded work -- do not restate it as unverified."
+                    )
                 message = (
                     "The model repeatedly stopped at analysis/advice without implementing "
                     "the requested change. No unverified draft was shown. The task was "
                     "checkpointed so it can resume with a tool-capable route."
+                    + prior_paths_summary
                 )
                 renderer.handle_event({
                     "event_type": "ai_task_failed",

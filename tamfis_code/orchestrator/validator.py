@@ -731,6 +731,41 @@ def validate_completion(
                 item.get("tool_name") in _MUTATING_TOOLS and item.get("success") is True
                 for item in tool_records
             )
+        if not validated and effective_edit_task:
+            # Resumed-turn verification: after /retry or resume, the run's own
+            # records may hold only successful INSPECTIONS while the actual
+            # mutations sit in the session mutation ledger (merged upstream as
+            # ledger tool records). A successful inspection that targets a
+            # path the ledger proves was written IS real verification of that
+            # mutation -- the model looked at the changed file and reported on
+            # it. Live-confirmed 2026-09-25: a truthful retry report was
+            # rejected purely because this gate counted only this run's
+            # execute_command calls, of which a verification-only retry has
+            # none by definition.
+            mutated_paths = _successful_mutation_paths(tool_records, workspace_root)
+            if mutated_paths:
+                base = Path(workspace_root or ".").resolve()
+                for item in tool_records:
+                    if (
+                        item.get("tool_name") not in {"read_file", "search_code", "list_directory", "get_git_info"}
+                        or item.get("success") is not True
+                    ):
+                        continue
+                    target = str(
+                        (item.get("arguments") or {}).get("path")
+                        or (item.get("arguments") or {}).get("query")
+                        or ""
+                    )
+                    if not target:
+                        continue
+                    candidate = Path(target).expanduser()
+                    resolved = (candidate if candidate.is_absolute() else base / candidate).resolve()
+                    if any(
+                        resolved == mutated or resolved in mutated.parents or mutated in resolved.parents
+                        for mutated in mutated_paths
+                    ):
+                        validated = True
+                        break
         checks.append({"name": "documentation_only_change", "passed": True, "value": documentation_only})
 
         # Verification is ordered evidence.  A later failed check/build must
